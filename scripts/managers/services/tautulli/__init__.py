@@ -220,9 +220,15 @@ class TautulliManager(BaseManager, ComponentManagerMixin):
         device_codec_mtx = self.transcode.get_device_codec_matrix(all_entries)
         series_stats     = self.series.get_series_completion_stats(all_entries)
         episode_stats    = self.episodes.get_episode_completion_stats(all_entries)
-        # Persist the per-device codec play/transcode matrix — the keystone signal
-        # for per-device profile selection (a new key; no consumer reads it yet).
+        # Persist the derived play-statistics signals the scorers consume:
+        #   tautulli/transcode — stream-codec-pair transcode tally; read by Radarr
+        #                        space_pressure and Sonarr episode_files (Group-D).
+        #   tautulli/platforms — per-platform play counts; same readers.
+        #   tautulli/device_codec_matrix — per-device play/transcode matrix, the
+        #                        keystone signal for per-device profile selection.
         if self.global_cache:
+            self.global_cache.set("tautulli/transcode", transcode_stats)
+            self.global_cache.set("tautulli/platforms", platform_stats)
             self.global_cache.set("tautulli/device_codec_matrix", device_codec_mtx)
 
         # 8. Genre/actor/director affinity — derived from already-cached inputs
