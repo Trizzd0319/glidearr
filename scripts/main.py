@@ -179,8 +179,6 @@ class Main(BaseManager, ComponentManagerMixin):
             sonarr=self.sonarr,
             radarr=self.radarr,
         )
-        self.registry.set_flag("acquisition_initialized")
-
         from scripts.managers.services.writeback import WritebackManager
         self.writeback = WritebackManager(
             logger=self.logger,
@@ -195,6 +193,7 @@ class Main(BaseManager, ComponentManagerMixin):
             radarr=self.radarr,
             tautulli=self.tautulli,
         )
+        self.registry.set_flag("acquisition_initialized")
         self.registry.set_flag("writeback_initialized")
 
         from scripts.managers.services.calendar import CalendarManager
@@ -248,19 +247,13 @@ class Main(BaseManager, ComponentManagerMixin):
         self._log_validation_table()
         self.logger.log_success("Validation complete — services ready.")
 
-    def _log_validation_table(self):
-        """One organized grid of every validated service (internal & external),
-        replacing the scattered per-service connectivity/finalize log lines."""
-        rows = []
-        for svc, r in (self._auth_results or {}).items():
-            if not isinstance(r, dict):
-                continue
-            status = "OK" if r.get("ok") else "FAIL"
-            detail = str(r.get("version") or r.get("label") or r.get("detail") or "")
-            rows.append([str(svc).capitalize(), status, detail])
-        rows.sort()
-        self.logger.log_grid(["Service", "Status", "Detail"], rows,
-                             title="Validation - services (internal & external)", cap=28)
+    def _validate_factories(self):
+        for flag in [
+            "registry_initialized", "config_initialized", "cache_initialized",
+            "metrics_initialized", "basemanager_initialized",
+        ]:
+            if not self.registry.has_flag(flag):
+                raise RuntimeError(f"Critical: Factory with flag '{flag}' failed initialization.")
 
     def _validate_managers(self):
         for flag in ["tautulli_initialized", "trakt_initialized", "trakt_movies_initialized", "radarr_initialized"]:
@@ -283,76 +276,19 @@ class Main(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_warning(f"[Main] Sonarr API pre-validation deferred to run(): {e}")
 
-    def _validate_factories(self):
-        for flag in [
-            "registry_initialized", "config_initialized", "cache_initialized",
-            "metrics_initialized", "basemanager_initialized",
-        ]:
-            if not self.registry.has_flag(flag):
-                raise RuntimeError(f"Critical: Factory with flag '{flag}' failed initialization.")
-
-    def clear_all_service_flags(self):
-        self.registry.clear_flags(prefix="tautulli_")
-        self.registry.clear_flags(prefix="trakt_")
-        self.registry.clear_flags(prefix="radarr_")
-        # self.registry.clear_flags(prefix="sonarr_")
-        self.registry.clear_flags(prefix="basemanager_")
-        self.registry.clear_flags(prefix="config_")
-        self.registry.clear_flags(prefix="cache_")
-        self.registry.clear_flags(prefix="metrics_")
-        self.registry.clear_flags(prefix="registry_")
-        self.registry.clear_flags(prefix="validator_")
-
-    def _start_radarr_library_prefetch(self):
-        """
-        Warm the Radarr movie snapshot in the background so it is ready before the
-        first repair scan reads it. This is the single freshness decision for the
-        run: get_movie_library() loads the persistent on-disk snapshot when it is
-        younger than ``radarr_movie_library_max_age_s`` (config, default 900s) — so a
-        run that lands inside that window skips the ~39s live GET /movie entirely —
-        otherwise it does one live fetch (overlapping the Tautulli+Trakt+Sonarr
-        phases) and re-stamps the cache for next time. Either way it warms the
-        module-level _COLLECTION_CACHE, so the repair scans AND the orchestration
-        enrichment transparently reuse the same snapshot.
-
-        Fire-and-forget + best-effort: if it fails or hasn't finished in time, the
-        repair scans just do their own live fetch — no regression, no behavior
-        change (read-only GET; identical in dry_run/live).
-
-        This was inserted here instead of letting it run during normal ordering due
-        delaying activation of script by ~39s. timing-runs showed this lasted from
-        ~30-50 seconds on average, causing unneccessary disruption in testing.
-        """
-        radarr = getattr(self, "radarr", None)
-        im = getattr(radarr, "instance_manager", None) or getattr(radarr, "radarr_api", None)
-        if im is None or not hasattr(im, "_make_request") or not hasattr(im, "_get_apis"):
-            return None
-
-        try:
-            max_age_s = int(self.config.get("radarr_movie_library_max_age_s", 900) or 0)
-        except Exception:
-            max_age_s = 900
-
-        def _worker():
-            try:
-                names = list((im._get_apis() or {}).keys())
-                t0 = _time.monotonic()
-                for name in names:
-                    if hasattr(im, "get_movie_library"):
-                        im.get_movie_library(name, max_age_s=max_age_s, global_cache=self.global_cache)
-                    else:
-                        im._make_request(name, "movie", fallback=[])
-                self.logger.log_debug(
-                    f"[Main] Radarr library prefetch warmed {len(names)} instance(s) "
-                    f"in {_time.monotonic() - t0:.1f}s (max_age={max_age_s}s)"
-                )
-            except Exception as e:
-                self.logger.log_debug(f"[Main] Radarr library prefetch skipped: {e}")
-
-        import threading
-        thread = threading.Thread(target=_worker, name="radarr-movie-prefetch", daemon=True)
-        thread.start()
-        return thread
+    def _log_validation_table(self):
+        """One organized grid of every validated service (internal & external),
+        replacing the scattered per-service connectivity/finalize log lines."""
+        rows = []
+        for svc, r in (self._auth_results or {}).items():
+            if not isinstance(r, dict):
+                continue
+            status = "OK" if r.get("ok") else "FAIL"
+            detail = str(r.get("version") or r.get("label") or r.get("detail") or "")
+            rows.append([str(svc).capitalize(), status, detail])
+        rows.sort()
+        self.logger.log_grid(["Service", "Status", "Detail"], rows,
+                             title="Validation - services (internal & external)", cap=28)
 
     def run(self):
         summary = RunSummaryCollector(dry_run=self.dry_run)
@@ -408,15 +344,21 @@ class Main(BaseManager, ComponentManagerMixin):
                              title="Prepared - managers", cap=20)
 
         # ── Phase 2: run all services ─────────────────────────────────────
-        # Order matters for cross-service cache dependencies:
-        #   Tautulli → writes tautulli/affinity + tautulli/group/*/tmdb_completions
-        #   Trakt    → writes trakt/history/movies (priority set for Radarr enrichment)
-        #   Sonarr   → independent of Radarr (verified: neither reads the other's
-        #              global_cache keys) — runs BEFORE Radarr so its ~15s wall
-        #              overlaps the background movie prefetch, hiding Radarr's cold
-        #              full-library fetch behind work that has to happen anyway.
-        #   Radarr   → reads the Tautulli + Trakt caches above; also runs Trakt
-        #              movie ratings. Runs LAST so the prefetch has already landed.
+        # Ordered as a producer→consumer pipeline, verified against the actual
+        # cross-service global_cache reads (not just intent):
+        #   SOURCES   Tautulli → tautulli/affinity + tautulli/group/*/tmdb_completions
+        #             Trakt    → trakt/history/movies (priority set for Radarr enrich)
+        #             MAL      → mal/* (consumed only in Phase 3)
+        #   LIBRARIES Sonarr + Radarr are independent of each other (verified:
+        #             neither reads the other's keys). Sonarr runs first so its ~15s
+        #             wall overlaps the background Radarr movie prefetch, hiding
+        #             Radarr's cold full-library fetch behind work that has to happen
+        #             anyway; Radarr is joined to the prefetch and runs last.
+        #   PLEX      both passes (run + run_reconcile) sit together, after the *arr.
+        #             Plex reads nothing from Trakt, and its only forward consumer
+        #             (acquisition's plex/watchlist/union, Phase 3) comes later — so
+        #             there is no reason to split the passes across Phase 2 the way
+        #             the old order did (inventory early / reconcile late).
         self.logger.log_info("Phase 2 — running all services...")
 
         try:
@@ -424,15 +366,6 @@ class Main(BaseManager, ComponentManagerMixin):
         except Exception as e:
             summary.add_error(f"Tautulli: {e}")
             self.logger.log_error(f"[Main] Tautulli run failed: {e}")
-
-        # Plex inventory/identity/watchlist — BEFORE Trakt so plex/watchlist/union
-        # is warm for acquisition (the last phase). Reconcile is a separate later
-        # pass (after Sonarr+Radarr). Plex self-disables when unconfigured.
-        try:
-            self.plex.run()
-        except Exception as e:
-            summary.add_error(f"Plex: {e}")
-            self.logger.log_error(f"[Main] Plex inventory run failed: {e}")
 
         try:
             self.trakt.run()
@@ -497,8 +430,20 @@ class Main(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_debug(f"[Main] size calibration refresh skipped: {e}")
 
-        # Plex reconcile — pure zero-API set-diff (orphans/missing) now that both
-        # *arr libraries are warm. Diagnostic only; never auto-deletes.
+        # ── Plex (single contiguous block, after the *arr) ────────────────
+        # Pass 1 — inventory/identity/watchlist. Writes plex/watchlist/union for
+        # Phase-3 acquisition and needs Tautulli's user list (already run). It reads
+        # nothing the *arr produce, so running it here instead of early is free and
+        # keeps both Plex passes together. Plex self-disables when unconfigured.
+        try:
+            self.plex.run()
+        except Exception as e:
+            summary.add_error(f"Plex: {e}")
+            self.logger.log_error(f"[Main] Plex inventory run failed: {e}")
+
+        # Pass 2 — reconcile: pure zero-API set-diff (orphans/missing) plus playlist
+        # plans, now that both *arr libraries + Sonarr JIT state are warm and the
+        # Sonarr API is validated. Diagnostic only; never auto-deletes.
         try:
             self.plex.run_reconcile()
         except Exception as e:
@@ -602,6 +547,69 @@ class Main(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_warning(f"[Main] Run-summary render failed: {e}")
         self._warn_if_deletions_disabled()
+
+    def _start_radarr_library_prefetch(self):
+        """
+        Warm the Radarr movie snapshot in the background so it is ready before the
+        first repair scan reads it. This is the single freshness decision for the
+        run: get_movie_library() loads the persistent on-disk snapshot when it is
+        younger than ``radarr_movie_library_max_age_s`` (config, default 900s) — so a
+        run that lands inside that window skips the ~39s live GET /movie entirely —
+        otherwise it does one live fetch (overlapping the Tautulli+Trakt+Sonarr
+        phases) and re-stamps the cache for next time. Either way it warms the
+        module-level _COLLECTION_CACHE, so the repair scans AND the orchestration
+        enrichment transparently reuse the same snapshot.
+
+        Fire-and-forget + best-effort: if it fails or hasn't finished in time, the
+        repair scans just do their own live fetch — no regression, no behavior
+        change (read-only GET; identical in dry_run/live).
+
+        This was inserted here instead of letting it run during normal ordering due
+        delaying activation of script by ~39s. timing-runs showed this lasted from
+        ~30-50 seconds on average, causing unneccessary disruption in testing.
+        """
+        radarr = getattr(self, "radarr", None)
+        im = getattr(radarr, "instance_manager", None) or getattr(radarr, "radarr_api", None)
+        if im is None or not hasattr(im, "_make_request") or not hasattr(im, "_get_apis"):
+            return None
+
+        try:
+            max_age_s = int(self.config.get("radarr_movie_library_max_age_s", 900) or 0)
+        except Exception:
+            max_age_s = 900
+
+        def _worker():
+            try:
+                names = list((im._get_apis() or {}).keys())
+                t0 = _time.monotonic()
+                for name in names:
+                    if hasattr(im, "get_movie_library"):
+                        im.get_movie_library(name, max_age_s=max_age_s, global_cache=self.global_cache)
+                    else:
+                        im._make_request(name, "movie", fallback=[])
+                self.logger.log_debug(
+                    f"[Main] Radarr library prefetch warmed {len(names)} instance(s) "
+                    f"in {_time.monotonic() - t0:.1f}s (max_age={max_age_s}s)"
+                )
+            except Exception as e:
+                self.logger.log_debug(f"[Main] Radarr library prefetch skipped: {e}")
+
+        import threading
+        thread = threading.Thread(target=_worker, name="radarr-movie-prefetch", daemon=True)
+        thread.start()
+        return thread
+
+    def clear_all_service_flags(self):
+        self.registry.clear_flags(prefix="tautulli_")
+        self.registry.clear_flags(prefix="trakt_")
+        self.registry.clear_flags(prefix="radarr_")
+        # self.registry.clear_flags(prefix="sonarr_")
+        self.registry.clear_flags(prefix="basemanager_")
+        self.registry.clear_flags(prefix="config_")
+        self.registry.clear_flags(prefix="cache_")
+        self.registry.clear_flags(prefix="metrics_")
+        self.registry.clear_flags(prefix="registry_")
+        self.registry.clear_flags(prefix="validator_")
 
     def _warn_if_deletions_disabled(self) -> None:
         """LAST lines of the run log: when free_space_limit is unset (0), every media
