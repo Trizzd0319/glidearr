@@ -3,6 +3,7 @@ from typing import Optional
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.cache.key_builder import CacheKeyBuilder
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
+from scripts.managers.factories.mixins.ordered_components import topo_order
 from scripts.managers.services.sonarr.cache import SonarrCacheManager
 from scripts.managers.services.sonarr.episodes import SonarrEpisodesManager
 from scripts.managers.services.sonarr.instance import SonarrInstanceManager
@@ -47,6 +48,11 @@ class SonarrManager(BaseManager, ComponentManagerMixin):
         self.key_builder = CacheKeyBuilder()
 
         # --- Step 1: Define dependencies (active subset) ---
+        # {component: [names that must load before it]}. prepare()/run() iterate
+        # this through topo_order(), so the order honours these declared deps
+        # regardless of the dict's insertion order — explicit and reorder-proof.
+        # prepare() loads + prepares every entry; run() invokes only the entries
+        # that actually define a run().
         self.component_dependencies = {
             "instance_manager": ["manager"],
             # sonarr_cache is initialised manually in __init__ and is not a
@@ -172,10 +178,12 @@ class SonarrManager(BaseManager, ComponentManagerMixin):
     @timeit("prepare")
     def prepare(self):
         cls = self.__class__.__name__
+        # Explicit, dependency-respecting order (reorder-proof — see topo_order).
+        order = topo_order(self.component_dependencies)
         # Components built eagerly in __init__ (instance_manager) bypass
         # _load_component — the only thing that writes a load_summary row — so mark
         # them loaded here, else they render ❌ despite being healthy.
-        for name in self.component_dependencies:
+        for name in order:
             if getattr(self, name, None) is None:
                 self._load_component(name)
             elif not str(self.load_summary.get(name, "")).startswith("✅"):
@@ -183,7 +191,7 @@ class SonarrManager(BaseManager, ComponentManagerMixin):
         # Prepare sub-components; a prepare() failure flips that component to ❌
         # (previously such failures were silently swallowed).
         failed = []
-        for name in self.component_dependencies:
+        for name in order:
             component = getattr(self, name, None)
             if component and hasattr(component, "prepare"):
                 try:
@@ -206,7 +214,8 @@ class SonarrManager(BaseManager, ComponentManagerMixin):
     def run(self):
         cls = self.__class__.__name__
         results = {}
-        for name in self.component_dependencies:
+        order = topo_order(self.component_dependencies)
+        for name in order:
             component = getattr(self, name, None) or self._load_component(name)
             if component and hasattr(component, "run"):
                 try:
