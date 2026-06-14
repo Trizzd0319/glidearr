@@ -67,8 +67,8 @@ same-host setups.** Reasons tied to this codebase:
 2. **Overlap/debounce protection is free — but it is daemon-gated.** `main.py`
    writes `scripts/support/cache/trakt/main_run.active` (`{pid, ts}`) at startup
    and removes it in its `finally` block — **but both are behind `if
-   _daemon_enabled:`** ([`scripts/main.py:651-652`](scripts/main.py) write,
-   [`:683-684`](scripts/main.py) remove). The path + 30-min backstop
+   _daemon_enabled:`** (`_write_main_active_sentinel` [`scripts/main.py:690-691`](scripts/main.py),
+   `_remove_main_active_sentinel` [`:722-723`](scripts/main.py)). The path + 30-min backstop
    (`MAIN_ACTIVE_MAX_AGE_S = 1800`, re-check cadence `MAIN_ACTIVE_POLL_S = 5`) live
    in [`daemon_paths.py:41-43`](scripts/managers/factories/daemons/daemon_paths.py).
    **With the daemon disabled, no sentinel is ever written** — so the helper's
@@ -317,8 +317,8 @@ Read these before committing — no sugar-coating.
   informed-consent point.*
 
 - **Sentinel/debounce is daemon-gated.** The overlap and binge-collapse protection
-  exists **only when `daemons.enrich.enabled` is true** ([`main.py:651-652`,
-  `:683-684`](scripts/main.py)). With the daemon off there is no sentinel; the
+  exists **only when `daemons.enrich.enabled` is true** (`_write_main_active_sentinel`
+  / `_remove_main_active_sentinel`, [`main.py:690-691,722-723`](scripts/main.py)). With the daemon off there is no sentinel; the
   helper has no debounce and the scheduler↔event cross-overlap is unguarded.
 
 - **The daemon toggle is a three-way trade.** Enabling it gives cheap cache-only
@@ -427,7 +427,7 @@ same-host constraint and the security surface of §6.
 ---
 
 *Verified against the codebase 2026-06-13: sentinel path + daemon-gating
-([`main.py:651-652,683-684`](scripts/main.py)), path layout + constants
+([`main.py:690-691,722-723`](scripts/main.py)), path layout + constants
 ([`daemon_paths.py:24-43`](scripts/managers/factories/daemons/daemon_paths.py)),
 launch via self-bootstrap — `main.py` inserts the repo root onto `sys.path` at
 startup (mirroring `enrich_daemon.py` / `onboarding.py`) and is 100%
