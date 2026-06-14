@@ -617,9 +617,16 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
                 ("movie_files",    lambda i: self.run_movie_files_pull(i)),
                 ("relational",     lambda i: self.run_relational_pull(i)),
                 ("movie_ratings",  lambda i: self.run_movie_ratings(i)),
-                ("space_pressure", lambda i: self.run_space_pressure(i)),
                 ("movie_enrichment", lambda i: self.run_movie_enrichment(i)),
+                # refresh_scores MUST come before space_pressure: the deletion and
+                # active-watcher-upgrade stages read the persisted watchability_score
+                # column, and refresh_scores is its only writer. Running space_pressure
+                # first left those stages ranking on the *previous* run's scores (and
+                # the live-fallback only on a cold cache). Downgrades are unaffected —
+                # they recompute scores live — but deletions/upgrades read the column.
+                # Sonarr already orders scoring before its upgrade/downgrade passes.
                 ("refresh_scores",  lambda i: self.run_refresh_scores(i)),
+                ("space_pressure", lambda i: self.run_space_pressure(i)),
                 ("universe",       lambda i: self.run_universe_quality(i)),
             ]:
                 try:
@@ -637,8 +644,9 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
     def run_refresh_scores(self, instance: str) -> int:
         """
         Compute watchability scores for every Parquet row and persist them.
-        Must run before run_universe_quality so the universe manager has
-        valid scores to gate 4K eligibility.
+        Must run before run_space_pressure (whose deletion + active-watcher
+        upgrade stages read the persisted watchability_score column) and before
+        run_universe_quality (which gates 4K eligibility on the score).
         """
         resolved    = self._resolve_instance(instance)
         quality_mgr = self._get_quality_manager()
