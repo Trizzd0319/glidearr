@@ -132,6 +132,15 @@ class PlexStep(Step):
                           default=cur.get("url", ""))
         port = prompter.integer("plex.port", "Plex port",
                                 default=int(cur.get("port") or 32400))
+        # The account OWNER's token is what unlocks Home-profile enumeratoin (per-user
+        # playlists + age-gating); a managed/Home-user token only ever sees itself.
+        # Tell the operator how to grab the right one before prompting for it.
+        prompter.notice(
+            "   Tip: use the Plex ACCOUNT OWNER's token (not a managed/Home user) — only the\n"
+            "   owner token can list Home profiles for per-user playlists and age-gating.\n"
+            "   To find it: sign in to Plex as the owner, open any library item, then\n"
+            "   ⋯ (More) → Get Info → View XML, and copy the X-Plex-Token=... value from the\n"
+            "   URL that opens. (Or copy PlexOnlineToken=\"...\" from the server's Preferences.xml.)")
         token = prompter.secret("plex.plex_token", "Plex token (X-Plex-Token)",
                                 default=cur.get("plex_token", ""), required=True)
         media = prompter.text("plex.plex_media_path", "Plex media path",

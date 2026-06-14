@@ -46,6 +46,23 @@ def test_aggregate_series_signals():
     assert sd[2]["keep_policy"] == "keep_series"
 
 
+def test_aggregate_series_signals_nan_watch_stays_none_and_is_not_active():
+    # A NaN last_watched_at is truthy, and pd.to_datetime(NaN) -> NaT (no raise).
+    # Without the pd.notna guard it would be stored as NaT and, since NaT comparisons
+    # are all False, sail past the recency gate as a phantom "actively watched,
+    # watched NaN days ago" series. It must stay None and be treated as not-active.
+    df = pd.DataFrame([
+        {"series_id": 7, "series_title": "G", "last_watched_at": float("nan"),
+         "certification": "TV-MA", "keep_policy": None, "is_watched": True, "all_household_watched": False},
+    ])
+    sd = aggregate_series_signals(df)
+    assert sd[7]["latest_watch"] is None
+    active, stats = active_series_candidates(
+        sd, cutoff=datetime(2026, 5, 1, tzinfo=timezone.utc), kids_certs=_KIDS,
+    )
+    assert active == [] and stats["skipped_not_active"] == 1
+
+
 def test_active_series_candidates_guards():
     cutoff = datetime(2026, 5, 1, tzinfo=timezone.utc)
     recent = datetime(2026, 6, 1, tzinfo=timezone.utc)
@@ -77,6 +94,13 @@ def test_decide_series_upgrade_guards_in_order():
 
     at_best = {"statistics": {"episodeCount": 10, "episodeFileCount": 3}, "qualityProfileId": 9, "runtime": 30}
     assert decide_series_upgrade(at_best, set(), best_id=9, freeze_tags=_FREEZE, mbpm=50)["skip"] == "already_best"
+
+
+def test_decide_series_upgrade_skips_series_with_no_episodes():
+    # episodeCount 0 -> nothing on disk, nothing to grab: a profile change would be a
+    # pure no-op, so it must not be reported as an upgrade.
+    empty = {"statistics": {"episodeCount": 0, "episodeFileCount": 0}, "qualityProfileId": 1, "runtime": 30}
+    assert decide_series_upgrade(empty, set(), best_id=9, freeze_tags=_FREEZE, mbpm=50)["skip"] == "no_episodes"
 
 
 def test_decide_series_upgrade_numbers():

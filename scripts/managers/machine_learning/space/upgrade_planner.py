@@ -178,12 +178,17 @@ def aggregate_series_signals(df) -> "dict[int, dict]":
                 "title": title, "latest_watch": None, "certs": set(),
                 "keep_policy": policy, "watched_eps": 0, "household_eps": 0,
             }
-        if lw:
+        # pd.notna guards a missing watch date: a bare ``if lw`` lets NaN through
+        # (NaN is truthy), and pd.to_datetime(NaN) returns NaT rather than raising —
+        # which would store NaT and, since NaT comparisons are all False, sail past
+        # the recency gate as a phantom "actively watched, watched NaN days ago".
+        if pd.notna(lw):
             try:
                 dt = pd.to_datetime(lw, utc=True)
-                existing = series_data[sid]["latest_watch"]
-                if existing is None or dt > existing:
-                    series_data[sid]["latest_watch"] = dt
+                if pd.notna(dt):
+                    existing = series_data[sid]["latest_watch"]
+                    if existing is None or dt > existing:
+                        series_data[sid]["latest_watch"] = dt
             except Exception:
                 pass
         if has_watched and bool(row.get("is_watched")):
@@ -236,8 +241,10 @@ def decide_series_upgrade(series_record, tag_labels, *, best_id, freeze_tags, mb
                           default_runtime_min: float = 45.0) -> dict:
     """The record-based decision for one active series, given its FETCHED Sonarr record +
     resolved tag-label set. Guards (in order): fully-downloaded (episodeFileCount >=
-    episodeCount > 0) → ``skip='fully_downloaded'``; quality-freeze tag → ``'quality_frozen'``;
-    already at the target ``best_id`` → ``'already_best'``. Otherwise ``skip=None`` plus the
+    episodeCount > 0) → ``skip='fully_downloaded'``; no episodes known (episodeCount <= 0,
+    nothing on disk and nothing to grab) → ``'no_episodes'``; quality-freeze tag →
+    ``'quality_frozen'``; already at the target ``best_id`` → ``'already_best'``. Otherwise
+    ``skip=None`` plus the
     upgrade numbers (ep_total, ep_file_count, remaining, runtime_min, est_gb — the estimated
     grab of the remaining episodes at ``mbpm`` MiB/min). Pure."""
     stats_block = series_record.get("statistics") or {}
@@ -245,6 +252,11 @@ def decide_series_upgrade(series_record, tag_labels, *, best_id, freeze_tags, mb
     ep_file_count = stats_block.get("episodeFileCount", 0) or 0
     if ep_total > 0 and ep_file_count >= ep_total:
         return {"skip": "fully_downloaded"}
+    if ep_total <= 0:
+        # No episodes known to Sonarr: nothing on disk and nothing to grab, so a
+        # profile change is a pure no-op — and a series with zero episodes can't be
+        # "actively watched" in the first place.
+        return {"skip": "no_episodes"}
     if tag_labels & freeze_tags:
         return {"skip": "quality_frozen"}
     if series_record.get("qualityProfileId") == best_id:

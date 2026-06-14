@@ -15,6 +15,51 @@ from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
 from scripts.support.utilities.space_targets import space_targets
 
 
+def _profile_max_resolution(profile: dict | None) -> int:
+    """Highest resolution among a profile's *allowed* quality items (incl. nested groups)."""
+    best = 0
+    for item in ((profile or {}).get("items") or []):
+        if not item.get("allowed"):
+            continue
+        res = (item.get("quality") or {}).get("resolution", 0)
+        if isinstance(res, (int, float)):
+            best = max(best, int(res))
+        for sub in (item.get("items") or []):
+            if not sub.get("allowed"):
+                continue
+            sr = (sub.get("quality") or {}).get("resolution", 0)
+            if isinstance(sr, (int, float)):
+                best = max(best, int(sr))
+    return best
+
+
+def _is_anime_profile(profile: dict) -> bool:
+    """A quality profile dedicated to anime — named like ``[Anime] Remux-1080p``."""
+    return (profile.get("name") or "").strip().lower().startswith("[anime]")
+
+
+def select_upgrade_targets(profiles: list[dict]) -> tuple[dict | None, dict | None]:
+    """Highest-resolution upgrade target *within each seriesType family*.
+
+    Returns ``(best_standard, best_anime)``. A series is only ever upgraded inside
+    its own family: standard/daily series take the best non-anime profile, anime
+    series take the best anime profile. Each family falls back to the other only
+    when it has no profiles of its own, so a target is always returned whenever at
+    least one profile exists.
+
+    Without the split, a single global ``max(resolution)`` pick tie-breaks onto
+    whichever 2160p profile sorts last — the anime one — and routes every
+    actively-watched series onto the anime profile regardless of type.
+    """
+    def _best(pool: list[dict]) -> dict | None:
+        ranked = sorted(pool, key=_profile_max_resolution)
+        return ranked[-1] if ranked else None
+
+    best_standard = _best([p for p in profiles if not _is_anime_profile(p)])
+    best_anime    = _best([p for p in profiles if _is_anime_profile(p)])
+    return (best_standard or best_anime), (best_anime or best_standard)
+
+
 class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
     parent_name = "SonarrSeries"
 
@@ -93,7 +138,7 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
             "checked": 0, "upgraded": 0, "already_best": 0,
             "skipped_kids": 0, "skipped_not_active": 0,
             "skipped_keep": 0, "skipped_fully_downloaded": 0,
-            "skipped_quality_frozen": 0, "failed": 0,
+            "skipped_quality_frozen": 0, "skipped_no_episodes": 0, "failed": 0,
         }
 
         # ── Space check (upgrade only above the band top U) ──────────────────────
@@ -147,39 +192,19 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
         if not raw_profiles:
             return stats
 
-        def _max_res(p: dict) -> int:
-            best = 0
-            for item in (p.get("items") or []):
-                if not item.get("allowed"):
-                    continue
-                res = (item.get("quality") or {}).get("resolution", 0)
-                if isinstance(res, (int, float)):
-                    best = max(best, int(res))
-                for sub in (item.get("items") or []):
-                    if not sub.get("allowed"):
-                        continue
-                    sr = (sub.get("quality") or {}).get("resolution", 0)
-                    if isinstance(sr, (int, float)):
-                        best = max(best, int(sr))
-            return best
-
-        ranked     = sorted(raw_profiles, key=_max_res)
-        best       = ranked[-1] if ranked else None
-        if not best:
+        # Pick the highest-resolution upgrade target *within each seriesType family*
+        # (see select_upgrade_targets): anime series upgrade to the anime profile,
+        # standard/daily series to the best non-anime profile. A global argmax would
+        # tie-break onto whichever 2160p profile sorts last — the anime one — and land
+        # every actively-watched series on it regardless of type.
+        best_standard, best_anime = select_upgrade_targets(raw_profiles)
+        if best_standard is None:
             return stats
 
-        best_id   = best["id"]
-        best_name = best.get("name", str(best_id))
-        best_res  = _max_res(best)
-
         # --- Anticipated-space model (depends only on the target profile + df) ---
-        # Resolve the target MiB/min exactly as JIT _est_gb does: measured
-        # per-quality average → JIT fallback table → 25.0 default. Every
-        # active-watcher upgrade targets the same `best` profile, so compute once.
-        try:
-            _, _aw_target_name = ep_mgr._profile_max_quality(best) if (ep_mgr and best) else (-1, None)
-        except Exception:
-            _aw_target_name = None
+        # Resolve the target MiB/min exactly as JIT _est_gb does: measured per-quality
+        # average → JIT fallback table → 25.0 default. The df-derived tables are
+        # profile-independent (compute once); the per-family target name resolves below.
         _aw_measured = {}
         if ep_mgr is not None and df is not None and not df.empty:
             try:
@@ -187,7 +212,16 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
             except Exception:
                 _aw_measured = {}
         _aw_fallback = getattr(ep_mgr, "JIT_FALLBACK_MB_PER_MIN", {}) if ep_mgr else {}
-        _aw_mbpm = _aw_measured.get(_aw_target_name) or _aw_fallback.get(_aw_target_name) or 25.0
+
+        def _target_mbpm(target: dict | None) -> float:
+            try:
+                _, tname = ep_mgr._profile_max_quality(target) if (ep_mgr and target) else (-1, None)
+            except Exception:
+                tname = None
+            return _aw_measured.get(tname) or _aw_fallback.get(tname) or 25.0
+
+        _aw_mbpm_standard = _target_mbpm(best_standard)
+        _aw_mbpm_anime    = _target_mbpm(best_anime)
 
         # ── df-based guards (brain): keep_series/keep_season, recently-active, kids-only.
         # Run BEFORE any per-series fetch so a skipped series costs no API call.
@@ -226,6 +260,15 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
                 stats["skipped_fully_downloaded"] += 1
                 continue
 
+            # Per-family upgrade target (Sonarr seriesType): anime series upgrade to
+            # the anime profile, standard/daily to the best non-anime profile.
+            is_anime_series = (series.get("seriesType") or "").strip().lower() == "anime"
+            best      = best_anime if is_anime_series else best_standard
+            _aw_mbpm  = _aw_mbpm_anime if is_anime_series else _aw_mbpm_standard
+            best_id   = best["id"]
+            best_name = best.get("name", str(best_id))
+            best_res  = _profile_max_resolution(best)
+
             # Resolve the series' tag labels (cache → API) for the freeze-tag guard —
             # only for series that survived the fully-downloaded skip.
             tag_labels: set[str] = set()
@@ -255,6 +298,9 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
             if skip == "already_best":
                 stats["already_best"] += 1
                 continue
+            if skip == "no_episodes":
+                stats["skipped_no_episodes"] += 1
+                continue
 
             # ── Upgrade: format the "why this qualifies" detail + apply ──────────────
             ep_total      = verdict["ep_total"]
@@ -265,12 +311,14 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
             cur_profile_id   = series.get("qualityProfileId")
             cur_profile      = next((p for p in raw_profiles if p.get("id") == cur_profile_id), None)
             cur_profile_name = (cur_profile or {}).get("name", str(cur_profile_id))
-            cur_res          = _max_res(cur_profile) if cur_profile else 0
+            cur_res          = _profile_max_resolution(cur_profile) if cur_profile else 0
             cur_res_s        = f"≤{cur_res}p"  if cur_res  else "?"
             best_res_s       = f"≤{best_res}p" if best_res else "?"
 
             try:
                 days_ago = (pd.Timestamp.now(tz="UTC") - latest).days
+                if pd.isna(days_ago):        # NaT latest -> nan days; don't render "nand"
+                    days_ago = None
             except Exception:
                 days_ago = None
             recency = (
