@@ -1,0 +1,13 @@
+#!/bin/sh
+# Glidearr pre-commit secret guard.
+# Activate (per clone):  python scripts/support/setup/install_hooks.py
+#                or:      git config core.hooksPath scripts/hooks
+DIR="$(dirname "$0")"
+if command -v python >/dev/null 2>&1; then PY=python
+elif command -v python3 >/dev/null 2>&1; then PY=python3
+else
+  echo "pre-commit: python not found - skipping secret scan" >&2
+  exit 0
+fi
+"$PY" "$DIR/secret_scan.py" || exit 1
+exec "$PY" "$DIR/brain_purity.py"

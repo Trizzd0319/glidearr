@@ -1,0 +1,58 @@
+# Local agent/editor state — never commit
+.claude/
+
+# Credentials and secrets — never commit
+scripts/support/config/config.json
+scripts/alpha/config/config.json
+scripts/alpha/config/config.json.*
+**/config/config.json
+**/config/config.json.*
+*.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+scripts/support/logs/
+*.log
+*.log.jsonl
+*.log.gz
+*.jsonl
+
+# Cache files
+scripts/cache/
+scripts/support/cache/
+*.zip
+*.gz
+*.parquet
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Stray run-log dumps (redirect targets, not source)
+/test_log.txt
+/test_log2.txt
+/test_daemon_log.txt
+
+# Vendored third-party Kometa overlay asset bundles (PNGs/yml dumped under the
+# cache factory dir) — not source; keep out of commits.
+scripts/managers/factories/cache/kometa-*/

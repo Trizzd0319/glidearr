@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img">
+  <title>Glidearr favicon</title>
+  <desc>Simplified flat Glidearr icon for small sizes: a paper glider on a solid indigo badge.</desc>
+  <rect x="0" y="0" width="512" height="512" rx="116" fill="#1b1640"/>
+  <circle cx="190" cy="340" r="9" fill="#6ff0db"/>
+  <circle cx="208" cy="324" r="11" fill="#9bf6e6"/>
+  <g transform="translate(256,236) rotate(-18) scale(3.6) translate(-45,-35)">
+    <polygon points="90,35 4,6 38,35" fill="#f5f8fc"/>
+    <polygon points="90,35 38,35 4,64" fill="#aab6dc"/>
+  </g>
+</svg>

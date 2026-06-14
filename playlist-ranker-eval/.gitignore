@@ -1,0 +1,12 @@
+# Generated reports — your own data; do not commit
+playlist_eval_report.json
+playlist_eval_report.md
+*_report.json
+*_report.md
+reports/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/

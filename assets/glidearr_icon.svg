@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img">
+  <title>Glidearr</title>
+  <desc>A folded paper glider rising along a dotted flight path on a deep indigo badge with a teal accent.</desc>
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="38%" r="72%">
+      <stop offset="0" stop-color="#3a3270"/>
+      <stop offset="1" stop-color="#15122c"/>
+    </radialGradient>
+  </defs>
+  <rect x="0" y="0" width="512" height="512" rx="116" fill="url(#bg)"/>
+  <circle cx="250" cy="222" r="176" fill="#2dd4bf" opacity="0.10"/>
+  <line x1="92" y1="452" x2="420" y2="452" stroke="#2dd4bf" stroke-width="5" stroke-linecap="round" opacity="0.22"/>
+  <circle cx="116" cy="432" r="4.5" fill="#5eead4" opacity="0.16"/>
+  <circle cx="128" cy="413" r="5" fill="#5eead4" opacity="0.28"/>
+  <circle cx="141" cy="395" r="5.6" fill="#5eead4" opacity="0.42"/>
+  <circle cx="156" cy="377" r="6.3" fill="#5eead4" opacity="0.58"/>
+  <circle cx="171" cy="359" r="7.1" fill="#5eead4" opacity="0.74"/>
+  <circle cx="188" cy="342" r="7.9" fill="#6ff0db" opacity="0.88"/>
+  <circle cx="204" cy="327" r="8.6" fill="#9bf6e6" opacity="1"/>
+  <g transform="translate(256,236) rotate(-18) scale(3.6) translate(-45,-35)">
+    <polygon points="90,35 4,6 38,35" fill="#f5f8fc"/>
+    <polygon points="90,35 38,35 4,64" fill="#aab6dc"/>
+  </g>
+  <rect x="2" y="2" width="508" height="508" rx="114" fill="none" stroke="#2dd4bf" stroke-width="3" opacity="0.16"/>
+</svg>

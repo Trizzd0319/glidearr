@@ -1,0 +1,62 @@
+"""
+plex/_common.py — schema-tolerant parsing shared by the per-user fetchers.
+================================================================================
+Every UNSTABLE Plex response (Discover watchlist, plex.tv, onDeck) is parsed with
+``.get(...)`` only — never indexed — so a contract drift soft-empties (``[]``)
+instead of raising (DESIGN §6.3). One ``metadata_items`` / ``parse_item`` pair keeps
+that discipline uniform across watchlist / on_deck / ratings / collections.
+"""
+from __future__ import annotations
+
+_TYPE = {"1": "movie", "2": "show", "movie": "movie", "show": "show",
+         "episode": "episode", "season": "show", "4": "episode"}
+
+
+def metadata_items(resp) -> list:
+    """The ``Metadata`` list from a MediaContainer response (or ``[]``)."""
+    if not isinstance(resp, dict):
+        return []
+    mc = resp.get("MediaContainer", resp)
+    if not isinstance(mc, dict):
+        return []
+    items = mc.get("Metadata") or mc.get("Video") or mc.get("Directory") or []
+    return items if isinstance(items, list) else []
+
+
+def total_size(resp) -> int:
+    """Grand ``totalSize`` for the paging early-stop, or 0 when absent.
+
+    Deliberately does NOT fall back to ``size`` — ``size`` is the count of items in
+    the CURRENT page (== the page cap on a full page), so treating it as the grand
+    total would early-stop after page 1 and silently truncate a multi-page result
+    (the UNSTABLE Discover watchlist is exactly where ``totalSize`` may be absent).
+    Returning 0 makes the callers fall through to the safe ``if not items: break``
+    empty-page terminator (bounded by their _MAX_PAGES ceiling)."""
+    if not isinstance(resp, dict):
+        return 0
+    mc = resp.get("MediaContainer", resp)
+    if not isinstance(mc, dict):
+        return 0
+    try:
+        return int(mc.get("totalSize") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_item(item: dict) -> dict:
+    """Normalize one Metadata entry to a fetcher-friendly shape. Tolerant of every
+    missing field."""
+    if not isinstance(item, dict):
+        item = {}
+    raw_type = str(item.get("type", "")).lower()
+    return {
+        "rating_key": item.get("ratingKey") or item.get("ratingkey"),
+        "guid": item.get("guid") or "",
+        "guids": item.get("Guid") or item.get("guids") or [],
+        "title": item.get("title") or "",
+        "year": item.get("year"),
+        "type": _TYPE.get(raw_type, "movie" if raw_type in ("", "movie") else raw_type),
+        "user_rating": item.get("userRating"),
+        "view_offset_ms": item.get("viewOffset"),
+        "duration_ms": item.get("duration"),
+    }

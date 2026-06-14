@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 140 320 320" role="img">
+  <title>Glidearr mark</title>
+  <desc>The Glidearr glider and fading flight-path trail, no badge, for light backgrounds.</desc>
+  <circle cx="116" cy="432" r="4.5" fill="#14b8a6" opacity="0.30"/>
+  <circle cx="128" cy="413" r="5" fill="#14b8a6" opacity="0.42"/>
+  <circle cx="141" cy="395" r="5.6" fill="#14b8a6" opacity="0.55"/>
+  <circle cx="156" cy="377" r="6.3" fill="#14b8a6" opacity="0.68"/>
+  <circle cx="171" cy="359" r="7.1" fill="#14b8a6" opacity="0.80"/>
+  <circle cx="188" cy="342" r="7.9" fill="#0f9d8f" opacity="0.92"/>
+  <circle cx="204" cy="327" r="8.6" fill="#0d9488" opacity="1"/>
+  <g transform="translate(256,236) rotate(-18) scale(3.6) translate(-45,-35)">
+    <polygon points="90,35 4,6 38,35" fill="#1b1640"/>
+    <polygon points="90,35 38,35 4,64" fill="#4a477e"/>
+  </g>
+</svg>

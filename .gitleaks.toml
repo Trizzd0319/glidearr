@@ -1,0 +1,20 @@
+# gitleaks config for Glidearr.
+# Used automatically by the pre-commit hook when `gitleaks` is installed, and by
+# any CI gitleaks step. Extends the built-in ruleset; allowlists templates,
+# scrub markers, and blank secret fields so they aren't flagged as findings.
+title = "Glidearr"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Templates, scrub markers, and blank secret fields are not secrets"
+regexes = [
+  '''\*\*\*REMOVED\*\*\*''',          # history-scrub marker
+  '''"[A-Za-z0-9_]+"\s*:\s*""''',     # blank secret fields ("api": "")
+  '''<[^>]+>''',                      # <placeholder>
+]
+paths = [
+  '''scripts/support/config/default_config\.json''',  # blank template
+  '''(^|/)support/logs/''',                            # rotating logs (gitignored anyway)
+]

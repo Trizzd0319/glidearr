@@ -1,0 +1,85 @@
+
+REUSABLE PROCESS FLOW GENERATOR TEMPLATE
+=======================================
+
+Purpose:
+--------
+This template defines the structured prompt you can share with me anytime you want a clean, efficient, system-wide process flow generated across multiple managers (e.g., Sonarr, Tautulli, Machine Learning).
+
+
+Prompt:
+-------
+Write me a clean and efficient process flow based on the following system context:
+
+- Top-level orchestrator (Main.py or similar) coordinates multiple managers.
+- Each manager (e.g., SonarrManager, TautulliManager, MachineLearningManager) holds submodules.
+- Submodules are instantiated under their parent manager but do not directly cross-call into other domains.
+- Only the orchestrator handles multi-manager coordination, e.g.,:
+    - Detect low space (SonarrStorageManager)
+    - Check downgrade options (SonarrQualityManager)
+    - If none, use watch history (TautulliWatchHistoryManager) + ML (MachineLearningManager) to select deletions
+    - Execute deletions (SonarrEpisodesManager.deletion)
+
+I want the response to include:
+✅ The overall architecture flow
+✅ A clear control layer diagram (who owns what)
+✅ A high-level example call chain
+✅ Notes on best practices for clean boundaries
+✅ Recommendations for orchestration helper layers if needed
+
+Assume the managers follow:
+- Central container manager (e.g., SonarrManager) holding multiple submodules
+- Main orchestrator managing coordination
+- Dependency injection handled at top-level, not buried deep
+
+
+Reusable Structure of the Response:
+-----------------------------------
+
+✅ Architecture Flow
+- Main.py → Manager → Submodules
+- Main orchestrates across managers
+- Submodules don’t directly cross-call
+
+✅ Ownership Diagram
+| Layer                   | Responsibility                                           |
+|-------------------------|----------------------------------------------------------|
+| Main.py                 | Top-level coordination, multi-manager flow control       |
+| SonarrManager           | Owns Sonarr-related subsystems                           |
+| TautulliManager         | Owns Tautulli-related subsystems                         |
+| MachineLearningManager  | Owns ML-specific subsystems, fed by Sonarr + Tautulli    |
+| Submodules              | Focused on narrow, clear tasks (no orchestration logic)  |
+
+✅ Example Call Chain
+if sonarr.storage_manager.get_minimum_free_space() < threshold:
+    downgrade_candidates = sonarr.quality_manager.get_downgrade_candidates()
+    if downgrade_candidates:
+        sonarr.quality_manager.downgrade(downgrade_candidates)
+    else:
+        watch_data = tautulli.watch_history_manager.extract_history_entries()
+        deletion_candidates = ml_manager.get_deletion_candidates(watch_data)
+        if deletion_candidates:
+            sonarr.episodes_manager.deletion.delete_episode_ids(deletion_candidates)
+        else:
+            logger.log_warning("❌ No deletions possible — manual cleanup required!")
+
+✅ Best Practices
+- Inject managers once at top.
+- Never let submodules “reach sideways” into other managers.
+- Keep orchestration centralized.
+- Build orchestration helpers under main.orchestration if flow grows complex.
+
+✅ Optional Recommendations
+- Add orchestration layers for:
+    - Storage cleanup workflows.
+    - Quality downgrade decisioning.
+    - ML-based deletion targeting.
+- Centralize common contracts (like get_deletion_candidates()).
+
+Usage:
+------
+Whenever you want this generated for Sonarr, Tautulli, Radarr, MachineLearning, or any combined system, simply tell me:
+
+"Generate the orchestrated process flow using the reusable template we set."
+
+And I will return the full structured answer.

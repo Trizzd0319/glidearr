@@ -1,0 +1,15 @@
+# Glidearr runtime dependencies — install with: pip install -r requirements.txt
+# (Pin versions in your deployment to keep installs reproducible / supply-chain-safe.)
+
+arrapi
+requests
+pandas
+pyarrow
+tabulate
+tqdm
+
+# Secret management — keeps API keys/tokens out of plaintext config.json.
+# Desktop: uses the OS keyring (Windows Credential Manager / macOS Keychain /
+# Linux Secret Service). Headless/containers: secrets come from RECOMMENDARR_* env
+# vars instead, so a keyring backend is optional there.
+keyring>=25

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 140 320 320" role="img">
+  <title>Glidearr mark (monochrome)</title>
+  <desc>Single-colour Glidearr glider and flight-path trail using currentColor; inherits the surrounding text colour.</desc>
+  <g fill="currentColor">
+    <circle cx="116" cy="432" r="4.5" opacity="0.20"/>
+    <circle cx="128" cy="413" r="5" opacity="0.32"/>
+    <circle cx="141" cy="395" r="5.6" opacity="0.46"/>
+    <circle cx="156" cy="377" r="6.3" opacity="0.60"/>
+    <circle cx="171" cy="359" r="7.1" opacity="0.75"/>
+    <circle cx="188" cy="342" r="7.9" opacity="0.88"/>
+    <circle cx="204" cy="327" r="8.6" opacity="1"/>
+    <g transform="translate(256,236) rotate(-18) scale(3.6) translate(-45,-35)">
+      <polygon points="90,35 4,6 38,35"/>
+      <polygon points="90,35 38,35 4,64" opacity="0.62"/>
+    </g>
+  </g>
+</svg>

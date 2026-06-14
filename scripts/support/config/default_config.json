@@ -1,0 +1,121 @@
+{
+  "trakt": {
+    "client_id": "",
+    "client_secret": "",
+    "authorization": {
+      "access_token": "",
+      "token_type": "",
+      "expires_in":,
+      "refresh_token": "",
+      "scope": "",
+      "created_at":
+    }
+  },
+  "tvdb": {
+    "api": "",
+    "pin": "",
+    "token": ""
+  },
+  "rootFolders": {
+    "series": "",
+    "anime": "",
+    "kids": "",
+    "reality": "",
+    "documentary": ""
+  },
+  "animeGenres": [
+    ""
+  ],
+  "kidsGenres": [
+    ""
+  ],
+  "kidsCertifications": [
+    ""
+  ],
+  "realityGenres": [
+    ""
+  ],
+  "documentaryGenres": [
+    ""
+  ],
+  "free_space_limit":,
+  "firstRunCompleted":,
+  "radarr-4k": {
+    "url": "",
+    "port": "",
+    "api": "",
+    "base_url": ""
+  },
+  "radarr-standard": {
+    "url": "",
+    "port": "",
+    "api": "",
+    "base_url": ""
+  },
+  "sonarr_instances": {
+    "default_instance": "",
+    "720": {
+      "url": "",
+      "port": "",
+      "api": "",
+      "base_url": ""
+    },
+    "1080": {
+      "url": "",
+      "port": "",
+      "api": "",
+      "base_url": ""
+    },
+    "4k": {
+      "url": "",
+      "port": "",
+      "api": "",
+      "base_url": ""
+    }
+  },
+  "tautulli": {
+    "name": "",
+    "url": "",
+    "port": "",
+    "api": "",
+    "base_url": ""
+  },
+  "mal": {
+    "client_id": "",
+    "client_secret": "",
+    "redirect_uri": ""
+  },
+  "plex": {
+    "url": "",
+    "port":,
+    "plex_token": "",
+    "plex_media_path": ""
+  },
+  "sonarr_instances_categorized": {
+    "720p": "",
+    "1080p": "",
+    "4K": ""
+  },
+  "cache_expiration": {
+    "tautulli": 3600,
+    "sonarr": 86400,
+    "episode_monitoring": 86400,
+    "machine_learning": 604800,
+    "tautulli_transcode": 86400,
+    "series_storage": 604800,
+    "user_viewing": 172800,
+    "quality_profiles": 604800,
+    "transcode_formats": 86400,
+    "sonarr_metadata": 604800,
+    "episode_trends": 259200,
+    "free_space": 300,
+    "episode_formats": 86400,
+    "flagged_quality_issues": 604800,
+    "series_metadata": 604800,
+    "episode_files": 86400,
+    "root_folders": 86400,
+    "missing_episodes": 86400,
+    "series_lookup": 604800,
+    "sonarr_custom_formats": 604800
+  }
+}
