@@ -1,0 +1,24 @@
+# Normalise line endings: store LF in the repo and check out LF everywhere.
+# Keeps the repo consistent across Windows/macOS/Linux and safe for Docker.
+* text=auto eol=lf
+
+# Scripts that MUST stay LF (shell hooks run in Linux/Docker containers).
+*.sh                    text eol=lf
+*.py                    text eol=lf
+scripts/hooks/pre-commit text eol=lf
+
+# Windows scripts keep CRLF.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Binary assets — never touch line endings.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.parquet binary
+*.xlsx  binary
+*.zip   binary
+*.gz    binary
