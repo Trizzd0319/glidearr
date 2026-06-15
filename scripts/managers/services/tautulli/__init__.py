@@ -3,6 +3,7 @@ from typing import Optional
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
+from scripts.managers.factories.mixins.ordered_components import topo_order
 from scripts.managers.services.tautulli.api import TautulliAPI
 from scripts.managers.services.tautulli.devices import TautulliDevicesManager
 from scripts.managers.services.tautulli.episodes import TautulliEpisodesManager
@@ -135,9 +136,13 @@ class TautulliManager(BaseManager, ComponentManagerMixin):
     @timeit("prepare")
     def prepare(self):
         cls = self.__class__.__name__
+        # Iterate in dependency order (matches Sonarr/Radarr via topo_order). The
+        # components declare no inter-dependencies today, so this equals insertion
+        # order — it just keeps the load order honouring any deps added here later.
+        order = topo_order(self.component_dependencies)
         # Load every declared component (matches Sonarr/Radarr). Previously this
         # only loaded critical_keys, leaving instance/validator_manager unloaded.
-        for name in self.component_dependencies:
+        for name in order:
             if getattr(self, name, None) is None:
                 self._load_component(name)
             elif not str(self.load_summary.get(name, "")).startswith("✅"):
@@ -145,7 +150,7 @@ class TautulliManager(BaseManager, ComponentManagerMixin):
         # Prepare sub-components; a prepare() failure flips that component to ❌
         # rather than being silently swallowed.
         failed = []
-        for name in self.component_dependencies:
+        for name in order:
             component = getattr(self, name, None)
             if component and hasattr(component, "prepare"):
                 try:
