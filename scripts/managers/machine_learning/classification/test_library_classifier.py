@@ -73,14 +73,21 @@ def test_anime_beats_family():
     assert _show(["Anime", "Family"], "TV-PG") == "anime"
 
 
-# ── movies: same Family rating gate (kids-friendly films stay, adult drama out) ─
-def test_movie_family_rating_gate():
-    assert _movie(["Family", "Comedy"], "PG") == "kids"
-    assert _movie(["Family", "Adventure"]) == "kids"                    # unrated → kids
-    assert _movie(["Family", "Drama"], "R") == "standard"               # adult → out of kids
-    assert _movie(["Family", "Drama"], "PG-13") == "standard"           # > PG → out of kids
-    # hard Children genre still wins regardless of rating
-    assert _movie(["Children", "Family"], "R") == "kids"
+# ── movies: CSM recommended age is the PRIMARY (authoritative) kids signal ───────
+def test_movie_csm_age_drives_kids():
+    assert _movie(["Drama"], recommended_age=8) == "kids"               # CSM kid-safe → kids
+    assert _movie(["Family", "Comedy"], "PG", recommended_age=7) == "kids"
+    assert _movie(["Drama"], recommended_age=15) == "standard"          # CSM too old → not kids
+    assert _movie(["Family", "Comedy"], "G", recommended_age=14) == "standard"
+
+
+# ── movies: GENRE is no longer a kids route (only anime keeps genre/language) ────
+def test_movie_genre_is_not_a_kids_route():
+    # No CSM age + no kids studio → genre alone never routes a movie to Kids.
+    assert _movie(["Family", "Comedy"], "PG") == "standard"
+    assert _movie(["Children", "Comedy"]) == "standard"                 # even a hard 'Children' tag
+    assert _movie(["Animation", "Family", "Comedy"], "NR") == "standard"
+    assert _movie(["Preschool", "Adventure"]) == "standard"
 
 
 # ── movies: NO bare-cert route — a G/PG certificate ALONE must not route to Kids ──
@@ -98,21 +105,29 @@ def test_tv_cert_route_unchanged():
     assert _show(["Adventure"], "TV-Y7") == "kids"
 
 
-# ── movies: adult-genre veto blocks the soft Family route ───────────────────────
-def test_movie_family_adult_genre_veto():
-    assert _movie(["Family", "War"], "PG") == "standard"          # PG 'Family, War' classic → out
-    assert _movie(["Family", "Crime", "Drama"]) == "standard"     # family-tagged crime → out
-    assert _movie(["Family", "Thriller"], "PG") == "standard"
-    assert _movie(["Family", "Horror"]) == "standard"
-    # a hard kids genre still wins even with an adult-signal genre present
-    assert _movie(["Children", "Crime"], "PG") == "kids"
-    # plain kid-safe family with NO adult genre still routes to Kids
-    assert _movie(["Family", "Comedy"], "PG") == "kids"
+# ── movies: kids/family STUDIO is the only fallback when CSM has no rating ───────
+def test_movie_studio_fallback_when_no_csm():
+    assert _movie(["Comedy"], "G", studio="Pixar") == "kids"               # kid-safe cert + kids studio
+    assert _movie(["Comedy"], studio="Walt Disney Pictures") == "kids"     # unrated + kids studio
+    assert _movie(["Comedy"], "PG-13", studio="Pixar") == "standard"       # adult cert disqualifies studio
+    assert _movie(["Comedy"], "G", studio="A24") == "standard"             # not a kids studio
+    # CSM is authoritative: an older CSM age overrides the kids studio.
+    assert _movie(["Comedy"], studio="Pixar", recommended_age=15) == "standard"
 
 
-# ── 'NR' / 'Not Rated' normalises to UNRATED (rescues kid-safe Family titles) ────
-def test_nr_cert_treated_as_unrated():
-    # Disney animated shorts carry the literal cert "NR" — must still reach Kids via Family.
-    assert _movie(["Animation", "Family", "Comedy"], "NR") == "kids"
-    assert _movie(["Animation", "Music", "Family"], "Not Rated") == "kids"
+# ── anime keeps its genre/language route — now including Chinese (donghua) ───────
+def test_movie_anime_includes_chinese():
+    assert _movie(["Animation"], original_language="Japanese") == "anime"
+    assert _movie(["Animation"], original_language="Korean") == "anime"
+    assert _movie(["Animation"], original_language="Chinese") == "anime"    # NEW: donghua
+    assert _movie(["Anime"]) == "anime"
+    # English animation is NOT anime; CSM still decides kids vs standard for it.
+    assert _movie(["Animation"], original_language="English", recommended_age=8) == "kids"
+    assert _movie(["Animation"], original_language="English") == "standard"
+
+
+# ── shows: 'NR'/'Not Rated' still normalises to UNRATED for the soft-Family route ─
+def test_show_nr_cert_treated_as_unrated():
+    # TV keeps genre routing; a kid-safe Family show rated 'NR' still reaches Kids.
     assert _show(["Comedy", "Family"], "NR") == "kids"
+    assert _show(["Drama", "Family"], "Not Rated") == "kids"

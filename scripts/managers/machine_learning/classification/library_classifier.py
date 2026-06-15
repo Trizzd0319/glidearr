@@ -154,10 +154,11 @@ def _as_set(values, default) -> set[str]:
 
 _JAPANESE = frozenset({"japanese", "ja", "jp", "jpn"})
 _KOREAN = frozenset({"korean", "ko", "kor"})
-# Languages whose animation routes to the *anime* library — Japanese anime plus
-# Korean aeni/donghwa. Animated shows in one of these go to anime; animated shows
-# in a known OTHER language (English/French/…) do not.
-_ANIME_LANGUAGES = _JAPANESE | _KOREAN
+_CHINESE = frozenset({"chinese", "zh", "zho", "cmn", "mandarin", "cantonese", "yue"})
+# Languages whose animation routes to the *anime* library — Japanese anime, Korean
+# aeni, and Chinese donghua. Animated shows in one of these go to anime; animated
+# shows in a known OTHER language (English/French/…) do not.
+_ANIME_LANGUAGES = _JAPANESE | _KOREAN | _CHINESE
 
 
 def _anime_match(g: set, stype: str, olang: str, anime_g: set, is_anime_hint: bool) -> tuple[bool, str]:
@@ -175,6 +176,8 @@ def _anime_match(g: set, stype: str, olang: str, anime_g: set, is_anime_hint: bo
         return True, "japanese-animation"
     if animated and olang in _KOREAN:
         return True, "korean-animation"
+    if animated and olang in _CHINESE:
+        return True, "chinese-animation"
     # Typed anime with unknown language — keep (don't demote on missing data).
     known_non_anime_lang = bool(olang) and olang not in _ANIME_LANGUAGES
     if animated and stype == "anime" and not known_non_anime_lang:
@@ -422,25 +425,23 @@ def classify_movie_explained(
     :data:`MOVIE_CATEGORY_ORDER`. First matching rule wins, so the check order
     encodes precedence:
 
-      1. preschool — a 'Preschool' GENRE (not a cert) → Kids, beating anime.
-      2. anime     — anime genre, Japanese/Korean animation, or a source hint;
-                     beats the kids signals below (school-age anime → Anime).
-      3. csm       — Common Sense Media recommended age (``recommended_age``, e.g. from
-                     MDBList): ``<= kids_age_max`` → Kids; older → NOT Kids. This is the
-                     PRIMARY, authoritative signal — when present it decides outright and
-                     overrides the studio/animation fallback below.
-      4. kids      — FALLBACK, only when no CSM age is known: a hard Children/Kids GENRE,
-                     a typical kids/family STUDIO (``kids_studios``, cert-gated by
-                     :data:`MOVIE_ADULT_CERTS`), OR ANIMATION at a kid-safe cert.
-      5. 4k        — the file is 2160p/UHD (``is_uhd``) and it is neither kids nor anime.
-      6. standard  — everything else (the default movie library).
+      1. anime    — the 'anime' genre, a Japanese/Korean/Chinese animated film, or a
+                    source hint. This is the ONLY genre/language route kept.
+      2. kids     — Common Sense Media recommended age (``recommended_age``, e.g. from
+                    MDBList): ``<= kids_age_max`` → Kids; older → NOT Kids. CSM is the
+                    PRIMARY, authoritative kids signal — when present it decides outright
+                    and overrides the studio fallback.
+      3. kids     — FALLBACK, only when no CSM age is known: a typical kids/family STUDIO
+                    (``kids_studios``, cert-gated by :data:`MOVIE_ADULT_CERTS`).
+      4. 4k       — the file is 2160p/UHD (``is_uhd``) and it is neither kids nor anime.
+      5. standard — everything else (the default movie library).
 
-    The broad TMDB **'Family' genre is deliberately NOT a route** — it is tagged on far
-    too much general/foreign/adult cinema (Bollywood dramas, classics, sports dramas) and
-    flooded the Kids library. CSM age is the clean replacement where covered; the studio +
-    animation heuristic is the fallback for the (US-centric) titles CSM hasn't rated.
-    ``kids_certs`` / ``non_kids_genres`` / ``adult_veto_genres`` are accepted for signature
-    compatibility but unused here.
+    GENRE is deliberately NOT a kids route for movies: TMDB 'Family'/'Children'/etc. tags
+    are spread across far too much general/foreign/adult cinema (Bollywood dramas, classics,
+    sports dramas) and flooded the Kids library. CSM age is the clean primary signal; a kids
+    STUDIO is the only fallback for titles CSM hasn't rated. ``kids_genres`` / ``kids_certs``
+    / ``preschool_genres`` / ``non_kids_genres`` / ``adult_veto_genres`` are accepted for
+    signature compatibility but UNUSED.
     """
     g = {str(x).strip().lower() for x in (genres or []) if str(x).strip()}
     cert = (certification or "").strip().lower()
@@ -448,44 +449,33 @@ def classify_movie_explained(
     studio_l = (studio or "").strip().lower()
 
     anime_g = _as_set(anime_genres, DEFAULT_ANIME_GENRES)
-    kids_g = _as_set(kids_genres, DEFAULT_KIDS_GENRES)
     kids_s = _as_set(kids_studios, DEFAULT_KIDS_STUDIOS)
-    pre_g = _as_set(preschool_genres, DEFAULT_PRESCHOOL_GENRES)
 
-    # 1. Preschool GENRE → Kids (beats anime).
-    pre_genre_hit = g & pre_g
-    if pre_genre_hit:
-        return "kids", f"preschool:{sorted(pre_genre_hit)[0]}"
-
-    # 2. Anime — beats the kids signals (step 3). No seriesType for movies → "".
+    # 1. Anime — the 'anime' genre or Japanese/Korean/Chinese animation (the ONLY
+    #    genre/language route kept for movies). No seriesType for movies → "".
     anime_ok, anime_reason = _anime_match(g, "", olang, anime_g, is_anime_hint)
     if anime_ok:
         return "anime", anime_reason
 
-    # 3. Common Sense Media recommended age — PRIMARY signal when present. <= cutoff →
-    #    Kids; older → NOT Kids (and it overrides the studio/animation fallback, since CSM
-    #    is authoritative for titles it has rated). No CSM age → fall through to step 4.
+    # 2. Common Sense Media recommended age — the PRIMARY, authoritative kids signal.
+    #    <= cutoff → Kids; older → NOT Kids (overrides the studio fallback). No CSM age
+    #    → fall through to the studio fallback in step 3.
     if recommended_age is not None:
         if recommended_age <= kids_age_max:
             return "kids", f"csm:age{recommended_age}"
     else:
-        # 4. FALLBACK (no CSM coverage): a hard Children/Kids genre, a typical kids/family
-        #    STUDIO (not adult-rated), or ANIMATION at a kid-safe cert. 'Family' is NOT a route.
-        hard = g & (kids_g - {"family"})            # children / kids / preschool
-        if hard:
-            return "kids", f"genre:{sorted(hard)[0]}"
+        # 3. FALLBACK only when CSM has no rating: a typical kids/family STUDIO, cert-gated
+        #    by MOVIE_ADULT_CERTS. GENRE is deliberately NOT a kids route for movies.
         if studio_l and cert not in MOVIE_ADULT_CERTS and (
             studio_l in kids_s or any(tok in studio_l for tok in KIDS_STUDIO_TOKENS)
         ):
             return "kids", f"studio:{studio_l}"
-        if "animation" in g and cert in KID_SAFE_FAMILY_CERTS:
-            return "kids", f"animation+cert:{cert or 'nr'}"
 
-    # 5. Resolution split for everything else.
+    # 4. Resolution split for everything else.
     if is_uhd:
         return "4k", "resolution:2160p"
 
-    # 6. Default catch-all.
+    # 5. Default catch-all.
     return "standard", "default"
 
 
