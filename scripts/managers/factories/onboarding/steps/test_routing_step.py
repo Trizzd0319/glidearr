@@ -131,6 +131,7 @@ def test_empty_cfg_writes_defaults():
     assert r["tv"]["4k_enabled"] is False
     assert r["reorg_mode"] == "log_only"
     assert cfg.get("relocation_consent", False) is False
+    assert r["configured"] is True                    # stamp so the resolver honours the prefs
     assert res.ok is True and res.service == "routing"
 
 

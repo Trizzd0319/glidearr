@@ -324,6 +324,9 @@ class RoutingStep(Step):
                     default=bool(cfg.get("relocation_consent", False)),
                 ))
 
+        # Stamp that routing has been configured, so the resolver honours these preferences
+        # (a never-onboarded install with the schema defaults keeps today's add-time routing).
+        block["configured"] = True
         return [self._summary(prompter, cfg)]
 
     # ── resolved-routing summary ──────────────────────────────────────────────

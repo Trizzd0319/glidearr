@@ -38,6 +38,11 @@ class Resolver:
         self._root_folders = config.get("rootFolders", {}) or {}
         self._movie_root_folders = config.get("movieRootFolders", {}) or {}
         self._acq = config.get("acquisition", {}) or {}
+        # Operator routing preferences (the `routing` onboarding step). Honoured ONLY once
+        # the step has run (the ``configured`` stamp), so a never-onboarded install routes
+        # exactly as before — see _route_category.
+        self._routing = config.get("routing", {}) or {}
+        self._routing_on = bool(self._routing.get("configured"))
         # Common Sense Media age caches — the PRIMARY kids signal for both movies and shows
         # (see library_classifier). Loaded lazily once per Resolver and reused per candidate
         # (pure file reads, no network). The movie cache is keyed by Radarr tmdbId, the TV
@@ -122,12 +127,17 @@ class Resolver:
         id_field = "tvdbId" if is_show else "tmdbId"
         ext_id = obj.get(id_field) or (cand.get("ids") or {}).get("tvdb" if is_show else "tmdb")
 
+        # Apply the operator's routing preferences to the classified category, giving the
+        # EFFECTIVE bucket for FOLDER (and anime-movie INSTANCE) routing. A no-op until the
+        # routing step has run; the classified ``category`` is still reported downstream.
+        route_category = self._route_category(category, is_show)
+
         # Anime MOVIES route to Radarr's optional dedicated "anime" instance — and fall back to the
         # DEFAULT instance when no anime session is configured (gateway.categorized_instance returns
-        # default for an unmapped label). Anime SHOWS stay on the single Sonarr instance (Sonarr is
-        # single-instance now — no tier/anime session to split out); seriesType=anime is set on the
-        # add payload regardless. A kids-routed anime is category=="kids" (kids wins).
-        if category == "anime" and not is_show:
+        # default for an unmapped label) OR when the operator chose anime_policy=standard_only (then
+        # route_category collapsed anime → standard). Anime SHOWS stay on the single Sonarr instance;
+        # seriesType=anime is set on the add payload regardless of which FOLDER they land in.
+        if route_category == "anime" and not is_show:
             inst = gw.categorized_instance("anime")
         else:
             inst = default_inst
@@ -137,7 +147,7 @@ class Resolver:
             return out
 
         profile = self._pick_profile(gw, inst)
-        root = self._pick_root_folder(gw, inst, is_show, category)
+        root = self._pick_root_folder(gw, inst, is_show, route_category)
         size, unit = self._expected_size(profile, runtime, is_movie=not is_show)
 
         out.update({
@@ -274,6 +284,33 @@ class Resolver:
         enriched["expected_size_gb"] = size
         enriched["size_unit"]        = unit
         return enriched
+
+    def _route_category(self, category, is_show):
+        """Apply the operator's ``routing`` preferences to the classified category, returning
+        the EFFECTIVE library bucket for folder (and anime-movie instance) routing. A no-op
+        until the routing step has run (``routing.configured``), so a never-onboarded install
+        routes exactly as before. Redirects only when a bucket is turned OFF:
+          • movie kids  → standard  when routing.movies.kids_bucket_enabled is off
+          • movie anime → standard  when routing.movies.anime_policy == "standard_only"
+          • show  anime → series    when routing.tv.anime_policy == "series_type"
+          • show  kids  → series    when routing.tv.kids_bucket_enabled is off
+        ``seriesType``=anime is tracked separately, so a ``series_type`` anime still parses as
+        anime — it just lands in the series folder instead of a dedicated anime one."""
+        if not self._routing_on:
+            return category
+        mv = self._routing.get("movies", {}) or {}
+        tv = self._routing.get("tv", {}) or {}
+        if is_show:
+            if category == "anime" and tv.get("anime_policy") == "series_type":
+                return "series"
+            if category == "kids" and not tv.get("kids_bucket_enabled", True):
+                return "series"
+        else:
+            if category == "kids" and not mv.get("kids_bucket_enabled", True):
+                return "standard"
+            if category == "anime" and mv.get("anime_policy") == "standard_only":
+                return "standard"
+        return category
 
     def _pick_root_folder(self, gw, inst, is_show, category) -> str:
         # Show → the configured folder for its library bucket (series fallback).
