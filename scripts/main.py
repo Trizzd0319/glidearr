@@ -616,16 +616,26 @@ class Main(BaseManager, ComponentManagerMixin):
         delete pass was skipped this run (deletions_enabled hard gate). Emitted at the
         END so it can't be buried, at EVERY log level so it survives any level filter,
         and printed straight to the console when the session is interactive."""
-        from scripts.support.utilities.space_targets import deletions_enabled
+        from scripts.support.utilities.space_targets import deletions_enabled, deletions_consented
         try:
             if deletions_enabled(self.config):
                 return
-            banner = (
-                "⛔ DELETIONS DISABLED — free_space_limit is not set (0). Glidearr "
-                "did NOT delete any media files this run, and will not until you set "
-                "free_space_limit (a GB free-space floor) in config.json. Downgrades, "
-                "monitoring, grace marking and acquisition ran normally."
-            )
+            if not deletions_consented(self.config):
+                banner = (
+                    "⛔ DELETIONS DISABLED — you have NOT consented to media deletion. "
+                    "Glidearr scored and planned everything (and, where enabled, changed "
+                    "quality profiles and built playlists) but did NOT delete any files, "
+                    "and never will until you explicitly opt in: the onboarding 'Media "
+                    "deletion' step, or set RECOMMENDARR_DELETIONS_CONSENT=true — AND set "
+                    "free_space_limit (a GB free-space floor) in config.json."
+                )
+            else:
+                banner = (
+                    "⛔ DELETIONS DISABLED — you consented to deletion, but free_space_limit "
+                    "is not set (0). Set free_space_limit (a GB free-space floor) in "
+                    "config.json to arm reclamation. Downgrades, monitoring, grace marking, "
+                    "playlists and acquisition ran normally."
+                )
             for _emit in (self.logger.log_debug, self.logger.log_info,
                           self.logger.log_warning, self.logger.log_error):
                 try:

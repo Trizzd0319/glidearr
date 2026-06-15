@@ -37,6 +37,8 @@ Two deliberate exceptions, justified inline at their call sites:
 """
 from __future__ import annotations
 
+import os
+
 PRESSURE_FALLBACK_GB = 25.0          # last resort only (total drive unknown too)
 PRESSURE_FALLBACK_FRACTION = 0.25    # of total drive when free_space_limit unset
 
@@ -83,18 +85,39 @@ def space_targets(
     return T, T * (1.0 + max(0.0, headroom))
 
 
-def deletions_enabled(config) -> bool:
-    """HARD SAFETY GATE for media-file deletion: an operator-set ``free_space_limit``
-    (> 0) is required before ANY delete pass may remove a file. With the floor unset
-    (0 / missing / unparseable) every deletion path — per-service space-pressure
-    deletes, grace-marked file deletes, the stale-owned prune's delete stage, and the
-    cross-service coordinator — must SKIP deleting, so an unconfigured install can
-    never inadvertently delete media. Downgrades, monitoring, grace MARKING and
-    acquisition are unaffected; only the destructive delete APPLY is gated.
+_CONSENT_ENV_VARS = ("RECOMMENDARR_DELETIONS_CONSENT", "GLIDEARR_DELETIONS_CONSENT")
+_CONSENT_TRUTHY = {"1", "true", "yes", "on", "y"}
 
-    (Deliberately mirrors the ``free_space_limit`` clause of
-    ``coordinator_owns_deletion`` — the operator opting into a floor is what arms
-    deletion anywhere in the app.)"""
+
+def deletions_consented(config) -> bool:
+    """Explicit operator consent to DELETE media files — the informed-consent switch,
+    separate from ``free_space_limit``. The floor says *when* to reclaim space; consent
+    says *whether* deletion is permitted at all. Captured during onboarding (the 'Media
+    deletion' step, which explains exactly what gets deleted) or via the
+    ``RECOMMENDARR_DELETIONS_CONSENT`` / ``GLIDEARR_DELETIONS_CONSENT`` env var (for
+    headless / Docker). Defaults to False — nothing is ever deleted until the operator
+    has been shown what deletion does and explicitly opted in. A non-empty env var
+    overrides config, so a container can force consent on (=true) or off (=false)
+    regardless of config.json."""
+    for var in _CONSENT_ENV_VARS:
+        raw = os.environ.get(var)
+        if raw is not None and raw.strip() != "":
+            return raw.strip().lower() in _CONSENT_TRUTHY
+    return bool(_cfg_get(config, "deletions_consent", False))
+
+
+def deletions_enabled(config) -> bool:
+    """HARD SAFETY GATE for media-file deletion. BOTH are required before any delete
+    pass may remove a file:
+      1. explicit operator consent (``deletions_consented`` — onboarding/env opt-in), AND
+      2. an operator-set ``free_space_limit`` (> 0) that says when to reclaim.
+    With either missing, every deletion path — per-service space-pressure deletes,
+    grace-marked file deletes, the stale-owned prune's delete stage, and the
+    cross-service coordinator — must SKIP deleting, so an install can never delete media
+    without an informed opt-in. Downgrades, monitoring, grace MARKING, playlist planning
+    and acquisition are unaffected; only the destructive delete APPLY is gated."""
+    if not deletions_consented(config):
+        return False
     try:
         return float(_cfg_get(config, "free_space_limit", 0) or 0) > 0
     except (TypeError, ValueError):
@@ -107,11 +130,13 @@ def coordinator_owns_deletion(config) -> bool:
     blanket delete, Sonarr episode delete) must defer — they still MARK candidates,
     but the coordinator does the actual deleting on a unified, ranked movie+TV pool.
 
-    Requires ``space_coordinator_enabled`` AND a configured ``free_space_limit``
-    (the coordinator keys off the floor). Defaults to OFF until the coordinator
-    ships, so per-service deletion keeps working in the interim.
+    Requires ``space_coordinator_enabled`` AND explicit deletion consent
+    (``deletions_consented``) AND a configured ``free_space_limit`` (the coordinator
+    keys off the floor). Defaults to OFF.
     """
     if not bool(_cfg_get(config, "space_coordinator_enabled", False)):
+        return False
+    if not deletions_consented(config):
         return False
     try:
         return float(_cfg_get(config, "free_space_limit", 0) or 0) > 0

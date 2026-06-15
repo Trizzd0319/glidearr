@@ -14,6 +14,7 @@ from scripts.managers.machine_learning.space.space_targets import (  # noqa: F40
     PRESSURE_FALLBACK_GB,
     _cfg_get,
     coordinator_owns_deletion,
+    deletions_consented,
     deletions_enabled,
     space_targets,
 )

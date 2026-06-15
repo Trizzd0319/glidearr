@@ -111,9 +111,9 @@ def _sonarr_mgr() -> M:
     mgr.logger = _StubLogger()
     mgr.dry_run = True
     mgr.global_cache = None   # dry_run: restore-set write is skipped
-    # Arm the deletion hard gate (deletions_enabled): this stub exercises the
-    # coordinator delete APPLY primitive, so the pass must be allowed to run.
-    mgr.config = {"free_space_limit": 100.0}
+    # Arm the deletion hard gate (deletions_enabled = explicit consent AND floor):
+    # this stub exercises the coordinator delete APPLY primitive, so it must run.
+    mgr.config = {"free_space_limit": 100.0, "deletions_consent": True}
     mgr._saved = []           # capture save() calls (no real parquet in tests)
     mgr.save = lambda inst, df: mgr._saved.append(df)  # type: ignore
     return mgr

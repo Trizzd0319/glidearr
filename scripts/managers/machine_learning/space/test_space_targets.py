@@ -11,6 +11,7 @@ import pytest
 from scripts.managers.machine_learning.space.space_targets import (
     PRESSURE_FALLBACK_FRACTION,
     PRESSURE_FALLBACK_GB,
+    deletions_consented,
     deletions_enabled,
     space_targets,
 )
@@ -52,14 +53,34 @@ def test_25pct_of_total_takes_precedence_over_fallback_gb():
     assert T == pytest.approx(2000.0)   # 25% of 8000, not 100
 
 
-# ── deletions_enabled (the media-deletion hard safety gate) ──────────────────────
-def test_deletions_enabled_requires_explicit_floor():
-    assert deletions_enabled({"free_space_limit": 200}) is True
-    assert deletions_enabled({"free_space_limit": 0.1}) is True
+# ── deletions gate (consent AND floor — the media-deletion hard safety gate) ─────
+def test_deletions_enabled_requires_consent_and_floor():
+    assert deletions_enabled({"free_space_limit": 200, "deletions_consent": True}) is True
+    assert deletions_enabled({"free_space_limit": 0.1, "deletions_consent": True}) is True
+
+
+def test_deletions_disabled_without_consent():
+    # A floor alone is no longer enough — explicit consent is now required.
+    assert deletions_enabled({"free_space_limit": 500}) is False
+    assert deletions_enabled({"free_space_limit": 500, "deletions_consent": False}) is False
 
 
 def test_deletions_disabled_without_floor():
-    # unset / 0 / negative / garbage / None config → deletion is hard-disabled
-    for cfg in ({}, None, {"free_space_limit": 0}, {"free_space_limit": -5},
-                {"free_space_limit": None}, {"free_space_limit": "nope"}):
+    # Consent given but no usable floor → still hard-disabled.
+    for cfg in ({"deletions_consent": True}, {"free_space_limit": 0, "deletions_consent": True},
+                {"free_space_limit": -5, "deletions_consent": True},
+                {"free_space_limit": None, "deletions_consent": True},
+                {"free_space_limit": "nope", "deletions_consent": True}):
         assert deletions_enabled(cfg) is False, cfg
+    assert deletions_enabled(None) is False   # no consent, no floor
+
+
+def test_deletions_consent_env_overrides_config(monkeypatch):
+    for var in ("RECOMMENDARR_DELETIONS_CONSENT", "GLIDEARR_DELETIONS_CONSENT"):
+        monkeypatch.delenv(var, raising=False)
+    assert deletions_consented({"deletions_consent": True}) is True       # from config
+    assert deletions_consented({}) is False                               # default off
+    monkeypatch.setenv("RECOMMENDARR_DELETIONS_CONSENT", "true")
+    assert deletions_consented({"deletions_consent": False}) is True      # env opts in over config
+    monkeypatch.setenv("RECOMMENDARR_DELETIONS_CONSENT", "false")
+    assert deletions_consented({"deletions_consent": True}) is False      # env opts out over config
