@@ -41,8 +41,9 @@ def main() -> int:
     parser.add_argument("--reconfigure", action="store_true",
                         help="Re-run every step with current values pre-filled.")
     parser.add_argument("--service", metavar="NAME",
-                        help="Run a single step only (sonarr, radarr, library, trakt, "
-                             "tautulli, plex, tvdb, mal, mdblist, notifications).")
+                        help="Run a single step only (sonarr, radarr, library, routing, trakt, "
+                             "tautulli, plex, tvdb, mal, mdblist, daemons, next_episode, "
+                             "english_dub, deletions, notifications).")
     parser.add_argument("--config", metavar="PATH",
                         help="Path to the config.json to write (defaults to the app config).")
     parser.add_argument("--print-env-template", action="store_true",

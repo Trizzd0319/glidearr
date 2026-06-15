@@ -17,6 +17,7 @@ from scripts.managers.factories.onboarding.steps.mdblist import MdblistStep
 from scripts.managers.factories.onboarding.steps.media import PlexStep, TautulliStep
 from scripts.managers.factories.onboarding.steps.nextep import NextEpisodeStep
 from scripts.managers.factories.onboarding.steps.notifications import NotificationsStep
+from scripts.managers.factories.onboarding.steps.routing import RoutingStep
 from scripts.managers.factories.onboarding.steps.trakt import TraktStep
 
 # Ordered classes — instantiated per run with the active logger.
@@ -28,6 +29,9 @@ STEP_CLASSES = [
     SonarrStep,
     RadarrStep,
     LibraryStep,
+    # Routing follows Library so it can offer the instances + root folders the
+    # Sonarr/Radarr/Library steps have already discovered (and detect a 4K/anime instance).
+    RoutingStep,
     TraktStep,
     TautulliStep,
     PlexStep,
