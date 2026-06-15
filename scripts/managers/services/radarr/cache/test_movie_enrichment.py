@@ -26,7 +26,9 @@ class _StubCache:
 
 
 def _mgr(df, cache):
-    m = RadarrCacheMovieFilesManager.__new__(RadarrCacheMovieFilesManager)
+    # object.__new__ (not M.__new__) bypasses BaseManager's shared singleton so these
+    # tests can't pollute each other's stubbed load()/save() (see test_movie_files_cache).
+    m = object.__new__(RadarrCacheMovieFilesManager)
     m.logger = _Log()
     m._movie_cache = cache
     m._resolve_instance = lambda i: i
@@ -47,7 +49,7 @@ def test_broadcasts_daemon_cast_crew_and_rating():
     assert r["cast_names"] == "Sylvester Stallone|Michael B. Jordan"
     assert r["director_names"] == "Ryan Coogler"
     assert r["trakt_rating"] == 8.1 and r["trakt_vote_count"] == 1234
-    assert out[out.tmdb_id == 999].iloc[0]["cast_names"] is None   # unenriched → None
+    assert pd.isna(out[out.tmdb_id == 999].iloc[0]["cast_names"])   # unenriched → missing
 
 
 def test_no_daemon_data_is_noop():
