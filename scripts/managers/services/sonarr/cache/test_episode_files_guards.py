@@ -45,9 +45,9 @@ def _mgr() -> M:
     mgr = M.__new__(M)
     mgr.logger = _StubLogger()
     mgr.dry_run = True
-    # Arm the deletion hard gate (deletions_enabled): these tests exercise the
-    # delete pass's per-row guards, so the pass itself must be allowed to run.
-    mgr.config = {"free_space_limit": 100.0}
+    # Arm the deletion hard gate (deletions_enabled = explicit consent AND floor):
+    # these tests exercise the delete pass's per-row guards, so the pass must run.
+    mgr.config = {"free_space_limit": 100.0, "deletions_consent": True}
     return mgr
 
 
