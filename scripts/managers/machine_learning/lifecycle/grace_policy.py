@@ -57,6 +57,8 @@ def grace_mark(anchor, grace_td, now):
     (mirroring the original try/except: pass)."""
     try:
         until = pd.to_datetime(anchor, utc=True) + grace_td
+        if pd.isna(until):              # anchor=None yields NaT (no raise) on newer pandas
+            return None, None
         return until.isoformat(), (now >= until)
     except Exception:
         return None, None
