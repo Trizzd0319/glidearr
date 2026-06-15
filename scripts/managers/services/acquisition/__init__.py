@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
-from scripts.support.utilities.space_targets import space_targets
+from scripts.support.utilities.space_targets import deletions_enabled, space_targets
 
 
 class AcquisitionManager(BaseManager, ComponentManagerMixin):
@@ -81,6 +81,18 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         _, U = space_targets(self.config, total_gb=total)
         cache[key] = (free, U)
         return cache[key]
+
+    def _acquisition_paused(self, gw, inst, cache: dict) -> bool:
+        """True when NEW media must not be acquired: free space is in/below the
+        pressure band AND deletion is not armed (no consent / no free_space_limit), so
+        space can never be reclaimed — a deferred add would strand forever. When
+        deletion IS armed, callers defer instead (the freed space lets a later run
+        search the title). FAIL-OPEN: an unreadable instance yields free=inf, so this
+        returns False and acquisition is never blocked by a transient error."""
+        if gw is None or deletions_enabled(self.config):
+            return False
+        free, U = self._space_band(gw, inst, cache)
+        return free < U
 
     def _trigger_search(self, gw, inst, item: dict) -> bool:
         """Issue the deferred MoviesSearch/SeriesSearch. Returns True only on a truthy
@@ -229,6 +241,20 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         for e in selected:
             svc = "sonarr" if e.get("type") == "show" else "radarr"
             gw = gateways.get(svc)
+
+            # No way to reclaim space (deletion not consented/armed) and we're below the
+            # pressure band → skip the add entirely. A deferred title would never get its
+            # space freed, so pause new acquisition instead of stranding it in *arr.
+            if self._acquisition_paused(gw, e.get("instance"), band_cache):
+                skipped["space_full_no_deletion"] = skipped.get("space_full_no_deletion", 0) + 1
+                rows.append([
+                    str(e.get("title") or e.get("ext_id"))[:34],
+                    e.get("type"), e.get("score"), str(e.get("instance")),
+                    (e.get("quality_profile") or {}).get("name"),
+                    self._size_str(e), "skipped (full)",
+                ])
+                continue
+
             under_pressure = False
             if defer_enabled and gw is not None:
                 free, U = self._space_band(gw, e.get("instance"), band_cache)

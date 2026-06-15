@@ -157,3 +157,41 @@ def test_flush_abandons_after_max_attempts():
     stats = m._flush_deferred({"radarr": gw}, {})
     assert stats["abandoned"] == 1
     assert cache.get(_KEY) == []                          # dropped after the retry budget
+
+
+# ── acquisition pause when full + no deletion consent (can't reclaim) ─────────────
+def _no_consent_env(monkeypatch):
+    for var in ("RECOMMENDARR_DELETIONS_CONSENT", "GLIDEARR_DELETIONS_CONSENT"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_paused_when_full_and_no_deletion_consent(monkeypatch):
+    _no_consent_env(monkeypatch)
+    m = _mgr({"free_space_limit": 2500})                  # floor set, but no consent
+    gw = _GW("radarr", _IM(2000, 8000))                  # 2000 < U(2750)
+    assert m._acquisition_paused(gw, "standard", {}) is True
+
+
+def test_not_paused_with_deletion_consent(monkeypatch):
+    _no_consent_env(monkeypatch)
+    m = _mgr({"free_space_limit": 2500, "deletions_consent": True})
+    gw = _GW("radarr", _IM(2000, 8000))                  # under pressure, but deletion armed → defer
+    assert m._acquisition_paused(gw, "standard", {}) is False
+
+
+def test_not_paused_when_space_ok(monkeypatch):
+    _no_consent_env(monkeypatch)
+    m = _mgr({"free_space_limit": 2500})
+    gw = _GW("radarr", _IM(3000, 8000))                  # 3000 >= U(2750)
+    assert m._acquisition_paused(gw, "standard", {}) is False
+
+
+def test_pause_fails_open_on_unreadable_instance(monkeypatch):
+    _no_consent_env(monkeypatch)
+
+    class _BadIM:
+        def disk_free_gb(self, inst): raise RuntimeError("unreadable")
+        def disk_total_gb(self, inst): return 8000
+
+    m = _mgr({"free_space_limit": 2500})
+    assert m._acquisition_paused(_GW("radarr", _BadIM()), "standard", {}) is False
