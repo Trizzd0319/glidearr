@@ -73,6 +73,52 @@ def test_anime_beats_family():
     assert _show(["Anime", "Family"], "TV-PG") == "anime"
 
 
+# ── shows: CSM recommended age is the PRIMARY kids signal (parity with movies) ───
+def test_show_csm_age_drives_kids():
+    # A CSM kid-safe age routes to Kids even with a genre that would otherwise be 'series'
+    # or 'reality' — CSM is authoritative, beating the lifestyle veto like a hard kids genre.
+    assert _show(["Drama"], recommended_age=8) == "kids"
+    assert _show(["Reality"], recommended_age=6) == "kids"             # CSM beats the reality veto
+
+
+def test_show_csm_over_cutoff_blocks_soft_family():
+    # Without CSM this kid-safe-rated 'Family' show is Kids; a CSM age over the cutoff
+    # (CSM says NOT kids) suppresses the soft-Family kids route → series.
+    assert _show(["Drama", "Family"], "TV-PG") == "kids"               # baseline (no CSM)
+    assert _show(["Drama", "Family"], "TV-PG", recommended_age=15) == "series"
+
+
+def test_show_csm_over_cutoff_overrides_hard_genre_and_cert():
+    # CSM over the cutoff beats BOTH a hard Children genre and the TV-G cert route.
+    assert _show(["Children"], recommended_age=16) == "series"         # hard kids genre suppressed
+    assert _show(["Comedy"], "TV-G", recommended_age=16) == "series"   # cert route suppressed
+
+
+def test_show_csm_over_cutoff_still_reality_and_documentary():
+    # CSM>cutoff blocks the KIDS routes but the show must still classify normally elsewhere.
+    assert _show(["Reality"], recommended_age=16) == "reality"
+    assert _show(["Documentary"], recommended_age=16) == "documentary"
+
+
+def test_show_preschool_beats_csm():
+    # An explicit 'Preschool' GENRE is unambiguous toddler content — it wins even when CSM
+    # rates the title older (documented exception: preschool sits ABOVE CSM).
+    assert _show(["Preschool"], recommended_age=16) == "kids"
+
+
+def test_show_anime_beats_csm():
+    # Anime precedence is preserved: a kid-rated anime still routes to the Anime library.
+    assert _show(["Anime"], recommended_age=8) == "anime"
+    assert _show(["Animation"], original_language="Japanese", recommended_age=8) == "anime"
+
+
+def test_show_no_csm_leaves_genre_cert_flow_unchanged():
+    # Regression: with no CSM age the existing genre/cert routing is unchanged.
+    assert _show(["Comedy", "Family"], "TV-PG") == "kids"
+    assert _show(["Comedy"], "TV-G") == "kids"
+    assert _show(["Drama"]) == "series"
+
+
 # ── movies: CSM recommended age is the PRIMARY (authoritative) kids signal ───────
 def test_movie_csm_age_drives_kids():
     assert _movie(["Drama"], recommended_age=8) == "kids"               # CSM kid-safe → kids

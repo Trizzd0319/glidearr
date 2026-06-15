@@ -13,26 +13,33 @@ make the *same* decision.
 
 A show maps to exactly one category. Precedence is fixed and intentional:
 
-    kids(genre) → anime → reality → documentary → kids(cert) → series
+    preschool(genre) → anime → CSM age → kids(genre) → reality → documentary → kids(cert) → series
 
-A *children-genre* flag wins outright: a kids show lands in the Kids library even
-when it is also anime or a documentary (e.g. a children-genre anime → kids). A
-kids *certificate* alone (TV-G/…) does NOT override anime/reality/documentary — it
-applies only when nothing else matched ("kids if flagged for children, not just
-the TV-G certificate").
+The 'Preschool' GENRE wins outright — genuine toddler content stays in Kids even when it
+is also anime. ANIME then beats the soft children/family genres, so mainstream anime (One
+Piece/Pokémon, often rated TV-Y7) lands in the Anime library rather than Kids. Common Sense
+Media age, when known, is the PRIMARY kids signal beneath those two. A kids *certificate*
+alone (TV-G/…) does NOT override anime/reality/documentary — it applies only when nothing
+else matched ("kids if flagged for children, not just the TV-G certificate").
 
 Signals, in precedence order:
-  • kids(genre) — a genre in ``kids_genres`` (Children/Family/Kids/Preschool).
-                  TOP precedence: beats anime and documentary.
-  • anime       — a source hint (MAL/AniList candidate) OR a genre in
-                  ``anime_genres`` OR *anime-language animation* (animated AND
-                  ``original_language`` is Japanese or Korean). A bare Sonarr
-                  ``seriesType == "anime"`` is honoured ONLY when nothing
-                  contradicts it (no known non-anime language) — Western cartoons
-                  get mistyped as anime (e.g. Curious George), so it is not
-                  trusted on its own. This same test backs :func:`is_anime_media`
-                  for Sonarr ``seriesType``, so a children-genre anime routes to
-                  Kids but still keeps anime episode parsing.
+  • preschool   — the 'Preschool' GENRE only (NOT a cert). TOP precedence: beats anime and
+                  the lifestyle veto, so genuine toddler content always reaches Kids.
+  • anime       — a source hint (MAL/AniList candidate) OR a genre in ``anime_genres`` OR
+                  *anime-language animation* (animated AND ``original_language`` is
+                  Japanese, Korean, or Chinese — donghua). A bare Sonarr
+                  ``seriesType == "anime"`` is honoured ONLY when nothing contradicts it
+                  (no known non-anime language) — Western cartoons get mistyped as anime
+                  (e.g. Curious George), so it is not trusted on its own. This same test
+                  backs :func:`is_anime_media` for Sonarr ``seriesType``, so a
+                  children-genre anime routes to Kids but still keeps anime episode parsing.
+  • CSM age     — Common Sense Media ``recommended_age`` (e.g. from MDBList), the PRIMARY
+                  kids signal when known: ``<=`` the cutoff → Kids; OLDER → NOT Kids
+                  (suppressing the genre + cert Kids routes, but reality/documentary/series
+                  still resolve). Absent → the genre/cert flow runs unchanged.
+  • kids(genre) — a genre in ``kids_genres`` (Children/Family/Kids). A hard Children/Kids
+                  genre beats the lifestyle veto; the soft 'Family' genre is veto- and
+                  rating-gated. Used only when no CSM age decided the show.
   • reality     — a genre in ``reality_genres``.
   • documentary — a genre in ``documentary_genres``.
   • kids(cert)  — a US certification in ``kids_certs`` (TV-Y/TV-Y7/TV-G/G/PG),
@@ -252,6 +259,8 @@ def classify_show_explained(
     series_type: str | None = None,
     original_language: str | None = None,
     is_anime_hint: bool = False,
+    recommended_age: "int | None" = None,
+    kids_age_max: int = 11,        # oldest CSM age that still counts as 'kids' (mirrors movies)
     anime_genres=None,
     kids_genres=None,
     kids_certs=None,
@@ -264,7 +273,7 @@ def classify_show_explained(
     Return ``(category, reason)``. ``category`` is one of :data:`CATEGORY_ORDER`;
     the first matching rule wins, so the order of the checks encodes precedence:
 
-        preschool → anime → kids(genre) → reality → documentary → kids(cert) → series
+        preschool → anime → CSM age → kids(genre) → reality → documentary → kids(cert) → series
 
     ``reason`` is a short tag (e.g. ``"japanese-animation"``, ``"genre:animated-family"``)
     explaining the match. All genre/cert arguments are optional; when omitted (or
@@ -275,6 +284,12 @@ def classify_show_explained(
         lifestyle veto, so genuine toddler content stays in Kids; ANIME beats the
         children/family kids genres so mainstream anime (One Piece/Pokémon, often
         rated TV-Y7) → the anime library.
+      • COMMON SENSE MEDIA age (``recommended_age``, e.g. from MDBList) is the PRIMARY
+        kids signal when known, mirroring movies: ``<= kids_age_max`` → Kids outright;
+        OLDER than the cutoff → NOT Kids, which SUPPRESSES the genre + cert Kids routes
+        below (the show still resolves to reality/documentary/series). It sits BELOW
+        preschool + anime (an explicit Preschool tag or genuine anime still wins) and
+        ABOVE the genre/cert routes; absent (None) → the genre/cert flow runs unchanged.
       • A HARD kids genre (Children/Kids) routes to Kids and BEATS the lifestyle veto
         — an explicit children's tag is unambiguous (a 'Children, Food' kids cooking
         show is still kids). ``Family`` also routes to Kids on its own (no longer
@@ -304,6 +319,11 @@ def classify_show_explained(
     # The soft 'Family' genre only routes to Kids when kid-safe rated (≤ TV-PG/PG) or
     # unrated (incl. 'NR') — keeps adult 'family DRAMA' (TV-14/TV-MA/…) out of the Kids library.
     family_rating_ok = _family_rating_ok(cert)
+    # Common Sense Media age (recommended_age) is the PRIMARY kids signal when known.
+    # An age OVER the cutoff means CSM says NOT kids: it suppresses the genre + cert Kids
+    # routes below (but the show stays eligible for reality/documentary/series). The
+    # <= cutoff → Kids decision itself is made right after anime (step 2.5 below).
+    csm_blocks_kids = recommended_age is not None and recommended_age > kids_age_max
 
     # ── 1. Preschool GENRE → Kids (beats anime AND the lifestyle veto) ─────────
     pre_genre_hit = g & pre_g
@@ -315,9 +335,14 @@ def classify_show_explained(
     if anime_ok:
         return "anime", anime_reason
 
+    # ── 2.5. Common Sense Media age → Kids (PRIMARY when known; below preschool/anime) ─
+    if recommended_age is not None and recommended_age <= kids_age_max:
+        return "kids", f"csm:age{recommended_age}"
+
     # ── 3. Kids by GENRE: Children/Kids beat the veto; Family is veto- + rating-gated ─
+    #    Skipped when CSM has rated this show OVER the kids cutoff (csm_blocks_kids).
     kids_ok, kids_reason = _kids_by_genre(g, kids_g, vetoed, family_rating_ok)
-    if kids_ok:
+    if kids_ok and not csm_blocks_kids:
         return "kids", kids_reason
 
     # ── 4. Reality ────────────────────────────────────────────────────────────
@@ -330,8 +355,8 @@ def classify_show_explained(
     if doc_hit:
         return "documentary", f"genre:{sorted(doc_hit)[0]}"
 
-    # ── 6. Kids by CERTIFICATE (TV-G/G/PG) — last, unless lifestyle-vetoed ─────
-    if not vetoed and cert and cert in kids_c:
+    # ── 6. Kids by CERTIFICATE (TV-G/G/PG) — last; skipped if vetoed or CSM>cutoff ─
+    if not vetoed and not csm_blocks_kids and cert and cert in kids_c:
         return "kids", f"cert:{cert}"
 
     # ── 7. Default catch-all ──────────────────────────────────────────────────
@@ -343,11 +368,13 @@ def classify_show(**kwargs) -> str:
     return classify_show_explained(**kwargs)[0]
 
 
-def classify_from_config(show: dict, config_get, *, is_anime_hint: bool = False) -> str:
+def classify_from_config(show: dict, config_get, *, is_anime_hint: bool = False,
+                         recommended_age: "int | None" = None) -> str:
     """
     Convenience wrapper: classify a Sonarr/Trakt show dict, reading the genre and
     certification lists from config via ``config_get`` (a ``config.get``-style
-    callable taking ``(key, default)``).
+    callable taking ``(key, default)``). ``recommended_age`` (the Common Sense age,
+    when the caller has it) is forwarded as the primary kids signal.
     """
     ol = show.get("originalLanguage")
     return classify_show(
@@ -356,6 +383,7 @@ def classify_from_config(show: dict, config_get, *, is_anime_hint: bool = False)
         series_type=show.get("seriesType"),
         original_language=ol.get("name") if isinstance(ol, dict) else ol,
         is_anime_hint=is_anime_hint or bool(show.get("is_anime")),
+        recommended_age=recommended_age,
         anime_genres=config_get("animeGenres", None),
         kids_genres=config_get("kidsGenres", None),
         kids_certs=config_get("kidsCertifications", None),

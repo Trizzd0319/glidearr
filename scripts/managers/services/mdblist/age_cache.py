@@ -38,6 +38,25 @@ def load(path: Path = AGE_CACHE_PATH) -> dict:
         return {}
 
 
+def age_for(tmdb_id, *, path: Path = AGE_CACHE_PATH, cache: "dict | None" = None) -> "int | None":
+    """Common Sense recommended age for a tmdbId, or None. Pure cache read — no network.
+
+    Returns an int ONLY when a real CSM age is cached; None for both the
+    'looked-up-no-CSM' (stored null) and 'not cached yet' (missing key) cases — this is
+    the same ``isinstance(v, int)`` contract router_movie._csm_age already uses, so a
+    null/missing entry lets the classifier fall back to its genre/cert/studio heuristics.
+
+    ``cache`` lets a caller reuse an already-loaded dict so each candidate lookup doesn't
+    re-read the file; omit it for a one-off lookup (loads ``path`` itself). Pass
+    ``path=TV_AGE_CACHE_PATH`` for shows (the movie and show caches are separate files
+    because their tmdbIds share an integer space)."""
+    c = cache if cache is not None else load(path)
+    if not tmdb_id:
+        return None
+    v = c.get(str(tmdb_id))
+    return v if isinstance(v, int) else None
+
+
 def save(cache: dict, path: Path = AGE_CACHE_PATH) -> None:
     """Atomic write (temp + os.replace) so a hard kill never leaves a partial file."""
     path.parent.mkdir(parents=True, exist_ok=True)
