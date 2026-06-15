@@ -22,8 +22,11 @@ class _Log:
 
 def _mgr(tmp_path):
     """Build the manager without __init__ (which needs config/registry), wire only
-    what load()/save() touch, and point the parquet path at tmp."""
-    m = RadarrCacheMovieFilesManager.__new__(RadarrCacheMovieFilesManager)
+    what load()/save() touch, and point the parquet path at tmp. Uses object.__new__
+    (not M.__new__) to bypass BaseManager's shared singleton, so a sibling test that
+    stubs save()/load() on the singleton (e.g. test_movie_enrichment) cannot pollute
+    this one."""
+    m = object.__new__(RadarrCacheMovieFilesManager)
     m.logger = _Log()
     m._df_cache = {}
     m._parquet_path = lambda inst: tmp_path / f"{inst}.parquet"
