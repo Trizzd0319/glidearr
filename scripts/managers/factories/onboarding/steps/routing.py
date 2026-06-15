@@ -47,11 +47,24 @@ def _leaf(path) -> str:
     return str(path or "").replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
 
 
-def _auto_match(folders, keywords):
-    """First discovered root folder whose leaf name contains any keyword — used to
-    PRE-SELECT an existing kids/anime/4K folder as the default while still prompting."""
+def _auto_match(folders, keywords, prefer=()):
+    """Best discovered root folder for a bucket — used to PRE-SELECT a default while still
+    prompting. Prefers a folder whose PATH carries a media-context hint (``prefer``, e.g.
+    'tv'/'movie') AND whose leaf matches a ``keyword`` (so a Kids-TV prompt picks
+    ``…/tv/kids`` over ``…/movies/kids``); falls back to the first keyword-leaf match
+    regardless of context."""
+    kw, pref = tuple(keywords), tuple(prefer)
+
+    def leaf_match(p):
+        return any(k in _leaf(p) for k in kw)
+
+    if pref:
+        for p in folders:
+            low = str(p or "").replace("\\", "/").lower()
+            if leaf_match(p) and any(x in low for x in pref):
+                return p
     for p in folders:
-        if any(k in _leaf(p) for k in keywords):
+        if leaf_match(p):
             return p
     return None
 
@@ -94,12 +107,12 @@ def _discover_root_folders(cfg, ctx) -> list:
     return out
 
 
-def _folder_prompt(prompter, path, label, folders, keywords, current) -> str:
+def _folder_prompt(prompter, path, label, folders, keywords, current, prefer=()) -> str:
     """Inline-capture a root-folder binding. PRE-SELECTS an existing folder whose name
-    matches ``keywords`` (e.g. kids / anime / uhd) as the default while still prompting:
-    a choice over the discovered folders, or a text field when none were discovered.
-    Returns the chosen path; ``""`` means "no folder for this bucket"."""
-    detected = _auto_match(folders, keywords)
+    matches ``keywords`` (e.g. kids / anime / uhd), biased to the media context (``prefer``,
+    e.g. 'tv' vs 'movie'), as the default while still prompting: a choice over the discovered
+    folders, or a text field when none were discovered. ``""`` means "no folder"."""
+    detected = _auto_match(folders, keywords, prefer)
     default = current or detected or ""
     if detected and not current:
         prompter.notice(f"   Auto-detected a matching folder: {detected}  (default — press Enter to keep, or change)")
@@ -161,7 +174,7 @@ class RoutingStep(Step):
                 ) or 0)
                 movie_rf["4k"] = _folder_prompt(
                     prompter, "movieRootFolders.4k", "   4K MOVIE root folder (on the 4K instance)",
-                    folders, ("4k", "uhd", "2160"), movie_rf.get("4k", ""))
+                    folders, ("4k", "uhd", "2160"), movie_rf.get("4k", ""), prefer=("movie", "film"))
             else:
                 mb.setdefault("4k_dual_min_score", 0)
         else:
@@ -173,7 +186,7 @@ class RoutingStep(Step):
                 "   instance via --service radarr if you want true dual-version remote play."
             )
 
-        # ── MOVIES: anime instance (only when a dedicated one is mapped) ──────
+        # ── MOVIES: anime — instance policy (instance-gated) + folder (instance-independent) ─
         anime_inst = radarr_cat.get("anime")
         if anime_inst and anime_inst != default_radarr:
             prompter.notice(
@@ -183,20 +196,26 @@ class RoutingStep(Step):
             )
             mb["anime_policy"] = prompter.choice(
                 "routing.movies.anime_policy",
-                "How should anime movies be routed?",
+                "How should anime movies be routed across instances?",
                 options=["dedicated", "dedicated_plus_standard", "standard_only"],
                 default=mb.get("anime_policy", "dedicated"),
             )
-            if mb["anime_policy"] != "standard_only":
-                movie_rf["anime"] = _folder_prompt(
-                    prompter, "movieRootFolders.anime", "   Anime MOVIE root folder",
-                    folders, ("anime", "donghua"), movie_rf.get("anime", ""))
         else:
             mb.setdefault("anime_policy", "dedicated")
             prompter.notice(
-                "   No dedicated anime Radarr instance is mapped — anime movies route to the default\n"
-                "   instance. Map one via --service radarr to split them onto their own instance."
+                "   No dedicated anime Radarr instance is mapped — anime movies stay on the default\n"
+                "   instance (map one via --service radarr to split them out), but they can still go to\n"
+                "   their own anime FOLDER below."
             )
+        # The anime MOVIE folder is independent of the instance — anime movies route to it on
+        # whichever instance holds them. Offer it whenever anime content is evident (an existing
+        # value, an anime-looking folder, or a dedicated anime instance), unless standard_only.
+        if mb.get("anime_policy") != "standard_only" and (
+                movie_rf.get("anime") or _auto_match(folders, ("anime", "donghua")) or
+                (anime_inst and anime_inst != default_radarr)):
+            movie_rf["anime"] = _folder_prompt(
+                prompter, "movieRootFolders.anime", "   Anime MOVIE root folder",
+                folders, ("anime", "donghua"), movie_rf.get("anime", ""), prefer=("movie", "film"))
 
         # ── MOVIES: kids folder (captured inline — asked for nowhere else) ────
         mb["kids_bucket_enabled"] = bool(prompter.confirm(
@@ -207,7 +226,7 @@ class RoutingStep(Step):
         if mb["kids_bucket_enabled"]:
             movie_rf["kids"] = _folder_prompt(
                 prompter, "movieRootFolders.kids", "   Kids MOVIE root folder",
-                folders, ("kids", "child", "family"), movie_rf.get("kids", ""))
+                folders, ("kids", "child", "family"), movie_rf.get("kids", ""), prefer=("movie", "film"))
             if not movie_rf.get("kids"):
                 prompter.warn("   No kids folder set — kid-safe movies will fall back to the standard folder.")
 
@@ -224,10 +243,10 @@ class RoutingStep(Step):
             default=tv.get("anime_policy",
                            "series_type_plus_folder" if root_folders.get("anime") else "series_type"),
         )
-        if tv["anime_policy"] == "series_type_plus_folder" and not root_folders.get("anime"):
+        if tv["anime_policy"] == "series_type_plus_folder":
             root_folders["anime"] = _folder_prompt(
                 prompter, "rootFolders.anime", "   Anime TV root folder",
-                folders, ("anime", "donghua"), root_folders.get("anime", ""))
+                folders, ("anime", "donghua"), root_folders.get("anime", ""), prefer=("tv", "series", "show"))
             if not root_folders.get("anime"):
                 prompter.warn("   No anime TV folder — anime shows stay in the series folder (the tag is still set).")
 
@@ -273,7 +292,7 @@ class RoutingStep(Step):
         if tv["kids_bucket_enabled"]:
             root_folders["kids"] = _folder_prompt(
                 prompter, "rootFolders.kids", "   Kids TV root folder",
-                folders, ("kids", "child", "family"), root_folders.get("kids", ""))
+                folders, ("kids", "child", "family"), root_folders.get("kids", ""), prefer=("tv", "series", "show"))
             if not root_folders.get("kids"):
                 prompter.warn("   No kids TV folder set — kid-safe shows will fall back to the series folder.")
 
@@ -330,8 +349,8 @@ class RoutingStep(Step):
                  else f"     {'standard':<10} -> {di:<12} (your *arr default root folder)"]
         if mb.get("kids_bucket_enabled"):
             lines.append(row("kids", mrf.get("kids"), di))
-        if rcat.get("anime") and mb.get("anime_policy") != "standard_only":
-            lines.append(row("anime", mrf.get("anime"), rcat.get("anime"), f"({mb.get('anime_policy', 'dedicated')})"))
+        if mb.get("anime_policy") != "standard_only" and (mrf.get("anime") or rcat.get("anime")):
+            lines.append(row("anime", mrf.get("anime"), rcat.get("anime") or di, f"({mb.get('anime_policy', 'dedicated')})"))
         fourk = rcat.get("4K") or rcat.get("4k")
         if fourk and fourk != di:
             lines.append(row("4k", mrf.get("4k"), fourk, f"({mb.get('4k_policy', 'highest_only')})"))

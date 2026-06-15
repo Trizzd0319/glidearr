@@ -91,6 +91,36 @@ def test_inline_capture_overrides_with_explicit_choice():
     assert cfg["movieRootFolders"]["kids"] == "/data/kids2"
 
 
+# ── media-aware matching: TV prompts prefer TV folders, movie prompts movie folders ──
+def test_tv_kids_prefers_tv_folder_over_movie_folder():
+    ctx = {"root_folders": ["/data/media/movies/kids", "/data/media/tv/kids"]}
+    p = _FakePrompter(confirms={"routing.tv.kids_bucket_enabled": True})
+    cfg, _ = _run(p, ctx=ctx)
+    assert cfg["rootFolders"]["kids"] == "/data/media/tv/kids"           # not the movies/kids folder
+
+
+def test_movie_kids_prefers_movie_folder_over_tv_folder():
+    ctx = {"root_folders": ["/data/media/movies/kids", "/data/media/tv/kids"]}
+    p = _FakePrompter(confirms={"routing.movies.kids_bucket_enabled": True})
+    cfg, _ = _run(p, ctx=ctx)
+    assert cfg["movieRootFolders"]["kids"] == "/data/media/movies/kids"
+
+
+# ── anime folders are captured independent of a dedicated anime INSTANCE ──────
+def test_movie_anime_folder_captured_without_anime_instance():
+    ctx = {"root_folders": ["/data/media/movies", "/data/media/movies/anime"]}
+    cfg, _ = _run(_FakePrompter(), ctx=ctx)                              # no anime instance, but an anime folder exists
+    assert cfg["movieRootFolders"]["anime"] == "/data/media/movies/anime"
+
+
+def test_tv_anime_folder_captured_on_plus_folder_preferring_tv():
+    ctx = {"root_folders": ["/data/media/movies/anime", "/data/media/tv/anime"]}
+    p = _FakePrompter(choices={"routing.tv.anime_policy": "series_type_plus_folder"})
+    cfg, _ = _run(p, ctx=ctx)
+    assert cfg["rootFolders"]["anime"] == "/data/media/tv/anime"
+    assert cfg["movieRootFolders"]["anime"] == "/data/media/movies/anime"   # both captured, media-aware
+
+
 # ── defaults preserve today's behaviour ──────────────────────────────────────
 def test_empty_cfg_writes_defaults():
     cfg, res = _run(_FakePrompter())
