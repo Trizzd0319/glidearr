@@ -61,6 +61,37 @@ def empty_config() -> dict:
         # resolver._pick_root_folder + router_movie.py; absent in older configs (then
         # movie placement falls back to the *arr's first reported root folder).
         "movieRootFolders": {"standard": "", "anime": "", "kids": "", "4k": ""},
+        # Library re-organizer + 4K/anime routing preferences, captured by the `routing`
+        # onboarding step (re-runnable via --service routing). Every default reproduces
+        # today's behaviour, so existing installs are unchanged until the user opts in.
+        #   movies.4k_policy: "both" keeps a 4K + an HD copy (remote play); "highest_only" keeps one.
+        #   movies.anime_policy: "dedicated" routes anime movies to the dedicated anime instance;
+        #     "dedicated_plus_standard" keeps an extra standard copy; "standard_only" ignores the split.
+        #   tv.anime_policy: "series_type_plus_folder" (anime FOLDER + seriesType) | "series_type".
+        #   reorg_mode: "off" (no re-org) | "log_only" (classify owned + LOG misplacements, move
+        #     nothing) | "same_instance" (actuate same-instance root-folder moves; cross-instance
+        #     migration stays log-only). Actuation also requires relocation_consent (below).
+        "routing": {
+            "movies": {
+                "4k_policy": "highest_only",
+                "4k_dual_min_score": 0,
+                "anime_policy": "dedicated",
+                "kids_bucket_enabled": False,
+            },
+            "tv": {
+                "anime_policy": "series_type",
+                "4k_enabled": False,
+                "dual_version": "highest_only",
+                "kids_bucket_enabled": False,
+            },
+            "reorg_mode": "log_only",
+        },
+        # Explicit consent to MOVE owned files on disk between root folders / instances —
+        # destructive-adjacent (a mid-move failure can split state), so gated exactly like
+        # deletions_consent: off by default; RECOMMENDARR_RELOCATION_CONSENT /
+        # GLIDEARR_RELOCATION_CONSENT env override. Read by routing_targets.relocation_enabled;
+        # log_only / off never move files so never need consent.
+        "relocation_consent": False,
         "animeGenres": [],
         "documentaryGenres": [],
         "free_space_limit": 0,
@@ -163,6 +194,10 @@ def empty_config() -> dict:
         "radarr_instances": {"default_instance": {"name": ""}},
         "sonarr_instances": {"default_instance": {"name": ""}},
         "radarr_instances_categorized": {},   # {tier_label: instance_name} — 720p/1080p/4K/anime → which Radarr session
+        # Symmetric twin for Sonarr (e.g. {"4k": "sonarr4k"}). gateway.categorized_instance is
+        # already generic (reads f"{service}_instances_categorized"), so a dedicated 4K/anime TV
+        # session needs no gateway change — only this key + populating it.
+        "sonarr_instances_categorized": {},
         "tautulli": {"default": {"url": "", "port": "", "api": "", "base_url": ""}},
         "mal": {
             "client_id": "",
