@@ -19,7 +19,7 @@ from __future__ import annotations
 from scripts.managers.machine_learning.classification import library_router
 from scripts.managers.services.mdblist import age_cache
 from scripts.support.utilities.library_classifier import classify_movie, classify_show, is_anime_media
-from scripts.support.utilities.size_model import estimate_gb, profile_max_quality
+from scripts.support.utilities.size_model import estimate_gb, profile_max_quality, target_resolution_for_score
 
 
 class Resolver:
@@ -242,15 +242,10 @@ class Resolver:
 
     @staticmethod
     def _target_resolution_for_score(score: int) -> int:
-        """Watchability/acquisition score → target resolution tier (naming-agnostic,
-        mirrors the scorer's QUALITY_PROFILE_THRESHOLDS bands)."""
-        if score >= 70:
-            return 2160
-        if score >= 35:
-            return 1080
-        if score >= 20:
-            return 720
-        return 480
+        """Watchability/acquisition score → target resolution tier. Delegates to the shared
+        ``size_model.target_resolution_for_score`` so add-time and the dual-version HD baseline
+        agree on what resolution a score justifies."""
+        return target_resolution_for_score(score)
 
     def _profile_for_score(self, profiles: list, score: int):
         """Pick the highest-resolution profile whose max allowed resolution does not

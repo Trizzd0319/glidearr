@@ -292,6 +292,24 @@ def profile_max_quality(profile: dict) -> "tuple[int, str | None]":
     return best_res, best_name
 
 
+def target_resolution_for_score(score) -> int:
+    """Watchability / acquisition score → target resolution tier (naming-agnostic, mirrors the
+    scorer's QUALITY_PROFILE_THRESHOLDS bands): score >=70 → 2160, >=35 → 1080, >=20 → 720, else
+    480. Shared by the resolver's score-driven profile pick and the dual-version HD baseline
+    (which clamps it below 4K) so add-time and the baseline use ONE ladder."""
+    try:
+        s = int(score)
+    except (TypeError, ValueError):
+        return 480
+    if s >= 70:
+        return 2160
+    if s >= 35:
+        return 1080
+    if s >= 20:
+        return 720
+    return 480
+
+
 def estimate_gb_for_profile(
     profile: dict,
     runtime_min: "float | int | None",
