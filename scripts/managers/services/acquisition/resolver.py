@@ -16,6 +16,7 @@ dedicated anime instance. MAL candidates are anime by construction. See
 """
 from __future__ import annotations
 
+from scripts.managers.machine_learning.classification import library_router
 from scripts.managers.services.mdblist import age_cache
 from scripts.support.utilities.library_classifier import classify_movie, classify_show, is_anime_media
 from scripts.support.utilities.size_model import estimate_gb, profile_max_quality
@@ -295,22 +296,11 @@ class Resolver:
           • show  anime → series    when routing.tv.anime_policy == "series_type"
           • show  kids  → series    when routing.tv.kids_bucket_enabled is off
         ``seriesType``=anime is tracked separately, so a ``series_type`` anime still parses as
-        anime — it just lands in the series folder instead of a dedicated anime one."""
+        anime — it just lands in the series folder instead of a dedicated anime one. Delegates to
+        the shared ``library_router.route_category`` so the re-organizer makes the same decision."""
         if not self._routing_on:
             return category
-        mv = self._routing.get("movies", {}) or {}
-        tv = self._routing.get("tv", {}) or {}
-        if is_show:
-            if category == "anime" and tv.get("anime_policy") == "series_type":
-                return "series"
-            if category == "kids" and not tv.get("kids_bucket_enabled", True):
-                return "series"
-        else:
-            if category == "kids" and not mv.get("kids_bucket_enabled", True):
-                return "standard"
-            if category == "anime" and mv.get("anime_policy") == "standard_only":
-                return "standard"
-        return category
+        return library_router.route_category(category, is_show, self._routing)
 
     def _pick_root_folder(self, gw, inst, is_show, category) -> str:
         # Show → the configured folder for its library bucket (series fallback).

@@ -472,6 +472,20 @@ class Main(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_debug(f"[Main] plan summary skipped: {e}")
 
+        # ── Phase 2.6: library re-organizer (opt-in; gated) ────────────────
+        # Reconciles owned media to the correct library FOLDER. Runs AFTER the space
+        # coordinator's delete decisions and BEFORE Phase-3 acquisition. No-op until the
+        # routing onboarding step stamped routing.configured; log_only just LOGS misplacements,
+        # and same_instance moves are further gated by relocation consent + never run under dry_run.
+        try:
+            from scripts.managers.services.routing import RoutingManager
+            RoutingManager(config=self.config, logger=self.logger,
+                           radarr=getattr(self, "radarr", None), sonarr=getattr(self, "sonarr", None),
+                           dry_run=self.dry_run).run()
+        except Exception as e:
+            summary.add_error(f"Routing: {e}")
+            self.logger.log_error(f"[Main] routing re-organizer failed: {e}")
+
         # ── Phase 3: acquisition / write-back / calendar (opt-in; gated) ───
         # Each capability is a no-op unless its config flag is enabled and never
         # writes under dry_run, so with defaults this phase changes nothing.
