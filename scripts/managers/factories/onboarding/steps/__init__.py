@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from scripts.managers.factories.onboarding.steps.arr import RadarrStep, SonarrStep
 from scripts.managers.factories.onboarding.steps.daemons import DaemonsStep
+from scripts.managers.factories.onboarding.steps.deletions import DeletionsStep
 from scripts.managers.factories.onboarding.steps.english_dub import EnglishDubStep
 from scripts.managers.factories.onboarding.steps.extras import TvdbStep
 from scripts.managers.factories.onboarding.steps.library import LibraryStep
@@ -36,6 +37,7 @@ STEP_CLASSES = [
     DaemonsStep,
     NextEpisodeStep,
     EnglishDubStep,
+    DeletionsStep,
     NotificationsStep,
 ]
 
