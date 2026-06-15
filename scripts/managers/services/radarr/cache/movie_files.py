@@ -199,6 +199,14 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         if self.dry_run:
             self.logger.log_debug(f"🛡️ {self.__class__.__name__} dry_run=True — no destructive operations will run")
 
+        # Run-scoped write-through cache of the loaded movie_files dataframe, keyed by
+        # resolved instance name. load() serves a copy from here instead of re-reading
+        # the parquet on every orchestration task (~8-11 reads/instance otherwise);
+        # save() writes through to disk AND refreshes it. reset_run_cache() clears it at
+        # the start of each orchestration / coordinator run. The copies in/out keep
+        # behaviour identical to always re-reading from disk.
+        self._df_cache: dict = {}
+
         self.register()
         self.logger.log_debug(f"🧰 Initialized {self.__class__.__name__}")
 
@@ -504,6 +512,9 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
     @LoggerManager().log_function_entry
     @timeit("load_movie_files")
     def load(self, instance: str) -> pd.DataFrame:
+        cache = getattr(self, "_df_cache", None)
+        if cache is not None and instance in cache:
+            return cache[instance].copy()   # copy-out: callers may mutate without saving
         path = self._parquet_path(instance)
         if path.exists():
             try:
@@ -511,11 +522,14 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                 for col in self._NUMERIC_COLUMNS:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors="coerce")
+                if cache is not None:
+                    cache[instance] = df.copy()
                 return df
             except Exception as e:
                 self.logger.log_warning(
                     f"Could not read movie_files.parquet for '{instance}': {e}"
                 )
+        # Do NOT cache the empty fallback — let the next call re-attempt the disk read.
         return pd.DataFrame(columns=self.SCHEMA_COLUMNS)
 
     @LoggerManager().log_function_entry
@@ -528,6 +542,12 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                 na_position="last",
             ).reset_index(drop=True)
             df_out.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
+            # Write-through: refresh the run cache with the SORTED df_out (a copy) so a
+            # later load() is indistinguishable from re-reading this file from disk, and
+            # a caller still mutating its local df after save() cannot alter the snapshot.
+            cache = getattr(self, "_df_cache", None)
+            if cache is not None:
+                cache[instance] = df_out.copy()
             self.logger.log_info(
                 f"Movie file cache saved for '{instance}': "
                 f"{len(df_out)} rows -> {path.name}"
@@ -538,6 +558,12 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                 f"Failed to save movie_files.parquet for '{instance}': {e}"
             )
             return False
+
+    def reset_run_cache(self) -> None:
+        """Drop the run-scoped movie_files dataframe cache so the next load() reads
+        fresh from disk. Called at the start of each Radarr orchestration run (and
+        defensively by the space coordinator) to bound the cache to a single run."""
+        self._df_cache = {}
 
     # ── Enrichment broadcast (Radarr twin of episode_files.refresh_enrichment) ───
     def _get_movie_cache(self):

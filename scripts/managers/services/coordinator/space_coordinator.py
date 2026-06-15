@@ -191,6 +191,15 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
             return stats
 
         # ── Stage 2: combined ranked delete pool ────────────────────────────────
+        # Defensive: drop the Radarr movie_files run cache so this post-run load reads
+        # fresh from disk, decoupled from the orchestration run that populated it.
+        try:
+            if radarr_sp and hasattr(radarr_sp, "_get_movie_files_manager"):
+                _mfm = radarr_sp._get_movie_files_manager()
+                if _mfm is not None and hasattr(_mfm, "reset_run_cache"):
+                    _mfm.reset_run_cache()
+        except Exception:
+            pass
         radarr_df = radarr_sp.load_movie_files(radarr_inst) if (radarr_sp and radarr_inst) else None
         sonarr_df = sonarr_ef.load(sonarr_inst) if (sonarr_ef and sonarr_inst) else None
 

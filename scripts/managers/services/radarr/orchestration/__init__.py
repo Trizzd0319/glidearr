@@ -603,6 +603,19 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
             self.logger.log_warning("[Orchestration] No Radarr instances found — nothing to run")
             return {}
 
+        # Start each Radarr run with a cold movie_files cache so the per-task reads
+        # below reuse one in-memory dataframe instead of re-reading the parquet ~8-11x
+        # per instance. Best-effort: a missing manager must never break the run.
+        try:
+            _cache_mgr = self._get_cache_manager()
+            _mf = getattr(_cache_mgr, "movie_files", None) if _cache_mgr else None
+            if _mf is None:
+                _mf = self.registry.get("manager", "RadarrCacheMovieFilesManager")
+            if _mf is not None and hasattr(_mf, "reset_run_cache"):
+                _mf.reset_run_cache()
+        except Exception:
+            pass
+
         results: dict = {}
         for inst in instances:
             resolved = self._resolve_instance(inst)
