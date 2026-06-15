@@ -6,15 +6,17 @@ canonical ids), dedup against the target instance's library, then resolve the
 target instance, quality profile, root folder, and an estimated size. The
 resolved object doubles as the add-payload base in the adder.
 
-Library routing: every show is classified into one library bucket via the shared
-``library_classifier`` (precedence anime → kids → reality → documentary → series)
-and routed to the matching ``rootFolders`` entry. Anime shows keep ``seriesType=anime``
+Library routing: every candidate is classified into one library bucket via the shared
+``library_classifier``, with Common Sense Media age (``recommended_age``, read from the
+MDBList age cache by tmdbId) as the PRIMARY kids signal for BOTH shows and movies, and
+routed to the matching ``rootFolders`` entry. Anime shows keep ``seriesType=anime``
 but stay on the single Sonarr instance; anime MOVIES route to Radarr's optional
 dedicated anime instance. MAL candidates are anime by construction. See
 ``support/utilities/library_classifier.py`` for the classification contract.
 """
 from __future__ import annotations
 
+from scripts.managers.services.mdblist import age_cache
 from scripts.support.utilities.library_classifier import classify_movie, classify_show, is_anime_media
 from scripts.support.utilities.size_model import estimate_gb, profile_max_quality
 
@@ -36,6 +38,12 @@ class Resolver:
         self._root_folders = config.get("rootFolders", {}) or {}
         self._movie_root_folders = config.get("movieRootFolders", {}) or {}
         self._acq = config.get("acquisition", {}) or {}
+        # Common Sense Media age caches — the PRIMARY kids signal for both movies and shows
+        # (see library_classifier). Loaded lazily once per Resolver and reused per candidate
+        # (pure file reads, no network). The movie cache is keyed by Radarr tmdbId, the TV
+        # cache by Sonarr series tmdbId (separate files — movie/show tmdbIds share a space).
+        self._movie_age_cache = None
+        self._show_age_cache = None
 
     def prepare(self, cand: dict) -> dict:
         is_show = cand.get("type") == "show"
@@ -58,6 +66,9 @@ class Resolver:
         certification = obj.get("certification") or cand.get("certification")
         _ol = obj.get("originalLanguage")
         original_language = _ol.get("name") if isinstance(_ol, dict) else (_ol or cand.get("language"))
+        # Kids/family STUDIO is the movie-only fallback when CSM has no age (Radarr movies
+        # carry a single ``studio`` string; shows have none). See classify_movie_explained.
+        studio = None if is_show else (obj.get("studio") or cand.get("studio"))
 
         # Classify shows into a library bucket (folder). ``is_anime`` is tracked
         # separately for Sonarr seriesType — a children-genre anime routes to the
@@ -70,6 +81,7 @@ class Resolver:
                 series_type=obj.get("seriesType"),
                 original_language=original_language,
                 is_anime_hint=bool(cand.get("is_anime")),
+                recommended_age=self._csm_show_age(obj.get("tmdbId")),
                 anime_genres=self._anime_genres,
                 kids_genres=self._kids_genres,
                 kids_certs=self._kids_certs,
@@ -96,6 +108,8 @@ class Resolver:
                 genres=genres,
                 certification=certification,
                 original_language=original_language,
+                studio=studio,
+                recommended_age=self._csm_movie_age(obj.get("tmdbId")),
                 is_anime_hint=is_anime,
                 is_uhd=False,
                 anime_genres=self._anime_genres,
@@ -172,6 +186,20 @@ class Resolver:
         if not self._anime_genres:
             return False
         return any(str(g).lower() in self._anime_genres for g in (genres or []))
+
+    def _csm_movie_age(self, tmdb_id):
+        """Common Sense recommended age for a movie tmdbId (None if uncached/no rating)."""
+        if self._movie_age_cache is None:
+            self._movie_age_cache = age_cache.load(age_cache.AGE_CACHE_PATH)
+        return age_cache.age_for(tmdb_id, cache=self._movie_age_cache)
+
+    def _csm_show_age(self, tmdb_id):
+        """Common Sense recommended age for a show tmdbId (None if uncached/no rating). The
+        TV cache is keyed by the Sonarr series tmdbId — present on Sonarr lookup objects
+        even though the resolver routes/dedupes shows by tvdbId."""
+        if self._show_age_cache is None:
+            self._show_age_cache = age_cache.load(age_cache.TV_AGE_CACHE_PATH)
+        return age_cache.age_for(tmdb_id, cache=self._show_age_cache)
 
     def _pick_profile(self, gw, inst, score=None) -> dict:
         profiles = gw.quality_profiles(inst) or []

@@ -7,20 +7,22 @@ documentary → documentaries, everything else → series — and correct any wr
 ``seriesType`` along the way.
 
 It classifies each series with the shared standard in
-``support/utilities/library_classifier.py`` (precedence: anime → kids → reality
-→ documentary → series), compares that to where the series currently sits, and
-applies the difference via Sonarr's ``series/editor`` endpoint:
+``support/utilities/library_classifier.py`` (precedence: preschool → anime → CSM age →
+kids → reality → documentary → series), compares that to where the series currently sits,
+and applies the difference via Sonarr's ``series/editor`` endpoint:
   • mis-filed series are moved (``moveFiles=true`` — Sonarr relocates on disk);
   • a wrong ``seriesType`` is corrected (anime-classified → ``anime``; a series
     mistyped ``anime`` that is NOT anime → ``standard``).
 
 Classification (precedence — first match wins):
-  • kids (genre)  — Children/Family/Kids/Preschool routes to Kids even when the
-                    show is also anime or a documentary.
+  • preschool     — the 'Preschool' GENRE: genuine toddler content, beats anime.
   • anime         — anime-language animation (animated AND originalLanguage
-                    Japanese/Korean), an explicit anime genre, or a bare
+                    Japanese/Korean/Chinese), an explicit anime genre, or a bare
                     seriesType="anime" that nothing contradicts. A Western cartoon
                     mistyped as anime (e.g. Curious George) is NOT anime.
+  • CSM age       — Common Sense Media recommended age (cached by tmdbId): at/under
+                    the kids cutoff → Kids; older → NOT Kids. PRIMARY signal when known.
+  • kids (genre)  — Children/Family/Kids routes to Kids (used when no CSM age applies).
   • reality       — Reality / Game Show / Talk Show.
   • documentary   — Documentary / Biography / Nature.
   • kids (cert)   — TV-Y/TV-Y7/TV-G/G/PG, applied LAST (a cert never overrides
@@ -70,6 +72,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import sys
 from collections import defaultdict
@@ -183,15 +186,47 @@ def _olang(series: dict):
     return ol.get("name") if isinstance(ol, dict) else ol
 
 
+# Common Sense Media recommended-age cache for SHOWS (tmdbId → age|null), populated by
+# enrich_csm_ages.py / the enrich daemon from MDBList. PRIMARY kids signal; a missing/null
+# entry lets the classifier fall back to its genre/cert heuristics. Read directly from the
+# JSON (no ``scripts.``-prefixed import) to keep this tool standalone — mirrors
+# router_movie._csm_age, but pointed at the SEPARATE TV cache file (show and movie tmdbIds
+# share an integer space, so they can't share a {tmdbId: age} dict). Loaded once, lazily.
+KIDS_AGE_MAX = 11                            # CSM age at/under which a show is 'kids' (matches router_movie)
+_CSM_AGE_CACHE: "dict | None" = None
+
+
+def _csm_age(tmdb_id) -> "int | None":
+    global _CSM_AGE_CACHE
+    if _CSM_AGE_CACHE is None:
+        path = _SCRIPTS_DIR / "support" / "cache" / "mdblist" / "age_ratings_tv.json"
+        try:
+            with open(path, encoding="utf-8") as f:
+                _CSM_AGE_CACHE = json.load(f) or {}
+            print(f"Common Sense ages: {sum(1 for v in _CSM_AGE_CACHE.values() if isinstance(v, int)):,} "
+                  f"cached (of {len(_CSM_AGE_CACHE):,} looked up).")
+        except Exception:
+            _CSM_AGE_CACHE = {}
+            print("Common Sense ages: no TV cache yet (run enrich_csm_ages.py --media tv) — using genre/cert only.")
+    if not tmdb_id:
+        return None
+    v = _CSM_AGE_CACHE.get(str(tmdb_id))
+    return v if isinstance(v, int) else None
+
+
 def classify(series: dict) -> tuple[str, str]:
     """Return ``(category, reason)`` for a Sonarr series dict, using the classifier's
-    built-in (tight) genre/cert defaults — no config lists are passed."""
+    built-in (tight) genre/cert defaults — no config lists are passed. Common Sense Media
+    age (when cached for this series' tmdbId) is the PRIMARY kids signal, matching the
+    add-time resolver and router_movie."""
     return classify_show_explained(
         genres=series.get("genres"),
         certification=series.get("certification"),
         series_type=series.get("seriesType"),
         original_language=_olang(series),
         is_anime_hint=False,                 # Sonarr carries no source hint
+        recommended_age=_csm_age(series.get("tmdbId")),   # Common Sense age (primary)
+        kids_age_max=KIDS_AGE_MAX,
     )
 
 
