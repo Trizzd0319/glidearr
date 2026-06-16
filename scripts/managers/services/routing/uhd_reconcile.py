@@ -43,6 +43,7 @@ from scripts.managers.machine_learning.space.routing_targets import (
     proactive_4k_enabled,
     relocation_consented,
     reorg_mode,
+    uhd_remote_play_ok,
 )
 from scripts.managers.services.acquisition.gateway import ArrGateway
 from scripts.managers.services.radarr.storage.cross_instance_move import CrossInstanceMove
@@ -63,6 +64,7 @@ class UhdReconcileManager:
         self.dry_run = bool(dry_run)
         self._im = self._extract_im(radarr)
         self._registry = registry
+        self.global_cache = kwargs.get("global_cache")
         self._routing = self.config.get("routing", {}) or {}
         self._mrf = self.config.get("movieRootFolders", {}) or {}
 
@@ -71,6 +73,16 @@ class UhdReconcileManager:
         if mgr is None:
             return None
         return getattr(mgr, "instance_manager", None) or getattr(mgr, "radarr_api", None)
+
+    def _remote_play_ok(self) -> bool:
+        """Stage-C remote-play gate for the PROACTIVE 4K acquire — the SAME authority the add-time
+        resolver uses (``routing_targets.uhd_remote_play_ok``), reading the same cached fingerprint
+        matrix + platform weights, so reconcile and add-time never diverge on what counts as
+        remote-playable. Returns True when the transcode gate is OFF (proactive acquire unchanged)."""
+        gc = self.global_cache
+        records = gc.get("tautulli/transcode_fingerprint") if gc else None
+        weights = gc.get("tautulli/platforms") if gc else None
+        return uhd_remote_play_ok(self.config, records, weights)
 
     def _likelihood_map(self, instance) -> dict:
         """``{tmdbId: watch_likelihood (0-100)}`` for owned movies on ``instance``, read from the
@@ -150,8 +162,11 @@ class UhdReconcileManager:
         hasfile = {m.get("tmdbId") for m in ultra
                    if isinstance(m, dict) and m.get("tmdbId") is not None and m.get("hasFile")}
 
+        # Stage-C remote-play gate (household-global) — computed once for the whole sweep.
+        crp = self._remote_play_ok()
+
         for name in self._source_instances(gw, fourk):
-            self._reconcile_instance(gw, mover, name, fourk, dest_root, dest_pid, present, hasfile)
+            self._reconcile_instance(gw, mover, name, fourk, dest_root, dest_pid, present, hasfile, crp)
 
     def _source_instances(self, gw, fourk) -> list:
         """The HD/standard-tier instances to scan as MOVE SOURCES — where the 1080p baseline lives.
@@ -254,7 +269,8 @@ class UhdReconcileManager:
             return False
 
     # ── per standard instance ──────────────────────────────────────────────────
-    def _reconcile_instance(self, gw, mover, std_inst, fourk, dest_root, dest_pid, present, hasfile):
+    def _reconcile_instance(self, gw, mover, std_inst, fourk, dest_root, dest_pid, present, hasfile,
+                            can_remote_play=True):
         try:
             movies = gw.library_items(std_inst) or []
         except Exception as e:
@@ -288,7 +304,7 @@ class UhdReconcileManager:
             # proactive_4k flag + 4K-instance space; actuation (add vs log) rides the mover's dry_run.
             if proactive and not dest_present and res < _UHD_RES and dual_version.wants_uhd(
                     keep_tagged=False, score=lk, space_allows=space_ok_4k,
-                    uhd_threshold=threshold, can_remote_play=True):
+                    uhd_threshold=threshold, can_remote_play=can_remote_play):
                 ast = mover.acquire(mv, to_inst=fourk, dest_root=dest_root,
                                     dest_profile_id=dest_pid).get("status")
                 if ast not in ("skip", "noop"):

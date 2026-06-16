@@ -494,7 +494,7 @@ class Main(BaseManager, ComponentManagerMixin):
             from scripts.managers.services.routing.uhd_reconcile import UhdReconcileManager
             UhdReconcileManager(config=self.config, logger=self.logger,
                                 radarr=getattr(self, "radarr", None), dry_run=self.dry_run,
-                                registry=self.registry).run()
+                                registry=self.registry, global_cache=self.global_cache).run()
         except Exception as e:
             summary.add_error(f"UHD reconcile: {e}")
             self.logger.log_error(f"[Main] uhd reconcile failed: {e}")

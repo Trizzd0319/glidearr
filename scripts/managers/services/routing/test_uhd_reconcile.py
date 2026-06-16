@@ -223,7 +223,24 @@ def test_move_log_includes_watch_score(monkeypatch):
 
 
 # ── proactive 4K acquire (owned 1080p movie warranting 4K gets a 4K copy on the 4K instance) ──
-def _proactive_run(monkeypatch, std, *, score=90, proactive=True, free=9999.0):
+class _GateCache:
+    """Minimal global_cache stub serving the two keys the Stage-C remote-play gate reads."""
+    def __init__(self, records, weights):
+        self._d = {"tautulli/transcode_fingerprint": records or [],
+                   "tautulli/platforms": weights or {}}
+
+    def get(self, key, *a, **k):
+        return self._d.get(key)
+
+
+def _hevc_cell(*, transcode, direct, device="Chromecast"):
+    # a 2160p HEVC capability cell matching the gate's source fingerprint at the drop_audio level
+    return [{"device": device, "fingerprint": ["hevc", "eac3", "none", "2160p_sdr", "unknown"],
+             "transcode": transcode, "direct": direct, "last_seen": 0, "n": transcode + direct}]
+
+
+def _proactive_run(monkeypatch, std, *, score=90, proactive=True, free=9999.0,
+                   gate=False, fp_records=None, weights=None):
     import pandas as pd
     for v in ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT"):
         monkeypatch.delenv(v, raising=False)
@@ -233,10 +250,13 @@ def _proactive_run(monkeypatch, std, *, score=90, proactive=True, free=9999.0):
     cfg = _cfg()                                            # both + same_instance + consent
     cfg["routing"]["movies"]["proactive_4k"] = proactive
     cfg["routing"]["movies"]["4k_dual_min_score"] = 70
+    if gate:
+        cfg["routing"]["movies"]["transcode_gate"] = True
+    gc = _GateCache(fp_records, weights) if gate else None
     df = pd.DataFrame([{"tmdb_id": mv["tmdbId"], "is_watched": True, "watchability_score": score}
                        for mv in std])
     UhdReconcileManager(config=cfg, logger=None, radarr=_Mgr(im), dry_run=False,
-                        registry=_Reg(_SP(df))).run()
+                        registry=_Reg(_SP(df)), global_cache=gc).run()
     return im
 
 
@@ -263,6 +283,28 @@ def test_no_proactive_acquire_below_threshold(monkeypatch):
 def test_no_proactive_acquire_when_space_tight(monkeypatch):
     im = _proactive_run(monkeypatch, [_M1080], score=90, free=1.0)   # below the 4K-instance band
     assert im.adds == []                                   # space-gated
+
+
+# ── Stage-C remote-play gate on the proactive acquire (same authority as add-time) ──
+def test_proactive_suppressed_when_remote_play_false(monkeypatch):
+    # gate ON + the household always transcodes 2160p HEVC → suppress the proactive 4K acquire
+    im = _proactive_run(monkeypatch, [_M1080], score=90, gate=True,
+                        fp_records=_hevc_cell(transcode=4, direct=0), weights={"Chromecast": 1})
+    assert im.adds == []
+
+
+def test_proactive_acquires_when_remote_play_true(monkeypatch):
+    # gate ON but the household direct-plays 2160p HEVC → still acquire
+    im = _proactive_run(monkeypatch, [_M1080], score=90, gate=True,
+                        fp_records=_hevc_cell(transcode=0, direct=4), weights={"Chromecast": 1})
+    acq = [a for a in im.adds if a[0] == "ultra"]
+    assert len(acq) == 1 and acq[0][1]["tmdbId"] == 14160
+
+
+def test_proactive_acquires_on_no_data_even_with_gate_on(monkeypatch):
+    # gate ON but no transcode history yet → explore (acquire and learn), never deny a fresh household
+    im = _proactive_run(monkeypatch, [_M1080], score=90, gate=True, fp_records=[], weights={})
+    assert len([a for a in im.adds if a[0] == "ultra"]) == 1
 
 
 # ── downgrade low-watchability 4K-only titles to a 1080p baseline under pressure ──
