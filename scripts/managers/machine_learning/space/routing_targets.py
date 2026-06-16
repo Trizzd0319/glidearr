@@ -99,6 +99,24 @@ def proactive_4k_enabled(config) -> bool:
     return relocation_enabled(config)
 
 
+def transcode_gate_enabled(config) -> bool:
+    """Gate for the transcode/remote-play capability check on the 4K BONUS copy: only acquire
+    the 2160p companion when a likely household device can DIRECT-PLAY it (else the 4K would
+    just force a transcode and the 1080p baseline already covers playback). Requires
+    ``routing.movies.transcode_gate`` AND ``4k_policy == "both"`` (the gate only affects the
+    dual-version 4K add, the one place ``can_remote_play`` is consumed). DELIBERATELY independent
+    of relocation/move consent: this gate only SUPPRESSES an acquire, it never moves a file, so
+    it carries no move-actuation dependency (unlike ``proactive_4k_enabled``). Default OFF — with
+    it off ``can_remote_play`` stays the hardcoded True and 4K behaviour is byte-for-byte unchanged."""
+    routing = _cfg_get(config, "routing", None) or {}
+    if not isinstance(routing, dict):
+        return False
+    mv = routing.get("movies", {}) or {}
+    if not isinstance(mv, dict):
+        return False
+    return bool(mv.get("transcode_gate")) and mv.get("4k_policy") == "both"
+
+
 def evict_uhd_first(config) -> bool:
     """Gate for evicting dual-version 4K BONUS copies FIRST under space pressure — each has a
     surviving 1080p baseline on the standard instance, so reclaiming it loses no title (pure

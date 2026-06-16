@@ -83,6 +83,10 @@ def empty_config() -> dict:
                 "4k_dual_min_score": 0,
                 "proactive_4k": False,
                 "evict_uhd_first": False,
+                # Only acquire the 4K bonus copy when a likely household device can
+                # direct-play it (learned from Tautulli transcode history); else the
+                # 1080p baseline already covers playback. Default OFF → 4K added regardless.
+                "transcode_gate": False,
                 "anime_policy": "dedicated",
                 "kids_bucket_enabled": False,
             },

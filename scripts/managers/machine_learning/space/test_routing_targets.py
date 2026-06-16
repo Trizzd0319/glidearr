@@ -11,6 +11,7 @@ from scripts.managers.machine_learning.space.routing_targets import (
     relocation_consented,
     relocation_enabled,
     reorg_mode,
+    transcode_gate_enabled,
 )
 
 _ENV = ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT")
@@ -163,3 +164,33 @@ def test_evict_uhd_first_needs_deletion_ownership(_clear_delete_env):
 def test_evict_uhd_first_handles_malformed_config(_clear_delete_env):
     assert evict_uhd_first({"routing": "oops"}) is False
     assert evict_uhd_first({"routing": {"movies": "oops"}}) is False
+
+
+# ── transcode_gate_enabled (transcode_gate AND 4k_policy==both; NO relocation/move dep) ───
+def _transcode_cfg(*, flag=True, policy="both"):
+    return {"routing": {"movies": {"transcode_gate": flag, "4k_policy": policy}}}
+
+
+def test_transcode_gate_defaults_false():
+    assert transcode_gate_enabled({}) is False
+    assert transcode_gate_enabled(None) is False
+    assert transcode_gate_enabled(_transcode_cfg(flag=False)) is False
+
+
+def test_transcode_gate_enabled_when_flag_and_both():
+    assert transcode_gate_enabled(_transcode_cfg()) is True
+
+
+def test_transcode_gate_false_without_both_policy():
+    assert transcode_gate_enabled(_transcode_cfg(policy="highest_only")) is False
+
+
+def test_transcode_gate_independent_of_relocation_consent():
+    # No relocation_consent and no reorg_mode set anywhere — the gate is a read-only acquire
+    # suppressor, never a file move, so it must NOT require the relocation/move actuation gate.
+    assert transcode_gate_enabled(_transcode_cfg()) is True
+
+
+def test_transcode_gate_handles_malformed_config():
+    assert transcode_gate_enabled({"routing": "oops"}) is False
+    assert transcode_gate_enabled({"routing": {"movies": "oops"}}) is False
