@@ -42,6 +42,7 @@ from scripts.managers.machine_learning.space.routing_targets import reorg_mode, 
 from scripts.managers.services.acquisition.gateway import ArrGateway
 from scripts.managers.services.radarr.storage.cross_instance_move import CrossInstanceMove
 from scripts.support.utilities.size_model import profile_max_quality
+from scripts.support.utilities.watch_likelihood import watch_likelihood
 
 # Alias-aware: the role map writes "4K" while the folder bucket is "4k" (and operators may use
 # uhd/2160) — accept them all so a casing/naming split never silently disables the move.
@@ -50,11 +51,12 @@ _UHD_RES = 2160
 
 
 class UhdReconcileManager:
-    def __init__(self, config=None, logger=None, *, radarr=None, dry_run=False, **kwargs):
+    def __init__(self, config=None, logger=None, *, radarr=None, dry_run=False, registry=None, **kwargs):
         self.config = config or {}
         self.logger = logger
         self.dry_run = bool(dry_run)
         self._im = self._extract_im(radarr)
+        self._registry = registry
         self._routing = self.config.get("routing", {}) or {}
         self._mrf = self.config.get("movieRootFolders", {}) or {}
 
@@ -63,6 +65,37 @@ class UhdReconcileManager:
         if mgr is None:
             return None
         return getattr(mgr, "instance_manager", None) or getattr(mgr, "radarr_api", None)
+
+    def _likelihood_map(self, instance) -> dict:
+        """``{tmdbId: watch_likelihood (0-100)}`` for owned movies on ``instance``, read from the
+        Radarr movie_files Parquet cache (the SAME persisted watchability the quality/space managers
+        use, so the dual-version 4K decision agrees with the upgrade brain). Empty when the
+        registry/cache is unavailable — the move logic never depends on it."""
+        sp = None
+        if self._registry is not None:
+            try:
+                sp = self._registry.get("manager", "RadarrSpacePressureManager")
+            except Exception:
+                sp = None
+        if sp is None or not hasattr(sp, "load_movie_files"):
+            return {}
+        try:
+            df = sp.load_movie_files(instance)
+        except Exception:
+            return {}
+        if df is None or getattr(df, "empty", True) or "tmdb_id" not in getattr(df, "columns", []):
+            return {}
+        out: dict = {}
+        for _, row in df.iterrows():
+            try:
+                tmdb = int(row.get("tmdb_id"))
+            except (TypeError, ValueError):
+                continue
+            try:
+                out[tmdb] = float(watch_likelihood(row, config=self.config))
+            except Exception:
+                continue
+        return out
 
     def _log(self, level, msg):
         if self.logger and hasattr(self.logger, level):
@@ -134,6 +167,7 @@ class UhdReconcileManager:
             self._log("log_warning", f"[UHD] {std_inst}: no ≤1080 quality profile — cannot keep a "
                                      f"1080p baseline; skipping cross-instance move.")
             return
+        likelihoods = self._likelihood_map(std_inst)     # {tmdbId: watch_likelihood}; {} if unavailable
         acted = 0
         for mv in movies:
             tmdb = mv.get("tmdbId")
@@ -156,7 +190,9 @@ class UhdReconcileManager:
             st = res.get("status")
             if st not in ("skip", "noop"):
                 acted += 1
-                self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}' → {fourk} [{st}]")
+                lk = likelihoods.get(tmdb)
+                watch = f" (watch {lk:.0f})" if lk is not None else ""
+                self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} [{st}]")
         if acted:
             self._log("log_info", f"[UHD] {std_inst}: {acted} title(s) in cross-instance move to {fourk}.")
 

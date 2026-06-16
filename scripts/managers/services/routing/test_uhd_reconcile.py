@@ -55,6 +55,23 @@ class _Mgr:
     def __init__(self, im): self.instance_manager = im
 
 
+class _SP:
+    def __init__(self, df): self._df = df
+    def load_movie_files(self, inst): return self._df
+
+
+class _Reg:
+    def __init__(self, sp): self._sp = sp
+    def get(self, kind, key): return self._sp if key == "RadarrSpacePressureManager" else None
+
+
+class _CapLog:
+    def __init__(self): self.info = []
+    def log_info(self, m): self.info.append(m)
+    def log_warning(self, m): pass
+    def log_success(self, m): pass
+
+
 def _cfg(*, reorg="same_instance", policy="both", configured=True, with_4k=True, consent=True):
     routing = {"reorg_mode": reorg, "movies": {"4k_policy": policy}, "tv": {}}
     if configured:
@@ -170,6 +187,35 @@ def test_noop_when_not_configured(monkeypatch):
 def test_noop_without_distinct_4k_instance(monkeypatch):
     im = _run(_cfg(with_4k=False), [_M4K], [], monkeypatch=monkeypatch)
     assert im.adds == [] and im.puts == [] and im.commands == []
+
+
+# ── watchability score threading (read-only) ──────────────────────────────────
+def test_likelihood_map_reads_watchability_from_cache():
+    import pandas as pd
+    df = pd.DataFrame([{"tmdb_id": 862, "is_watched": True, "watchability_score": 80},
+                       {"tmdb_id": 14160, "is_watched": False, "watchability_score": 10}])
+    m = UhdReconcileManager(config={}, logger=None, registry=_Reg(_SP(df)))
+    lk = m._likelihood_map("standard")
+    assert lk.get(862) == 75.0                         # watched + score 80 → likelihood 75
+    assert 14160 in lk
+
+
+def test_likelihood_map_empty_without_registry():
+    assert UhdReconcileManager(config={}, logger=None)._likelihood_map("standard") == {}
+
+
+def test_move_log_includes_watch_score(monkeypatch):
+    import pandas as pd
+    for v in ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT"):
+        monkeypatch.delenv(v, raising=False)
+    im = _Im({"standard": [_M4K], "ultra": []},
+             profiles={"standard": _STD_PROFILES, "ultra": _UHD_PROFILES},
+             roots={"ultra": [{"path": "/data/media/movies/4k"}]})
+    df = pd.DataFrame([{"tmdb_id": 862, "is_watched": True, "watchability_score": 80}])
+    log = _CapLog()
+    UhdReconcileManager(config=_cfg(), logger=log, radarr=_Mgr(im), dry_run=False,
+                        registry=_Reg(_SP(df))).run()
+    assert any("watch 75" in s for s in log.info)      # the per-title move log shows the score
 
 
 def test_only_scans_hd_tier_sources_not_a_real_4k_library(monkeypatch):
