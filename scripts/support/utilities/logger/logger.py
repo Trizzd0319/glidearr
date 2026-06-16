@@ -569,6 +569,22 @@ class LoggerManager:
                 f.write(json.dumps(details) + "\n")
         self.log_debug(f"[STRUCTURED] {category}: {details}")
 
+    def log_to_file(self, category, message, *, reset=False):
+        """Append a plain line to a DEDICATED log file (``support/logs/{category}.log``) WITHOUT
+        echoing to the main run log or the console — for high-volume drill-down output (e.g. the
+        re-organizer's per-title relocation plan, which can be thousands of titles) that would
+        otherwise flood the run log. ``reset=True`` truncates first (one fresh plan per run).
+        Secrets are scrubbed and decorative glyphs stripped, exactly like the console path.
+        Thread-safe; best-effort (never raises)."""
+        try:
+            path = LOG_DIR / f"{category}.log"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with LoggerManager._file_lock:
+                with open(path, "w" if reset else "a", encoding="utf-8") as f:
+                    f.write(self._present(message) + "\n")
+        except Exception:
+            pass
+
     def _log_trace_to_file(self, trace_id, func_name, location, error_message):
         trace_log_path = LOG_DIR / "tvdb_enrichment_trace.log"
         trace_log_path.parent.mkdir(parents=True, exist_ok=True)

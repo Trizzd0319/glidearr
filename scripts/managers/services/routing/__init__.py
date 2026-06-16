@@ -65,10 +65,20 @@ class RoutingManager:
         mode = reorg_mode(self.config)
         if mode == "off":
             return
+        # The full per-title plan can be thousands of lines, so it goes to a DEDICATED file
+        # (support/logs/routing.log) instead of flooding the run log/console — the main log gets
+        # only a per-instance count. Fresh plan each run.
+        self._detail(f"==== routing relocation plan (mode={mode}) ====", reset=True)
         self._reorg(is_show=False, im=self._radarr_im, get_ep="movie",
                     put_ep="movie/editor", id_key="movieIds", mode=mode)
         self._reorg(is_show=True, im=self._sonarr_im, get_ep="series",
                     put_ep="series/editor", id_key="seriesIds", mode=mode)
+
+    def _detail(self, msg, *, reset=False):
+        """Write a per-title relocation line to the dedicated routing log file (NOT the main run
+        log). No-op when the logger lacks the file sink (e.g. a None logger in tests)."""
+        if self.logger and hasattr(self.logger, "log_to_file"):
+            self.logger.log_to_file("routing", msg, reset=reset)
 
     # ── per-service ───────────────────────────────────────────────────────────
     def _reorg(self, *, is_show, im, get_ep, put_ep, id_key, mode):
@@ -92,10 +102,12 @@ class RoutingManager:
                 continue
             kind = "show" if is_show else "movie"
             self._log("log_info", f"[Routing] {name}: {len(plans)} {kind}(s) misplaced "
-                                  f"({'applying same-instance moves' if apply else 'log only'})")
+                                  f"({'applying same-instance moves' if apply else 'log only'}) "
+                                  f"— full plan in support/logs/routing.log")
+            self._detail(f"-- {name} ({kind}s): {len(plans)} misplaced --")
             for p in plans:
-                self._log("log_info", f"   {p['title']}: {p['current_root'] or '?'} -> "
-                                      f"{p['target_root'] or '(stay)'}  [{p['reason']}]")
+                self._detail(f"[{name}] {p['title']}: {p['current_root'] or '?'} -> "
+                             f"{p['target_root'] or '(stay)'}  [{p['reason']}]")
             if apply:
                 self._apply(im, name, put_ep, id_key, plans, is_show)
 
