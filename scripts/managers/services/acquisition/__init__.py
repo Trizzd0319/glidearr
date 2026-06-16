@@ -82,6 +82,14 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         cache[key] = (free, U)
         return cache[key]
 
+    def _space_ok(self, gw, inst, cache: dict) -> bool:
+        """True when an instance is at/above its pressure band (free >= U) — comfortable enough
+        to take the 4K bonus copy. FAIL-OPEN via ``_space_band`` (free=inf on a read error)."""
+        if gw is None:
+            return True
+        free, U = self._space_band(gw, inst, cache)
+        return free >= U
+
     def _acquisition_paused(self, gw, inst, cache: dict) -> bool:
         """True when NEW media must not be acquired: free space is in/below the
         pressure band AND deletion is not armed (no consent / no free_space_limit), so
@@ -228,6 +236,10 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             # matrix) — higher score → higher quality tier — instead of the default
             # first ("Any") profile. No-op if acquisition.quality_profile is pinned.
             resolver.resolve_quality(enriched, sc["total"])
+            # Dual-version: when 4k_policy=='both' + a distinct 4K instance, RE-CAP this
+            # primary copy to the <=1080 score-adaptive baseline (the 2160p copy goes on the
+            # 4K instance via the companion add below). No-op for highest_only / no 4K instance.
+            resolver.apply_hd_baseline(enriched)
             prepared.append(enriched)
 
         min_score = int(acq.get("min_score", 0) or 0)
@@ -261,8 +273,11 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 under_pressure = free < U
 
             # Under pressure: add at the resolved profile but with search OFF, and queue
-            # it for a deferred search once free recovers above U.
-            res = adder.add(e, search=False if under_pressure else None)
+            # it for a deferred search once free recovers above U. A dual-version baseline
+            # searches ON when not pressured — both the 1080p floor and the 4K bonus must
+            # actually grab a file (search_on_add stays the policy for ordinary single adds).
+            base_search = True if e.get("dual_baseline") else None
+            res = adder.add(e, search=False if under_pressure else base_search)
             action = res.get("action")
 
             if under_pressure and action in ("added", "would-add"):
@@ -293,6 +308,30 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 action,
             ])
             self.logger.log_debug(f"[acquire] '{e.get('title')}' matrix={e.get('matrix')}")
+
+            # Dual-version companion (4k_policy=='both'): add the 2160p copy on the 4K instance
+            # ON TOP of the <=1080 baseline just added. Make-before-break — gated on the baseline
+            # POSTing OK and NOT being deferred, so the durable floor lands (and searches) first;
+            # if the standard instance is pressured this run, the 4K copy waits for the reconcile
+            # sweep. plan_uhd_companion returns None unless dual is active + UHD is warranted +
+            # the 4K instance has space + the title isn't already a 4K copy.
+            if svc == "radarr" and res.get("ok") and not under_pressure:
+                companion = resolver.plan_uhd_companion(
+                    e, space_ok=lambda inst, _gw=gw: self._space_ok(_gw, inst, band_cache))
+                if companion is not None:
+                    cres = adder.add(companion, search=True)
+                    caction = cres.get("action")
+                    added += caction == "added"
+                    would += caction == "would-add"
+                    failed += caction == "add-failed"
+                    rows.append([
+                        str(companion.get("title") or companion.get("ext_id"))[:34],
+                        "movie", companion.get("score"),
+                        f"{companion.get('instance')} [4k]",
+                        (companion.get("quality_profile") or {}).get("name"),
+                        self._size_str(companion),
+                        f"{caction} [4k]",
+                    ])
 
         # Persist the new deferrals onto the backlog (live runs only), bounding its length
         # so chronic pressure can't grow it without limit (keep the newest).

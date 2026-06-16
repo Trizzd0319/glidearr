@@ -17,6 +17,7 @@ dedicated anime instance. MAL candidates are anime by construction. See
 from __future__ import annotations
 
 from scripts.managers.machine_learning.classification import library_router
+from scripts.managers.machine_learning.space import dual_version
 from scripts.managers.services.mdblist import age_cache
 from scripts.support.utilities.library_classifier import classify_movie, classify_show, is_anime_media
 from scripts.support.utilities.size_model import estimate_gb, profile_max_quality, target_resolution_for_score
@@ -162,6 +163,7 @@ class Resolver:
             "year": year,
             "certification": certification,
             "category": category,
+            "route_category": route_category,
             "is_anime": is_anime,
             "ext_id": ext_id,
             "id_field": id_field,
@@ -227,10 +229,16 @@ class Resolver:
             chosen = self._profile_for_score(profiles, int(score))
         if chosen is None and profiles:
             chosen = profiles[0]
+        return self._profile_view(chosen)
+
+    @staticmethod
+    def _profile_view(chosen) -> dict:
+        """Normalise a raw *arr quality profile into the resolver's add-payload view
+        ``{id, name, cutoff, max_quality, max_res}``. Sizing keys off the highest quality
+        the profile is ALLOWED to grab (``profile_max_quality``), not its cutoff (the
+        "good enough, stop upgrading" floor). ``None`` → the neutral default profile."""
         if chosen is None:
             return {"id": 1, "name": "(default)", "cutoff": None, "max_quality": None, "max_res": -1}
-        # Size off the highest quality the profile is ALLOWED to grab, not its
-        # cutoff (the "good enough, stop upgrading" floor).
         max_res, max_q = profile_max_quality(chosen)
         return {
             "id": chosen.get("id"),
@@ -280,6 +288,123 @@ class Resolver:
         enriched["expected_size_gb"] = size
         enriched["size_unit"]        = unit
         return enriched
+
+    # ── dual-version (1080p baseline + 4K bonus) ──────────────────────────────
+    # Active only when the operator chose routing.movies.4k_policy == "both" AND a DISTINCT
+    # 4K Radarr instance exists. Then a movie is kept as a <=1080 baseline on the standard
+    # instance (the durable, remote-play floor) PLUS — when warranted — a 2160p copy on the
+    # 4K instance. With the default "highest_only" every method below short-circuits before
+    # touching anything, so existing installs add exactly one copy as before.
+    _UHD_LABELS = ("4K", "4k", "uhd", "UHD", "2160p", "2160")
+
+    def _uhd_instance(self, gw):
+        """The DISTINCT 4K/UHD Radarr instance name, or None when there is no separate one.
+        ``categorized_instance`` returns the default for an unmapped/whitespace label, so a
+        label that resolves back to the default means "no dedicated 4K session" → degrade to a
+        single baseline. Alias-aware (``4K``/``4k``/``uhd``/``2160p``) because the role map is
+        written as ``4K`` while the folder bucket is ``4k`` (see RadarrStep.categorize_labels)."""
+        default_inst = gw.default_instance()
+        for label in self._UHD_LABELS:
+            inst = gw.categorized_instance(label)
+            if inst and inst != default_inst:
+                return inst
+        return None
+
+    def dual_active(self, enriched) -> bool:
+        """True when this candidate should be kept as a dual version — a <=1080 baseline on
+        the standard instance plus a 2160p copy on a distinct 4K instance. Requires
+        routing.configured, movies.4k_policy=='both', a MOVIE (not a show), a NON-anime route
+        (anime movies ride the dedicated anime instance — a single copy), and an actual
+        separate 4K Radarr instance."""
+        if enriched.get("type") == "show":
+            return False
+        mv = self._routing.get("movies", {}) or {}
+        if not self._routing_on or mv.get("4k_policy") != "both":
+            return False
+        if self._route_category(enriched.get("category", "standard"), False) == "anime":
+            return False
+        gw = self.gw.get("radarr")
+        if not gw or not gw.available:
+            return False
+        return self._uhd_instance(gw) is not None
+
+    def apply_hd_baseline(self, enriched: dict) -> dict:
+        """When :meth:`dual_active`, RE-CAP the primary copy to the score-adaptive <=1080
+        baseline on the standard instance — the durable, remote-play-friendly floor any client
+        can direct-play. The default ``_pick_profile`` caps at the SCORE tier (2160 for a high
+        score), which would put a 4K file on the standard instance; this clamps it to <=1080 via
+        the shared ``dual_version.pick_hd_profile`` so the 2160p copy lives ONLY on the 4K
+        instance. No-op (returns unchanged) when dual is inactive. Mutates + returns ``enriched``."""
+        if not self.dual_active(enriched):
+            return enriched
+        gw = self.gw.get("radarr")
+        raw = dual_version.pick_hd_profile(gw.quality_profiles(enriched["instance"]) or [],
+                                           enriched.get("score"))
+        if raw is not None:
+            view = self._profile_view(raw)
+            size, unit = self._expected_size(view, int(enriched.get("runtime") or 0), is_movie=True)
+            enriched["quality_profile"]  = view
+            enriched["expected_size_gb"] = size
+            enriched["size_unit"]        = unit
+        enriched["dual_baseline"] = True
+        return enriched
+
+    def _uhd_profile(self, gw, inst) -> dict:
+        """The 4K copy's profile: the HIGHEST-resolution profile the 4K instance offers (a 2160p
+        library by construction). Not score-capped — the 4K instance is the premium tier, so the
+        copy that lands there is always its top quality. ``profiles[0]`` would be fragile to
+        ordering, so we explicitly take the max by allowed resolution."""
+        profiles = gw.quality_profiles(inst) or []
+        if not profiles:
+            return self._profile_view(None)
+        top = max(profiles, key=lambda p: (profile_max_quality(p)[0] or 0))
+        return self._profile_view(top)
+
+    def plan_uhd_companion(self, enriched: dict, *, space_ok, keep_tagged: bool = False,
+                           can_remote_play: bool = True) -> "dict | None":
+        """Build the 2160p companion add (a SECOND enriched dict on the 4K instance) to sit ON
+        TOP of the <=1080 baseline, or ``None``. Emitted only when :meth:`dual_active`, the 4K
+        copy is WARRANTED (``dual_version.wants_uhd`` — keep-tagged OR score>=threshold, AND the
+        4K instance has space, AND a viewer can use it), and the title is not already in the 4K
+        library. ``space_ok(inst) -> bool`` reports whether an instance is above its pressure
+        band (the bonus is never added at the baseline's expense). Does NOT mutate the primary.
+
+        ``keep_tagged`` is False at add time (a fresh candidate carries no *arr tags yet);
+        ``can_remote_play`` is a constant True until the per-device capability matrix is wired.
+        The threshold is ``routing.movies.4k_dual_min_score`` (0/unset → the shared default 70)."""
+        if not self.dual_active(enriched):
+            return None
+        gw = self.gw.get("radarr")
+        inst_4k = self._uhd_instance(gw)
+        mv = self._routing.get("movies", {}) or {}
+        try:
+            threshold = int(mv.get("4k_dual_min_score") or dual_version.DEFAULT_UHD_SCORE)
+        except (TypeError, ValueError):
+            threshold = dual_version.DEFAULT_UHD_SCORE
+        if not dual_version.wants_uhd(keep_tagged=keep_tagged, score=enriched.get("score"),
+                                      space_allows=bool(space_ok(inst_4k)), uhd_threshold=threshold,
+                                      can_remote_play=can_remote_play):
+            return None
+        ext_id, id_field = enriched.get("ext_id"), enriched.get("id_field")
+        if gw.in_library(inst_4k, id_field, ext_id):
+            return None                                # already a 4K copy — nothing to add
+        profile = self._uhd_profile(gw, inst_4k)
+        if profile.get("id") is None:
+            return None                                # 4K instance has no usable profile
+        root = self._movie_root_folders.get("4k") or self._pick_root_folder(gw, inst_4k, False, "standard")
+        if not root:
+            return None
+        size, unit = self._expected_size(profile, int(enriched.get("runtime") or 0), is_movie=True)
+        companion = dict(enriched)
+        companion.update({
+            "instance": inst_4k,
+            "quality_profile": profile,
+            "root_folder": root,
+            "expected_size_gb": size,
+            "size_unit": unit,
+            "is_uhd_companion": True,
+        })
+        return companion
 
     def _route_category(self, category, is_show):
         """Apply the operator's ``routing`` preferences to the classified category, returning
