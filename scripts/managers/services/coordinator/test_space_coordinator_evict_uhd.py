@@ -121,6 +121,20 @@ def test_4k_only_title_without_baseline_is_never_evicted(monkeypatch):
     assert all(inst != "ultra" for inst, _ in sp.deletes)      # the orphan 4K copy is never deleted
 
 
+def test_downgrades_only_recovery_does_not_crash(monkeypatch):
+    # downgrades alone recover free above U → the Stage-1 "downgrades_only" early return runs
+    # _run_restores BEFORE the Stage-2 4K block; uhd_inst must already be bound (no NameError).
+    _no_env(monkeypatch)
+    sp = _RadarrSP({"standard": _std_df()}, free=50.0, total=400.0)
+
+    def _recover(inst, free):
+        sp._free = 200.0                                  # above the band top → no deletion needed
+        return {"recovered": True}
+    sp.run_downgrades = _recover
+    stats = _coord(sp, _Restore(), _cfg()).run()
+    assert stats.get("action") == "downgrades_only" and sp.deletes == []
+
+
 def test_gate_off_does_no_4k_eviction(monkeypatch):
     _no_env(monkeypatch)
     uhd_df = pd.DataFrame([{"tmdb_id": 1, "movie_file_id": 111, "watchability_score": 90,

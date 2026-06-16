@@ -171,6 +171,9 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
 
         stats: dict = {"enabled": True, "free_before_gb": round(free, 1),
                        "downgrades": {}, "deletions": {}, "restores": {}}
+        # Bound up-front (None) so the Stage-1 "downgrades_only" and the "no candidates" early
+        # returns can pass uhd_inst to _run_restores before the Stage-2 4K block (re)assigns it.
+        uhd_inst, uhd_df = None, None
 
         # ── Stage 1: downgrades (both services) ─────────────────────────────────
         if radarr_sp and radarr_inst:
@@ -225,7 +228,6 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         # reclaiming it loses NO title (pure reclaim). The ranker (uhd_first) then puts them
         # ahead of every whole title, lowest-watchability first, so a whole title is never
         # deleted while a reclaimable 4K copy remains.
-        uhd_inst, uhd_df = None, None
         if radarr_sp and radarr_inst and evict_uhd_first(self.config):
             uhd_inst = self._uhd_instance(radarr_inst)
             if uhd_inst and uhd_inst != radarr_inst:
