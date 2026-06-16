@@ -65,6 +65,9 @@ def empty_config() -> dict:
         # onboarding step (re-runnable via --service routing). Every default reproduces
         # today's behaviour, so existing installs are unchanged until the user opts in.
         #   movies.4k_policy: "both" keeps a 4K + an HD copy (remote play); "highest_only" keeps one.
+        #   movies.proactive_4k: with 4k_policy=="both", proactively give ANY owned movie whose
+        #     watch-likelihood warrants 4K a copy on the 4K instance (not just glidearr-acquired /
+        #     universe / recently-watched). Off by default; only actuates with the relocation gate.
         #   movies.anime_policy: "dedicated" routes anime movies to the dedicated anime instance;
         #     "dedicated_plus_standard" keeps an extra standard copy; "standard_only" ignores the split.
         #   tv.anime_policy: "series_type_plus_folder" (anime FOLDER + seriesType) | "series_type".
@@ -75,6 +78,7 @@ def empty_config() -> dict:
             "movies": {
                 "4k_policy": "highest_only",
                 "4k_dual_min_score": 0,
+                "proactive_4k": False,
                 "anime_policy": "dedicated",
                 "kids_bucket_enabled": False,
             },

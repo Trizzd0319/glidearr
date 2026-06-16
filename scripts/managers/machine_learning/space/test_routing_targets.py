@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from scripts.managers.machine_learning.space.routing_targets import (
+    proactive_4k_enabled,
     relocation_consented,
     relocation_enabled,
     reorg_mode,
@@ -84,3 +85,34 @@ def test_enabled_false_when_off():
 def test_enabled_env_consent_with_same_instance(monkeypatch):
     monkeypatch.setenv("GLIDEARR_RELOCATION_CONSENT", "yes")
     assert relocation_enabled({"routing": {"reorg_mode": "same_instance"}}) is True
+
+
+# ── proactive_4k_enabled (proactive_4k AND 4k_policy==both AND relocation_enabled) ───
+def _proactive_cfg(*, proactive=True, policy="both", reorg="same_instance", consent=True):
+    cfg = {"routing": {"reorg_mode": reorg,
+                       "movies": {"proactive_4k": proactive, "4k_policy": policy}}}
+    if consent:
+        cfg["relocation_consent"] = True
+    return cfg
+
+
+def test_proactive_4k_defaults_false():
+    assert proactive_4k_enabled({}) is False
+    assert proactive_4k_enabled(None) is False
+
+
+def test_proactive_4k_enabled_when_all_set():
+    assert proactive_4k_enabled(_proactive_cfg()) is True
+
+
+def test_proactive_4k_false_when_flag_off():
+    assert proactive_4k_enabled(_proactive_cfg(proactive=False)) is False
+
+
+def test_proactive_4k_false_without_both_policy():
+    assert proactive_4k_enabled(_proactive_cfg(policy="highest_only")) is False
+
+
+def test_proactive_4k_false_without_actuation_gate():
+    assert proactive_4k_enabled(_proactive_cfg(consent=False)) is False        # needs relocation consent
+    assert proactive_4k_enabled(_proactive_cfg(reorg="log_only")) is False     # needs same_instance

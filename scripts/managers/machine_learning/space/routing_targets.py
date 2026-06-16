@@ -79,3 +79,19 @@ def relocation_enabled(config) -> bool:
     With either missing, the re-organizer may still classify and LOG misplacements
     (``log_only``) but must never move a file."""
     return reorg_mode(config) == "same_instance" and relocation_consented(config)
+
+
+def proactive_4k_enabled(config) -> bool:
+    """HARD GATE for the proactive-4K dual-version behaviour: (a) give ANY owned movie whose
+    watch-likelihood warrants 4K a copy on the 4K instance, and (b) CAP the standard-instance
+    quality upgrade so it never bumps that title to 4K on standard (otherwise the two paths
+    double-grab the same 2160p). Requires ``routing.movies.proactive_4k`` AND
+    ``routing.movies.4k_policy == "both"`` AND the move-actuation gate (``relocation_enabled``).
+    Tying it to relocation_enabled is deliberate: the standard upgrade cap and the 4K-instance
+    acquire MUST move together, so the standard 4K upgrade is never disabled without the 4K-instance
+    replacement actually being actuated. Default OFF (existing installs unchanged)."""
+    routing = _cfg_get(config, "routing", None) or {}
+    mv = routing.get("movies", {}) or {}
+    if not mv.get("proactive_4k") or mv.get("4k_policy") != "both":
+        return False
+    return relocation_enabled(config)
