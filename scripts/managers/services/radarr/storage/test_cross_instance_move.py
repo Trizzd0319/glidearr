@@ -10,7 +10,7 @@ from scripts.managers.services.radarr.storage.cross_instance_move import CrossIn
 
 class _GW:
     def __init__(self):
-        self.adds, self.commands, self.puts, self.deletes = [], [], [], []
+        self.adds, self.commands, self.puts = [], [], []
 
     def add(self, inst, payload):
         self.adds.append((inst, payload)); return {"id": 500}
@@ -20,9 +20,6 @@ class _GW:
 
     def put(self, inst, endpoint, payload):
         self.puts.append((inst, endpoint, payload)); return {"ok": True}
-
-    def delete(self, inst, endpoint):
-        self.deletes.append((inst, endpoint)); return {}
 
 
 _MOVIE = {"id": 1, "title": "Toy Story", "tmdbId": 862, "year": 1995, "monitored": True,
@@ -78,54 +75,51 @@ def test_pending_skips_unmonitor_when_already_unmonitored():
     assert gw.commands and gw.commands[0][1]["importMode"] == "Move"
 
 
-# ── FINALIZE (delete stale record + re-add the 1080p baseline; never a physical delete) ──────
-def test_finalize_deletes_record_and_readds_baseline_with_search():
+# ── FINALIZE (retune the EXISTING record in place — no delete, no re-add) ──────────────────────
+def test_finalize_retunes_in_place_with_rescan_and_search():
     m, gw = _mover()
-    res = _relocate(m, dict(_MOVIE, monitored=False), dest_present=True, dest_hasfile=True, hd=3)
+    res = _relocate(m, _MOVIE, dest_present=True, dest_hasfile=True, hd=3)   # profile 9 != baseline 3
     assert res["status"] == "finalized"
-    assert gw.deletes == [("standard", "movie/1?deleteFiles=false")]   # record only, no physical file
-    assert len(gw.adds) == 1
-    inst, payload = gw.adds[0]
-    assert inst == "standard" and payload["qualityProfileId"] == 3
-    assert payload["rootFolderPath"] == "/data/media/movies/Kids"      # source folder preserved
-    assert payload["addOptions"] == {"searchForMovie": True} and payload["monitored"] is True
-    assert "movieFile" not in payload and "path" not in payload
-    assert gw.puts == []                                    # no retune PUT
+    # the EXISTING record is retuned (no add, no delete → Radarr id/history preserved)
+    assert gw.adds == []
+    assert gw.puts == [("standard", "movie/editor",
+                        {"movieIds": [1], "qualityProfileId": 3, "monitored": True})]
+    # rescan clears the moved-away 2160p, then search grabs the 1080p baseline
+    assert ("standard", {"name": "RescanMovie", "movieIds": [1]}) in gw.commands
+    assert ("standard", {"name": "MoviesSearch", "movieIds": [1]}) in gw.commands
 
 
-def test_finalize_only_when_source_in_flight_unmonitored():
-    # a still-monitored title on the destination is steady (or a freshly re-added baseline) → noop
+def test_finalize_noop_when_already_at_baseline_profile():
     m, gw = _mover()
-    res = _relocate(m, dict(_MOVIE, monitored=True), dest_hasfile=True, hd=3)
+    res = _relocate(m, dict(_MOVIE, qualityProfileId=3), dest_hasfile=True, hd=3)
     assert res["status"] == "noop"
-    assert gw.deletes == [] and gw.adds == []
+    assert gw.puts == [] and gw.commands == []             # already finalized — nothing to do
 
 
-def test_finalize_skips_steady_1080_baseline_even_if_unmonitored():
-    # an operator-un-monitored title that ALREADY holds a healthy ≤1080 baseline file is a steady
-    # dual title, NOT one we are moving — it must never be DELETE+re-added.
+def test_finalize_skips_steady_1080_baseline():
+    # a title that ALREADY holds a healthy ≤1080 baseline file is a steady dual title, never ours
     m, gw = _mover()
     steady = {"id": 1, "title": "X", "tmdbId": 862, "monitored": False, "rootFolderPath": "/r",
-              "hasFile": True, "movieFile": {"quality": {"quality": {"resolution": 1080}}}}
+              "qualityProfileId": 9, "hasFile": True, "movieFile": {"quality": {"quality": {"resolution": 1080}}}}
     res = _relocate(m, steady, dest_present=True, dest_hasfile=True, hd=3)
     assert res["status"] == "noop"
-    assert gw.deletes == [] and gw.adds == []
+    assert gw.puts == [] and gw.commands == []
 
 
 def test_finalize_noop_when_no_baseline_profile():
     m, gw = _mover()
-    res = _relocate(m, dict(_MOVIE, monitored=False), dest_hasfile=True, hd=None)
+    res = _relocate(m, _MOVIE, dest_hasfile=True, hd=None)
     assert res["status"] == "noop"
-    assert gw.deletes == [] and gw.adds == []              # never delete without a clean re-add
+    assert gw.puts == [] and gw.commands == []
 
 
 # ── make-before-break + dry_run ───────────────────────────────────────────────
 def test_dry_run_writes_nothing():
     m, gw = _mover(dry_run=True)
     r1 = _relocate(m, dest_hasfile=False)
-    r2 = _relocate(m, dict(_MOVIE, monitored=False), dest_hasfile=True)
+    r2 = _relocate(m, _MOVIE, dest_hasfile=True)
     assert r1["status"] == "would-move-in" and r2["status"] == "would-finalize"
-    assert gw.puts == [] and gw.commands == [] and gw.adds == [] and gw.deletes == []
+    assert gw.puts == [] and gw.commands == [] and gw.adds == []
 
 
 def test_move_in_never_touches_source_file():

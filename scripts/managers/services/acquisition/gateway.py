@@ -119,8 +119,5 @@ class ArrGateway:
     def put(self, inst, endpoint, payload):
         return self._req(self.resolve(inst), endpoint, method="PUT", payload=payload)
 
-    def delete(self, inst, endpoint):
-        return self._req(self.resolve(inst), endpoint, method="DELETE")
-
     def command(self, inst, payload):
         return self._req(self.resolve(inst), "command", method="POST", payload=payload)

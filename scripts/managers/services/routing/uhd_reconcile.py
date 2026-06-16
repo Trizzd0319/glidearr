@@ -28,13 +28,12 @@ Gated, so it is inert until the operator opts in:
 The re-grab fallback for deployments where the two instances do NOT share storage (so the 4K
 instance can't import from the standard folder) is a deliberate follow-up.
 
-EXPERIMENTAL — the move uses Radarr's async import commands; the exact timing/convergence wants
-validation against a live shared-storage pair before the consent gate is flipped on. Known,
-non-data-loss limitations: (1) on a deployment whose instances do NOT actually share storage, the
-destination import never completes and the move re-issues a scan each run (harmless churn — no copy
-is ever lost); (2) if the baseline re-add fails after the source record is removed, the title still
-lives on the 4K instance but the 1080p baseline is abandoned (logged). No path ever deletes a
-physical file (every record DELETE is ``deleteFiles=false``).
+EXPERIMENTAL — the move uses Radarr's async import/rescan commands; the exact timing/convergence
+wants validation against a live shared-storage pair before the consent gate is flipped on. The
+source Radarr RECORD is never deleted (it is retuned in place, so its id/history survive) and no
+physical file is ever deleted. Known, non-data-loss limitation: on a deployment whose instances do
+NOT actually share storage, the destination import never completes and the move re-issues a scan
+each run (harmless churn — no copy is ever lost).
 """
 from __future__ import annotations
 
@@ -127,14 +126,13 @@ class UhdReconcileManager:
             if tmdb is None:
                 continue
             dest_hasfile = tmdb in hasfile
-            monitored = bool(mv.get("monitored", True))
             res = self._res(mv)
-            # FINALIZE: a title we already un-monitored (in-flight) whose 2160p has now landed on
-            # the 4K instance — but NOT one that already holds a healthy ≤1080 baseline file (that's
-            # a steady dual title an operator merely un-monitored, never ours to touch).
-            # MOVE-IN/PENDING: a 2160p file not yet (with a file) on the 4K side.
-            already_baseline = mv.get("hasFile") and 0 < res <= 1080
-            is_finalize = dest_hasfile and not monitored and not already_baseline
+            # FINALIZE: the 2160p has landed on the 4K instance and the source isn't yet the 1080p
+            # baseline — but NOT a title already AT the baseline profile or already holding a healthy
+            # ≤1080 file (a steady dual title is left untouched). MOVE-IN/PENDING: a 2160p file not
+            # yet (with a file) on the 4K side.
+            already_baseline = (mv.get("qualityProfileId") == hd_pid) or (mv.get("hasFile") and 0 < res <= 1080)
+            is_finalize = dest_hasfile and not already_baseline
             is_movein = (not dest_hasfile) and res >= _UHD_RES
             if not (is_finalize or is_movein):
                 continue

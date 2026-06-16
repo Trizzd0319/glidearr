@@ -7,24 +7,28 @@ glidearr never touches the filesystem, so this works whether glidearr runs along
 stack or remotely (it only needs HTTP reach to both instances). The destination performs the
 physical move via ``DownloadedMoviesScan importMode=Move`` against the source folder.
 
-Two steps, idempotent across runs and make-before-break — the source is never left without a copy
-of the title, and a PHYSICAL file is never deleted (the only DELETE is a movie RECORD, always with
-``deleteFiles=false``). The source's ``monitored`` flag is the unambiguous in-flight marker:
+Two steps, idempotent across runs and make-before-break. NOTHING is ever deleted — not a physical
+file, and not even the Radarr movie RECORD: the source movie is retuned IN PLACE, so its Radarr id,
+grab/import history and added-date are all preserved (glidearr's own caches are tmdb-keyed, so they
+are unaffected either way). The in-flight marker is the source's quality profile (a 2160p-capable
+profile ≠ the baseline) plus its file state:
 
-  • MOVE-IN (``dest_hasfile`` False, source still ``monitored``): un-monitor the source (so it can't
-    auto-re-grab the 2160p while its file is being moved out from under it — this is also the
-    in-flight marker), add the title to the destination monitored + SEARCH OFF (we want the
-    existing file, not a re-download), then trigger ``DownloadedMoviesScan importMode=Move`` on the
-    destination pointed at the SOURCE folder → the destination moves+imports the 2160p into its own
-    4K root. The source FILE is untouched until the destination takes it; nothing is deleted.
+  • MOVE-IN (``dest_hasfile`` False, source has a 2160p file): un-monitor the source (so it can't
+    auto-re-grab the 2160p while its file is being moved out from under it), add the title to the
+    destination monitored + SEARCH OFF (we want the existing file, not a re-download), then trigger
+    ``DownloadedMoviesScan importMode=Move`` on the destination pointed at the SOURCE folder → the
+    destination moves+imports the 2160p into its own 4K root. The source FILE is untouched until the
+    destination takes it.
 
-  • FINALIZE (``dest_hasfile`` True AND source un-monitored — our marker): the 2160p is safely on
-    the destination, so DELETE the (now-stale) source movie RECORD with ``deleteFiles=false`` (never
-    touches a physical file) and re-add the source fresh at its ≤1080 baseline profile, monitored,
-    SEARCH ON → it grabs the small 1080p baseline (the ``4k_policy=='both'`` end-state: 1080p on the
-    source + 2160p on the destination). A fresh add can't be confused by the stale 2160p record, so
-    the 1080p actually grabs. Re-add only proceeds when both a baseline profile and the source root
-    are known, so the source is never deleted without a clean re-add.
+  • FINALIZE (``dest_hasfile`` True AND the source is not yet at the baseline profile / a healthy
+    ≤1080 file): the 2160p is safely on the destination, so retune the EXISTING source record to its
+    ≤1080 baseline profile + re-monitor (``movie/editor`` — no delete), ``RescanMovie`` it so Radarr
+    notices the 2160p file was moved away, then ``MoviesSearch`` → the source re-grabs the small
+    1080p baseline (the ``4k_policy=='both'`` end-state: 1080p on the source + 2160p on the
+    destination). Because the search runs after the rescan clears the stale file — and the source is
+    left monitored at the 1080p profile — Radarr's own missing-file monitoring backstops the grab if
+    the immediate search races the async rescan. Fires once (the source then sits at the baseline
+    profile, so it is no longer selected).
 
 If the destination import never completes (e.g. the instances don't really share storage, so the
 destination can't see the source folder), ``dest_hasfile`` stays False, the source keeps its 2160p
@@ -81,33 +85,30 @@ class CrossInstanceMove:
             return {"status": "skip", "reason": "missing id/tmdbId", "title": title, "tmdb": tmdb}
         monitored = bool(src_movie.get("monitored", True))
 
-        # ── FINALIZE: 2160p on the destination AND the source is our in-flight marker ───────────
-        if dest_hasfile and not monitored:
-            # SAFETY: never touch a title that already holds a healthy ≤1080 baseline file — that's
-            # a steady dual-version title (or an already-finalized one) an operator merely
-            # un-monitored, NOT one we are moving. ``monitored`` alone is operator-writable, so this
-            # guard stops a spurious DELETE+re-add of a title that was never in a move.
-            if src_movie.get("hasFile") and 0 < self._file_res(src_movie) <= 1080:
+        # ── FINALIZE: 2160p on the destination → retune the EXISTING source record in place ─────
+        if dest_hasfile:
+            # SAFETY: never touch a title already AT the baseline profile, or already holding a
+            # healthy ≤1080 file — that's a steady dual-version title (or one we already finalized),
+            # not one we are moving. So a spurious finalize can't fire on it.
+            if hd_profile_id is None:
                 return {"status": "noop", "title": title, "tmdb": tmdb}
-            root = src_movie.get("rootFolderPath")
-            if hd_profile_id is None or not root:
-                self._log("log_warning", f"[Relocate] '{title}': 2160p on {to_inst}, but {from_inst} "
-                                         f"has no ≤1080 profile / known root — leaving source as-is.")
+            if src_movie.get("qualityProfileId") == hd_profile_id or \
+                    (src_movie.get("hasFile") and 0 < self._file_res(src_movie) <= 1080):
                 return {"status": "noop", "title": title, "tmdb": tmdb}
             if self.dry_run:
-                self._log("log_info", f"[Relocate] would finalize '{title}': re-add {from_inst} as "
-                                      f"1080p baseline + search (2160p already on {to_inst}).")
+                self._log("log_info", f"[Relocate] would finalize '{title}': retune {from_inst} to "
+                                      f"1080p baseline + rescan + search (2160p already on {to_inst}).")
                 return {"status": "would-finalize", "title": title, "tmdb": tmdb}
-            # DELETE the stale source record (deleteFiles=false → no physical file touched), then
-            # re-add fresh so a 1080p search isn't suppressed by the moved-away 2160p record.
-            self.gw.delete(from_inst, f"movie/{src_id}?deleteFiles=false")
-            if not self._readd_baseline(src_movie, from_inst, hd_profile_id, root):
-                return {"status": "readd-failed", "title": title, "tmdb": tmdb}
-            self._log("log_success", f"[Relocate] '{title}': 2160p on {to_inst}; {from_inst} re-added "
-                                     f"as 1080p baseline + searching.")
+            # Retune the EXISTING record (no delete → Radarr id/history preserved). RescanMovie so
+            # Radarr clears the moved-away 2160p, then search; left monitored at 1080p so Radarr's
+            # missing-file monitoring backstops the grab if the search races the async rescan.
+            self.gw.put(from_inst, "movie/editor",
+                        {"movieIds": [src_id], "qualityProfileId": hd_profile_id, "monitored": True})
+            self.gw.command(from_inst, {"name": "RescanMovie", "movieIds": [src_id]})
+            self.gw.command(from_inst, {"name": "MoviesSearch", "movieIds": [src_id]})
+            self._log("log_success", f"[Relocate] '{title}': 2160p on {to_inst}; {from_inst} retuned "
+                                     f"in place to the 1080p baseline + rescan + search.")
             return {"status": "finalized", "title": title, "tmdb": tmdb}
-        if dest_hasfile:
-            return {"status": "noop", "title": title, "tmdb": tmdb}     # monitored + on dest → steady
 
         # ── MOVE-IN / PENDING: get the 2160p onto the destination (source file untouched) ───────
         folder = self._src_folder(src_movie)
@@ -127,27 +128,8 @@ class CrossInstanceMove:
                 return {"status": "add-failed", "title": title, "tmdb": tmdb}
         self.gw.command(to_inst, {"name": "DownloadedMoviesScan", "path": folder, "importMode": "Move"})
         self._log("log_info", f"[Relocate] '{title}': {to_inst} importing 2160p from {folder} (Move); "
-                              f"{from_inst} re-added as 1080p once the import confirms.")
+                              f"{from_inst} retuned to 1080p once the import confirms.")
         return {"status": "moved-in" if monitored else "pending-import", "title": title, "tmdb": tmdb}
-
-    def _readd_baseline(self, src_movie, from_inst, hd_profile_id, root) -> bool:
-        """Re-add the title to the SOURCE instance fresh at its ≤1080 baseline profile, monitored,
-        SEARCH ON — into its existing root folder (kids/standard preserved). A fresh add has no
-        stale file record, so the 1080p search actually grabs. Returns ok."""
-        payload = dict(src_movie)
-        for k in ("id", "movieFile", "movieFileId", "path", "folderName"):
-            payload.pop(k, None)
-        payload["qualityProfileId"] = hd_profile_id
-        payload["rootFolderPath"] = root
-        payload["monitored"] = True
-        payload.setdefault("minimumAvailability", "released")
-        payload["addOptions"] = {"searchForMovie": True}
-        try:
-            return bool(self.gw.add(from_inst, payload))
-        except Exception as e:
-            self._log("log_warning", f"[Relocate] baseline re-add to {from_inst} failed for "
-                                     f"'{src_movie.get('title')}': {e}")
-            return False
 
     def _add_to_dest(self, src_movie, to_inst, dest_root, dest_profile_id) -> bool:
         """Add the title to the destination, monitored, SEARCH OFF (we want the moved file, not a

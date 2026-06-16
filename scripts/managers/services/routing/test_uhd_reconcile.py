@@ -101,30 +101,30 @@ def test_does_not_move_1080p(monkeypatch):
     assert im.adds == [] and im.puts == [] and im.commands == []
 
 
-# ── FINALIZE (delete stale record + re-add the 1080p baseline) ────────────────
-def test_finalize_deletes_and_readds_baseline(monkeypatch):
-    inflight = dict(_M4K, monitored=False)                 # we un-monitored it during MOVE-IN
-    im = _run(_cfg(), [inflight], [_U_HASFILE], monkeypatch=monkeypatch)
-    assert ("standard", "movie/1?deleteFiles=false") in im.deletes
-    add = [a for a in im.adds if a[0] == "standard"]
-    assert len(add) == 1
-    assert add[0][1]["qualityProfileId"] == 3              # the ≤1080 baseline profile
-    assert add[0][1]["addOptions"] == {"searchForMovie": True}
-    assert add[0][1]["rootFolderPath"] == "/data/media/movies/Kids"   # folder preserved
+# ── FINALIZE (retune the EXISTING record in place — no delete, no re-add) ─────
+def test_finalize_retunes_standard_in_place(monkeypatch):
+    im = _run(_cfg(), [_M4K], [_U_HASFILE], monkeypatch=monkeypatch)   # _M4K profile 9 != baseline 3
+    assert im.deletes == []                                # NEVER deletes the Radarr record
+    assert im.adds == []                                   # never re-adds (id/history preserved)
+    assert ("standard", {"movieIds": [1], "qualityProfileId": 3, "monitored": True}) in im.puts
+    assert ("standard", {"name": "RescanMovie", "movieIds": [1]}) in im.commands
+    assert ("standard", {"name": "MoviesSearch", "movieIds": [1]}) in im.commands
 
 
-def test_monitored_title_on_4k_is_steady_noop(monkeypatch):
-    # a still-monitored standard title that's also on ultra = steady dual (or freshly re-added) → skip
-    im = _run(_cfg(), [_M4K], [_U_HASFILE], monkeypatch=monkeypatch)
+def test_steady_baseline_title_is_noop(monkeypatch):
+    # standard already at the baseline profile with a 1080p file + also on ultra = steady dual → skip
+    steady = dict(_M4K, qualityProfileId=3, hasFile=True,
+                  movieFile={"quality": {"quality": {"resolution": 1080}}})
+    im = _run(_cfg(), [steady], [_U_HASFILE], monkeypatch=monkeypatch)
     assert im.deletes == [] and im.puts == [] and im.commands == [] and im.adds == []
 
 
 def test_unmonitored_steady_1080_baseline_not_finalized(monkeypatch):
-    # operator un-monitored a steady 1080p dual title that's also on ultra → must NOT DELETE+re-add
-    steady = dict(_M4K, monitored=False, hasFile=True,
+    # an operator-un-monitored steady 1080p dual title that's also on ultra → must NOT be touched
+    steady = dict(_M4K, monitored=False, qualityProfileId=9, hasFile=True,
                   movieFile={"quality": {"quality": {"resolution": 1080}}})
     im = _run(_cfg(), [steady], [_U_HASFILE], monkeypatch=monkeypatch)
-    assert im.deletes == [] and im.adds == [] and im.commands == []
+    assert im.deletes == [] and im.adds == [] and im.commands == [] and im.puts == []
 
 
 def test_pending_import_rescans_without_touching_source(monkeypatch):
