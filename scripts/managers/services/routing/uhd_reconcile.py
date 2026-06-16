@@ -1,42 +1,51 @@
 """
-uhd_reconcile.py — steady-state dual-version reconcile (mirror standard 2160p → 4K instance).
+uhd_reconcile.py — steady-state dual-version reconcile (move standard 2160p → the 4K instance).
 ================================================================================
 The add-time path (resolver.plan_uhd_companion) keeps a NEW movie as a <=1080 baseline on the
 standard instance PLUS a 2160p copy on the 4K instance when 4k_policy=='both'. This sweep is the
-catch-up for OWNED movies that the add-time path never saw — the operator's case:
+catch-up for OWNED movies the add-time path never saw — the operator's case:
 
     "If we add a movie to standard radarr, and it gets upgraded to 4k, add it to the 4k
-     instance and go through the profile selection process."
+     instance ... If one instance doesn't have access to the other's folders, re-grab/downgrade."
 
-For each standard-instance movie whose CURRENT FILE is 2160p (it was upgraded past the HD tier,
-or added manually) and that has NO copy on the 4K instance yet, it mirrors the title onto the 4K
-instance — its top (2160p) profile, ``movieRootFolders['4k']`` root, monitored, search ON — so the
-premium copy lives where it belongs. The 1080p baseline already exists on the standard instance,
-so this is make-before-break by construction (the durable copy is never absent).
+For each standard-instance movie whose CURRENT FILE is 2160p, it drives a cross-instance MOVE
+(``CrossInstanceMove``): the 4K instance imports+moves the existing 2160p file (no re-download,
+shared storage), and once that's confirmed the standard record is retuned to its ≤1080 baseline
+and re-grabbed — the ``both`` end-state (1080p on standard + 2160p on the 4K instance). The move is
+make-before-break (the source is only changed after the destination has the file) and idempotent
+across runs. State is read from BOTH instance libraries here; the mover does the gated API steps.
 
-Gated like the rest of the re-organizer, so it is inert until the operator opts in:
-  • routing.configured        — the routing onboarding step has run.
-  • routing.movies.4k_policy  — must be "both"; "highest_only" (default) → skip.
-  • a DISTINCT 4K instance     — the categorized "4K"/"4k" label resolves to a session other than
-                                 the default; otherwise there is nowhere to mirror to.
-  • routing.reorg_mode        — off (skip) / log_only (LOG mirror candidates, add NOTHING —
-                                 the default) / same_instance (actuate the mirror adds). A
-                                 dry_run never POSTs regardless. Mirroring is an ADD (it never
-                                 moves or deletes a file), so unlike a folder move it does not
-                                 require relocation_consent — the same_instance switch is enough.
+Gated, so it is inert until the operator opts in:
+  • routing.configured              — the routing onboarding step has run.
+  • routing.movies.4k_policy=='both'— "highest_only" (default) → skip.
+  • a DISTINCT 4K instance           — the categorized "4K"/"4k" label resolves to another session.
+  • routing.reorg_mode               — off (skip) / log_only (LOG the plan, move NOTHING — default)
+                                       / same_instance (actuate).
+  • relocation_consent               — the MOVE physically relocates files + re-searches, so (like a
+                                       folder move) it requires explicit consent. Without it, or
+                                       under dry_run, the mover only logs the plan.
 
-Score-based mirroring (a high-watchability owned movie that only has a 1080p file and should gain
-a 4K copy) is a deliberate follow-up: it needs the per-title watchability score threaded in from
-the Radarr Parquet cache. This sweep covers the explicit file-upgrade case only.
+The re-grab fallback for deployments where the two instances do NOT share storage (so the 4K
+instance can't import from the standard folder) is a deliberate follow-up.
+
+EXPERIMENTAL — the move uses Radarr's async import commands; the exact timing/convergence wants
+validation against a live shared-storage pair before the consent gate is flipped on. Known,
+non-data-loss limitations: (1) on a deployment whose instances do NOT actually share storage, the
+destination import never completes and the move re-issues a scan each run (harmless churn — no copy
+is ever lost); (2) if the baseline re-add fails after the source record is removed, the title still
+lives on the 4K instance but the 1080p baseline is abandoned (logged). No path ever deletes a
+physical file (every record DELETE is ``deleteFiles=false``).
 """
 from __future__ import annotations
 
-from scripts.managers.machine_learning.space.routing_targets import reorg_mode
+from scripts.managers.machine_learning.space import dual_version
+from scripts.managers.machine_learning.space.routing_targets import reorg_mode, relocation_consented
 from scripts.managers.services.acquisition.gateway import ArrGateway
+from scripts.managers.services.radarr.storage.cross_instance_move import CrossInstanceMove
 from scripts.support.utilities.size_model import profile_max_quality
 
 # Alias-aware: the role map writes "4K" while the folder bucket is "4k" (and operators may use
-# uhd/2160) — accept them all so a casing/naming split never silently disables the mirror.
+# uhd/2160) — accept them all so a casing/naming split never silently disables the move.
 _UHD_LABELS = ("4K", "4k", "uhd", "UHD", "2160p", "2160")
 _UHD_RES = 2160
 
@@ -65,7 +74,7 @@ class UhdReconcileManager:
         if not self._routing.get("configured"):
             return                                          # never-onboarded → nothing
         if (self._routing.get("movies", {}) or {}).get("4k_policy") != "both":
-            return                                          # single-copy policy → nothing to mirror
+            return                                          # single-copy policy → nothing to move
         mode = reorg_mode(self.config)
         if mode == "off":
             return
@@ -75,46 +84,69 @@ class UhdReconcileManager:
         gw = ArrGateway("radarr", im, self.config, self.logger)
         fourk = self._uhd_instance(gw)
         if not fourk:
-            return                                          # no distinct 4K instance → nowhere to mirror
-        prof_id, prof_name = self._top_profile(gw, fourk)
-        root = self._mrf.get("4k") or self._first_root(gw, fourk)
-        if prof_id is None or not root:
-            self._log("log_warning", f"[UHD] 4K instance '{fourk}' has no quality profile or "
-                                     f"root folder configured — skipping mirror.")
+            return                                          # no distinct 4K instance → nowhere to move
+        dest_pid, _ = self._top_profile(gw, fourk)
+        dest_root = self._mrf.get("4k") or self._first_root(gw, fourk)
+        if dest_pid is None or not dest_root:
+            self._log("log_warning", f"[UHD] 4K instance '{fourk}' has no quality profile or root "
+                                     f"folder configured — skipping cross-instance move.")
             return
-        apply = (mode == "same_instance") and not self.dry_run
+
+        # Actuating the MOVE physically relocates files + re-searches, so it needs explicit
+        # relocation consent AND the same_instance mode AND a live run. Otherwise the mover runs
+        # dry (logs the plan, writes nothing) — log_only / no-consent are safe by default.
+        actuate = (mode == "same_instance") and relocation_consented(self.config) and not self.dry_run
+        mover = CrossInstanceMove(gw, self.logger, dry_run=not actuate)
+
+        ultra = gw.library_items(fourk) or []
+        present = {m.get("tmdbId") for m in ultra if isinstance(m, dict) and m.get("tmdbId") is not None}
+        hasfile = {m.get("tmdbId") for m in ultra
+                   if isinstance(m, dict) and m.get("tmdbId") is not None and m.get("hasFile")}
+
         for name in list((im._get_apis() or {}).keys()):
             if name == fourk:
                 continue                                    # don't scan the 4K instance itself
-            self._reconcile_instance(gw, name, fourk, prof_id, prof_name, root, apply)
+            self._reconcile_instance(gw, mover, name, fourk, dest_root, dest_pid, present, hasfile)
 
     # ── per standard instance ──────────────────────────────────────────────────
-    def _reconcile_instance(self, gw, std_inst, fourk, prof_id, prof_name, root, apply):
+    def _reconcile_instance(self, gw, mover, std_inst, fourk, dest_root, dest_pid, present, hasfile):
         try:
             movies = gw.library_items(std_inst) or []
         except Exception as e:
             self._log("log_warning", f"[UHD] movie fetch failed for '{std_inst}': {e}")
             return
-        mirrored = 0
+        hd = dual_version.pick_hd_profile(gw.quality_profiles(std_inst) or [], None)
+        hd_pid = hd.get("id") if hd else None
+        if hd_pid is None:
+            self._log("log_warning", f"[UHD] {std_inst}: no ≤1080 quality profile — cannot keep a "
+                                     f"1080p baseline; skipping cross-instance move.")
+            return
+        acted = 0
         for mv in movies:
             tmdb = mv.get("tmdbId")
-            if tmdb is None or self._res(mv) < _UHD_RES:
-                continue                                    # no 2160p file → not an upgrade case
-            if gw.in_library(fourk, "tmdbId", tmdb):
-                continue                                    # a 4K copy already exists
-            self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}' is 2160p with no 4K copy "
-                                  f"→ mirror to '{fourk}' ({'adding' if apply else 'log only'})")
-            if not apply:
+            if tmdb is None:
                 continue
-            try:
-                gw.add(fourk, self._add_payload(mv, prof_id, root))
-                mirrored += 1
-                self._log("log_success", f"[UHD] mirrored '{mv.get('title')}' → {fourk} "
-                                         f"({prof_name}, search ON)")
-            except Exception as e:
-                self._log("log_warning", f"[UHD] mirror add failed for '{mv.get('title')}': {e}")
-        if mirrored:
-            self._log("log_info", f"[UHD] {std_inst}: mirrored {mirrored} title(s) to {fourk}.")
+            dest_hasfile = tmdb in hasfile
+            monitored = bool(mv.get("monitored", True))
+            res = self._res(mv)
+            # FINALIZE: a title we already un-monitored (in-flight) whose 2160p has now landed on
+            # the 4K instance — but NOT one that already holds a healthy ≤1080 baseline file (that's
+            # a steady dual title an operator merely un-monitored, never ours to touch).
+            # MOVE-IN/PENDING: a 2160p file not yet (with a file) on the 4K side.
+            already_baseline = mv.get("hasFile") and 0 < res <= 1080
+            is_finalize = dest_hasfile and not monitored and not already_baseline
+            is_movein = (not dest_hasfile) and res >= _UHD_RES
+            if not (is_finalize or is_movein):
+                continue
+            res = mover.relocate(mv, from_inst=std_inst, to_inst=fourk, dest_root=dest_root,
+                                 dest_profile_id=dest_pid, hd_profile_id=hd_pid,
+                                 dest_present=tmdb in present, dest_hasfile=dest_hasfile)
+            st = res.get("status")
+            if st not in ("skip", "noop"):
+                acted += 1
+                self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}' → {fourk} [{st}]")
+        if acted:
+            self._log("log_info", f"[UHD] {std_inst}: {acted} title(s) in cross-instance move to {fourk}.")
 
     # ── helpers ─────────────────────────────────────────────────────────────────
     def _uhd_instance(self, gw):
@@ -154,23 +186,3 @@ class UhdReconcileManager:
             if isinstance(f, dict) and f.get("path"):
                 return f["path"]
         return ""
-
-    @staticmethod
-    def _add_payload(movie, prof_id, root) -> dict:
-        """Clone the owned standard-instance movie object into a Radarr add payload for the 4K
-        instance — same tmdbId/title/images/year, but the 4K instance's profile + root, monitored,
-        search ON. The standard instance's own id / movieFile are stripped (they don't apply on the
-        4K session)."""
-        payload = dict(movie)
-        # Strip the standard-instance identity AND its absolute path. Radarr treats an explicit
-        # ``path`` as authoritative over ``rootFolderPath``, so leaving the owned movie's
-        # ``/standard/Title (Year)`` path would create the 4K copy in the STANDARD folder — drop
-        # it (and ``folderName``) so ``rootFolderPath`` (the 4k root) wins.
-        for k in ("id", "movieFile", "movieFileId", "path", "folderName"):
-            payload.pop(k, None)
-        payload["qualityProfileId"] = prof_id
-        payload["rootFolderPath"] = root
-        payload["monitored"] = True
-        payload.setdefault("minimumAvailability", "released")
-        payload["addOptions"] = {"searchForMovie": True}
-        return payload
