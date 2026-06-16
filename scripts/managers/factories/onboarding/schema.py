@@ -130,6 +130,11 @@ def empty_config() -> dict:
         "space_pressure_delete_enabled": True,
         "space_pressure_include_unwatched": True,
         "space_pressure_score_ceiling": 20,
+        # Widen the under-pressure DOWNGRADE band to the delete band: when true, any title the
+        # coordinator could delete (watchability < score_ceiling) is first stepped down to 720p
+        # (make-before-break via Radarr's replace) and only DELETED if downgrades can't free
+        # enough. False (default) keeps the narrower downgrade band (score < 6).
+        "space_pressure_downgrade_before_delete": False,
         # Cross-service space coordinator: when enabled, deletion of movies AND TV is
         # centralised into one ranked, lowest-watchability-first pool (downgrade both
         # first, then delete to free_space_limit). Default OFF until fully rolled out.

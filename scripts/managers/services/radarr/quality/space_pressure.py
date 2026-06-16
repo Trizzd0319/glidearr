@@ -211,6 +211,20 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         )
         return None
 
+    def _downgrade_protect_threshold(self) -> int:
+        """Watchability floor BELOW which movies are stepped down under space pressure.
+
+        Default = WATCHABILITY_PROTECT_THRESHOLD (6): only the near-unwatched step down.
+        When space_pressure_downgrade_before_delete is on, widen it to MATCH the delete
+        ceiling (space_pressure_score_ceiling, default 20) so any title the coordinator
+        could delete is shrunk to 720p FIRST — deletion becomes the last resort."""
+        if self.config and self.config.get("space_pressure_downgrade_before_delete", False):
+            try:
+                return int(self.config.get("space_pressure_score_ceiling", 20))
+            except (TypeError, ValueError):
+                return 20
+        return self.WATCHABILITY_PROTECT_THRESHOLD
+
     @staticmethod
     def _profile_max_resolution(profile: dict) -> int:
         """Highest resolution among a profile's *allowed* quality items (incl. nested
@@ -542,12 +556,16 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # steps the lowest-watchability movies DOWN the ranked ladder one rank at a time,
         # spread across the pool, until ~need_gb is reclaimed (no single title crushed to
         # the floor). The service APPLIES each per-title target (PUT + search + stamp).
+        # Optional: widen the downgrade band to MATCH the delete band, so any title the
+        # coordinator could delete is shrunk to 720p FIRST and only deleted if downgrades
+        # can't free enough (make-before-break via Radarr's replace; deletion = last resort).
+        protect = self._downgrade_protect_threshold()
         candidates, _pstats = plan_movie_downgrades(
             df, score_map, ranked_profiles,
             need_gb=need_gb,
             recent_cutoff=recent_cutoff,
             active_colls=active_colls,
-            protect_threshold=self.WATCHABILITY_PROTECT_THRESHOLD,
+            protect_threshold=protect,
             floor_resolution=floor_resolution,
         )
         stats.update(_pstats)
