@@ -823,12 +823,18 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         return critic_avg(ratings)
 
     @timeit("build_movie_delete_candidates")
-    def build_delete_candidates(self, instance: str, df) -> list[dict]:
+    def build_delete_candidates(self, instance: str, df, *,
+                                ignore_score_ceiling: bool = False) -> list[dict]:
         """Return the ranked-but-unsorted list of MOVIE delete-candidates for the
         coordinator's combined pool. Same guards/tiers as run_deletions but it does
         NOT delete. Reads the persisted watchability_score column (refresh_scores)
         falling back to a live score_map. Each dict: service/idx/fid/tmdb_id/score/
-        critic/size_bytes/size_gb/tier/title."""
+        critic/size_bytes/size_gb/tier/title/resolution.
+
+        ``ignore_score_ceiling`` (default False) keeps every keep/franchise/recently-watched
+        guard but skips ONLY the watchability score ceiling — used to build the dual-version
+        4K-copy reclaim pool, where each baseline-backed 4K copy is pure reclaim (no title lost)
+        regardless of watchability, so it must be reclaimable before any whole title."""
         out: list[dict] = []
         if df is None or df.empty:
             return out
@@ -896,7 +902,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             if bool(marked.loc[idx]):
                 tier = 0
             else:
-                if not include_unwatched or score >= ceiling:
+                if not include_unwatched or (score >= ceiling and not ignore_score_ceiling):
                     continue
                 da = df.at[idx, "date_added"] if "date_added" in df.columns else None
                 if da:
@@ -908,11 +914,13 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 tier = 1
 
             tmdb_id = df.at[idx, "tmdb_id"] if "tmdb_id" in df.columns else None
+            _res = df.at[idx, "resolution"] if "resolution" in df.columns else None
             out.append({
                 "service": "movie", "tier": tier, "score": score,
                 "critic": self._row_critic_avg(df, idx), "size_bytes": size,
                 "size_gb": size / (1024 ** 3), "idx": idx, "fid": int(fid),
                 "tmdb_id": int(tmdb_id) if (tmdb_id is not None and pd.notna(tmdb_id)) else None,
+                "resolution": int(_res) if (_res is not None and pd.notna(_res)) else None,
                 "title": (df.at[idx, "title"] if "title" in df.columns else None) or f"movie {fid}",
             })
         return out
