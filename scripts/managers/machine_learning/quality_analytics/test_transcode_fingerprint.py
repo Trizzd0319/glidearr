@@ -12,7 +12,7 @@ from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint i
     row_fingerprint, source_fingerprint,
     transcode_fingerprint_matrix, per_user_transcode_fingerprint_matrix,
     serialize_fingerprint_matrix, deserialize_fingerprint_matrix,
-    predict_transcode, choose_tier,
+    predict_transcode, choose_tier, can_remote_play,
 )
 
 
@@ -180,3 +180,32 @@ def test_choose_tier_exploits_thin_evidence_past_explore_cap():
     m = {("Roku", fp): {"transcode": 2, "direct": 0, "n": 2, "last_seen": 0}}
     tier, reason = choose_tier(m, fp, {"Roku": 1.0}, min_n=3, explore_cap=2)
     assert tier == "hd" and "thin" in reason
+
+
+# ── can_remote_play (the Stage-C single-authority boolean) ────────────────────
+def test_can_remote_play_false_when_transcode_likely():
+    fp = ("hevc", "eac3", "none", "2160p_hdr", "wan")
+    m = {("Chromecast", fp): {"transcode": 4, "direct": 0, "n": 4, "last_seen": 0}}
+    assert can_remote_play(m, fp, {"Chromecast": 1.0}) is False     # would transcode → no 4K
+
+
+def test_can_remote_play_true_when_direct_play_likely():
+    fp = ("hevc", "truehd", "none", "2160p_hdr", "lan")
+    m = {("PS5", fp): {"transcode": 0, "direct": 4, "n": 4, "last_seen": 0}}
+    assert can_remote_play(m, fp, {"PS5": 1.0}) is True              # direct-plays → 4K worth it
+
+
+def test_can_remote_play_true_on_no_data_explores():
+    # cold/empty matrix → explore (acquire 4K, learn) — a fresh household is never denied
+    assert can_remote_play({}, ("av1", "opus", "none", "2160p_hdr", "wan"), {"Roku": 1.0}) is True
+    assert can_remote_play({}, ("hevc", "eac3", "none", "2160p_hdr", "lan"), {}) is True
+
+
+def test_can_remote_play_matches_choose_tier_exactly():
+    # the wrapper must agree with choose_tier on every read (single authority, no second policy)
+    fp = ("hevc", "eac3", "none", "2160p_hdr", "wan")
+    for buckets in ({"transcode": 4, "direct": 0, "n": 4, "last_seen": 0},
+                    {"transcode": 0, "direct": 4, "n": 4, "last_seen": 0}):
+        m = {("Roku", fp): buckets}
+        tier, _ = choose_tier(m, fp, {"Roku": 1.0})
+        assert can_remote_play(m, fp, {"Roku": 1.0}) is (tier == "4k")

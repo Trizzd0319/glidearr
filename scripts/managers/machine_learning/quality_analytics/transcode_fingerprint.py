@@ -296,3 +296,22 @@ def choose_tier(matrix, fingerprint, platform_weights, *, min_n: int = 3,
     if ratio >= transcode_thresh:
         return ("hd", f"exploit(thin): {transcode}/{n} transcoded")
     return ("4k", f"exploit(thin): {transcode}/{n} direct")
+
+
+# ── remote-play gate (the Stage-C single authority) ───────────────────────────
+
+def can_remote_play(matrix, fingerprint, platform_weights, *, min_n: int = 3,
+                    explore_cap: int = 2, transcode_thresh: float = 0.34) -> bool:
+    """Whether the 4K BONUS copy is worth acquiring for the household: ``True`` when a likely
+    device can DIRECT-PLAY the candidate ``fingerprint`` (or there is no trusted read yet, so
+    we EXPLORE and learn from the next run), ``False`` when it would force a transcode (the
+    1080p baseline already covers playback, so the 4K would only burn CPU).
+
+    SINGLE AUTHORITY: a thin boolean wrapper over :func:`choose_tier`, so the transcode
+    threshold and the no-data/explore policy live in exactly ONE place. The add-time resolver
+    and the proactive reconcile both call this, so they can never diverge on what counts as
+    remote-playable. An empty/cold matrix yields ``True`` (explore), matching choose_tier's
+    bias — a fresh household is never denied all 4K bonuses."""
+    tier, _reason = choose_tier(matrix, fingerprint, platform_weights, min_n=min_n,
+                                explore_cap=explore_cap, transcode_thresh=transcode_thresh)
+    return tier == "4k"
