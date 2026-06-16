@@ -68,6 +68,9 @@ def empty_config() -> dict:
         #   movies.proactive_4k: with 4k_policy=="both", proactively give ANY owned movie whose
         #     watch-likelihood warrants 4K a copy on the 4K instance (not just glidearr-acquired /
         #     universe / recently-watched). Off by default; only actuates with the relocation gate.
+        #   movies.evict_uhd_first: under space pressure, reclaim dual-version 4K BONUS copies
+        #     (1080p baseline survives → no title lost) BEFORE deleting any whole title. Off by
+        #     default; gated on the deletion coordinator owning deletion (NOT relocation consent).
         #   movies.anime_policy: "dedicated" routes anime movies to the dedicated anime instance;
         #     "dedicated_plus_standard" keeps an extra standard copy; "standard_only" ignores the split.
         #   tv.anime_policy: "series_type_plus_folder" (anime FOLDER + seriesType) | "series_type".
@@ -79,6 +82,7 @@ def empty_config() -> dict:
                 "4k_policy": "highest_only",
                 "4k_dual_min_score": 0,
                 "proactive_4k": False,
+                "evict_uhd_first": False,
                 "anime_policy": "dedicated",
                 "kids_bucket_enabled": False,
             },

@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from scripts.managers.machine_learning.space.routing_targets import (
+    evict_uhd_first,
     proactive_4k_enabled,
     relocation_consented,
     relocation_enabled,
@@ -121,3 +122,44 @@ def test_proactive_4k_false_without_actuation_gate():
 def test_proactive_4k_handles_malformed_config():
     assert proactive_4k_enabled({"routing": "oops"}) is False                  # routing not a dict
     assert proactive_4k_enabled({"routing": {"movies": "oops"}}) is False      # movies not a dict
+
+
+# ── evict_uhd_first (deletion gate, INDEPENDENT of relocation consent) ────────
+@pytest.fixture
+def _clear_delete_env(monkeypatch):
+    for v in ("RECOMMENDARR_DELETIONS_CONSENT", "GLIDEARR_DELETIONS_CONSENT"):
+        monkeypatch.delenv(v, raising=False)
+
+
+def _evict_cfg(*, flag=True, policy="both", coordinator=True, consent=True, floor=2500):
+    cfg = {"routing": {"movies": {"evict_uhd_first": flag, "4k_policy": policy}},
+           "free_space_limit": floor}
+    if coordinator:
+        cfg["space_coordinator_enabled"] = True
+    if consent:
+        cfg["deletions_consent"] = True
+    return cfg
+
+
+def test_evict_uhd_first_enabled_without_any_relocation_consent(_clear_delete_env):
+    # the autouse fixture already cleared relocation env, and _evict_cfg sets NO relocation_consent
+    # → proves eviction is gated only on DELETION ownership, never on move consent.
+    assert evict_uhd_first(_evict_cfg()) is True
+
+
+def test_evict_uhd_first_defaults_false(_clear_delete_env):
+    assert evict_uhd_first({}) is False
+    assert evict_uhd_first(None) is False
+    assert evict_uhd_first(_evict_cfg(flag=False)) is False
+    assert evict_uhd_first(_evict_cfg(policy="highest_only")) is False
+
+
+def test_evict_uhd_first_needs_deletion_ownership(_clear_delete_env):
+    assert evict_uhd_first(_evict_cfg(coordinator=False)) is False   # coordinator not owning deletion
+    assert evict_uhd_first(_evict_cfg(consent=False)) is False       # no deletion consent
+    assert evict_uhd_first(_evict_cfg(floor=0)) is False             # no free_space_limit floor
+
+
+def test_evict_uhd_first_handles_malformed_config(_clear_delete_env):
+    assert evict_uhd_first({"routing": "oops"}) is False
+    assert evict_uhd_first({"routing": {"movies": "oops"}}) is False

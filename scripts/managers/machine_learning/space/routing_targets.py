@@ -97,3 +97,21 @@ def proactive_4k_enabled(config) -> bool:
     if not isinstance(mv, dict) or not mv.get("proactive_4k") or mv.get("4k_policy") != "both":
         return False
     return relocation_enabled(config)
+
+
+def evict_uhd_first(config) -> bool:
+    """Gate for evicting dual-version 4K BONUS copies FIRST under space pressure — each has a
+    surviving 1080p baseline on the standard instance, so reclaiming it loses no title (pure
+    reclaim) and it should go before any whole title. Requires ``routing.movies.evict_uhd_first``
+    AND ``4k_policy == "both"`` AND the cross-service coordinator owning deletion
+    (``coordinator_owns_deletion`` — space_coordinator_enabled + free_space_limit). DELIBERATELY
+    independent of relocation/move consent: eviction is a DELETION path with its own consent (the
+    space floor), NOT a file move. Default OFF (existing installs unchanged)."""
+    from scripts.managers.machine_learning.space.space_targets import coordinator_owns_deletion
+    routing = _cfg_get(config, "routing", None) or {}
+    if not isinstance(routing, dict):
+        return False
+    mv = routing.get("movies", {}) or {}
+    if not isinstance(mv, dict) or not mv.get("evict_uhd_first") or mv.get("4k_policy") != "both":
+        return False
+    return coordinator_owns_deletion(config)
