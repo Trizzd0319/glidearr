@@ -117,6 +117,29 @@ def transcode_gate_enabled(config) -> bool:
     return bool(mv.get("transcode_gate")) and mv.get("4k_policy") == "both"
 
 
+def uhd_remote_play_ok(config, fingerprint_records, platform_weights, *, hdr: bool = False) -> bool:
+    """Should the 4K BONUS copy be acquired given the household's transcode habits? The single
+    wiring authority shared by the add-time resolver and the proactive reconcile, so they decide
+    IDENTICALLY (computing it in only one place would split add-time vs reconcile behaviour).
+
+    Returns ``True`` — no change — when the transcode gate is OFF (``transcode_gate_enabled``).
+    When ON, it rebuilds the cached capability matrix and asks the ``can_remote_play`` policy
+    authority whether a likely device can direct-play a representative 2160p HEVC file (the codec
+    and resolution the 4K bonus lands in; the file's exact audio/HDR are unknown until grab, and
+    the predictor's graded fallback coarsens those axes away). ``hdr`` lets a caller that knows the
+    candidate is HDR ask the tone-mapping-aware cell; the default SDR read leans on the dominant
+    codec signal. Inputs are PASSED IN (the caller reads ``tautulli/transcode_fingerprint`` and
+    ``tautulli/platforms``), so this stays pure and unit-testable."""
+    if not transcode_gate_enabled(config):
+        return True
+    from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint import (
+        can_remote_play, deserialize_fingerprint_matrix, source_fingerprint,
+    )
+    matrix = deserialize_fingerprint_matrix(fingerprint_records)
+    fp = source_fingerprint(video_codec="hevc", height=2160, hdr=hdr, location="unknown")
+    return can_remote_play(matrix, fp, platform_weights or {})
+
+
 def evict_uhd_first(config) -> bool:
     """Gate for evicting dual-version 4K BONUS copies FIRST under space pressure — each has a
     surviving 1080p baseline on the standard instance, so reclaiming it loses no title (pure

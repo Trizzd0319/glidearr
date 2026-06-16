@@ -177,3 +177,25 @@ def test_companion_honours_explicit_lower_threshold():
 def test_companion_none_when_already_in_4k_library():
     r = _resolver(both=True, with_4k=True, in_lib={("uhd", "862")})
     assert r.plan_uhd_companion(_movie(r, score=87), space_ok=_ok) is None
+
+
+# ── can_remote_play gate (Stage C) ────────────────────────────────────────────
+def test_companion_suppressed_when_remote_play_false():
+    # a likely device would transcode this 2160p file → the high-score 4K bonus is suppressed
+    r = _resolver(both=True, with_4k=True)
+    assert r.plan_uhd_companion(_movie(r, score=87), space_ok=_ok, can_remote_play=False) is None
+
+
+def test_companion_still_emits_for_keep_tagged_even_when_remote_play_false():
+    # keep/universe-tagged titles bypass the remote-play gate by design (wants_uhd ANDs
+    # can_remote_play onto the SCORE branch only) — they still get the 4K copy.
+    r = _resolver(both=True, with_4k=True)
+    c = r.plan_uhd_companion(_movie(r, score=10), space_ok=_ok,
+                             keep_tagged=True, can_remote_play=False)
+    assert c is not None and c["instance"] == "uhd"
+
+
+def test_companion_default_remote_play_true_emits():
+    # default arg is True → unchanged from pre-Stage-C behaviour (regression lock)
+    r = _resolver(both=True, with_4k=True)
+    assert r.plan_uhd_companion(_movie(r, score=87), space_ok=_ok) is not None

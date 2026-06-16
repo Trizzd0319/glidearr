@@ -12,6 +12,7 @@ from scripts.managers.machine_learning.space.routing_targets import (
     relocation_enabled,
     reorg_mode,
     transcode_gate_enabled,
+    uhd_remote_play_ok,
 )
 
 _ENV = ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT")
@@ -194,3 +195,37 @@ def test_transcode_gate_independent_of_relocation_consent():
 def test_transcode_gate_handles_malformed_config():
     assert transcode_gate_enabled({"routing": "oops"}) is False
     assert transcode_gate_enabled({"routing": {"movies": "oops"}}) is False
+
+
+# ── uhd_remote_play_ok (the shared add-time/reconcile wiring authority) ────────
+def _fp_record(*, transcode, direct, device="Chromecast", res="2160p_sdr"):
+    # a serialized fingerprint cell whose (codec,res,loc) matches the helper's HEVC/2160p
+    # source fingerprint at the drop_audio fallback level
+    return [{"device": device, "fingerprint": ["hevc", "eac3", "none", res, "unknown"],
+             "transcode": transcode, "direct": direct, "last_seen": 0, "n": transcode + direct}]
+
+
+def test_uhd_remote_play_ok_true_when_gate_off():
+    # flag OFF → always True regardless of matrix (zero behaviour change)
+    cfg = _transcode_cfg(flag=False)
+    assert uhd_remote_play_ok(cfg, _fp_record(transcode=9, direct=0), {"Chromecast": 1}) is True
+    assert uhd_remote_play_ok({}, None, None) is True
+
+
+def test_uhd_remote_play_ok_false_when_household_transcodes_hevc():
+    cfg = _transcode_cfg()  # flag on, 4k_policy both
+    recs = _fp_record(transcode=4, direct=0)
+    assert uhd_remote_play_ok(cfg, recs, {"Chromecast": 1}) is False
+
+
+def test_uhd_remote_play_ok_true_when_household_direct_plays_hevc():
+    cfg = _transcode_cfg()
+    recs = _fp_record(transcode=0, direct=4)
+    assert uhd_remote_play_ok(cfg, recs, {"Chromecast": 1}) is True
+
+
+def test_uhd_remote_play_ok_true_on_no_data_even_with_gate_on():
+    # gate on but the matrix is empty/cold → explore (acquire) so a fresh household isn't denied
+    cfg = _transcode_cfg()
+    assert uhd_remote_play_ok(cfg, None, None) is True
+    assert uhd_remote_play_ok(cfg, [], {"Chromecast": 1}) is True

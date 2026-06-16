@@ -369,9 +369,11 @@ class Resolver:
         library. ``space_ok(inst) -> bool`` reports whether an instance is above its pressure
         band (the bonus is never added at the baseline's expense). Does NOT mutate the primary.
 
-        ``keep_tagged`` is False at add time (a fresh candidate carries no *arr tags yet);
-        ``can_remote_play`` is a constant True until the per-device capability matrix is wired.
-        The threshold is ``routing.movies.4k_dual_min_score`` (0/unset → the shared default 70)."""
+        ``keep_tagged`` is False at add time (a fresh candidate carries no *arr tags yet).
+        ``can_remote_play`` is supplied by the caller (the Stage-C transcode gate computes it once
+        per run via ``routing_targets.uhd_remote_play_ok``); it defaults True so an unwired/flag-off
+        caller behaves exactly as before. The threshold is ``routing.movies.4k_dual_min_score``
+        (0/unset → the shared default 70)."""
         if not self.dual_active(enriched):
             return None
         gw = self.gw.get("radarr")

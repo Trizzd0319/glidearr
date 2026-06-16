@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
+from scripts.managers.machine_learning.space.routing_targets import uhd_remote_play_ok
 from scripts.managers.services.acquisition.adder import Adder
 from scripts.managers.services.acquisition.candidates import CandidateGatherer
 from scripts.managers.services.acquisition.gateway import ArrGateway
@@ -248,6 +249,17 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         cap = int(acq.get("max_adds_per_run", 10) or 0)
         selected = eligible[:cap] if cap > 0 else eligible
 
+        # Stage-C remote-play gate (default OFF): when routing.movies.transcode_gate is on,
+        # only emit the 4K bonus copy if a likely household device can DIRECT-PLAY a 2160p HEVC
+        # file (learned from Tautulli transcode history). Computed ONCE per run — it's a
+        # household-global, candidate-independent read — and passed into plan_uhd_companion.
+        # Flag OFF → True (the companion is emitted exactly as before).
+        uhd_crp = uhd_remote_play_ok(
+            self.config,
+            self.global_cache.get("tautulli/transcode_fingerprint") if self.global_cache else None,
+            self.global_cache.get("tautulli/platforms") if self.global_cache else None,
+        )
+
         rows, added, would, failed, deferred = [], 0, 0, 0, 0
         new_deferred: list[dict] = []
         for e in selected:
@@ -317,7 +329,8 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             # the 4K instance has space + the title isn't already a 4K copy.
             if svc == "radarr" and res.get("ok") and not under_pressure:
                 companion = resolver.plan_uhd_companion(
-                    e, space_ok=lambda inst, _gw=gw: self._space_ok(_gw, inst, band_cache))
+                    e, space_ok=lambda inst, _gw=gw: self._space_ok(_gw, inst, band_cache),
+                    can_remote_play=uhd_crp)
                 if companion is not None:
                     cres = adder.add(companion, search=True)
                     caction = cres.get("action")
