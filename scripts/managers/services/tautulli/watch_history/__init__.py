@@ -21,13 +21,24 @@ _HISTORY_TTL = 86_400  # 24 hours
 #   transcode_decision,
 #   stream_video_codec,
 #   stream_audio_codec       — transcode format stats
+#   subtitle_decision        — subtitle handling (none/copy/burn); a burned-in sub
+#                              forces a transcode. NOT PII — a playback setting.
+#   stream_video_full_resolution — streamed resolution + HDR tier; a media property,
+#                              NOT PII.
+#   location                 — coarse lan/wan bit only (home vs. remote); NOT an IP
+#                              and NOT geolocation, so far less identifying than the
+#                              dropped ip_address. Feeds the WAN-bandwidth transcode read.
+#       ↳ the three above feed the per-device transcode-capability fingerprint
+#         (quality_analytics.transcode_fingerprint) read by the Stage-C remote-play gate;
+#         without them the matrix self-degrades to a codec-only read.
 #
 # DROPPED on purpose (and why):
 #   friendly_name  — household members' real display names (PII). Not read from
 #                    this cache; "user" is the identifier every consumer uses.
 #   ip_address     — WAN IP of the viewer (PII / location-linkable). Never read.
+#                    (location's lan/wan bit is admitted; the raw IP stays dropped.)
 #   machine_id     — device fingerprint that can re-identify a viewer (PII).
-#                    Never read.
+#                    Never read. (device granularity stays per-platform, not per-box.)
 # user_id is retained as a non-PII stable identifier; friendly_name is dropped
 # entirely since no consumer needs a human-readable display name from this cache.
 _CACHED_HISTORY_FIELDS = (
@@ -43,6 +54,12 @@ _CACHED_HISTORY_FIELDS = (
     "transcode_decision",
     "stream_video_codec",
     "stream_audio_codec",
+    # Transcode-capability fingerprint axes (Stage-C remote-play gate). See the PII
+    # rationale block above — these are media/playback properties, and location is a
+    # coarse lan/wan bit, not an IP.
+    "subtitle_decision",
+    "stream_video_full_resolution",
+    "location",
     "date",   # unix watch timestamp — drives temporal affinity decay (not PII)
     # season / episode indices (non-PII) — let the playlist watched-filter match an
     # owned episode by (series, season, episode), which survives Plex ratingKey churn
