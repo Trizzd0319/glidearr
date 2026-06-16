@@ -357,16 +357,30 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
                 stats["failed"] += 1
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[Quality] {prefix}Active-watcher upgrades for '{instance}': "
-            f"{stats['upgraded']} upgraded | {stats['already_best']} already best | "
-            f"{stats['skipped_not_active']} not active | "
-            f"{stats['skipped_kids']} kids-only | "
-            f"{stats['skipped_keep']} keep-tagged | "
-            f"{stats['skipped_fully_downloaded']} fully downloaded | "
-            f"{stats['skipped_quality_frozen']} quality-frozen | "
-            f"{stats['failed']} failed "
-            f"({free_gb:.1f} GB free)"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["upgraded",         stats["upgraded"]],
+                ["already best",     stats["already_best"]],
+                ["not active",       stats["skipped_not_active"]],
+                ["kids-only",        stats["skipped_kids"]],
+                ["keep-tagged",      stats["skipped_keep"]],
+                ["fully downloaded", stats["skipped_fully_downloaded"]],
+                ["quality-frozen",   stats["skipped_quality_frozen"]],
+                ["failed",           stats["failed"]],
+            ],
+            title=f"[Quality] {prefix}Active-watcher upgrades - '{instance}' ({free_gb:.1f} GB free)",
+            caption="Outcome of the active-watcher quality-profile upgrade pass for this instance.",
+            descriptions=[
+                "series whose profile was raised to the target",
+                "series already on the best profile, left as-is",
+                "series with no watch inside the active window",
+                "series skipped as kids-only certification",
+                "series skipped for a keep_series/keep_season tag",
+                "fully-downloaded series left for JIT to upgrade",
+                "series skipped for a quality-freeze tag",
+                "series whose fetch or upgrade PUT errored",
+            ],
         )
         return stats
 
