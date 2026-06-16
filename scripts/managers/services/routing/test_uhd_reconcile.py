@@ -28,11 +28,15 @@ _U_NOFILE = {"id": 5, "tmdbId": 862, "hasFile": False}
 
 
 class _Im:
-    def __init__(self, movies, profiles=None, roots=None):
+    def __init__(self, movies, profiles=None, roots=None, free=9999.0, total=10000.0):
         self._movies = movies
         self._profiles = profiles or {}
         self._roots = roots or {}
+        self._free, self._total = free, total
         self.commands, self.puts, self.adds, self.deletes, self.gets = [], [], [], [], []
+
+    def disk_free_gb(self, inst): return self._free
+    def disk_total_gb(self, inst): return self._total
 
     def _get_apis(self):
         return {n: object() for n in self._movies}
@@ -216,6 +220,49 @@ def test_move_log_includes_watch_score(monkeypatch):
     UhdReconcileManager(config=_cfg(), logger=log, radarr=_Mgr(im), dry_run=False,
                         registry=_Reg(_SP(df))).run()
     assert any("watch 75" in s for s in log.info)      # the per-title move log shows the score
+
+
+# ── proactive 4K acquire (owned 1080p movie warranting 4K gets a 4K copy on the 4K instance) ──
+def _proactive_run(monkeypatch, std, *, score=90, proactive=True, free=9999.0):
+    import pandas as pd
+    for v in ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT"):
+        monkeypatch.delenv(v, raising=False)
+    im = _Im({"standard": std, "ultra": []},
+             profiles={"standard": _STD_PROFILES, "ultra": _UHD_PROFILES},
+             roots={"ultra": [{"path": "/data/media/movies/4k"}]}, free=free)
+    cfg = _cfg()                                            # both + same_instance + consent
+    cfg["routing"]["movies"]["proactive_4k"] = proactive
+    cfg["routing"]["movies"]["4k_dual_min_score"] = 70
+    df = pd.DataFrame([{"tmdb_id": mv["tmdbId"], "is_watched": True, "watchability_score": score}
+                       for mv in std])
+    UhdReconcileManager(config=cfg, logger=None, radarr=_Mgr(im), dry_run=False,
+                        registry=_Reg(_SP(df))).run()
+    return im
+
+
+def test_proactive_acquires_4k_for_high_watchability_1080p(monkeypatch):
+    im = _proactive_run(monkeypatch, [_M1080], score=90)   # likelihood 75 >= 70
+    acq = [a for a in im.adds if a[0] == "ultra"]
+    assert len(acq) == 1
+    assert acq[0][1]["tmdbId"] == 14160
+    assert acq[0][1]["addOptions"] == {"searchForMovie": True}
+    assert acq[0][1]["qualityProfileId"] == 7              # the 4K instance's top profile
+    assert im.puts == [] and im.commands == []             # source 1080p untouched
+
+
+def test_no_proactive_acquire_when_flag_off(monkeypatch):
+    im = _proactive_run(monkeypatch, [_M1080], score=90, proactive=False)
+    assert im.adds == []                                   # default off → nothing
+
+
+def test_no_proactive_acquire_below_threshold(monkeypatch):
+    im = _proactive_run(monkeypatch, [_M1080], score=10)   # likelihood low → < 70
+    assert im.adds == []
+
+
+def test_no_proactive_acquire_when_space_tight(monkeypatch):
+    im = _proactive_run(monkeypatch, [_M1080], score=90, free=1.0)   # below the 4K-instance band
+    assert im.adds == []                                   # space-gated
 
 
 def test_only_scans_hd_tier_sources_not_a_real_4k_library(monkeypatch):

@@ -38,10 +38,15 @@ each run (harmless churn — no copy is ever lost).
 from __future__ import annotations
 
 from scripts.managers.machine_learning.space import dual_version
-from scripts.managers.machine_learning.space.routing_targets import reorg_mode, relocation_consented
+from scripts.managers.machine_learning.space.routing_targets import (
+    proactive_4k_enabled,
+    relocation_consented,
+    reorg_mode,
+)
 from scripts.managers.services.acquisition.gateway import ArrGateway
 from scripts.managers.services.radarr.storage.cross_instance_move import CrossInstanceMove
 from scripts.support.utilities.size_model import profile_max_quality
+from scripts.support.utilities.space_targets import space_targets
 from scripts.support.utilities.watch_likelihood import watch_likelihood
 
 # Alias-aware: the role map writes "4K" while the folder bucket is "4k" (and operators may use
@@ -168,13 +173,35 @@ class UhdReconcileManager:
                                      f"1080p baseline; skipping cross-instance move.")
             return
         likelihoods = self._likelihood_map(std_inst)     # {tmdbId: watch_likelihood}; {} if unavailable
+        proactive = bool((self._routing.get("movies", {}) or {}).get("proactive_4k"))
+        threshold = int((self._routing.get("movies", {}) or {}).get("4k_dual_min_score")
+                        or dual_version.DEFAULT_UHD_SCORE)
+        space_ok_4k = self._space_allows(gw, fourk) if proactive else False
         acted = 0
         for mv in movies:
             tmdb = mv.get("tmdbId")
             if tmdb is None:
                 continue
             dest_hasfile = tmdb in hasfile
+            dest_present = tmdb in present
             res = self._res(mv)
+            lk = likelihoods.get(tmdb)
+            watch = f" (watch {lk:.0f})" if lk is not None else ""
+
+            # PROACTIVE ACQUIRE: an owned movie that WARRANTS 4K (watch-likelihood ≥ threshold) but
+            # has no 4K anywhere (no 2160p file on the source AND not on the 4K instance) → acquire a
+            # fresh 4K copy on the 4K instance; the source keeps its ≤1080 baseline. Gated on the
+            # proactive_4k flag + 4K-instance space; actuation (add vs log) rides the mover's dry_run.
+            if proactive and not dest_present and res < _UHD_RES and dual_version.wants_uhd(
+                    keep_tagged=False, score=lk, space_allows=space_ok_4k,
+                    uhd_threshold=threshold, can_remote_play=True):
+                ast = mover.acquire(mv, to_inst=fourk, dest_root=dest_root,
+                                    dest_profile_id=dest_pid).get("status")
+                if ast not in ("skip", "noop"):
+                    acted += 1
+                    self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} [{ast}]")
+                continue
+
             # FINALIZE: the 2160p has landed on the 4K instance and the source isn't yet the 1080p
             # baseline — but NOT a title already AT the baseline profile or already holding a healthy
             # ≤1080 file (a steady dual title is left untouched). MOVE-IN/PENDING: a 2160p file not
@@ -184,17 +211,14 @@ class UhdReconcileManager:
             is_movein = (not dest_hasfile) and res >= _UHD_RES
             if not (is_finalize or is_movein):
                 continue
-            res = mover.relocate(mv, from_inst=std_inst, to_inst=fourk, dest_root=dest_root,
-                                 dest_profile_id=dest_pid, hd_profile_id=hd_pid,
-                                 dest_present=tmdb in present, dest_hasfile=dest_hasfile)
-            st = res.get("status")
+            st = mover.relocate(mv, from_inst=std_inst, to_inst=fourk, dest_root=dest_root,
+                                dest_profile_id=dest_pid, hd_profile_id=hd_pid,
+                                dest_present=dest_present, dest_hasfile=dest_hasfile).get("status")
             if st not in ("skip", "noop"):
                 acted += 1
-                lk = likelihoods.get(tmdb)
-                watch = f" (watch {lk:.0f})" if lk is not None else ""
                 self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} [{st}]")
         if acted:
-            self._log("log_info", f"[UHD] {std_inst}: {acted} title(s) in cross-instance move to {fourk}.")
+            self._log("log_info", f"[UHD] {std_inst}: {acted} title(s) routed to {fourk} (move/acquire).")
 
     # ── helpers ─────────────────────────────────────────────────────────────────
     def _uhd_instance(self, gw):
@@ -205,6 +229,27 @@ class UhdReconcileManager:
             if inst and inst != default_inst:
                 return inst
         return None
+
+    def _space_allows(self, gw, inst) -> bool:
+        """True when ``inst`` is comfortably above its pressure band (free >= U) — room for a
+        speculative 4K acquire. FAIL-CLOSED: an unreadable disk returns False, so proactive 4K is
+        never grabbed when free space is unknown (unlike the always-allowed move of an existing file)."""
+        im = getattr(gw, "im", None)
+        if im is None:
+            return False
+        try:
+            free = float(im.disk_free_gb(inst))
+        except Exception:
+            return False
+        try:
+            total = im.disk_total_gb(inst)
+        except Exception:
+            total = None
+        try:
+            _, U = space_targets(self.config, total_gb=total)
+        except Exception:
+            return False
+        return free >= U
 
     @staticmethod
     def _res(movie) -> int:

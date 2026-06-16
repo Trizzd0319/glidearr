@@ -134,3 +134,23 @@ def test_skip_when_no_file_path():
     res = _relocate(m, {"id": 1, "title": "X", "tmdbId": 5, "monitored": True}, dest_hasfile=False)
     assert res["status"] == "skip"
     assert gw.adds == [] and gw.commands == []
+
+
+# ── acquire (proactive 4K fill — new copy on the 4K instance, source untouched) ───────────────
+def test_acquire_adds_4k_with_search_on():
+    m, gw = _mover()
+    res = m.acquire(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k", dest_profile_id=7)
+    assert res["status"] == "acquired"
+    assert len(gw.adds) == 1
+    inst, payload = gw.adds[0]
+    assert inst == "ultra" and payload["qualityProfileId"] == 7
+    assert payload["rootFolderPath"] == "/data/media/movies/4k"
+    assert payload["addOptions"] == {"searchForMovie": True} and payload["monitored"] is True
+    assert "movieFile" not in payload and "path" not in payload
+    assert gw.puts == [] and gw.commands == []             # source untouched, no scan
+
+
+def test_acquire_dry_run_no_add():
+    m, gw = _mover(dry_run=True)
+    res = m.acquire(_MOVIE, to_inst="ultra", dest_root="/r", dest_profile_id=7)
+    assert res["status"] == "would-acquire" and gw.adds == []

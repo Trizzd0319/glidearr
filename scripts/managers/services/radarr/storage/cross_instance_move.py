@@ -131,10 +131,29 @@ class CrossInstanceMove:
                               f"{from_inst} retuned to 1080p once the import confirms.")
         return {"status": "moved-in" if monitored else "pending-import", "title": title, "tmdb": tmdb}
 
-    def _add_to_dest(self, src_movie, to_inst, dest_root, dest_profile_id) -> bool:
-        """Add the title to the destination, monitored, SEARCH OFF (we want the moved file, not a
-        fresh download). Clones the source object; strips the source identity + its absolute path so
-        the destination's ``rootFolderPath`` is authoritative. Returns ok."""
+    def acquire(self, src_movie: dict, *, to_inst: str, dest_root: str, dest_profile_id) -> dict:
+        """Acquire a NEW 4K copy on the destination instance (monitored, SEARCH ON) for an owned
+        movie that WARRANTS 4K but has none — the proactive dual-version fill. The SOURCE instance
+        is untouched (it keeps its existing ≤1080 baseline); this only adds the 4K side. The caller
+        owns eligibility (proactive_4k gate + watchability + space); this just emits the add."""
+        tmdb = src_movie.get("tmdbId")
+        title = src_movie.get("title")
+        if tmdb is None:
+            return {"status": "skip", "title": title, "tmdb": tmdb}
+        if self.dry_run:
+            self._log("log_info", f"[Relocate] would acquire a 4K copy of '{title}' on {to_inst} "
+                                  f"(search ON; {src_movie.get('rootFolderPath') or 'source'} stays ≤1080).")
+            return {"status": "would-acquire", "title": title, "tmdb": tmdb}
+        ok = self._add_to_dest(src_movie, to_inst, dest_root, dest_profile_id, search=True)
+        if ok:
+            self._log("log_success", f"[Relocate] acquiring a 4K copy of '{title}' on {to_inst} (search ON).")
+        return {"status": "acquired" if ok else "acquire-failed", "title": title, "tmdb": tmdb}
+
+    def _add_to_dest(self, src_movie, to_inst, dest_root, dest_profile_id, *, search: bool = False) -> bool:
+        """Add the title to the destination, monitored. ``search`` False (default) = take the moved
+        file, not a fresh download (the MOVE path); True = acquire a fresh copy (the proactive 4K
+        path). Clones the source object; strips the source identity + its absolute path so the
+        destination's ``rootFolderPath`` is authoritative. Returns ok."""
         payload = dict(src_movie)
         for k in ("id", "movieFile", "movieFileId", "path", "folderName"):
             payload.pop(k, None)
@@ -142,7 +161,7 @@ class CrossInstanceMove:
         payload["rootFolderPath"] = dest_root
         payload["monitored"] = True
         payload.setdefault("minimumAvailability", "released")
-        payload["addOptions"] = {"searchForMovie": False}
+        payload["addOptions"] = {"searchForMovie": bool(search)}
         try:
             return bool(self.gw.add(to_inst, payload))
         except Exception as e:
