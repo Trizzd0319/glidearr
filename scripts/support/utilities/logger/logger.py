@@ -138,13 +138,15 @@ def _looks_numeric(s: str) -> bool:
         return False
 
 
-def _box_table(headers, rows, title="", cap=None) -> str:
+def _box_table(headers, rows, title="", cap=None, caption="") -> str:
     """Render an outlined, Kometa-style table as one multi-line string.
 
     Columns are sized to their own widest (capped) cell; numeric columns are
     right-aligned, everything else left-aligned. A long ``title`` widens the
     last column so it always fits inside the banner without breaking alignment.
-    Returns "" when ``rows`` is empty."""
+    ``caption`` (optional) is word-wrapped to the table width and rendered as
+    full-width lines just under the title — a one-line description of what the
+    whole table is. Returns "" when ``rows`` is empty."""
     if not rows:
         return ""
     NBSP = _NBSP
@@ -196,7 +198,19 @@ def _box_table(headers, rows, title="", cap=None) -> str:
     else:
         top = border
 
-    return "\n".join([top, empty, _row(head), head_sep, *(_row(r) for r in body), empty, border])
+    # Caption: word-wrapped to the table width, rendered as full-width lines under the title.
+    # NBSP-pad like cells so _strip_decor's space-collapsing can't mangle it.
+    cap_lines = []
+    _cap = (caption or "").strip()
+    if _cap:
+        import textwrap
+        for _w in (textwrap.wrap(_cap, width=max(1, inner_w - 2)) or [""]):
+            _w = _w[: inner_w - 2]
+            pad = NBSP * (inner_w - 1 - len(_w))
+            cap_lines.append("|" + NBSP + _w.replace(" ", NBSP) + pad + "|")
+
+    return "\n".join([top, *cap_lines, empty, _row(head), head_sep,
+                      *(_row(r) for r in body), empty, border])
 
 
 class _ColorFormatter(logging.Formatter):
@@ -496,11 +510,29 @@ class LoggerManager:
         for logger in [self.recommender_logger, self.api_logger, self.function_logger]:
             self._log_json(logger, "info", message)
 
-    def log_table(self, headers, data, title=""):
+    def log_table(self, headers, data, title="", descriptions=None, caption=""):
+        """Render a boxed table.
+
+        ``caption`` (optional) is a one-line description of WHAT THE TABLE IS, word-wrapped under
+        the title. ``descriptions`` (optional) is a sequence parallel to ``data``: when given, a
+        final ``Description`` column is appended explaining what each row's item IS, so terse
+        metric labels (``acquired``, ``no-space``, …) are self-documenting in the log. Rows past
+        the end of ``descriptions`` (or a ``None`` entry) get a blank description cell. Pass
+        plain-ASCII text — the cp1252 console/log can't encode ≤ / … / —."""
         if not data:
             self.log_info("⚠️ No data available to display.")
             return
-        block = _box_table(headers, data, title=title)
+        _headers, _data = headers, data
+        if descriptions is not None:
+            _headers = list(headers) + ["Description"]
+            _data = [
+                list(row) + [
+                    "" if (i >= len(descriptions) or descriptions[i] is None)
+                    else str(descriptions[i])
+                ]
+                for i, row in enumerate(data)
+            ]
+        block = _box_table(_headers, _data, title=title, caption=caption)
         if block:
             self.log_info(f"\n{block}\n")
 
