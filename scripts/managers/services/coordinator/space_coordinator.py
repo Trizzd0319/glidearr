@@ -35,12 +35,15 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pandas as pd
+
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.space.coordinator_ranker import (
     critic_sort,
     select_for_target,
 )
+from scripts.managers.machine_learning.space.routing_targets import evict_uhd_first
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_targets import coordinator_owns_deletion, space_targets
@@ -102,14 +105,16 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
     @classmethod
     def _select_for_target(cls, pool: list[dict], need_gb: float, *,
                            recency_ramp: "dict | None" = None, now=None,
-                           tier_size: "float | None" = None) -> tuple[list[dict], float]:
+                           tier_size: "float | None" = None,
+                           uhd_first: bool = False) -> tuple[list[dict], float]:
         """Rank the combined movie+episode delete pool to the free-space target —
         delegates to the brain (space.coordinator_ranker.select_for_target). Returns
         ``(selected, projected_gb)``. ``recency_ramp``/``now`` sink a recently-watched
         file to the bottom of the order; ``tier_size`` buckets the score so the biggest
-        file in the lowest tier goes first. All default to the byte-identical ranking."""
+        file in the lowest tier goes first; ``uhd_first`` puts baseline-backed 4K bonus
+        copies ahead of every whole title. All default to the byte-identical ranking."""
         return select_for_target(pool, need_gb, recency_ramp=recency_ramp, now=now,
-                                 tier_size=tier_size)
+                                 tier_size=tier_size, uhd_first=uhd_first)
 
     # ── Entry point ──────────────────────────────────────────────────────────────
     @LoggerManager().log_function_entry
@@ -187,7 +192,7 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                 f"no deletion needed."
             )
             stats["action"] = "downgrades_only"
-            stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst)
+            stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, uhd_inst=uhd_inst)
             return stats
 
         # ── Stage 2: combined ranked delete pool ────────────────────────────────
@@ -215,10 +220,46 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
             except Exception as e:
                 self.logger.log_warning(f"[SpaceCoordinator] episode candidate build failed: {e}")
 
+        # ── Evict-4K-first (default-off): add the dual-version 4K BONUS copies to the pool ──
+        # Each is a 2160p copy whose 1080p baseline SURVIVES on the standard instance, so
+        # reclaiming it loses NO title (pure reclaim). The ranker (uhd_first) then puts them
+        # ahead of every whole title, lowest-watchability first, so a whole title is never
+        # deleted while a reclaimable 4K copy remains.
+        uhd_inst, uhd_df = None, None
+        if radarr_sp and radarr_inst and evict_uhd_first(self.config):
+            uhd_inst = self._uhd_instance(radarr_inst)
+            if uhd_inst and uhd_inst != radarr_inst:
+                survivors = self._baseline_survivors(radarr_df)     # standard tmdbIds WITH a file
+                try:
+                    uhd_df = radarr_sp.load_movie_files(uhd_inst)
+                except Exception as e:
+                    self.logger.log_warning(f"[SpaceCoordinator] 4K movie_files load failed for "
+                                            f"'{uhd_inst}': {e}")
+                    uhd_df = None
+                if uhd_df is not None and not uhd_df.empty:
+                    try:
+                        uhd_cands = radarr_sp.build_delete_candidates(
+                            uhd_inst, uhd_df, ignore_score_ceiling=True)
+                    except Exception as e:
+                        self.logger.log_warning(f"[SpaceCoordinator] 4K candidate build failed: {e}")
+                        uhd_cands = []
+                    added = 0
+                    for c in uhd_cands:
+                        res = c.get("resolution")
+                        if res and int(res) > 1080 and c.get("tmdb_id") in survivors:
+                            c["is_uhd_copy"] = True            # ranker evicts these first
+                            c["instance"] = uhd_inst           # deleted against the 4K instance
+                            pool.append(c)
+                            added += 1
+                    if added:
+                        self.logger.log_info(
+                            f"[SpaceCoordinator] {added} reclaimable 4K copy(ies) on '{uhd_inst}' "
+                            f"(1080p baseline survives → reclaimed before any whole title).")
+
         if not pool:
             self.logger.log_info("[SpaceCoordinator] no eligible delete candidates — nothing to do.")
             stats["action"] = "no_candidates"
-            stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst)
+            stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, uhd_inst=uhd_inst)
             return stats
 
         # Rank lowest watchability first, then lowest critic, then biggest file
@@ -237,11 +278,16 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         except (TypeError, ValueError):
             _tier_size = None
         selected, projected = self._select_for_target(
-            pool, need, recency_ramp=_recency_ramp, now=_now, tier_size=_tier_size
+            pool, need, recency_ramp=_recency_ramp, now=_now, tier_size=_tier_size,
+            uhd_first=bool(uhd_inst),
         )
 
         movie_picks = [c for c in selected if c.get("service") == "movie"]
         episode_picks = [c for c in selected if c.get("service") == "episode"]
+        # Split the movie picks by instance: the standard 1080p-tier titles delete against the
+        # standard instance/df; the dual-version 4K copies delete against the 4K instance/df.
+        std_movie_picks = [c for c in movie_picks if not c.get("is_uhd_copy")]
+        uhd_movie_picks = [c for c in movie_picks if c.get("is_uhd_copy")]
         for c in movie_picks:
             c["reason"] = f"coordinator pool (score {c.get('score')})"
         episode_fids = [c["fid"] for c in episode_picks if c.get("fid") is not None]
@@ -257,11 +303,18 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                 f"reclaimable from {len(pool)} candidate(s); deleting all eligible."
             )
 
-        if movie_picks and radarr_sp and radarr_df is not None:
+        if std_movie_picks and radarr_sp and radarr_df is not None:
             try:
-                stats["deletions"]["radarr"] = radarr_sp.delete_selected_movie_files(radarr_inst, radarr_df, movie_picks)
+                stats["deletions"]["radarr"] = radarr_sp.delete_selected_movie_files(radarr_inst, radarr_df, std_movie_picks)
             except Exception as e:
                 self.logger.log_warning(f"[SpaceCoordinator] movie deletion failed: {e}")
+        if uhd_movie_picks and radarr_sp and uhd_df is not None:
+            try:
+                # Deletes ONLY the 2160p file on the 4K instance (separate DB/record); the standard
+                # instance's 1080p baseline is untouched. Recorded under the 4K instance's restore ledger.
+                stats["deletions"]["radarr_uhd"] = radarr_sp.delete_selected_movie_files(uhd_inst, uhd_df, uhd_movie_picks)
+            except Exception as e:
+                self.logger.log_warning(f"[SpaceCoordinator] 4K copy deletion failed: {e}")
         if episode_fids and sonarr_ef:
             try:
                 stats["deletions"]["sonarr"] = sonarr_ef.delete_selected_episode_files(sonarr_inst, episode_fids)
@@ -274,7 +327,7 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         stats["action"] = "deleted"
 
         # ── Stage 3: restore recovered ──────────────────────────────────────────
-        stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst)
+        stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, uhd_inst=uhd_inst)
         return stats
 
     # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -297,6 +350,37 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
             return float("inf")
         return min(vals)
 
+    # ── evict-4K-first helpers ────────────────────────────────────────────────────
+    _UHD_LABELS = ("4k", "uhd", "2160p", "2160")
+
+    def _uhd_instance(self, default_inst):
+        """The distinct 4K Radarr instance from the categorized map, or None. Config-only (mirrors
+        the reconcile's alias logic): a "4K"/"4k"/"uhd"/"2160p" categorized label that maps to a real
+        instance OTHER than the default. None → no separate 4K instance → eviction stays single-pool."""
+        cat = (self.config or {}).get("radarr_instances_categorized", {}) or {}
+        insts = (self.config or {}).get("radarr_instances", {}) or {}
+        lower = {str(k).lower(): v for k, v in cat.items() if k}
+        for label in self._UHD_LABELS:
+            v = lower.get(label)
+            if v and str(v) in insts and str(v) != str(default_inst):
+                return str(v)
+        return None
+
+    @staticmethod
+    def _baseline_survivors(df) -> frozenset:
+        """tmdbIds on the standard instance that own an actual file — deleting a 4K copy of any of
+        these loses NO title. Read from the already-loaded standard df (no extra HTTP); a not-yet-
+        cached baseline simply isn't a survivor, which is fail-safe (we then don't evict its 4K)."""
+        if df is None or getattr(df, "empty", True) or "tmdb_id" not in getattr(df, "columns", []):
+            return frozenset()
+        if "movie_file_id" in df.columns:
+            has = df["movie_file_id"].notna()
+        elif "has_file" in df.columns:
+            has = df["has_file"].fillna(False).astype(bool)
+        else:
+            return frozenset()
+        return frozenset(int(t) for t, h in zip(df["tmdb_id"], has) if h and pd.notna(t))
+
     def _read_total(self, radarr_sp, radarr_inst, sonarr_sp, sonarr_inst) -> "float | None":
         """Total capacity (GB) of the shared media mount, mount-deduped. Radarr and
         Sonarr report the same underlying mount, so take the MIN of whatever's
@@ -317,13 +401,21 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         vals = [v for v in vals if v == v and v > 0 and v != float("inf")]
         return min(vals) if vals else None
 
-    def _run_restores(self, radarr_restore, radarr_inst, sonarr_ef, sonarr_inst) -> dict:
+    def _run_restores(self, radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, *, uhd_inst=None) -> dict:
         out: dict = {}
         if radarr_restore and radarr_inst and hasattr(radarr_restore, "restore_recovered_deletions"):
             try:
                 out["radarr"] = radarr_restore.restore_recovered_deletions(radarr_inst)
             except Exception as e:
                 self.logger.log_warning(f"[SpaceCoordinator] Radarr restore failed: {e}")
+        # Evicted 4K copies are recorded under the 4K instance's own restore ledger, so restore
+        # must run for it too — otherwise a 4K copy whose watchability recovers is never re-grabbed.
+        if radarr_restore and uhd_inst and uhd_inst != radarr_inst \
+                and hasattr(radarr_restore, "restore_recovered_deletions"):
+            try:
+                out["radarr_uhd"] = radarr_restore.restore_recovered_deletions(uhd_inst)
+            except Exception as e:
+                self.logger.log_warning(f"[SpaceCoordinator] 4K restore failed: {e}")
         if sonarr_ef and sonarr_inst and hasattr(sonarr_ef, "restore_recovered_episode_deletions"):
             try:
                 out["sonarr"] = sonarr_ef.restore_recovered_episode_deletions(sonarr_inst)
