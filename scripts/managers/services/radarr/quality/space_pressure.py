@@ -650,12 +650,26 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             mfm.save(instance, df)
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[SpacePressure] {prefix}Step-down pass complete: "
-            f"{stats['downgraded']} stepped down (~{stats.get('est_reclaim_gb', 0):.0f} GB) | "
-            f"{stats['already_at_720p']} at/below floor | "
-            f"{stats['skipped_protected']} protected | {stats['skipped_high_score']} high-score protected | "
-            f"{stats['skipped_recent']} recently watched | {stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["stepped down",        stats['downgraded']],
+                ["at/below floor",      stats['already_at_720p']],
+                ["protected",           stats['skipped_protected']],
+                ["high-score protected", stats['skipped_high_score']],
+                ["recently watched",    stats['skipped_recent']],
+                ["failed",              stats['failed']],
+            ],
+            title=f"[SpacePressure] {prefix}step-down pass - '{instance}' (~{stats.get('est_reclaim_gb', 0):.0f} GB reclaimed)",
+            caption="Result of the HD-720p step-down pass that shrinks low-score movies to free space.",
+            descriptions=[
+                "movies stepped down one quality rank",
+                "movies already at or below the 720p floor",
+                "movies protected from downgrade by keep policy",
+                "movies protected by a high watchability score",
+                "movies skipped for a recent watch",
+                "movies whose PUT/search call errored",
+            ],
         )
         return stats
 
@@ -813,14 +827,27 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         if (changed and not self.dry_run) or (self.dry_run and stamped):
             mfm.save(instance, df)
 
-        prefix = "[dry_run] " if self.dry_run else ""
-        verb   = "Would free" if self.dry_run else "Freed"
-        self.logger.log_info(
-            f"[SpacePressure] {prefix}Target-loop deletion for '{instance}': "
-            f"{stats['deleted']} deleted (watched={stats['tier_watched']}, "
-            f"unwatched={stats['tier_unwatched']}) — {verb} {self._fmt_bytes(stats['bytes_freed'])} | "
-            f"target {U:.0f} GB {'met' if stats['target_met'] else 'NOT met (candidates exhausted)'} | "
-            f"{stats['failed']} failed"
+        prefix  = "[dry_run] " if self.dry_run else ""
+        verb    = "would free" if self.dry_run else "freed"
+        _target = 'met' if stats['target_met'] else 'NOT met (candidates exhausted)'
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["checked",          stats['checked']],
+                ["deleted",          stats['deleted']],
+                ["watched tier",     stats['tier_watched']],
+                ["unwatched tier",   stats['tier_unwatched']],
+                ["failed",           stats['failed']],
+            ],
+            title=f"[SpacePressure] {prefix}target-loop deletion - '{instance}' (target {U:.0f} GB {_target})",
+            caption=f"Result of the last-resort delete loop that {verb} {self._fmt_bytes(stats['bytes_freed'])} toward the space target.",
+            descriptions=[
+                "movies examined as delete candidates",
+                "movie files deleted from disk",
+                "deletions from the watched + grace-expired tier",
+                "deletions from the unwatched low-score tier",
+                "movies whose DELETE call errored",
+            ],
         )
         return stats
 
@@ -1171,11 +1198,24 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             mfm.save(instance, df)
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[SpacePressure] {prefix}Active-watcher upgrades for '{instance}': "
-            f"{stats['upgraded']} upgraded | {stats['already_best']} already best | "
-            f"{stats['skipped_kids']} skipped kids | "
-            f"{stats['skipped_not_active']} not active | {stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["upgraded",      stats['upgraded']],
+                ["already best",  stats['already_best']],
+                ["skipped kids",  stats['skipped_kids']],
+                ["not active",    stats['skipped_not_active']],
+                ["failed",        stats['failed']],
+            ],
+            title=f"[SpacePressure] {prefix}active-watcher upgrades - '{instance}'",
+            caption="Result of the pass that upgrades actively-watched movies to the best profile when space is plentiful.",
+            descriptions=[
+                "movies upgraded to a higher quality profile",
+                "movies already at the best available profile",
+                "kids-library movies skipped from upgrade",
+                "movies not watched recently enough to upgrade",
+                "movies whose PUT/search call errored",
+            ],
         )
         return stats
 

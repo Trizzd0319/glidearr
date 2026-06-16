@@ -299,10 +299,22 @@ class RadarrRepairMetadataManager(BaseManager, ComponentManagerMixin):
         stats["still_missing"] = max(0, still_missing_count)
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[Metadata] {prefix}Missing-ID repair for '{instance}': "
-            f"{stats['checked']} checked | {stats['imdb_resolved']} imdbId resolved | "
-            f"{stats['refresh_queued']} refresh queued | {stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["checked",         stats["checked"]],
+                ["imdbId resolved", stats["imdb_resolved"]],
+                ["refresh queued",  stats["refresh_queued"]],
+                ["failed",          stats["failed"]],
+            ],
+            title=f"[Metadata] {prefix}Missing-ID repair - '{instance}'",
+            caption="Result of the pass that fills in movies missing a tmdbId or imdbId.",
+            descriptions=[
+                "movies with a missing external ID examined",
+                "imdbId filled in from the full movie record",
+                "movies a RefreshMovie was queued for",
+                "RefreshMovie batches that errored",
+            ],
         )
         return stats
 
@@ -381,10 +393,20 @@ class RadarrRepairMetadataManager(BaseManager, ComponentManagerMixin):
             self._add_pending_ids(instance, queued_this_run)
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[Metadata] {prefix}Problematic-title repair for '{instance}': "
-            f"{stats['checked']} checked | {stats['refresh_queued']} refresh queued | "
-            f"{stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["checked",        stats["checked"]],
+                ["refresh queued", stats["refresh_queued"]],
+                ["failed",         stats["failed"]],
+            ],
+            title=f"[Metadata] {prefix}Problematic-title repair - '{instance}'",
+            caption="Result of refreshing movies whose titles contain bad characters.",
+            descriptions=[
+                "movies with a problematic title examined",
+                "movies a RefreshMovie was queued for",
+                "RefreshMovie batches that errored",
+            ],
         )
         return stats
 

@@ -1112,14 +1112,26 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         if stats["checked"]:
             prefix = "[dry_run] " if self.dry_run else ""
             verb   = "Would free" if self.dry_run else "Freed"
-            self.logger.log_info(
-                f"{prefix}Radarr deletion pass for '{instance}': "
-                f"{stats['deleted']} file(s) — {verb} {self._fmt_bytes(stats['bytes_freed'])} | "
-                f"{stats['failed']} failed | "
-                f"{stats['skipped_franchise']} franchise guard(s) | "
-                f"{stats['skipped_universe']} universe guard(s) | "
-                f"{stats['skipped_keep']} keep-policy guard(s) | "
-                f"{stats['skipped_no_file']} no file id"
+            self.logger.log_table(
+                ["Outcome", "Count"],
+                [
+                    ["deleted",            stats["deleted"]],
+                    ["failed",             stats["failed"]],
+                    ["franchise guard",    stats["skipped_franchise"]],
+                    ["universe guard",     stats["skipped_universe"]],
+                    ["keep-policy guard",  stats["skipped_keep"]],
+                    ["no file id",         stats["skipped_no_file"]],
+                ],
+                title=f"{prefix}Radarr deletion pass - '{instance}' ({verb} {self._fmt_bytes(stats['bytes_freed'])})",
+                caption="Outcome of the grace-marked movie file deletion pass for this instance.",
+                descriptions=[
+                    "movie files removed from Radarr this pass",
+                    "delete calls that errored",
+                    "rows skipped because they are franchise entries",
+                    "rows skipped because they belong to a universe",
+                    "rows skipped by a keep-forever/keep-movie policy",
+                    "marked rows with no movie file id to delete",
+                ],
             )
 
         needs_save = stats["deleted"] or stats["skipped_franchise"] or stats["skipped_universe"]

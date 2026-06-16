@@ -14,10 +14,12 @@ class _Logger:
     def __init__(self):
         self.grid_calls = 0
         self.summaries: list[str] = []
+        self.tables: list = []                         # captured log_table row data
     def log_grid(self, *a, **k):   self.grid_calls += 1
     def log_info(self, msg, *a, **k): self.summaries.append(msg)
     def log_warning(self, *a, **k): pass
     def log_debug(self, *a, **k):   pass
+    def log_table(self, headers, data, *a, **k): self.tables.append(data)
 
 
 def _mk(dry_run, folders, api):
@@ -38,7 +40,9 @@ def test_dry_run_no_grid_stats_preserved():
     stats = m.repair_import_untracked("standard")
     assert m.logger.grid_calls == 0                  # the per-folder grid is gone
     assert stats == {"checked": 51, "triggered": 50, "failed": 0}
-    assert any("51 checked | 50 triggered | 0 failed" in s for s in m.logger.summaries)
+    # the stats summary moved from a piped log line to a log_table; assert the counts are in it
+    _counts = {row[0]: row[1] for tbl in m.logger.tables for row in tbl}
+    assert _counts == {"checked": 51, "triggered": 50, "failed": 0}
 
 
 def test_no_untracked_returns_early():

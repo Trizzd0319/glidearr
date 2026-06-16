@@ -594,14 +594,28 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                 stats["failed"] = len(monitor_ids)
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[Anomaly] {prefix}Owned-movie monitor pass for '{instance}' "
-            f"(policy={policy}, threshold={threshold}): "
-            f"{stats['monitored']} monitored "
-            f"(keep={stats['monitored_keep']}, watched={stats['monitored_watched']}, "
-            f"score>={threshold}: {stats['monitored_score']}) | "
-            f"{stats['left_unmonitored']} left unmonitored | "
-            f"{stats['deferred']} deferred (no credits yet) | {stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["monitored",         stats["monitored"]],
+                ["monitored_keep",    stats["monitored_keep"]],
+                ["monitored_watched", stats["monitored_watched"]],
+                ["monitored_score",   stats["monitored_score"]],
+                ["left_unmonitored",  stats["left_unmonitored"]],
+                ["deferred",          stats["deferred"]],
+                ["failed",            stats["failed"]],
+            ],
+            title=f"[Anomaly] {prefix}Owned-movie monitor pass - '{instance}' (policy={policy}, threshold={threshold})",
+            caption="Which owned has-file but unmonitored movies got re-monitored this pass and why.",
+            descriptions=[
+                "owned movies set monitored=True this pass",
+                "monitored because keep/universe tagged",
+                "monitored because already watched",
+                "monitored because score met the threshold",
+                "left unmonitored (score below threshold)",
+                "deferred: Trakt credits not cached yet",
+                "movies whose bulk re-monitor call errored",
+            ],
         )
         return stats
 
@@ -955,15 +969,35 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         prefix   = "[dry_run] " if self.dry_run else ""
         expedite = (f" [expedited from {delete_days}d, {free_gb:.0f}GB free]"
                     if eff_delete_days < delete_days else "")
-        idle = "" if pressure_active else f" [space OK ({free_gb:.0f}GB ≥ {U:.0f}GB) — clocks only, no prune]"
-        self.logger.log_info(
-            f"[Anomaly] {prefix}Stale-owned prune for '{instance}' "
-            f"(floor<{floor}, unmonitor@{unmonitor_days}d, "
-            f"delete@{eff_delete_days}d{expedite}{idle}{'' if delete_enabled else ' [disabled]'}): "
-            f"{stats['checked']} owned | {stats['below_floor']} below floor | {stats['aging']} aging | "
-            f"{stats['unmonitored']} {'would unmonitor' if self.dry_run else 'unmonitored'} | "
-            f"{stats['deleted']} {'would delete' if self.dry_run else 'deleted'} | "
-            f"{stats['guarded']} guarded | {stats['deferred']} deferred (no credits) | {stats['failed']} failed"
+        idle = "" if pressure_active else f" [space OK ({free_gb:.0f}GB >= {U:.0f}GB) - clocks only, no prune]"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["checked",     stats["checked"]],
+                ["below_floor", stats["below_floor"]],
+                ["aging",       stats["aging"]],
+                ["unmonitored", stats["unmonitored"]],
+                ["deleted",     stats["deleted"]],
+                ["guarded",     stats["guarded"]],
+                ["deferred",    stats["deferred"]],
+                ["failed",      stats["failed"]],
+            ],
+            title=(
+                f"[Anomaly] {prefix}Stale-owned prune - '{instance}' "
+                f"(floor<{floor}, unmonitor@{unmonitor_days}d, "
+                f"delete@{eff_delete_days}d{expedite}{idle}{'' if delete_enabled else ' [disabled]'})"
+            ),
+            caption="Two-stage prune of stale low-watchability owned movies: unmonitor then delete.",
+            descriptions=[
+                "owned has-file movies examined this pass",
+                "movies scoring below the demote floor",
+                "below-floor movies whose dwell clock advanced",
+                "stale movies set unmonitored this pass",
+                "stale movie files deleted this pass",
+                "skipped: keep-tagged or already watched",
+                "deferred: Trakt credits not cached yet",
+                "movies whose unmonitor/delete call errored",
+            ],
         )
         return stats
 
@@ -1073,11 +1107,26 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             pass
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[Anomaly] {prefix}Deletion-restore for '{instance}' (score>{restore_floor}): "
-            f"{stats['tracked']} tracked | {stats['restored']} {'would restore' if self.dry_run else 'restored'} | "
-            f"{stats['still_low']} still low | {stats['deferred']} deferred | "
-            f"{stats['dropped']} dropped | {stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["tracked",   stats["tracked"]],
+                ["restored",  stats["restored"]],
+                ["still_low", stats["still_low"]],
+                ["deferred",  stats["deferred"]],
+                ["dropped",   stats["dropped"]],
+                ["failed",    stats["failed"]],
+            ],
+            title=f"[Anomaly] {prefix}Deletion-restore - '{instance}' (score>{restore_floor})",
+            caption="Re-acquires previously pruned movies whose watchability score recovered.",
+            descriptions=[
+                "previously deleted movies still being tracked",
+                "movies re-monitored and re-searched this pass",
+                "movies still scoring at or below the floor",
+                "deferred: Trakt credits not cached yet",
+                "entries dropped: gone or re-acquired otherwise",
+                "movies whose restore call errored",
+            ],
         )
         return stats
 
@@ -1382,15 +1431,30 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             stats["searched"] += len(search_ids)
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[Anomaly] {prefix}Monitored-missing triage for '{instance}': "
-            f"{stats['checked']} checked | {stats['searched']} searched | "
-            f"{stats['adjusted_and_searched']} adjusted+searched | "
-            f"{stats['unmonitored']} unmonitored | "
-            f"{stats['skipped_keep_tagged']} skipped (keep-tagged) | "
-            f"{stats.get('deferred', 0)} deferred (no credits yet) | "
-            f"{stats.get('not_available', 0)} not-yet-released | "
-            f"{stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["checked",               stats["checked"]],
+                ["searched",              stats["searched"]],
+                ["adjusted_and_searched", stats["adjusted_and_searched"]],
+                ["unmonitored",           stats["unmonitored"]],
+                ["skipped_keep_tagged",   stats["skipped_keep_tagged"]],
+                ["deferred",              stats.get("deferred", 0)],
+                ["not_available",         stats.get("not_available", 0)],
+                ["failed",                stats["failed"]],
+            ],
+            title=f"[Anomaly] {prefix}Monitored-missing triage - '{instance}'",
+            caption="Scores monitored-but-missing movies and routes each to search, adjust, or unmonitor.",
+            descriptions=[
+                "monitored-missing movies examined this pass",
+                "movies a search was triggered for as-is",
+                "movies dropped to HD-720p then searched",
+                "low-score movies set unmonitored",
+                "skipped: keep/universe tagged, never unmonitored",
+                "deferred: Trakt credits not cached yet",
+                "skipped: no home-media release available yet",
+                "movies whose search/edit/unmonitor call errored",
+            ],
         )
         return stats
 

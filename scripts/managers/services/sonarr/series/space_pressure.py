@@ -313,12 +313,34 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             ef.save(instance, df)
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[SpacePressure-TV] {prefix}'{instance}': {free_space_gb:.0f}GB free → target {U:.0f}GB "
-            f"(need ~{need_gb:.0f}GB) | {stats['downgraded']} stepped down (~{stats['est_reclaim_gb']:.0f}GB, "
-            f"target {'met' if _pstats.get('target_met') else 'NOT met'}) | "
-            f"{stats['candidates']} candidate(s) | {stats['skipped_high_score']} score≥{ceiling:.0f} | "
-            f"{stats['skipped_protected']} keep | {stats['skipped_recent']} recent | "
-            f"{stats['skipped_already']} at/below floor | {stats['failed']} failed"
+        target_status = "met" if _pstats.get("target_met") else "NOT met"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["stepped down",     stats["downgraded"]],
+                ["reclaim GB",       stats["est_reclaim_gb"]],
+                ["candidates",       stats["candidates"]],
+                ["score over ceil",  stats["skipped_high_score"]],
+                ["keep-tagged",      stats["skipped_protected"]],
+                ["recent",           stats["skipped_recent"]],
+                ["at/below floor",   stats["skipped_already"]],
+                ["failed",           stats["failed"]],
+            ],
+            title=f"[SpacePressure-TV] {prefix}'{instance}' "
+                  f"(free {free_space_gb:.0f}GB, target {U:.0f}GB, need ~{need_gb:.0f}GB, "
+                  f"target {target_status})",
+            caption="Per-pass result of the TV space-pressure step-down: how many low-watchability "
+                    "series were downgraded toward HD-720p, the space reclaimed, and what was skipped "
+                    "and why.",
+            descriptions=[
+                "series whose profile was stepped down a tier",
+                "estimated space reclaimed by the step-downs",
+                "series the planner picked as candidates",
+                "series skipped for watchability score over the ceiling",
+                "series skipped because keep-tagged",
+                "series skipped for a recent watch or air date",
+                "series already at or below the 720p floor",
+                "series whose PUT/search call errored",
+            ],
         )
         return stats

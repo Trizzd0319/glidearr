@@ -411,14 +411,28 @@ class TautulliManager(BaseManager, ComponentManagerMixin):
                     f"{len(tmdb_map)} unique movies resolved to tmdb_id{detail}."
                 )
 
-        self.logger.log_info(
-            f"[Tautulli] Run complete — "
-            f"{len(user_list)} users | "
-            f"{len(all_entries)} history entries | "
-            f"{len(metadata_index)} metadata items | "
-            f"{len(library_index)} libraries | "
-            f"{len(series_stats)} shows | "
-            f"{len(transcode_stats)} transcode formats | "
-            f"{len(platform_stats)} platforms | "
-            f"{len(genre_affinity.get('genres', {}))} genres tracked."
+        self.logger.log_table(
+            ["Signal", "Count"],
+            [
+                ["users",            len(user_list)],
+                ["history entries",  len(all_entries)],
+                ["metadata items",   len(metadata_index)],
+                ["libraries",        len(library_index)],
+                ["shows",            len(series_stats)],
+                ["transcode formats", len(transcode_stats)],
+                ["platforms",        len(platform_stats)],
+                ["genres tracked",   len(genre_affinity.get('genres', {}))],
+            ],
+            title="[Tautulli] Run complete",
+            caption="Final tally of the signals this Tautulli collection run produced.",
+            descriptions=[
+                "Tautulli/Plex accounts found",
+                "watch-history records loaded from cache",
+                "unique rating_keys with cached metadata",
+                "Plex libraries discovered",
+                "shows with completion stats computed",
+                "stream codec-pair transcode formats tallied",
+                "distinct client platforms seen in history",
+                "genres present in the household affinity map",
+            ],
         )

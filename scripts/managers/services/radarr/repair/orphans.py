@@ -217,10 +217,22 @@ class RadarrRepairOrphansManager(BaseManager, ComponentManagerMixin):
                 )
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[Orphans] {prefix}Stale record repair for '{instance}': "
-            f"{stats['checked']} checked | {stats['rescan_queued']} rescanned | "
-            f"{stats['refresh_queued']} refreshed | {stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["checked",   stats["checked"]],
+                ["rescanned", stats["rescan_queued"]],
+                ["refreshed", stats["refresh_queued"]],
+                ["failed",    stats["failed"]],
+            ],
+            title=f"[Orphans] {prefix}Stale record repair - '{instance}'",
+            caption="Two-pass repair of monitored movies with no file: rescan to re-detect, then refresh metadata.",
+            descriptions=[
+                "stale movie records examined this pass",
+                "movies queued for a folder rescan",
+                "movies queued for a metadata refresh",
+                "movies whose rescan/refresh batch errored",
+            ],
         )
         return stats
 
@@ -312,10 +324,20 @@ class RadarrRepairOrphansManager(BaseManager, ComponentManagerMixin):
                 stats["failed"] += 1
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[Orphans] {prefix}Untracked import for '{instance}': "
-            f"{stats['checked']} checked | {stats['triggered']} triggered | "
-            f"{stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["checked",   stats["checked"]],
+                ["triggered", stats["triggered"]],
+                ["failed",    stats["failed"]],
+            ],
+            title=f"[Orphans] {prefix}Untracked import - '{instance}'",
+            caption="Import scans triggered for on-disk movie folders Radarr has not yet imported.",
+            descriptions=[
+                "untracked folders examined this pass",
+                "folders a DownloadedMoviesScan was triggered for",
+                "folders whose import scan call errored",
+            ],
         )
         return stats
 

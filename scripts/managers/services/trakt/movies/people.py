@@ -372,10 +372,22 @@ class TraktMoviePeopleManager(BaseManager, ComponentManagerMixin):
                 else:
                     enriched.append(movie)
                     missing += 1
-            self.logger.log_info(
-                f"[TraktPeople] enrich_movies (cache_only): total={len(enriched)}, "
-                f"attached={attached}, missing={missing}, no_tmdb_id={no_id} "
-                f"- live fetching delegated to the enrichment daemon."
+            self.logger.log_table(
+                ["Outcome", "Count"],
+                [
+                    ["total",       len(enriched)],
+                    ["attached",    attached],
+                    ["missing",     missing],
+                    ["no_tmdb_id",  no_id],
+                ],
+                title="[TraktPeople] enrich_movies (cache_only, daemon owns live fetching)",
+                caption="Cache-only enrichment pass attaching credits from disk only, no live Trakt calls.",
+                descriptions=[
+                    "movies processed this pass",
+                    "movies that got credits from the disk cache",
+                    "movies with no cached credits, left unenriched",
+                    "movies skipped because they have no tmdbId",
+                ],
             )
             return enriched
 
@@ -475,13 +487,31 @@ class TraktMoviePeopleManager(BaseManager, ComponentManagerMixin):
 
             enriched.append(movie)
 
-        self.logger.log_info(
-            f"[TraktPeople] enrich_movies: total={len(enriched)}, "
-            f"priority={len(priority_ids)} ({len(watched_ids)} trakt + {len(watched_norm)} tautulli titles), "
-            f"fetched={fetched}, cache_hit={cache_hit}, deferred={deferred} | "
-            f"watched {p_start}\u2192{p_end}/{len(uncached_priority)} | "
-            f"owned {owned_done}/{owned_total} (rel) | "
-            f"unowned {u_start}\u2192{u_end}/{len(sorted_unowned)} | "
-            f"no_tmdb_id={no_tmdb_id}"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["total",       len(enriched)],
+                ["priority",    len(priority_ids)],
+                ["fetched",     fetched],
+                ["cache_hit",   cache_hit],
+                ["deferred",    deferred],
+                ["watched",     f"{p_start}->{p_end}/{len(uncached_priority)}"],
+                ["owned",       f"{owned_done}/{owned_total}"],
+                ["unowned",     f"{u_start}->{u_end}/{len(sorted_unowned)}"],
+                ["no_tmdb_id",  no_tmdb_id],
+            ],
+            title="[TraktPeople] enrich_movies",
+            caption="Per-run credit enrichment outcomes plus the watched/owned/unowned cursor progress.",
+            descriptions=[
+                "movies processed this pass",
+                "watched movies prioritized (trakt ids plus tautulli titles)",
+                "movies credits were live-fetched from Trakt for",
+                "movies credits came from the disk cache for",
+                "movies deferred to a later run by the cursor budget",
+                "uncached watched cursor window start to end over total",
+                "owned relevance cursor done count over total this cycle",
+                "unowned cursor window start to end over total",
+                "movies skipped because they have no tmdbId",
+            ],
         )
         return enriched
