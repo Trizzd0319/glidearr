@@ -486,6 +486,18 @@ class Main(BaseManager, ComponentManagerMixin):
             summary.add_error(f"Routing: {e}")
             self.logger.log_error(f"[Main] routing re-organizer failed: {e}")
 
+        # Dual-version reconcile: mirror standard-instance movies that were upgraded to a 2160p
+        # file onto the dedicated 4K instance (so the premium copy lives where it belongs). Inert
+        # unless routing.configured + movies.4k_policy=='both' + a distinct 4K instance; log_only
+        # just LOGS candidates, same_instance actuates the mirror adds, dry_run never POSTs.
+        try:
+            from scripts.managers.services.routing.uhd_reconcile import UhdReconcileManager
+            UhdReconcileManager(config=self.config, logger=self.logger,
+                                radarr=getattr(self, "radarr", None), dry_run=self.dry_run).run()
+        except Exception as e:
+            summary.add_error(f"UHD reconcile: {e}")
+            self.logger.log_error(f"[Main] uhd reconcile failed: {e}")
+
         # ── Phase 3: acquisition / write-back / calendar (opt-in; gated) ───
         # Each capability is a no-op unless its config flag is enabled and never
         # writes under dry_run, so with defaults this phase changes nothing.
