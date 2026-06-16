@@ -32,6 +32,7 @@ from scripts.managers.machine_learning.likelihood.watch_likelihood import (
 )
 from scripts.managers.machine_learning.sizing.size_model import estimate_gb_for_profile
 from scripts.managers.machine_learning.space.downgrade_planner import step_targets
+from scripts.managers.machine_learning.space.dual_version import hd_capped_likelihood
 
 
 def universe_action(free_space_gb, downgrade_threshold, upgrade_threshold) -> "str | None":
@@ -60,6 +61,9 @@ def upgrade_target(ranked_profiles, current_profile_id, likelihood, config, *, m
     # upgrade onto a normal profile and silently strip the dub. Off (no english ladder
     # configured / current not English) → identical to before.
     english     = int(current_profile_id) in english_ladder_ids(config)
+    # proactive_4k single-authority cap: when actuating, never bump the standard instance to 4K
+    # here — the 4K copy is acquired on the dedicated 4K instance by the reconcile. No-op otherwise.
+    L           = hd_capped_likelihood(L, ranked_profiles, config, english=english)
     target_id   = profile_id_for_likelihood(L, config=config, english=english)
     target_rank = ladder_rank(target_id, config=config, english=english)
     cur_rank    = ladder_rank(current_profile_id, config=config, english=english)

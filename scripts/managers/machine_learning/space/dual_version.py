@@ -115,3 +115,45 @@ def plan_hd_baseline(*, tmdb, title, routing, hd_profiles, hd_instance, hd_root,
     return ({"tmdb": tmdb, "title": title, "instance": hd_instance,
              "root_folder": hd_root, "profile": profile},
             f"queue 1080p baseline ({profile.get('name', '?')})")
+
+
+def hd_capped_likelihood(likelihood, ranked_profiles, config, *, english: bool = False):
+    """Cap a watch-likelihood just BELOW the lowest 4K (>1080) rung of the Radarr quality ladder so
+    the SAME-INSTANCE upgrade brain targets a ≤1080 profile instead of bumping the standard instance
+    to 4K — the 4K copy is acquired on the dedicated 4K instance by the reconcile (single authority,
+    no double-grab). Active ONLY when proactive_4k is actuating (``proactive_4k_enabled``); otherwise
+    returns the likelihood unchanged, so the existing same-instance 4K upgrades are byte-for-byte
+    untouched. Also a no-op when the ladder has no 4K rung among the present profiles."""
+    from scripts.managers.machine_learning.space.routing_targets import proactive_4k_enabled
+    if not proactive_4k_enabled(config):
+        return likelihood
+    try:
+        from scripts.managers.machine_learning.likelihood.watch_likelihood import (
+            radarr_ladder, radarr_ladder_english,
+        )
+        ladder = radarr_ladder_english(config) if english else radarr_ladder(config)
+    except Exception:
+        return likelihood
+    by_id = {p.get("id"): p for p in (ranked_profiles or [])}
+    first_4k_thresh = None
+    for entry in (ladder or []):                          # ascending by threshold
+        try:
+            thresh, pid = entry[0], int(entry[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        prof = by_id.get(pid)
+        if prof is None:
+            continue
+        try:
+            res, _ = profile_max_quality(prof)
+        except Exception:
+            continue
+        if res is not None and int(res) > HD_MAX_RES:     # > 1080 → a 4K/UHD rung
+            first_4k_thresh = thresh
+            break
+    if first_4k_thresh is None:
+        return likelihood
+    try:
+        return min(float(likelihood), float(first_4k_thresh) - 1.0)
+    except (TypeError, ValueError):
+        return likelihood

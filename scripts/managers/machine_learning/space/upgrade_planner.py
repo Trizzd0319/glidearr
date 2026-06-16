@@ -37,6 +37,7 @@ from scripts.managers.machine_learning.likelihood.watch_likelihood import (
     watch_likelihood,
 )
 from scripts.managers.machine_learning.sizing.size_model import estimate_gb_for_profile
+from scripts.managers.machine_learning.space.dual_version import hd_capped_likelihood
 
 # Kids certifications excluded from active-watcher upgrades (G/PG-tier).
 KIDS_CERTS = {"g", "pg", "tv-g", "tv-y", "tv-y7"}
@@ -109,6 +110,9 @@ def plan_movie_upgrades(
         # (actively-watched-once → high-1080; rewatched / high-affinity → 4K).
         # Only UPGRADE (target rank > current); never downgrade here.
         likelihood  = watch_likelihood(df.loc[idx], config=config)
+        # proactive_4k single-authority cap: when actuating, never bump the standard instance to 4K
+        # here — the 4K copy is acquired on the dedicated 4K instance by the reconcile.
+        likelihood  = hd_capped_likelihood(likelihood, ranked_profiles, config)
         target_pid  = profile_id_for_likelihood(likelihood, config=config)
         target_rank = ladder_rank(target_pid, config=config)
         cur_rank    = ladder_rank(int(cur_qp_id), config=config) if pd.notna(cur_qp_id) else -1

@@ -3,8 +3,11 @@ below 4K — 1080p OR 720p whichever the shared ladder justifies), and 4K is the
 only when space + keep/watchability warrant it, dropped FIRST under pressure)."""
 from __future__ import annotations
 
+import pytest
+
 from scripts.managers.machine_learning.space.dual_version import (
-    hd_target_resolution, pick_hd_profile, wants_uhd, should_drop_uhd, plan_hd_baseline,
+    hd_capped_likelihood, hd_target_resolution, pick_hd_profile, wants_uhd, should_drop_uhd,
+    plan_hd_baseline,
 )
 
 
@@ -14,6 +17,40 @@ def _profile(name, res):
 
 _PROFILES = [_profile("SD", 480), _profile("HD-720", 720), _profile("HD-1080", 1080), _profile("UHD", 2160)]
 _BOTH = {"movies": {"4k_policy": "both"}}
+
+
+# Ladder-id profiles (the cap matches Radarr ladder profile ids, not resolutions): default ladder
+# rung 8 = 1080p (likelihood 55), rung 9 = 2160p/4K (likelihood 70).
+def _lprofile(pid, res):
+    return {"id": pid, "name": f"p{pid}", "items": [{"allowed": True, "quality": {"resolution": res}}]}
+
+
+_LADDER_PROFS = [_lprofile(8, 1080), _lprofile(9, 2160)]
+
+
+@pytest.fixture
+def _proactive_cfg(monkeypatch):
+    for v in ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT"):
+        monkeypatch.delenv(v, raising=False)
+    return {"routing": {"reorg_mode": "same_instance", "movies": {"proactive_4k": True, "4k_policy": "both"}},
+            "relocation_consent": True}
+
+
+# ── hd_capped_likelihood (the single-authority upgrade cap) ───────────────────
+def test_hd_cap_noop_when_proactive_off():
+    assert hd_capped_likelihood(90, _LADDER_PROFS, {}) == 90        # default off → byte-for-byte unchanged
+
+
+def test_hd_cap_lowers_below_first_present_4k_rung(_proactive_cfg):
+    assert hd_capped_likelihood(90, _LADDER_PROFS, _proactive_cfg) == 69.0   # first 4K rung at 70 → 69
+
+
+def test_hd_cap_leaves_already_low_likelihood(_proactive_cfg):
+    assert hd_capped_likelihood(50, _LADDER_PROFS, _proactive_cfg) == 50
+
+
+def test_hd_cap_noop_when_no_4k_profile_present(_proactive_cfg):
+    assert hd_capped_likelihood(90, [_lprofile(8, 1080)], _proactive_cfg) == 90   # no 4K rung → unchanged
 
 
 # ── adaptive baseline tier (shared ladder, clamped below 4K) ──────────────────
