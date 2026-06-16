@@ -170,3 +170,26 @@ def test_noop_when_not_configured(monkeypatch):
 def test_noop_without_distinct_4k_instance(monkeypatch):
     im = _run(_cfg(with_4k=False), [_M4K], [], monkeypatch=monkeypatch)
     assert im.adds == [] and im.puts == [] and im.commands == []
+
+
+def test_only_scans_hd_tier_sources_not_a_real_4k_library(monkeypatch):
+    # standard = source; "ultra" = a real 4K library (uncategorized) that must be LEFT ALONE;
+    # "testing-ultra" = the configured 4K target. The sweep must not drag ultra's 2160p into it.
+    for v in ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT"):
+        monkeypatch.delenv(v, raising=False)
+    real_ultra_movie = dict(_M4K, id=77, tmdbId=999, title="RealUltra4K")
+    im = _Im({"standard": [_M4K], "ultra": [real_ultra_movie], "testing-ultra": []},
+             profiles={"standard": _STD_PROFILES, "testing-ultra": _UHD_PROFILES},
+             roots={"testing-ultra": [{"path": "/data/media/movies/4k"}]})
+    cfg = {"routing": {"reorg_mode": "same_instance", "movies": {"4k_policy": "both"}, "tv": {},
+                       "configured": True},
+           "movieRootFolders": {"standard": "/data/media/movies/standard", "4k": "/data/media/movies/4k"},
+           "radarr_instances": {"standard": {"url": "s"}, "ultra": {"url": "u"},
+                                "testing-ultra": {"url": "t"}, "default_instance": "standard"},
+           "radarr_instances_categorized": {"720p": "standard", "1080p": "standard", "4K": "testing-ultra"},
+           "relocation_consent": True}
+    UhdReconcileManager(config=cfg, logger=None, radarr=_Mgr(im), dry_run=False).run()
+    adds_to_target = [a for a in im.adds if a[0] == "testing-ultra"]
+    assert any(a[1].get("tmdbId") == 862 for a in adds_to_target)        # standard's title moved in
+    assert not any(a[1].get("tmdbId") == 999 for a in adds_to_target)    # real ultra library untouched
+    assert not any(p[0] == "ultra" for p in im.puts)                     # ultra never written to

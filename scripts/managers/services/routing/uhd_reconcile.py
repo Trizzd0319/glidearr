@@ -102,10 +102,24 @@ class UhdReconcileManager:
         hasfile = {m.get("tmdbId") for m in ultra
                    if isinstance(m, dict) and m.get("tmdbId") is not None and m.get("hasFile")}
 
-        for name in list((im._get_apis() or {}).keys()):
-            if name == fourk:
-                continue                                    # don't scan the 4K instance itself
+        for name in self._source_instances(gw, fourk):
             self._reconcile_instance(gw, mover, name, fourk, dest_root, dest_pid, present, hasfile)
+
+    def _source_instances(self, gw, fourk) -> list:
+        """The HD/standard-tier instances to scan as MOVE SOURCES — where the 1080p baseline lives.
+        ONLY the categorized 720p/1080p instances plus the default; NEVER the 4K instance itself
+        and NEVER an uncategorized or other-4K-tier instance. This is the guard that stops the sweep
+        from dragging a *real* 4K library (an instance that legitimately holds 2160p) into the move
+        just because it isn't the configured 4K target."""
+        names: list = []
+        for label in ("1080p", "720p"):
+            inst = gw.categorized_instance(label)
+            if inst and inst != fourk and inst not in names:
+                names.append(inst)
+        default = gw.default_instance()
+        if default and default != fourk and default not in names:
+            names.append(default)
+        return names
 
     # ── per standard instance ──────────────────────────────────────────────────
     def _reconcile_instance(self, gw, mover, std_inst, fourk, dest_root, dest_pid, present, hasfile):
