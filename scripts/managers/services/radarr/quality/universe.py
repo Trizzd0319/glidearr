@@ -45,6 +45,7 @@ import pandas as pd
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
+from scripts.managers.machine_learning.classification.keep_policy import FRANCHISE_HINTS
 from scripts.managers.machine_learning.ledger.decision_ledger import stamp_universe_plan
 from scripts.managers.machine_learning.space.universe_quality import (
     downgrade_single_rank,
@@ -316,7 +317,25 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                 + ", ".join(f"'{tag_label_map[tid]}' (id={tid})" for tid in uni_tag_ids)
             )
 
-        # ── Live movies with universe tags ────────────────────────────────────
+        # ── Per-universe summary (ONE table) ──────────────────────────────────
+        # Pending quality-action marks (upgrade/downgrade) live only in the Parquet; owned /
+        # missing / cutoff-unmet live only in the live Radarr payload. Load the Parquet's marks
+        # up front keyed by movie_id, so the single live-anchored table below can fold them in
+        # by an EXACT id-join (no fragile universe-label matching). The Parquet stores OWNED
+        # movies only, so it can't report Missing/CutoffUnmet — hence the live anchor.
+        mfm = self._get_movie_files_manager()
+        _qa_by_id: dict[int, str] = {}
+        if mfm:
+            df = mfm.load(instance)
+            if not df.empty and "keep_policy" in df.columns:
+                parquet_uni = df[df["keep_policy"] == "universe"]
+                report["movies_in_parquet"] = len(parquet_uni)
+                if "quality_action" in df.columns and "movie_id" in df.columns:
+                    for _, row in df[df["quality_action"].notna()].iterrows():
+                        _mid = row.get("movie_id")
+                        if pd.notna(_mid):
+                            _qa_by_id[int(_mid)] = str(row.get("quality_action") or "").lower()
+
         if uni_tag_ids:
             all_movies = []
             if self.global_cache:
@@ -325,55 +344,82 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                 all_movies = self.radarr_api._make_request(instance, "movie", fallback=[]) or []
 
             tagged = [
-                {"id": m.get("id"), "title": m.get("title"), "tags": m.get("tags", [])}
+                {"id": m.get("id"), "title": m.get("title"), "tags": m.get("tags", []),
+                 "has_file": bool(m.get("hasFile")), "size": int(m.get("sizeOnDisk") or 0),
+                 # TMDB collection name (e.g. 'The Conjuring Collection') — used to auto-split a
+                 # bare-'universe' movie into its franchise when no explicit tag/hint is present.
+                 "collection": ((m.get("collection") or {}).get("name") or ""),
+                 # cutoff-unmet = an owned movie whose file is still below the profile cutoff
+                 # (upgrade-eligible). Radarr exposes qualityCutoffNotMet on the movieFile
+                 # sub-object (NOT the top-level movie) — same path find_cutoff_not_met reads.
+                 "cutoff_unmet": bool((m.get("movieFile") or {}).get("qualityCutoffNotMet", False))}
                 for m in all_movies
                 if any(tid in uni_tag_ids for tid in (m.get("tags") or []))
             ]
             report["movies_tagged_in_radarr"] = len(tagged)
-            self.logger.log_info(
-                f"[Universe] {len(tagged)} movie(s) tagged with keep-universe* in Radarr "
-                f"(grouped by universe, then title):"
-            )
 
-            def _uni_name(tag_ids):
-                # Most specific universe label: 'keep-universe-mcu' -> 'mcu'; a bare
-                # 'keep-universe'/'universe' (no -suffix) -> 'universe' (the ungrouped general
-                # bucket). Add granular 'keep-universe-<name>' tags in Radarr to split franchises.
-                for tid in tag_ids:
-                    lbl = tag_label_map.get(tid, "").lower()
+            def _uni_name(tag_ids, collection):
+                # Universe label for the audit view (display-only; does NOT change keep behavior):
+                #   1. explicit suffix:  'keep-universe-mcu' -> 'mcu'
+                #   2. a short FRANCHISE_HINT tag ('mcu','dc','startrek',…) next to a bare
+                #      'universe' tag -> that hint (the LESS AWKWARD split — no per-franchise tag).
+                #      1+2 mirror classification.keep_policy, so they match the Parquet universe_name.
+                #   3. else the movie's TMDB collection ('The Conjuring Collection' -> 'Conjuring')
+                #      so franchises break out with ZERO tagging — automatic, but per-sub-franchise
+                #   4. else the ungrouped 'universe' bucket
+                labels = {(tag_label_map.get(tid) or "").lower() for tid in tag_ids}
+                for lbl in labels:
                     if lbl.startswith("keep-universe-"):
                         return lbl[len("keep-universe-"):]
-                return "universe"
+                hints = sorted(labels & FRANCHISE_HINTS)
+                if hints:
+                    return "|".join(hints)
+                c = (collection or "").strip()
+                if c.lower().endswith(" collection"):
+                    c = c[: -len(" collection")].strip()
+                return c or "universe"
 
-            _uni_rows = sorted(
-                ([_uni_name([tid for tid in t["tags"] if tid in uni_tag_ids]),
-                  str(t["title"] or "")] for t in tagged),
-                key=lambda r: (r[0], r[1].lower()),   # group by universe, then title-alpha
+            # ONE row per universe: total tagged, owned vs. still missing, owned-but-below-cutoff
+            # (upgrade-eligible), how many are MARKED for a space-driven upgrade / downgrade
+            # (folded in from the Parquet by movie_id), and the universe's footprint on disk.
+            # Collapses the former 300+ row per-title dump AND the second Parquet table into one.
+            _uni_agg: dict[str, dict] = {}
+            for t in tagged:
+                # full tag list (hint tags aren't in uni_tag_ids) + TMDB collection fallback
+                uni = _uni_name(t["tags"], t["collection"])
+                a = _uni_agg.setdefault(
+                    uni, {"total": 0, "owned": 0, "cutoff": 0, "upg": 0, "dng": 0, "size": 0}
+                )
+                a["total"]  += 1
+                a["owned"]  += 1 if t["has_file"] else 0
+                a["cutoff"] += 1 if t["cutoff_unmet"] else 0
+                _qa = _qa_by_id.get(int(t["id"])) if t["id"] is not None else None
+                if _qa == "upgrade":
+                    a["upg"] += 1
+                elif _qa == "downgrade":
+                    a["dng"] += 1
+                a["size"]   += t["size"]
+            self.logger.log_info(
+                f"[Universe] {len(tagged)} movie(s) tagged with keep-universe* in Radarr "
+                f"across {len(_uni_agg)} universe(s):"
             )
-            self.logger.log_grid(["Universe", "Movie"], _uni_rows, cap=28)
 
-        # ── Parquet universe rows ────────────────────────────────────────────────
-        mfm = self._get_movie_files_manager()
-        if mfm:
-            df = mfm.load(instance)
-            if not df.empty and "keep_policy" in df.columns:
-                parquet_uni = df[df["keep_policy"] == "universe"]
-                report["movies_in_parquet"] = len(parquet_uni)
-                self.logger.log_info(
-                    f"[Universe] Parquet has {len(parquet_uni)} row(s) with keep_policy='universe' "
-                    f"(grouped by universe, then title):"
-                )
-                _pq_rows = sorted(
-                    ([str(row.get("universe_name") or "universe"),
-                      str(row.get("title") or ""),
-                      str(row.get("quality_action") or "-"),
-                      str(row.get("quality_profile_name") or "-")]
-                     for _, row in parquet_uni.iterrows()),
-                    key=lambda r: (r[0], r[1].lower()),   # group by universe, then title-alpha
-                )
-                self.logger.log_grid(
-                    ["Universe", "Movie", "Action", "Profile"], _pq_rows, cap=24,
-                )
+            def _uni_row(label, a):
+                return [label, str(a["total"]), str(a["owned"]), str(a["total"] - a["owned"]),
+                        str(a["cutoff"]), str(a["upg"]), str(a["dng"]), f"{a['size'] / 1e9:.0f}"]
+
+            # biggest universes first (collection auto-grouping can produce many rows), ties alpha
+            _uni_rows = [_uni_row(uni, a) for uni, a in
+                         sorted(_uni_agg.items(), key=lambda kv: (-kv[1]["total"], kv[0].lower()))]
+            if len(_uni_agg) > 1:   # totals row only earns its place once there's >1 universe
+                _tot = {k: sum(a[k] for a in _uni_agg.values())
+                        for k in ("total", "owned", "cutoff", "upg", "dng", "size")}
+                _uni_rows.append(_uni_row("TOTAL", _tot))
+            self.logger.log_grid(
+                ["Universe", "Movies", "Owned", "Missing", "CutoffUnmet",
+                 "Upgrade", "Downgrade", "Size GB"],
+                _uni_rows, cap=28,
+            )
 
         # ── Mismatch analysis ─────────────────────────────────────────────────
         if report["movies_in_parquet"] == 0 and report["movies_tagged_in_radarr"] == 0:

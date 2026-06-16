@@ -16,11 +16,19 @@ episode resolvers — candidates for a later micro-slice.)
 from __future__ import annotations
 
 # Known franchise hint tags used to label a bare-"universe" movie when no explicit
-# keep-universe-<name> suffix is present.
+# keep-universe-<name> suffix is present. A movie tagged bare "universe" + one of these short
+# tags (e.g. "universe" + "conjuring") groups under that hint — the LESS AWKWARD alternative to
+# a per-franchise "keep-universe-<name>" tag. Hints only activate when the operator applies the
+# tag; an unused hint changes nothing. Use "startrek"/"starwars" rather than the ambiguous
+# legacy "star". Add the canonical short token for any franchise you tag.
 FRANCHISE_HINTS = {
-    "mcu", "xmen", "dc", "star", "transformers", "fast",
+    "mcu", "xmen", "dc", "star", "startrek", "starwars", "transformers", "fast",
     "godzilla", "jurassic", "matrix", "alien", "predator",
     "terminator", "indiana", "rocky", "rambo", "mission",
+    # extended set — franchises common in larger libraries
+    "conjuring", "demonslayer", "dragonball", "potter", "mummy", "scorpion",
+    "creed", "blade", "ghostrider", "fantasticfour", "taylorswift", "viewaskew",
+    "spiderman", "venom", "hellraiser", "saw", "purge", "johnwick",
 }
 
 # Movie keep-tag label sets (Radarr uses hyphens). Shared by build_keep_policy_map
