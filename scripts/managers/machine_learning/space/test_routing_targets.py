@@ -116,3 +116,8 @@ def test_proactive_4k_false_without_both_policy():
 def test_proactive_4k_false_without_actuation_gate():
     assert proactive_4k_enabled(_proactive_cfg(consent=False)) is False        # needs relocation consent
     assert proactive_4k_enabled(_proactive_cfg(reorg="log_only")) is False     # needs same_instance
+
+
+def test_proactive_4k_handles_malformed_config():
+    assert proactive_4k_enabled({"routing": "oops"}) is False                  # routing not a dict
+    assert proactive_4k_enabled({"routing": {"movies": "oops"}}) is False      # movies not a dict

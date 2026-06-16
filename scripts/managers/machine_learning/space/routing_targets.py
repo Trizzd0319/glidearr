@@ -91,7 +91,9 @@ def proactive_4k_enabled(config) -> bool:
     acquire MUST move together, so the standard 4K upgrade is never disabled without the 4K-instance
     replacement actually being actuated. Default OFF (existing installs unchanged)."""
     routing = _cfg_get(config, "routing", None) or {}
+    if not isinstance(routing, dict):
+        return False
     mv = routing.get("movies", {}) or {}
-    if not mv.get("proactive_4k") or mv.get("4k_policy") != "both":
+    if not isinstance(mv, dict) or not mv.get("proactive_4k") or mv.get("4k_policy") != "both":
         return False
     return relocation_enabled(config)
