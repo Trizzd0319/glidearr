@@ -5,10 +5,13 @@ fingerprint, the graded-fallback predictor, and the bounded explore/exploit tier
 decision. All pure — synthetic history rows, no I/O."""
 from __future__ import annotations
 
+import json
+
 from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint import (
     _norm_video, _norm_audio, _norm_subtitle, _norm_res_hdr, _norm_location,
     row_fingerprint, source_fingerprint,
     transcode_fingerprint_matrix, per_user_transcode_fingerprint_matrix,
+    serialize_fingerprint_matrix, deserialize_fingerprint_matrix,
     predict_transcode, choose_tier,
 )
 
@@ -65,6 +68,40 @@ def test_per_user_matrix_groups_by_user():
     assert set(pum) == {"alice", "bob"}
     assert sum(b["transcode"] for b in pum["alice"].values()) == 1
     assert sum(b["direct"] for b in pum["bob"].values()) == 1
+
+
+# ── JSON round-trip (cache serialization) ─────────────────────────────────────
+def test_serialize_deserialize_round_trip_is_identity():
+    hist = [_row(decision="transcode", date=10), _row(decision="direct play", date=20),
+            _row(platform="PS5", vc="h264", res="1080", decision="direct play")]
+    matrix = transcode_fingerprint_matrix(hist)
+    records = serialize_fingerprint_matrix(matrix)
+    # The serialized form survives a real JSON dump/load (the cache layer's transport)…
+    revived = deserialize_fingerprint_matrix(json.loads(json.dumps(records)))
+    assert revived == matrix                                   # …and rebuilds the exact matrix
+    # the predictor reads the revived matrix identically to the original
+    assert predict_transcode(matrix, ("hevc", "eac3", "none", "2160p_sdr", "lan"), {"Chromecast": 1}) == \
+           predict_transcode(revived, ("hevc", "eac3", "none", "2160p_sdr", "lan"), {"Chromecast": 1})
+
+
+def test_serialize_empty_matrix():
+    assert serialize_fingerprint_matrix({}) == []
+    assert serialize_fingerprint_matrix(None) == []
+    assert deserialize_fingerprint_matrix([]) == {}
+    assert deserialize_fingerprint_matrix(None) == {}
+
+
+def test_deserialize_skips_malformed_records():
+    records = [
+        {"device": "PS5", "fingerprint": ["h264", "ac3", "none", "1080p_sdr", "lan"],
+         "direct": 4, "transcode": 0, "last_seen": 5, "n": 4},
+        "not-a-dict",                                          # skipped
+        {"fingerprint": ["x"]},                                # missing device → skipped
+        {"device": "TV", "fingerprint": "oops"},               # fingerprint not a list → skipped
+    ]
+    out = deserialize_fingerprint_matrix(records)
+    assert list(out) == [("PS5", ("h264", "ac3", "none", "1080p_sdr", "lan"))]
+    assert out[("PS5", ("h264", "ac3", "none", "1080p_sdr", "lan"))]["direct"] == 4
 
 
 # ── source fingerprint (candidate file) ───────────────────────────────────────

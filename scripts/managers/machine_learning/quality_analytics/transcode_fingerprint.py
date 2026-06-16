@@ -158,6 +158,50 @@ def per_user_transcode_fingerprint_matrix(history_entries: list) -> dict:
     return {u: transcode_fingerprint_matrix(rows) for u, rows in by_user.items()}
 
 
+# ── JSON round-trip (the matrix is tuple-keyed; the cache is JSON) ─────────────
+# The cache layer's make_json_safe stringifies dict keys with str(k) — IRREVERSIBLY for
+# a (device, fingerprint) tuple key (it becomes a Python-repr string with no inverse). So
+# the matrix can't be cached as-is and read back; it must be flattened to a record list
+# that round-trips EXACTLY. serialize/deserialize are inverses (verified by unit test) and
+# are the single source of truth for the on-disk shape.
+
+def serialize_fingerprint_matrix(matrix) -> list:
+    """Flatten ``{(device, fingerprint): bucket}`` to a JSON-safe list of records
+    ``[{device, fingerprint: [v,a,sub,res,loc], direct, transcode, last_seen, n}, ...]``."""
+    out = []
+    for (device, fp), bucket in (matrix or {}).items():
+        out.append({
+            "device": device,
+            "fingerprint": list(fp),
+            "direct": _int(bucket.get("direct")),
+            "transcode": _int(bucket.get("transcode")),
+            "last_seen": _int(bucket.get("last_seen")),
+            "n": _int(bucket.get("n")),
+        })
+    return out
+
+
+def deserialize_fingerprint_matrix(records) -> dict:
+    """Inverse of :func:`serialize_fingerprint_matrix`: rebuild the tuple-keyed matrix from
+    the cached record list. Tolerant — a malformed record (missing device / non-list
+    fingerprint) is skipped, never raised, so a partially-corrupt cache degrades gracefully."""
+    out: dict = {}
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        device = rec.get("device")
+        fp = rec.get("fingerprint")
+        if device is None or not isinstance(fp, (list, tuple)):
+            continue
+        out[(device, tuple(fp))] = {
+            "direct": _int(rec.get("direct")),
+            "transcode": _int(rec.get("transcode")),
+            "last_seen": _int(rec.get("last_seen")),
+            "n": _int(rec.get("n")),
+        }
+    return out
+
+
 # ── predictor (graded fallback) ───────────────────────────────────────────────
 
 def _aggregate(matrix, predicate) -> tuple:

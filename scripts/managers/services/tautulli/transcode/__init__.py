@@ -3,6 +3,10 @@ from scripts.managers.machine_learning.quality_analytics.transcode import (
     device_codec_matrix,
     transcode_stats,
 )
+from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint import (
+    serialize_fingerprint_matrix,
+    transcode_fingerprint_matrix,
+)
 
 
 class TautulliTranscodeManager(BaseManager):
@@ -29,3 +33,17 @@ class TautulliTranscodeManager(BaseManager):
             f"[TautulliTranscode] device-codec matrix: {len(matrix)} device(s)."
         )
         return matrix
+
+    def get_transcode_fingerprint_matrix(self, history_entries: list) -> list:
+        """Per-device transcode CAPABILITY fingerprint — the (codec, audio, subtitle,
+        res/HDR, location) matrix the Stage-C remote-play gate consumes. Returns the
+        JSON-SAFE record list (serialize_fingerprint_matrix), not the raw tuple-keyed dict,
+        because the cache stringifies tuple keys irreversibly; the consumer rebuilds the
+        matrix with deserialize_fingerprint_matrix. Self-degrades to a codec-only read until
+        the richer history fields are admitted to the projection. COMPUTATION lives in the
+        brain (quality_analytics.transcode_fingerprint); manager keeps FETCH + log."""
+        records = serialize_fingerprint_matrix(transcode_fingerprint_matrix(history_entries))
+        self.logger.log_info(
+            f"[TautulliTranscode] transcode-fingerprint matrix: {len(records)} cell(s)."
+        )
+        return records

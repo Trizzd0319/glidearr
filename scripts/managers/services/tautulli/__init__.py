@@ -223,6 +223,7 @@ class TautulliManager(BaseManager, ComponentManagerMixin):
         transcode_stats  = self.transcode.get_transcode_stats(all_entries)
         platform_stats   = self.devices.get_platform_usage(all_entries)
         device_codec_mtx = self.transcode.get_device_codec_matrix(all_entries)
+        fingerprint_mtx  = self.transcode.get_transcode_fingerprint_matrix(all_entries)
         series_stats     = self.series.get_series_completion_stats(all_entries)
         episode_stats    = self.episodes.get_episode_completion_stats(all_entries)
         # Persist the derived play-statistics signals the scorers consume:
@@ -231,10 +232,14 @@ class TautulliManager(BaseManager, ComponentManagerMixin):
         #   tautulli/platforms — per-platform play counts; same readers.
         #   tautulli/device_codec_matrix — per-device play/transcode matrix, the
         #                        keystone signal for per-device profile selection.
+        #   tautulli/transcode_fingerprint — per-device (codec,audio,sub,res/HDR,location)
+        #                        capability matrix (JSON-safe record list); read by the
+        #                        Stage-C remote-play gate on the 4K bonus copy.
         if self.global_cache:
             self.global_cache.set("tautulli/transcode", transcode_stats)
             self.global_cache.set("tautulli/platforms", platform_stats)
             self.global_cache.set("tautulli/device_codec_matrix", device_codec_mtx)
+            self.global_cache.set("tautulli/transcode_fingerprint", fingerprint_mtx)
 
         # 8. Genre/actor/director affinity — derived from already-cached inputs
         genre_affinity = self.users.compute_genre_affinity(all_entries, metadata_index)
