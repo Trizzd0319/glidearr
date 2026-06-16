@@ -60,13 +60,14 @@ def recency_bonus(candidate: dict, ramp: dict, now) -> float:
 
 def select_for_target(pool: list[dict], need_gb: float, *,
                       recency_ramp: "dict | None" = None, now=None,
-                      tier_size: "float | None" = None) -> "tuple[list[dict], float]":
+                      tier_size: "float | None" = None,
+                      uhd_first: bool = False) -> "tuple[list[dict], float]":
     """Rank the combined movie+episode pool (lowest watchability first, then lowest
     critic, then biggest file first) and greedily accumulate from the bottom until
     projected reclaim reaches ``need_gb``. Returns ``(selected, projected_gb)``.
     Pure — unit-testable without the manager graph.
 
-    Two optional, independently default-off refinements; with BOTH off the sort key is
+    Three optional, independently default-off refinements; with ALL off the sort key is
     the exact ``(score, critic, -size)`` it has always been (byte-identical):
 
       * ``recency_ramp`` enabled AND ``now`` supplied -> the score term gains a recency
@@ -75,7 +76,13 @@ def select_for_target(pool: list[dict], need_gb: float, *,
       * ``tier_size`` truthy -> the score term is coarsened into buckets of that width
         (``floor(score / tier_size)``) so within a watchability tier the BIGGEST file
         goes first — fewer deletions to reclaim ``need_gb`` and a stabler order under
-        small score jitter."""
+        small score jitter.
+      * ``uhd_first`` -> a candidate flagged ``is_uhd_copy`` (a dual-version 4K BONUS copy
+        whose 1080p baseline survives on the standard instance, so deleting it loses NO
+        title — pure reclaim) sorts AHEAD of every whole-title candidate. Within the 4K
+        group the existing ``(score, critic, -size)`` order still applies, so the
+        least-watchable, biggest 4K copies go first and the greedy accumulator stops as
+        soon as the target is met — whole titles are touched only if no 4K reclaim is left."""
     use_recency = bool(recency_ramp and recency_ramp.get("enabled") and now is not None)
     _now = pd.to_datetime(now, utc=True) if use_recency else None
 
@@ -85,12 +92,16 @@ def select_for_target(pool: list[dict], need_gb: float, *,
             s = s + recency_bonus(c, recency_ramp, _now)
         return s
 
+    def _uhd_rank(c):
+        # 0 = a baseline-backed 4K bonus copy → evict first (pure reclaim); 1 = everything else.
+        return 0 if (uhd_first and c.get("is_uhd_copy")) else 1
+
     if tier_size:
         _ts = float(tier_size)
-        key = lambda c: (math.floor(_score_term(c) / _ts),
+        key = lambda c: (_uhd_rank(c), math.floor(_score_term(c) / _ts),
                          critic_sort(c.get("critic")), -float(c.get("size_gb") or 0.0))
     else:
-        key = lambda c: (_score_term(c),
+        key = lambda c: (_uhd_rank(c), _score_term(c),
                          critic_sort(c.get("critic")), -float(c.get("size_gb") or 0.0))
     ordered = sorted(pool, key=key)
     selected: list[dict] = []

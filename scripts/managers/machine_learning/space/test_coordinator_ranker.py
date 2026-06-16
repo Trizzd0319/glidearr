@@ -40,6 +40,41 @@ def test_select_for_target_default_order():
     assert [c["fid"] for c in sel] == ["lo", "mid"] and proj == 4.0
 
 
+# ── uhd_first bias (evict baseline-backed 4K copies before any whole title) ──────
+def _uc(score, size_gb, *, fid=None, uhd=False):
+    return {"score": score, "size_gb": size_gb, "critic": None,
+            "last_watched_at": None, "fid": fid, "is_uhd_copy": uhd}
+
+
+def test_uhd_first_off_is_byte_identical():
+    # is_uhd_copy flags present but uhd_first unset → exact same order as the bare key.
+    pool = [_uc(8, 2, fid="hi", uhd=True), _uc(2, 3, fid="lo"), _uc(5, 1, fid="mid", uhd=True)]
+    base, _ = select_for_target([dict(c) for c in pool], need_gb=4.0)
+    biased_off, _ = select_for_target([dict(c) for c in pool], need_gb=4.0, uhd_first=False)
+    assert [c["fid"] for c in base] == [c["fid"] for c in biased_off]
+
+
+def test_uhd_first_evicts_4k_ahead_of_lower_score_title():
+    # a high-watchability 4K copy (score 95) still goes BEFORE a cold whole title (score 2),
+    # because deleting the 4K copy loses no title (its baseline survives) — pure reclaim.
+    pool = [_uc(95, 5, fid="uhd", uhd=True), _uc(2, 5, fid="cold_title")]
+    sel, _ = select_for_target(pool, need_gb=4.0, uhd_first=True)
+    assert sel[0]["fid"] == "uhd" and sel[0]["is_uhd_copy"] is True
+
+
+def test_uhd_first_within_group_keeps_lowest_watchability_first():
+    pool = [_uc(90, 5, fid="hi_uhd", uhd=True), _uc(10, 5, fid="lo_uhd", uhd=True)]
+    sel, _ = select_for_target(pool, need_gb=4.0, uhd_first=True)
+    assert sel[0]["fid"] == "lo_uhd"                       # lowest-watchability 4K copy goes first
+
+
+def test_uhd_first_ignores_unflagged_4k_only_title():
+    # a 2160p copy with NO surviving baseline is never flagged is_uhd_copy → ranks on score only.
+    pool = [_uc(2, 5, fid="cold_title"), _uc(8, 5, fid="uhd_only", uhd=False)]
+    sel, _ = select_for_target(pool, need_gb=4.0, uhd_first=True)
+    assert sel[0]["fid"] == "cold_title"                  # no evict-first priority without the flag
+
+
 def test_select_for_target_recency_off_is_byte_identical():
     pool = [_c(2, 3, watched=_iso(0), fid="lo"), _c(8, 2, watched=_iso(0), fid="hi")]
     # ramp absent / disabled / now omitted -> identical bare-score order (lo first).
