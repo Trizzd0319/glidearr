@@ -265,6 +265,70 @@ def test_no_proactive_acquire_when_space_tight(monkeypatch):
     assert im.adds == []                                   # space-gated
 
 
+# ── downgrade low-watchability 4K-only titles to a 1080p baseline under pressure ──
+_ORPHAN_4K = {"id": 5, "title": "Orphan", "tmdbId": 777, "monitored": True, "qualityProfileId": 7,
+              "movieFile": {"quality": {"quality": {"resolution": 2160}}},
+              "rootFolderPath": "/data/media/movies/4k"}
+
+
+def _evict_cfg(*, evict=True, reorg="off"):
+    return {"routing": {"configured": True, "reorg_mode": reorg,
+                        "movies": {"4k_policy": "both", "evict_uhd_first": evict}, "tv": {}},
+            "movieRootFolders": {"standard": "/data/media/movies/standard", "4k": "/data/media/movies/4k"},
+            "radarr_instances": {"standard": {"url": "s"}, "ultra": {"url": "u"}, "default_instance": "standard"},
+            "radarr_instances_categorized": {"4K": "ultra"},
+            "space_coordinator_enabled": True, "deletions_consent": True, "free_space_limit": 1000.0}
+
+
+def _downgrade_run(monkeypatch, *, std, ultra, score=5, free=500.0, evict=True):
+    import pandas as pd
+    for v in ("RECOMMENDARR_DELETIONS_CONSENT", "GLIDEARR_DELETIONS_CONSENT",
+              "RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT"):
+        monkeypatch.delenv(v, raising=False)
+    im = _Im({"standard": std, "ultra": ultra},
+             profiles={"standard": _STD_PROFILES, "ultra": _UHD_PROFILES},
+             roots={"ultra": [{"path": "/data/media/movies/4k"}],
+                    "standard": [{"path": "/data/media/movies/standard"}]},
+             free=free, total=10000.0)
+    df = pd.DataFrame([{"tmdb_id": 777, "is_watched": False, "watchability_score": score}])
+    UhdReconcileManager(config=_evict_cfg(evict=evict), logger=None, radarr=_Mgr(im), dry_run=False,
+                        registry=_Reg(_SP(df))).run()
+    return im
+
+
+def test_downgrades_low_watchability_orphan_4k_under_pressure(monkeypatch):
+    im = _downgrade_run(monkeypatch, std=[], ultra=[_ORPHAN_4K], score=5, free=500.0)
+    add = [a for a in im.adds if a[0] == "standard"]
+    assert len(add) == 1                                   # a 1080p baseline grabbed on standard
+    assert add[0][1]["tmdbId"] == 777
+    assert add[0][1]["qualityProfileId"] == 3              # the ≤1080 baseline profile
+    assert add[0][1]["addOptions"] == {"searchForMovie": True}
+    assert add[0][1]["rootFolderPath"] == "/data/media/movies/standard"
+    assert not any(a[0] == "ultra" for a in im.adds)       # the 4K copy is untouched (make-before-break)
+
+
+def test_no_downgrade_when_not_under_pressure(monkeypatch):
+    im = _downgrade_run(monkeypatch, std=[], ultra=[_ORPHAN_4K], score=5, free=9999.0)
+    assert im.adds == []                                   # free above the band → nothing
+
+
+def test_no_downgrade_for_high_watchability_orphan(monkeypatch):
+    im = _downgrade_run(monkeypatch, std=[], ultra=[_ORPHAN_4K], score=95, free=500.0)
+    assert im.adds == []                                   # warrants 4K → kept in 4K
+
+
+def test_no_downgrade_when_baseline_already_present(monkeypatch):
+    # the title already has a record on standard (pending or filed) → no repeat grab
+    on_std = {"id": 1, "title": "Orphan", "tmdbId": 777, "qualityProfileId": 3}
+    im = _downgrade_run(monkeypatch, std=[on_std], ultra=[_ORPHAN_4K], score=5, free=500.0)
+    assert im.adds == []
+
+
+def test_no_downgrade_when_evict_gate_off(monkeypatch):
+    im = _downgrade_run(monkeypatch, std=[], ultra=[_ORPHAN_4K], score=5, free=500.0, evict=False)
+    assert im.adds == []
+
+
 def test_only_scans_hd_tier_sources_not_a_real_4k_library(monkeypatch):
     # standard = source; "ultra" = a real 4K library (uncategorized) that must be LEFT ALONE;
     # "testing-ultra" = the configured 4K target. The sweep must not drag ultra's 2160p into it.

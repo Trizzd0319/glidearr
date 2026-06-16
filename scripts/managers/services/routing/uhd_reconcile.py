@@ -39,6 +39,7 @@ from __future__ import annotations
 
 from scripts.managers.machine_learning.space import dual_version
 from scripts.managers.machine_learning.space.routing_targets import (
+    evict_uhd_first,
     proactive_4k_enabled,
     relocation_consented,
     reorg_mode,
@@ -111,24 +112,33 @@ class UhdReconcileManager:
         if not self._routing.get("configured"):
             return                                          # never-onboarded → nothing
         if (self._routing.get("movies", {}) or {}).get("4k_policy") != "both":
-            return                                          # single-copy policy → nothing to move
+            return                                          # single-copy policy → nothing to do
         mode = reorg_mode(self.config)
-        if mode == "off":
-            return
+        evict = evict_uhd_first(self.config)
+        if mode == "off" and not evict:
+            return                                          # neither path enabled → nothing
         im = self._im
         if im is None or not hasattr(im, "_get_apis") or not hasattr(im, "_make_request"):
             return
         gw = ArrGateway("radarr", im, self.config, self.logger)
         fourk = self._uhd_instance(gw)
         if not fourk:
-            return                                          # no distinct 4K instance → nowhere to move
+            return                                          # no distinct 4K instance → nowhere to route
+        # MOVE / ACQUIRE owned standard-tier titles toward the 4K instance (reorg-gated).
+        if mode != "off":
+            self._run_move_acquire(gw, fourk, mode)
+        # DOWNGRADE low-watchability 4K-ONLY titles to a 1080p baseline on standard under pressure
+        # (evict-gated), so the coordinator can then reclaim their 4K without losing the title.
+        if evict:
+            self._downgrade_orphan_4k(gw, fourk)
+
+    def _run_move_acquire(self, gw, fourk, mode):
         dest_pid, _ = self._top_profile(gw, fourk)
         dest_root = self._mrf.get("4k") or self._first_root(gw, fourk)
         if dest_pid is None or not dest_root:
             self._log("log_warning", f"[UHD] 4K instance '{fourk}' has no quality profile or root "
                                      f"folder configured — skipping cross-instance move.")
             return
-
         # Actuating the MOVE physically relocates files + re-searches, so it needs explicit
         # relocation consent AND the same_instance mode AND a live run. Otherwise the mover runs
         # dry (logs the plan, writes nothing) — log_only / no-consent are safe by default.
@@ -158,6 +168,90 @@ class UhdReconcileManager:
         if default and default != fourk and default not in names:
             names.append(default)
         return names
+
+    # ── downgrade low-watchability 4K-only titles under pressure ──────────────────
+    def _downgrade_orphan_4k(self, gw, fourk):
+        """Under space pressure, for each LOW-watchability 4K-ONLY title on the 4K instance (no copy
+        on any standard-tier instance), grab a ≤1080 baseline on the default standard instance —
+        monitored, search ON. MAKE-BEFORE-BREAK: the 4K stays; the coordinator reclaims it on a later
+        run once the baseline file lands (the title is then baseline-backed). Idempotent — skipped
+        once the title has ANY standard record (pending or filed), so the add never repeats."""
+        std_inst = gw.default_instance()
+        if not std_inst or std_inst == fourk or not self._under_pressure(gw, std_inst):
+            return                                          # no standard tier, or no pressure → skip
+        hd = dual_version.pick_hd_profile(gw.quality_profiles(std_inst) or [], None)
+        hd_pid = hd.get("id") if hd else None
+        std_root = self._mrf.get("standard") or self._first_root(gw, std_inst)
+        if hd_pid is None or not std_root:
+            self._log("log_warning", f"[UHD] standard instance '{std_inst}' has no ≤1080 profile / root "
+                                     f"— cannot downgrade 4K-only titles.")
+            return
+        # Any tmdbId with a record on a standard-tier instance already has (or is grabbing) a baseline.
+        present = set()
+        for name in self._source_instances(gw, fourk):
+            for m in (gw.library_items(name) or []):
+                if m.get("tmdbId") is not None:
+                    present.add(m.get("tmdbId"))
+        threshold = int((self._routing.get("movies", {}) or {}).get("4k_dual_min_score")
+                        or dual_version.DEFAULT_UHD_SCORE)
+        likelihoods = self._likelihood_map(fourk)
+        downgraded = 0
+        for mv in (gw.library_items(fourk) or []):
+            tmdb = mv.get("tmdbId")
+            if tmdb is None or tmdb in present:
+                continue                                    # has a baseline (or one pending) → skip
+            lk = likelihoods.get(tmdb)
+            if lk is None or lk >= threshold:
+                continue                                    # warrants 4K (or unscored) → keep in 4K
+            if self.dry_run:
+                self._log("log_info", f"[UHD] would downgrade 4K-only '{mv.get('title')}' (watch {lk:.0f})"
+                                      f" → 1080p baseline on {std_inst}; 4K reclaimed once it lands.")
+                downgraded += 1
+            elif self._grab_baseline(gw, std_inst, mv, hd_pid, std_root):
+                downgraded += 1
+                self._log("log_info", f"[UHD] downgrading 4K-only '{mv.get('title')}' (watch {lk:.0f}) →"
+                                      f" 1080p baseline searching on {std_inst}; 4K reclaimed once it lands.")
+        if downgraded:
+            self._log("log_info", f"[UHD] {downgraded} low-watchability 4K-only title(s) downgrading to a "
+                                  f"1080p baseline (make-before-break; 4K reclaimed by the coordinator next run).")
+
+    def _under_pressure(self, gw, inst) -> bool:
+        """True when the shared mount is in the pressure band (free < U). FAIL-OPEN: an unreadable
+        disk returns False, so no speculative downgrade happens when free space is unknown."""
+        im = getattr(gw, "im", None)
+        if im is None:
+            return False
+        try:
+            free = float(im.disk_free_gb(inst))
+        except Exception:
+            return False
+        try:
+            total = im.disk_total_gb(inst)
+        except Exception:
+            total = None
+        try:
+            _, U = space_targets(self.config, total_gb=total)
+        except Exception:
+            return False
+        return free < U
+
+    @staticmethod
+    def _grab_baseline(gw, std_inst, src_movie, hd_pid, std_root) -> bool:
+        """Add a fresh ≤1080 baseline of a 4K-only title to the standard instance (monitored, search
+        ON). Clones the 4K movie object; strips its identity/path so the standard root wins. The 4K
+        copy is untouched (make-before-break). Returns ok."""
+        payload = dict(src_movie)
+        for k in ("id", "movieFile", "movieFileId", "path", "folderName"):
+            payload.pop(k, None)
+        payload["qualityProfileId"] = hd_pid
+        payload["rootFolderPath"] = std_root
+        payload["monitored"] = True
+        payload.setdefault("minimumAvailability", "released")
+        payload["addOptions"] = {"searchForMovie": True}
+        try:
+            return bool(gw.add(std_inst, payload))
+        except Exception:
+            return False
 
     # ── per standard instance ──────────────────────────────────────────────────
     def _reconcile_instance(self, gw, mover, std_inst, fourk, dest_root, dest_pid, present, hasfile):
