@@ -743,6 +743,10 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
 
             movie_id   = int(movie_id)
             current_qp = int(current_qp)
+            _cur_profile = str(
+                (df.at[idx, "quality_profile_name"] if "quality_profile_name" in df.columns else None)
+                or "-"
+            )
 
             # Watch-likelihood gates the upgrade tier: 4K only for rewatched
             # content; untouched titles (even keep-universe) are capped below 4K.
@@ -770,7 +774,8 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                 _rows.append([
                     str(title)[:24],
                     "hold",
-                    f"{_cur_label}->{_cur_label}" if _cur_label != "-" else "-",
+                    _cur_label,        # quality — shown ONCE for a hold (no X->X repeat)
+                    _cur_profile,      # profile — unchanged, so shown once
                 ])
                 changed = True
                 continue
@@ -788,8 +793,9 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                 None, self._profile_max_resolution(target_profile)
             )
             _from_to = f"{_cur_label}->{_tgt_label}" if (_cur_label != "-" or _tgt_label != "-") else "-"
+            _profile_from_to = f"{_cur_profile}->{target_name}"   # profile changes on up/downgrade
             if self.dry_run:
-                _rows.append([str(title)[:24], str(action), _from_to])
+                _rows.append([str(title)[:24], str(action), _from_to, _profile_from_to])
                 # Ledger-only stamp. CRUCIAL: do NOT write quality_profile_id here —
                 # persisting the speculative target would make the next REAL run think
                 # the movie is already at that profile and SKIP the actual grab. We also
@@ -819,7 +825,7 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                     method="PUT",
                     payload=movie_payload,
                 )
-                _rows.append([str(title)[:24], str(action), _from_to])
+                _rows.append([str(title)[:24], str(action), _from_to, _profile_from_to])
                 df.at[idx, "quality_profile_id"]   = target_id
                 df.at[idx, "quality_profile_name"] = target_name
                 df.at[idx, "quality_action"]       = None
@@ -843,10 +849,10 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
         _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
         if _rs is not None:
             _rs.add_rows("radarr", "Universe quality actions", instance,
-                         ["Title", "Action", "From->To"], _rows, order=20)
+                         ["Title", "Action", "From->To", "Profile"], _rows, order=20)
         else:
             self.logger.log_grid(
-                ["Title", "Action", "From->To"],
+                ["Title", "Action", "From->To", "Profile"],
                 _rows,
                 title="Radarr universe quality actions" + (" [dry_run]" if self.dry_run else ""),
                 cap=32,

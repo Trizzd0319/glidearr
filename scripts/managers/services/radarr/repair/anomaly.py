@@ -1178,19 +1178,22 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         tag_label_map      = ctx["tag_label_map"]
         people_mgr         = ctx["people_mgr"]
 
-        # HD-720p profile id (for marginal movies)
+        # HD-720p profile id (for marginal movies) + id->name map for the grid's Profile column.
         hd720p_id: int | None = None
+        _prof_name_by_id: dict = {}
         try:
             raw_profiles = (
                 self.global_cache.get(f"radarr.quality.{instance}")
                 or self.radarr_api._make_request(instance, "qualityprofile", fallback=[]) or []
             )
             for p in raw_profiles:
-                if (p.get("name") or "").lower().strip() == "hd-720p":
+                if p.get("id") is not None:
+                    _prof_name_by_id[int(p["id"])] = p.get("name") or str(p["id"])
+                if hd720p_id is None and (p.get("name") or "").lower().strip() == "hd-720p":
                     hd720p_id = p["id"]
-                    break
         except Exception:
             pass
+        _hd720p_name = _prof_name_by_id.get(hd720p_id, "HD-720p") if hd720p_id is not None else "HD-720p"
 
         # ── Score and act ────────────────────────────────────────────────────────
         # Live writes are deferred into id-lists and flushed as bulk /movie/editor
@@ -1270,6 +1273,9 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                     self.logger.log_debug(f"  ↺ Score failed for '{title}': {e}")
 
             cur_profile_id = (movie or {}).get("qualityProfileId")
+            _cur_prof = (
+                _prof_name_by_id.get(int(cur_profile_id), "-") if cur_profile_id is not None else "-"
+            )
 
             self.logger.log_debug(
                 f"  📊 '{title}' (tmdb={tmdb_id}) — score={score}"
@@ -1297,7 +1303,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             _meta = [str(title)[:28], _movie_year(movie), _movie_rating(movie)]
 
             if action == "keep_skip":
-                _rows.append(_meta + ["keep-skip", str(score)])
+                _rows.append(_meta + ["keep-skip", str(score), _cur_prof])
                 stats["skipped_keep_tagged"] += 1
                 continue
 
@@ -1310,7 +1316,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
 
             if action == "unmonitor":
                 # Unlikely to be watched — unmonitor (batched after the loop).
-                _rows.append(_meta + ["unmonitor", str(score)])
+                _rows.append(_meta + ["unmonitor", str(score), _cur_prof])
                 if self.dry_run:
                     stats["unmonitored"] += 1
                     continue
@@ -1318,7 +1324,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
 
             elif action == "adjust_and_search":
                 # Marginal watchability — lower quality bar first, then search
-                _rows.append(_meta + ["adjust+search", str(score)])
+                _rows.append(_meta + ["adjust+search", str(score), f"{_cur_prof}->{_hd720p_name}"])
                 if self.dry_run:
                     stats["adjusted_and_searched"] += 1
                     continue
@@ -1328,17 +1334,17 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
 
             else:  # "search"
                 # Good watchability — search at current quality
-                _rows.append(_meta + ["search", str(score)])
+                _rows.append(_meta + ["search", str(score), _cur_prof])
                 search_ids.append(mid)
                 search_titles[mid] = title
 
         _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
         if _rs is not None:
             _rs.add_rows("radarr", "Monitored-missing triage", instance,
-                         ["Title", "Year", "Rating", "Action", "Score"], _rows, order=30)
+                         ["Title", "Year", "Rating", "Action", "Score", "Profile"], _rows, order=30)
         else:
             self.logger.log_grid(
-                ["Title", "Year", "Rating", "Action", "Score"], _rows,
+                ["Title", "Year", "Rating", "Action", "Score", "Profile"], _rows,
                 title=(
                     f"Radarr triage: monitored-missing{' [dry_run]' if self.dry_run else ''}"
                     f"  (search>={WATCH_THRESHOLD}, adjust {UNMONITOR_BELOW}-{WATCH_THRESHOLD - 1}, "

@@ -110,11 +110,14 @@ def _mk_apply_mgr(df, ranked, target, sink, *, hold_qp, run_summary=None):
 def test_from_to_renders_quality_name_end_to_end():
     df = pd.DataFrame([
         dict(keep_policy="universe", title="2 Fast 2 Furious", quality_action="upgrade",
-             quality_profile_id=5,  quality_name="WEBDL-2160p", movie_id=101, universe_name="ff"),
+             quality_profile_id=5,  quality_name="WEBDL-2160p", quality_profile_name="WEB-4K",
+             movie_id=101, universe_name="ff"),
         dict(keep_policy="universe", title="Fast Five",        quality_action="upgrade",
-             quality_profile_id=11, quality_name="WEBDL-2160p", movie_id=102, universe_name="ff"),
+             quality_profile_id=11, quality_name="WEBDL-2160p", quality_profile_name="WEB-4K",
+             movie_id=102, universe_name="ff"),
         dict(keep_policy="universe", title="No File Movie",    quality_action="upgrade",
-             quality_profile_id=5,  quality_name=None,         movie_id=103, universe_name="ff"),
+             quality_profile_id=5,  quality_name=None,         quality_profile_name="WEB-4K",
+             movie_id=103, universe_name="ff"),
     ])
     ranked = [
         {"id": 5,  "items": [{"allowed": True, "quality": {"id": 18, "name": "WEBDL-2160p", "resolution": 2160}}]},
@@ -129,15 +132,19 @@ def test_from_to_renders_quality_name_end_to_end():
     mgr = _mk_apply_mgr(df, ranked, target, sink, hold_qp=11)
     mgr.apply_quality_actions("standard")
 
-    assert sink["headers"] == ["Title", "Action", "From->To"]
-    fromto = {r[0]: r[2] for r in sink["rows"]}
+    assert sink["headers"] == ["Title", "Action", "From->To", "Profile"]
+    fromto  = {r[0]: r[2] for r in sink["rows"]}
+    profile = {r[0]: r[3] for r in sink["rows"]}
 
     # A genuine same-resolution ladder upgrade now shows the edition delta, not 2160p->2160p.
     assert fromto["2 Fast 2 Furious"] == "WEBDL-2160p->Remux-2160p", fromto
     # No edition on the file (null quality_name) -> graceful resolution fallback on the FROM side.
     assert fromto["No File Movie"] == "2160p->Remux-2160p", fromto
-    # Hold (no target) -> current edition both sides.
-    assert fromto["Fast Five"] == "WEBDL-2160p->WEBDL-2160p", fromto
+    # Hold (no target) -> current edition shown ONCE (no X->X repeat).
+    assert fromto["Fast Five"] == "WEBDL-2160p", fromto
+    # New Profile column: from->to on a real change, single value on a hold.
+    assert profile["2 Fast 2 Furious"] == "WEB-4K->ultra", profile
+    assert profile["Fast Five"] == "WEB-4K", profile
 
 
 def test_universe_actions_route_into_run_summary():
@@ -177,8 +184,8 @@ def test_universe_actions_route_into_run_summary():
     assert len(rcap.grids) == 1
     title, headers, rows = rcap.grids[0]
     assert title == "Universe quality actions"
-    assert headers == ["Instance", "Title", "Action", "From->To"]
+    assert headers == ["Instance", "Title", "Action", "From->To", "Profile"]
     assert all(r[0] == "ultra" for r in rows)     # instance column
     fromto = {r[1]: r[3] for r in rows}
     assert fromto["2 Fast 2 Furious"] == "WEBDL-2160p->Remux-2160p"
-    assert fromto["Fast Five"] == "WEBDL-2160p->WEBDL-2160p"
+    assert fromto["Fast Five"] == "WEBDL-2160p"   # hold -> current edition shown once
