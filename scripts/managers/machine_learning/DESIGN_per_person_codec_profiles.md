@@ -1,8 +1,15 @@
 # Design — Per-Person, Codec-Aware Quality Profiles
 
-> Status: **planned** (implement after ML migration Step 3c). Grounded by a 4-lens
-> codebase investigation (workflow wf6rmp7jk). Brain (`machine_learning/`) DECIDES;
-> the Radarr/Sonarr service APPLIES.
+> Status: **partially landed.** A narrow first slice shipped as "Stage C": a
+> household-global transcode/remote-play gate on the dual-version 4K BONUS copy
+> (`routing.movies.transcode_gate`, default OFF). It reuses the already-built
+> `quality_analytics/transcode_fingerprint` engine: the per-device capability matrix
+> is now cached each run (`tautulli/transcode_fingerprint`), and
+> `routing_targets.uhd_remote_play_ok` is the single authority both the add-time
+> resolver and the proactive reconcile call, so a 4K copy is only acquired when a likely
+> device can direct-play 2160p HEVC. The PER-USER profile matrix (likely-viewer
+> inference + codec-aware profile provisioning, Phases 1-5 below) is still planned.
+> Brain (`machine_learning/`) DECIDES; the Radarr/Sonarr service APPLIES.
 
 ## Goal
 For each household member, derive a device + codec profile (which devices they use,
@@ -28,13 +35,12 @@ prefs) to avoid profile clutter.
 
 ---
 
-## Prerequisite finding (quick win, do first)
-`tautulli/platforms` and `tautulli/transcode` are READ by the scorers
-(`radarr/quality/space_pressure.py` ~387-388; `sonarr/cache/episode_files.py` ~858-859)
-but appear to be **never written** in `TautulliManager.run()` (~line 207-212) — so
-Group-D's D1/D2/D3 device/transcode scoring may be partly inert today. Verify; if
-confirmed, add the two `cache.set()` calls. Benefits current scoring immediately and
-de-risks this feature (the per-user signals extend the same path).
+## Prerequisite finding — DONE
+`tautulli/platforms` and `tautulli/transcode` ARE written in the Tautulli derived-stats
+block (`services/tautulli/__init__.py` ~235-237), alongside `tautulli/device_codec_matrix`
+and (Stage C) `tautulli/transcode_fingerprint`. The earlier "never written" concern is
+resolved — the scorers' Group-D device/transcode reads are live, and the Stage-C gate
+extends the same path.
 
 ---
 
@@ -61,7 +67,8 @@ Each phase is a disciplined slice (brain-pure function + service delegation + sa
 cache-key contract + parity/unit gate), exactly like migration Steps 3a/3b.
 
 ### Phase 0 — prereqs (small)
-- Fix the `tautulli/platforms` / `tautulli/transcode` cache writes (above).
+- ~~Fix the `tautulli/platforms` / `tautulli/transcode` cache writes~~ — DONE (above);
+  `tautulli/transcode_fingerprint` is also written now (Stage C).
 - Null-coalesce `metadata_index.video_codec` for deleted / non-media items.
 
 ### Phase 1 — per-user device/codec derivation (brain + service)
