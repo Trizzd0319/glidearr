@@ -38,6 +38,8 @@ class _StubLogger:
     def log_info(self, msg):     self.infos.append(str(msg))
     def log_debug(self, msg):    pass
     def log_error(self, msg):    pass
+    def log_table(self, *a, **k): pass
+    def log_grid(self, *a, **k):  pass
 
 
 def _mgr() -> M:

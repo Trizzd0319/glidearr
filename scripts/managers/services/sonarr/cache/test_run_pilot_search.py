@@ -20,6 +20,8 @@ class _StubLogger:
     def log_debug(self, *a, **k): pass
     def log_warning(self, *a, **k): pass
     def log_success(self, *a, **k): pass
+    def log_table(self, *a, **k): pass
+    def log_grid(self, *a, **k): pass
 
 
 def _prof(pid, res):
@@ -174,6 +176,107 @@ def test_multiple_pilots_all_search_no_cumulative_throttle():
     assert stats.get("skipped_space", 0) == 0
     assert int(df.at[0, "pilot_last_profile_id"]) == 13    # both at the highest tier (2160p)
     assert int(df.at[1, "pilot_last_profile_id"]) == 13
+
+
+# ── live mode: decision off the bulk snapshot, fresh GET only for the changers ──
+def test_live_reads_snapshot_and_fetches_fresh_only_for_changers():
+    """Regression: the live loop must NOT do a GET series/{sid} per stub (that was the multi-hour
+    first-run crawl). The tier decision is read from the ONE bulk snapshot; a fresh per-series GET
+    happens ONLY for a stub that actually changes profile, right before its PUT."""
+    df = pd.DataFrame([
+        # sid 1 already at the best tier (pid 13), never searched → stays put → NO change, NO GET.
+        {"series_id": 1, "series_title": "A", "is_pilot": True, "episode_file_id": None,
+         "pilot_search_attempts": None, "pilot_last_searched_at": None, "pilot_last_profile_id": None},
+        # sid 2 at an off-ladder profile (99) → best-tier targets 13 → changes → fresh GET + PUT.
+        {"series_id": 2, "series_title": "B", "is_pilot": True, "episode_file_id": None,
+         "pilot_search_attempts": None, "pilot_last_searched_at": None, "pilot_last_profile_id": None},
+    ])
+
+    class _CountingApi:
+        def __init__(self):
+            self.get_by_id = []   # sids fetched via GET series/{sid}
+            self.puts = []        # (sid, qp) PUTs
+        def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+            if endpoint == "qualityprofile":
+                return list(_PROFILES)
+            if endpoint == "series" and method == "GET":      # the ONE bulk snapshot
+                return [{"id": 1, "qualityProfileId": 13, "runtime": 100, "title": "A"},
+                        {"id": 2, "qualityProfileId": 99, "runtime": 100, "title": "B"}]
+            if endpoint.startswith("series/") and method == "GET":
+                sid = int(endpoint.split("/", 1)[1])
+                self.get_by_id.append(sid)
+                return {"id": sid, "qualityProfileId": 99, "runtime": 100, "title": "X"}
+            if endpoint.startswith("series/") and method == "PUT":
+                self.puts.append((int(endpoint.split("/", 1)[1]), payload.get("qualityProfileId")))
+                return payload
+            return fallback   # "command" POST etc.
+
+    api = _CountingApi()
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = api
+    m.sonarr_cache = None          # → snapshot falls back to the ONE bulk /series GET
+    m.global_cache = None
+    m.config = _ON
+    m.dry_run = False              # LIVE
+    m._resolve_instance = lambda inst: inst
+    m.load = lambda inst: df
+    m.save = lambda inst, d: None
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_free_space_gb = lambda inst: 5000.0     # ample → best tier 2160 (pid 13)
+    m._get_total_space_gb = lambda inst: 1000.0
+    m._get_episode_id = lambda *a, **k: 999
+
+    stats = m.run_pilot_search("inst")
+
+    assert stats["searched"] == 2                  # both still queued for EpisodeSearch
+    assert api.get_by_id == [2]                    # fresh GET ONLY for the changer — NOT one per stub
+    assert api.puts == [(2, 13)]                   # only sid 2 re-profiled, to the best tier
+
+
+def test_bulk_live_loop_resolves_ids_cache_only():
+    """Regression: in the bulk (use_tqdm) LIVE path the episode cache is pre-warmed concurrently,
+    so the serial loop must resolve S01E01 ids CACHE-ONLY (allow_live=False). Allowing the live
+    fallback re-introduced a per-stub episode?seriesId= GET (~1 s each) — the crawl the warm exists
+    to kill. Small batches (no warm) keep the live fallback."""
+    rows = [{"series_id": i, "series_title": f"S{i}", "is_pilot": True, "episode_file_id": None,
+             "pilot_search_attempts": None, "pilot_last_searched_at": None, "pilot_last_profile_id": None}
+            for i in range(1, 16)]   # 15 stubs > PROGRESS_BAR_THRESHOLD (10) → use_tqdm path
+    df = pd.DataFrame(rows)
+
+    class _Api:
+        def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+            if endpoint == "qualityprofile":
+                return list(_PROFILES)
+            if endpoint == "series" and method == "GET":   # bulk snapshot (all already at best tier)
+                return [{"id": i, "qualityProfileId": 13, "runtime": 100, "title": f"S{i}"} for i in range(1, 16)]
+            return fallback
+
+    captured_allow_live = []
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = _Api()
+    m.sonarr_cache = None
+    m.global_cache = None
+    m.config = _ON
+    m.dry_run = False
+    m._resolve_instance = lambda inst: inst
+    m.load = lambda inst: df
+    m.save = lambda inst, d: None
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_free_space_gb = lambda inst: 5000.0
+    m._get_total_space_gb = lambda inst: 1000.0
+    m._prewarm_by_series_episode_cache = lambda *a, **k: 0   # warm stubbed (no real API in the loop)
+
+    def _spy_get_ep(instance, sid, sn, en, **k):
+        captured_allow_live.append(k.get("allow_live"))
+        return 9000 + sid
+    m._get_episode_id = _spy_get_ep
+
+    m.run_pilot_search("inst")
+
+    assert captured_allow_live, "loop never resolved an episode id"
+    assert all(al is False for al in captured_allow_live), captured_allow_live   # cache-only, no live fallback
 
 
 # ── flag OFF: legacy floor-first (the parity escape hatch) ────────────────────────

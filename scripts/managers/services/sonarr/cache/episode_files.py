@@ -100,6 +100,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     JIT_MAX_EPISODES  = 3         # max episodes to JIT-upgrade per series per run (prevents upgrading
                                    # entire kids-cartoon library at once despite large runtime budget)
     JIT_RESERVE_PCT   = 0.05      # JIT upgrades must keep at least this fraction of total disk free
+    JIT_ACTIVE_WATCH_DAYS = 30    # a series watched within this window is "actively watched" — its
+                                   # next-up episodes are NEVER JIT-downgraded (same recency the
+                                   # prefetch uses for 'upgrade-eligible'); cold shows still calibrate
 
     # Fallback size model (MiB per minute) used by JIT space estimates when a
     # quality has no measured samples in the library yet. Now sourced from the
@@ -1686,6 +1689,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         _grid_rows: list[list[str]] = []
         _cne_start = time.time()
 
+        # series_id(str) → recent household watcher(s); built by sync_from_tautulli from the
+        # per-user Tautulli history (same source the JIT grab grid uses). Annotates the prefetch
+        # grid's 'For' column — who each next-up was queued for. Best-effort: {} → 'For' shows '-'.
+        _jit_watchers = (self.global_cache.get(f"sonarr/{instance}/jit_watchers")
+                         if self.global_cache else None) or {}
+
         # ── Parallel pre-warm of the per-series episode cache (bulk batches) ──────
         # The serial walk below calls _get_all_episodes per series; each regenerates
         # an expired by_series cache via a network GET, one at a time, logging a line
@@ -1710,6 +1719,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         for _cne_i, (_, row) in enumerate(last_by_series.iterrows(), start=1):
             sid          = int(row["series_id"])
             series_title = str(row.get("series_title") or "")
+            # Who this next-up is queued FOR — recent household watcher(s), most-recent first
+            # (same attribution the JIT grab grid shows). Display-only; never affects the walk.
+            _for_cell = ", ".join((_jit_watchers.get(str(sid)) or [])[:2]) or "-"
             _total_series = len(last_by_series)
             if not use_tqdm:
                 self.logger.log_info(
@@ -1746,7 +1758,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 row.get("last_watched_at"), _now_cne,
                 cold_days=_cold_days, has_upcoming=bool(sonarr_series_obj.get("nextAiring")),
             ):
-                _grid_rows.append([series_title, "-", "cold-skip", "-", "-", "-"])
+                _grid_rows.append([series_title, "-", "cold-skip", "-", "-", "-", _for_cell])
                 continue
 
             # Walk forward from the last watched episode, accumulating runtime
@@ -2042,11 +2054,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     next_label = "?"
                 _grid_rows.append([
                     series_title, policy or "-", f"acquire {ep_count}", next_label,
-                    f"{accumulated_s/3600:.1f}h/{series_budget/3600:.1f}h", _note_cell,
+                    f"{accumulated_s/3600:.1f}h/{series_budget/3600:.1f}h", _note_cell, _for_cell,
                 ])
             else:
                 _grid_rows.append([
-                    series_title, policy or "-", "no-new", "-", "-", _note_cell,
+                    series_title, policy or "-", "no-new", "-", "-", _note_cell, _for_cell,
                 ])
 
         # One aligned grid of every per-series prefetch decision, printed once
@@ -2054,11 +2066,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
         if _rs is not None:
             _rs.add_rows("sonarr", "Next-episode prefetch", instance,
-                         ["Series", "Policy", "Decision", "Next", "Budget", "Note"],
+                         ["Series", "Policy", "Decision", "Next", "Budget", "Note", "For"],
                          _grid_rows, order=10)
         else:
             self.logger.log_grid(
-                ["Series", "Policy", "Decision", "Next", "Budget", "Note"],
+                ["Series", "Policy", "Decision", "Next", "Budget", "Note", "For"],
                 _grid_rows,
                 title=(
                     f"Sonarr next-episode prefetch{' [dry_run]' if self.dry_run else ''}"
@@ -2547,6 +2559,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
         all_monitor_ids: list[int] = []
         per_series_search: dict[int, tuple[str, list[int]]] = {}  # sid → (title, [ep_ids])
+        monitored_eps: list[tuple] = []   # (series_title, sn, en, sid) → which eps this pass monitored
+
+        # series_id(str) → recent household watcher(s) for the 'For' column — same attribution the
+        # prefetch + JIT grab grids use. Best-effort: {} when unavailable → 'For' shows '-'.
+        _jit_watchers = (self.global_cache.get(f"sonarr/{instance}/jit_watchers")
+                         if self.global_cache else None) or {}
 
         for sid, episodes in pending_by_series.items():
             series_title = episodes[0][2]
@@ -2580,6 +2598,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
                 if ep_id:
                     all_monitor_ids.append(ep_id)
+                    monitored_eps.append((series_title, sn, en, sid))
                     _t, _ids = per_series_search.get(sid, (series_title, []))
                     _ids.append(ep_id)
                     per_series_search[sid] = (_t, _ids)
@@ -2637,6 +2656,30 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"{stats['not_in_sonarr']} not in Sonarr, "
                 f"{stats['failed']} failed."
             )
+
+        # Per-episode detail of WHICH next-ups this pass monitored — the one-line count above
+        # stays in the live log; the detail moves to the end-of-run summary so it sits next to
+        # the Next-episode prefetch (order 10) and JIT next-up grab plan (order 12) grids, which
+        # carry the same episodes through the prefetch → monitor → grab pipeline. ASCII cells.
+        if monitored_eps:
+            _mon_rows = [
+                [title, f"S{sn:02d}E{en:02d}",
+                 ", ".join((_jit_watchers.get(str(sid)) or [])[:2]) or "-"]
+                for (title, sn, en, sid) in sorted(monitored_eps, key=lambda e: (e[0].lower(), e[1], e[2]))
+            ]
+            _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
+            if _rs is not None:
+                _rs.add_rows("sonarr", "Next-up monitored", instance,
+                             ["Series", "Ep", "For"], _mon_rows, order=11)
+            else:
+                self.logger.log_grid(
+                    ["Series", "Ep", "For"], _mon_rows,
+                    title=(
+                        f"Next-up monitored - '{instance}'"
+                        f"{' [dry_run]' if self.dry_run else ''}"
+                    ),
+                    cap=24,
+                )
 
         return stats
 
@@ -2916,18 +2959,34 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
         if stats["checked"]:
             prefix = "[dry_run] " if self.dry_run else ""
-            verb   = "Would free" if self.dry_run else "Freed"
-            self.logger.log_info(
-                f"🗑️ {prefix}Sonarr deletion pass for '{instance}': "
-                f"{stats['deleted']} file(s) — {verb} {self._fmt_bytes(stats['bytes_freed'])} | "
-                f"{stats['failed']} failed | "
-                f"{stats['skipped_pilot']} pilot guard(s) | "
-                f"{stats['skipped_keep']} keep-policy guard(s) | "
-                f"{stats['skipped_recent_air']} recent-air guard(s) | "
-                f"{stats['skipped_household']} household guard(s) | "
-                f"{stats['skipped_shared_file']} shared-file guard(s) | "
-                f"{stats['skipped_no_file']} no file id | "
-                f"{stats['coalesced_multiep']} multi-ep coalesced"
+            verb   = "would free" if self.dry_run else "freed"
+            self.logger.log_table(
+                ["Outcome", "Count"],
+                [
+                    ["deleted",            stats["deleted"]],
+                    ["failed",             stats["failed"]],
+                    ["pilot guard",        stats["skipped_pilot"]],
+                    ["keep-policy guard",  stats["skipped_keep"]],
+                    ["recent-air guard",   stats["skipped_recent_air"]],
+                    ["household guard",    stats["skipped_household"]],
+                    ["shared-file guard",  stats["skipped_shared_file"]],
+                    ["no file id",         stats["skipped_no_file"]],
+                    ["multi-ep coalesced", stats["coalesced_multiep"]],
+                ],
+                title=f"🗑️ {prefix}Sonarr deletion pass '{instance}' ({verb} {self._fmt_bytes(stats['bytes_freed'])})",
+                caption="Per-pass outcome of the Sonarr file deletion sweep: how many "
+                        "episode files were removed and how many were held back by each guard.",
+                descriptions=[
+                    "episode files actually deleted this pass",
+                    "delete calls that errored",
+                    "files kept: protected pilot episode",
+                    "files kept: keep_series / keep_season tag",
+                    "files kept: episode aired too recently",
+                    "files kept: a household member has not watched",
+                    "files kept: file shared by another tracked episode",
+                    "rows skipped: no Sonarr episode file id",
+                    "extra rows folded into one multi-episode file delete",
+                ],
             )
 
         return df, stats
@@ -3484,21 +3543,42 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 )
 
         if remaining_after > 0:
-            self.logger.log_info(
-                f"📋 Pilot batch done for '{instance}': "
-                f"+{stats['rows_added']} with file data, "
-                f"+{stats['stubs_added']} new stub(s), "
-                f"{stats['stubs_upgraded']} upgraded, "
-                f"{stats['stubs_refreshed']} refreshed. "
-                f"{remaining_after} series still pending — continuing next run."
+            self.logger.log_table(
+                ["Outcome", "Count"],
+                [
+                    ["with file data", stats["rows_added"]],
+                    ["new stubs",      stats["stubs_added"]],
+                    ["upgraded",       stats["stubs_upgraded"]],
+                    ["refreshed",      stats["stubs_refreshed"]],
+                ],
+                title=f"📋 Pilot batch done '{instance}' ({remaining_after} series still pending)",
+                caption="What this pilot-cache batch wrote to the Parquet before the next "
+                        "run continues with the still-pending series.",
+                descriptions=[
+                    "series rows added with real episode file data",
+                    "new pilot stub rows added (no Sonarr file yet)",
+                    "existing stub rows upgraded to file rows",
+                    "stale stub rows refreshed in place",
+                ],
             )
         else:
-            self.logger.log_info(
-                f"✅ Pilot cache fully populated for '{instance}': "
-                f"{stats['rows_added']} series with files, "
-                f"{stats['stubs_added']} new stubs, "
-                f"{stats['stubs_upgraded']} upgraded, "
-                f"{stats['stubs_refreshed']} refreshed."
+            self.logger.log_table(
+                ["Outcome", "Count"],
+                [
+                    ["with file data", stats["rows_added"]],
+                    ["new stubs",      stats["stubs_added"]],
+                    ["upgraded",       stats["stubs_upgraded"]],
+                    ["refreshed",      stats["stubs_refreshed"]],
+                ],
+                title=f"✅ Pilot cache fully populated '{instance}'",
+                caption="Final rollup once every series is cached: what this last pilot "
+                        "batch wrote to the Parquet.",
+                descriptions=[
+                    "series rows added with real episode file data",
+                    "new pilot stub rows added (no Sonarr file yet)",
+                    "existing stub rows upgraded to file rows",
+                    "stale stub rows refreshed in place",
+                ],
             )
 
         return stats
@@ -3699,46 +3779,44 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         queued        = []   # (idx, episode_id, new_pid, title) → batched EpisodeSearch
         series_queued = []   # (idx, series_id,  new_pid, title) → individual SeriesSearch
 
-        # ── Series source ─────────────────────────────────────────────────────
-        # The OLD code fetched a FRESH live GET series/{sid} per stub — thousands
-        # of serial round-trips. For dry-run (no PUT, the id only decorates logs)
-        # that freshness is pointless, so we snapshot every series ONCE from the
-        # local letter-bucketed cache (already populated by the series-sync phase
-        # this run → fast, memoised I/O) and look it up O(1). A single live
-        # GET /series would be the opposite failure mode: one huge blocking
-        # response that freezes the bar at 0% on a large library.
-        #
-        # LIVE mode still fetches fresh per stub inside the loop, so its profile
-        # PUTs write against current Sonarr state (a stale snapshot could revert
-        # concurrent changes). Only stubs needing a profile change are fetched,
-        # and the interval guard skips most after the first run.
+        # ── Series source (bulk snapshot, BOTH modes) ─────────────────────────
+        # The tier DECISION (current profile + runtime) is read from a single O(1) snapshot of
+        # every series — taken once from the local letter-bucketed cache (populated by the
+        # series-sync phase this run → fast, memoised I/O), or one bulk /series fetch on a cache
+        # miss. The OLD code did a FRESH live GET series/{sid} PER STUB in live mode — thousands
+        # of serial ~1 s round-trips (a multi-hour crawl on the first run, before the interval
+        # guard kicks in). A profile change is rare, so _pilot_set_profile instead re-fetches
+        # just the FEW changing series fresh right before the PUT — the write still lands against
+        # current Sonarr state (a stale snapshot could revert a concurrent change) without paying
+        # a per-stub GET for the 99% that don't change. A single live GET /series is the opposite
+        # failure mode (one huge blocking response that freezes the bar at 0%), so the cache is
+        # preferred and the bulk fetch is the fallback only.
         series_by_id: dict = {}
-        if self.dry_run:
-            _series_mgr = getattr(self.sonarr_cache, "series", None)
-            _all_series = None
-            if _series_mgr is not None:
-                for _meth in ("get_all_series", "iter_all_series"):
-                    _fn = getattr(_series_mgr, _meth, None)
-                    if callable(_fn):
-                        try:
-                            _all_series = list(_fn(instance))
-                            break
-                        except Exception:
-                            _all_series = None
-            if not _all_series:
-                # Cache miss → single live fetch (the bare "series" endpoint is
-                # run-memoised, so the rest of the run reuses it).
-                _all_series = self.sonarr_api._make_request(instance, "series", fallback=[]) or []
-            series_by_id = {
-                int(s["id"]): s for s in _all_series
-                if isinstance(s, dict) and s.get("id") is not None
-            }
-            if not series_by_id:
-                self.logger.log_warning(
-                    f"[PilotSearch] No series available for '{instance}' (letter cache "
-                    f"empty and live /series returned nothing) — stub searches this run "
-                    f"will be skipped (counted as failed)."
-                )
+        _series_mgr = getattr(self.sonarr_cache, "series", None)
+        _all_series = None
+        if _series_mgr is not None:
+            for _meth in ("get_all_series", "iter_all_series"):
+                _fn = getattr(_series_mgr, _meth, None)
+                if callable(_fn):
+                    try:
+                        _all_series = list(_fn(instance))
+                        break
+                    except Exception:
+                        _all_series = None
+        if not _all_series:
+            # Cache miss → single live fetch (the bare "series" endpoint is
+            # run-memoised, so the rest of the run reuses it).
+            _all_series = self.sonarr_api._make_request(instance, "series", fallback=[]) or []
+        series_by_id = {
+            int(s["id"]): s for s in _all_series
+            if isinstance(s, dict) and s.get("id") is not None
+        }
+        if not series_by_id:
+            self.logger.log_warning(
+                f"[PilotSearch] No series available for '{instance}' (letter cache "
+                f"empty and live /series returned nothing) — stub searches this run "
+                f"will be skipped (counted as failed)."
+            )
 
         # Shared episode cache for _get_episode_id. In LIVE mode the episode id is
         # needed to queue a precise EpisodeSearch, so pre-warm the by_series cache
@@ -3790,14 +3868,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 stats["skipped_recent"] += 1
                 continue
 
-            # ── Series object: dry-run uses the O(1) snapshot; live fetches fresh
-            #    per stub so the profile PUT writes against current state ─────────
-            if self.dry_run:
-                series = series_by_id.get(sid)
-            else:
-                series = self.sonarr_api._make_request(
-                    instance, f"series/{sid}", fallback=None
-                )
+            # ── Series object: read from the O(1) bulk snapshot in BOTH modes. The tier
+            #    decision needs only the current profile + runtime; the fresh per-stub GET is
+            #    deferred to _pilot_set_profile and made ONLY for a stub that actually changes
+            #    profile, so its PUT still writes against current Sonarr state. ──
+            series = series_by_id.get(sid)
             if not series or not isinstance(series, dict):
                 stats["failed"] += 1
                 continue
@@ -3848,13 +3923,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                         )
                     else:
                         try:
-                            series = dict(series)
-                            series["qualityProfileId"] = new_pid
-                            self.sonarr_api._make_request(
-                                instance, f"series/{sid}", method="PUT", payload=series
-                            )
-                            _log(f"  🎯 '{title}' → best-fit '{_tname}' ({_action})")
-                            stats["stepped_down"] += 1
+                            if self._pilot_set_profile(instance, sid, new_pid):
+                                _log(f"  🎯 '{title}' → best-fit '{_tname}' ({_action})")
+                                stats["stepped_down"] += 1
+                            else:
+                                new_pid = current_pid
                         except Exception as e:
                             self.logger.log_warning(
                                 f"  ⚠️ Best-tier profile set failed for '{title}': {e}"
@@ -3909,20 +3982,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                             )
                         else:
                             try:
-                                # Copy before mutating so the PUT body is self-contained
-                                # and we never edit the GET result in place. This runs in
-                                # LIVE mode only, where `series` is a fresh uncached
-                                # series/{sid} fetch (not shared) — so in-place mutation
-                                # would also be safe; the copy is just defensive hygiene.
-                                series = dict(series)
-                                series["qualityProfileId"] = new_pid
-                                self.sonarr_api._make_request(
-                                    instance, f"series/{sid}", method="PUT", payload=series
-                                )
-                                _log(
-                                    f"  🔽 '{title}' → floor '{floor_name}' (attempt 1)"
-                                )
-                                stats["stepped_down"] += 1
+                                if self._pilot_set_profile(instance, sid, new_pid):
+                                    _log(
+                                        f"  🔽 '{title}' → floor '{floor_name}' (attempt 1)"
+                                    )
+                                    stats["stepped_down"] += 1
+                                else:
+                                    new_pid = current_pid
                             except Exception as e:
                                 self.logger.log_warning(
                                     f"  ⚠️ Floor profile set failed for '{title}': {e}"
@@ -3947,21 +4013,14 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                             )
                         else:
                             try:
-                                # Copy before mutating so the PUT body is self-contained
-                                # and we never edit the GET result in place. This runs in
-                                # LIVE mode only, where `series` is a fresh uncached
-                                # series/{sid} fetch (not shared) — so in-place mutation
-                                # would also be safe; the copy is just defensive hygiene.
-                                series = dict(series)
-                                series["qualityProfileId"] = new_pid
-                                self.sonarr_api._make_request(
-                                    instance, f"series/{sid}", method="PUT", payload=series
-                                )
-                                _log(
-                                    f"  📈 Stepped up '{title}' → '{higher_name}' "
-                                    f"(attempt {attempts_done + 1})"
-                                )
-                                stats["stepped_down"] += 1
+                                if self._pilot_set_profile(instance, sid, new_pid):
+                                    _log(
+                                        f"  📈 Stepped up '{title}' → '{higher_name}' "
+                                        f"(attempt {attempts_done + 1})"
+                                    )
+                                    stats["stepped_down"] += 1
+                                else:
+                                    new_pid = current_pid
                             except Exception as e:
                                 self.logger.log_warning(
                                     f"  ⚠️ Step-up failed for '{title}': {e}"
@@ -3977,10 +4036,19 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             # ── Queue the search (pushed in batches after the loop) ───────────
             # log_cache_miss=False on bulk runs keeps the cache layer's per-item
             # "♻️ Cache miss" lines from cluttering the progress bar.
+            #
+            # CACHE-ONLY in the bulk path: when use_tqdm is set we already pre-warmed the
+            # by-series episode cache CONCURRENTLY above, so the serial loop must resolve the
+            # id from cache and NEVER fall back to a per-stub live episode?seriesId= GET — that
+            # fallback is exactly the serial-round-trip crawl the warm exists to eliminate (it
+            # was re-introducing ~1 s/stub even after the snapshot fix removed the series GET).
+            # A genuine cache miss (rare) just yields no id → harmless SeriesSearch fallback.
+            # Small batches (use_tqdm False) skip the warm, so they keep the live fallback for
+            # their handful of stubs.
             ep_id = self._get_episode_id(
                 instance, sid, 1, 1, series_ep_cache=_ep_cache,
                 log_cache_miss=not use_tqdm, log_expired=not use_tqdm,
-                allow_live=not self.dry_run,
+                allow_live=(not self.dry_run) and not use_tqdm,
             )
             if ep_id:
                 queued.append((idx, ep_id, new_pid, title))
@@ -4060,16 +4128,46 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             self.save(instance, df)
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"[PilotSearch] {prefix}'{instance}': "
-            f"{stats['searched']} searched | "
-            f"{stats['stepped_down']} profile changes | "
-            f"{stats['at_floor']} at ceiling | "
-            f"{stats['skipped_recent']} skipped (<{PILOT_SEARCH_INTERVAL_H}h) | "
-            f"{stats['skipped_space']} skipped (no space, re-probe) | "
-            f"{stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["searched",        stats["searched"]],
+                ["profile changes", stats["stepped_down"]],
+                ["at ceiling",      stats["at_floor"]],
+                ["skipped recent",  stats["skipped_recent"]],
+                ["skipped no-space", stats["skipped_space"]],
+                ["failed",          stats["failed"]],
+            ],
+            title=f"[PilotSearch] {prefix}'{instance}'",
+            caption="Per-pass outcome of the pilot step-down search: how many pilot stubs "
+                    "were searched, re-profiled, or skipped and why.",
+            descriptions=[
+                "pilot stubs a SeriesSearch was triggered for",
+                "stubs whose quality profile was stepped down",
+                "stubs already at the lowest profile (ceiling)",
+                f"stubs skipped: searched within last {PILOT_SEARCH_INTERVAL_H}h",
+                "stubs skipped: no disk space, will re-probe",
+                "search or profile-set calls that errored",
+            ],
         )
         return stats
+
+    def _pilot_set_profile(self, instance: str, sid: int, new_pid) -> bool:
+        """Re-fetch series ``sid`` FRESH and PUT only its qualityProfileId. The pilot tier
+        DECISION is read off the bulk snapshot (fast, no per-stub GET), but the WRITE must land
+        against CURRENT Sonarr state so it can't revert a concurrent change to another field —
+        so the one series that actually changes profile is fetched fresh here, right before the
+        PUT. Returns True on a PUT, False if the fresh fetch came back empty (caller keeps the
+        existing profile; the stub re-probes next run)."""
+        fresh = self.sonarr_api._make_request(instance, f"series/{sid}", fallback=None)
+        if not fresh or not isinstance(fresh, dict):
+            return False
+        fresh = dict(fresh)
+        fresh["qualityProfileId"] = new_pid
+        self.sonarr_api._make_request(
+            instance, f"series/{sid}", method="PUT", payload=fresh
+        )
+        return True
 
     def _get_total_space_gb(self, instance: str) -> float:
         """
@@ -4266,6 +4364,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         stats = {
             "checked": 0, "acquired": 0, "upgraded": 0, "already_upgraded": 0,
             "skipped_kids": 0, "skipped_keep": 0, "skipped_space": 0, "failed": 0,
+            "skipped_active_downgrade": 0,   # downgrades suppressed because the series is actively watched
         }
 
         # ── Space reserve: JIT upgrades must keep free space above the configured
@@ -4331,6 +4430,20 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 self.save(instance, df)  # persist the flag resets from reconcile
             return stats
 
+        # Series with a watch inside the active-watch window — their next-up episodes must NEVER be
+        # DOWNGRADED. Each upcoming episode is itself unwatched, so its per-episode watch_likelihood
+        # is affinity-only (no engagement floor) and a low-affinity show would otherwise have its
+        # owned 1080p torn down to the affinity tier mid-binge. The recency signal lives on the
+        # series' WATCHED rows (the next-up stubs have no last_watched_at), so derive it series-wide
+        # from the full df — the same last_watched_at the prefetch uses for 'upgrade-eligible'.
+        # UPGRADES and ACQUIRES are unaffected; only the tear-down is suppressed.
+        active_watch_sids: set = set()
+        if "last_watched_at" in df.columns and "series_id" in df.columns:
+            _lw = pd.to_datetime(df["last_watched_at"], utc=True, errors="coerce")
+            _cutoff = datetime.now(tz=timezone.utc) - timedelta(days=self.JIT_ACTIVE_WATCH_DAYS)
+            _recent_sids = df.loc[_lw >= _cutoff, "series_id"].dropna()
+            active_watch_sids = {int(s) for s in _recent_sids.unique()}
+
         # ── Quality model ──────────────────────────────────────────────────────
         # Profiles ranked ascending by max resolution; we try best-first so each
         # series gets the highest-quality profile whose estimated grab still
@@ -4379,8 +4492,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         for _c in ("planned_action", "plan_reason", "plan_reclaim_gb"):
             if _c not in df.columns:
                 df[_c] = None
-        for _c in ("planned_action", "plan_reason"):
-            if df[_c].dtype != object:
+        # pre_upgrade_quality holds a json.dumps snapshot (a STRING) stamped on the live grab
+        # path below. A parquet loaded with that column all-null comes back as float64, and a
+        # strict-dtype pandas rejects assigning a string into it ("Invalid value '{...}' for
+        # dtype 'float64'") — which crashed the whole JIT pass in LIVE mode (the stamp is in the
+        # not-dry_run branch, so dry-runs never hit it). Coerce it to object alongside the ledger.
+        for _c in ("planned_action", "plan_reason", "pre_upgrade_quality"):
+            if _c in df.columns and df[_c].dtype != object:
                 df[_c] = df[_c].astype(object)
 
         # series_id(str) → recent household watcher(s); built by sync_from_tautulli from the
@@ -4484,6 +4602,19 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 except (TypeError, ValueError):
                     _cr = None
                 action = "DOWNGRADE" if (_cr is not None and _cr > target_res) else "UPGRADE"
+
+            # ACTIVE-WATCH GUARD: never tear down an owned file of a series the household is
+            # currently watching. The episode is unwatched so its affinity-only tier is low, but
+            # the series is being binged now (watched within JIT_ACTIVE_WATCH_DAYS), so leave the
+            # existing higher-quality file alone. UPGRADE/ACQUIRE still proceed; only the proactive
+            # DOWNGRADE is skipped (downgrades under genuine pressure are the coordinator's job).
+            if action == "DOWNGRADE" and sid in active_watch_sids:
+                stats["skipped_active_downgrade"] += 1
+                self.logger.log_debug(
+                    f"  🛡️  JIT keep '{title}' S{sn:02d}E{en:02d}: actively watched "
+                    f"(within {self.JIT_ACTIVE_WATCH_DAYS}d) — not downgrading {cur_q}."
+                )
+                continue
 
             # Bucket the episode under its (series, target-tier) group. The first episode in a
             # group fixes the group's step-down ladder + representative profile; later same-tier
@@ -4599,7 +4730,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             if _rs is not None:
                 _rs.add_rows("sonarr", "JIT next-up grab plan", instance,
                              ["Series", "Ep", "Action", "From", "Target", "~GB", "ProjFree", "For"],
-                             table_rows, order=11)
+                             table_rows, order=12)
             else:
                 self.logger.log_grid(
                     ["Series", "Ep", "Action", "From", "Target", "~GB", "ProjFree", "For"],
@@ -4612,13 +4743,36 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     cap=24,   # per-column widths → lets Series + For show fuller without bloating the rest
                 )
 
-        self.logger.log_info(
-            f"[JIT] Next-up grab pass '{instance}': "
-            f"{stats['acquired']} acquired | {stats['upgraded']} re-quality | "
-            f"{stats['skipped_space']} no-space | {stats['skipped_kids']} kids | "
-            f"{stats['skipped_keep']} keep-tagged | {stats['failed']} failed | "
-            f"{len(queued)} series ({_group_count} tier-group(s)) queued for step-down search "
-            f"(reserve {reserve_gb:.0f} GB)"
+        # Vertical 2-column table (label → count) instead of one very wide pipe-delimited line,
+        # so the JIT outcome fits a screen without horizontal scrolling.
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["acquired",               stats["acquired"]],
+                ["re-quality",             stats["upgraded"]],
+                ["active-watch protected", stats["skipped_active_downgrade"]],
+                ["no-space",               stats["skipped_space"]],
+                ["kids",                   stats["skipped_kids"]],
+                ["keep-tagged",            stats["skipped_keep"]],
+                ["failed",                 stats["failed"]],
+                ["series queued",          len(queued)],
+                ["tier-groups",            _group_count],
+            ],
+            title=f"[JIT] grab pass '{instance}' (reserve {reserve_gb:.0f} GB)",
+            caption="Per-pass outcome of the just-in-time next-up grab: how many upcoming "
+                    "episodes were acquired or re-qualitied, what was skipped and why, and how "
+                    "much was queued for the background step-down search.",
+            descriptions=[
+                "missing next-up episodes grabbed fresh",
+                "owned next-up episodes re-grabbed at the calibrated tier",
+                "downgrades skipped: series watched within the active window",
+                "skipped: grab would breach the disk reserve",
+                "skipped: kids-cert series",
+                "skipped: keep_series / keep_season tagged",
+                "search or profile-set call errored",
+                "series handed to the background step-down search worker",
+                "distinct (series, target-tier) search groups queued",
+            ],
         )
         return stats
 
@@ -4848,12 +5002,16 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         wanted = {int(e) for e in ep_ids if e}
         if not wanted:
             return set()
-        ids = ",".join(str(e) for e in wanted)
+        # Sonarr's /queue/details wants REPEATED episodeIds params (?episodeIds=1&episodeIds=2),
+        # NOT a comma-joined value — 'id1,id2,...' 400s ("The value '...' is not valid"). That made
+        # this poll always fail, so the step-down worker never saw its grab land in the queue and
+        # churned the profile DOWN the ladder (the 7->6->4 false "found nothing" stepping).
+        _q = "&".join(f"episodeIds={e}" for e in wanted)
         for i in range(max(1, attempts)):
             found = set()
             try:
                 resp = self.sonarr_api._make_request(
-                    instance, f"queue/details?episodeIds={ids}", fallback=[]
+                    instance, f"queue/details?{_q}", fallback=[]
                 ) or []
                 for rec in resp:
                     if not isinstance(rec, dict):
@@ -5025,10 +5183,21 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if changed:
             self.save(instance, df)
 
-        self.logger.log_info(
-            f"[JIT] Restore pass '{instance}': "
-            f"{stats['restored']} restored | {stats['no_snapshot']} no-snapshot | "
-            f"{stats['failed']} failed"
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["restored",    stats["restored"]],
+                ["no-snapshot", stats["no_snapshot"]],
+                ["failed",      stats["failed"]],
+            ],
+            title=f"[JIT] Restore pass '{instance}'",
+            caption="Per-pass outcome of the JIT file-quality restore: how many upgraded "
+                    "episodes were rolled back to their pre-upgrade file.",
+            descriptions=[
+                "episodes restored to their pre-upgrade file",
+                "episodes skipped: no pre-upgrade snapshot recorded",
+                "restore search calls that errored",
+            ],
         )
         return stats
 
@@ -5364,13 +5533,29 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 )
 
         verb = "would free" if self.dry_run else "freed"
-        self.logger.log_info(
-            f"✅ Tautulli sync complete for '{instance}': "
-            f"+{stats['added']} new, {stats['updated']} updated, "
-            f"{stats['skipped']} skipped, "
-            f"{stats['acquired']} acquired, "
-            f"{stats['deleted']} deleted ({verb} {self._fmt_bytes(stats['bytes_freed'])}), "
-            f"{stats['purged']} purged, {stats['cleaned_up']} cleaned up."
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["added",      stats["added"]],
+                ["updated",    stats["updated"]],
+                ["skipped",    stats["skipped"]],
+                ["acquired",   stats["acquired"]],
+                ["deleted",    stats["deleted"]],
+                ["purged",     stats["purged"]],
+                ["cleaned up", stats["cleaned_up"]],
+            ],
+            title=f"✅ Tautulli sync complete '{instance}' ({verb} {self._fmt_bytes(stats['bytes_freed'])})",
+            caption="End-of-sync rollup of how each episode row changed while reconciling "
+                    "the Parquet cache against Tautulli watch history.",
+            descriptions=[
+                "new episode rows added from watch history",
+                "existing rows updated with fresh watch stats",
+                "history entries skipped: unresolvable in Sonarr",
+                "missing episodes a fresh grab was triggered for",
+                "episode files deleted under keep policy",
+                "rows purged: episode file gone from Sonarr",
+                "non-essential rows cleaned out of the cache",
+            ],
         )
         return stats
 

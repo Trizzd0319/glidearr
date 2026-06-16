@@ -12,6 +12,8 @@ with free=137 → ep1 fits 2160 (137−19.53=117.47≥110); after decrement ep2 
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 
 from scripts.managers.services.sonarr.cache.episode_files import SonarrCacheEpisodeFilesManager
@@ -157,6 +159,146 @@ def test_acquire_missing_episode_grabs_at_jit_tier():
     # acquire does NOT mark the row bumped and does NOT stamp the 'upgrade' ledger
     assert bool(df.iloc[0]["upgraded_for_watching"]) is False
     assert pd.isna(df.iloc[0]["planned_action"])
+
+
+# ── Active-watch downgrade protection ─────────────────────────────────────────────────────────
+# Tiered likelihood: a no-affinity UNWATCHED episode (score 0 → likelihood 12) lands below
+# hd_cutoff (20) → the 720 floor. So an owned 1080p next-up would be DOWNGRADEd to 720 unless the
+# series is actively watched (the protection under test — the "currently bingeing AoT" case).
+_WL_TIERED = dict(_WL, uhd_cutoff=70, fhd_cutoff=40, hd_cutoff=20)
+
+
+def _owned_1080(sid, sn, en, fid, last_watched_at=None):
+    r = _row(sid, sn, en, fid)
+    r["resolution"] = 1080
+    r["quality_name"] = "Bluray-1080p"
+    r["last_watched_at"] = last_watched_at
+    return r
+
+
+def _watched_anchor(sid, sn, en, fid, last_watched_at):
+    # A WATCHED earlier episode of the same series — not a next-up candidate itself, but it carries
+    # the series' last_watched_at recency the active-watch guard reads (next-up stubs have none).
+    r = _row(sid, sn, en, fid)
+    r["next_episode"] = False
+    r["is_watched"] = True
+    r["last_watched_at"] = last_watched_at
+    return r
+
+
+def _jit_manager(df, captured):
+    class _Api:
+        def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+            return list(_PROFILES) if endpoint == "qualityprofile" else fallback
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.config = {"free_space_limit": 100, "watch_likelihood": _WL_TIERED,
+                "jit_per_episode_tiers": {"enabled": True}}
+    m.dry_run = False
+    m.global_cache = None
+    m.sonarr_api = _Api()
+    m.load = lambda inst: df
+    m.save = lambda inst, d: None
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_free_space_gb = lambda inst: 5000.0           # ample → space never the limiter
+    m._get_total_space_gb = lambda inst: 1000.0
+    m._get_episode_id = lambda inst, sid, sn, en: 9000 + en
+    m._spawn_jit_search_worker = lambda inst, work: captured.update(work)
+    return m
+
+
+def test_active_watch_protects_owned_file_from_downgrade():
+    """A series watched within JIT_ACTIVE_WATCH_DAYS keeps its owned 1080p next-up file, even though
+    the unwatched episode's affinity-only tier (720) is lower — the AoT-mid-binge case."""
+    recent = (datetime.now(tz=timezone.utc) - timedelta(days=2)).isoformat()
+    df = pd.DataFrame([
+        _owned_1080(10, 1, 3, 1003),                 # next-up, unwatched, no own watch ts
+        _watched_anchor(10, 1, 2, 1002, recent),     # series watched 2 days ago → actively watched
+    ])
+    captured = {}
+    stats = _jit_manager(df, captured).run_jit_quality_upgrades("inst")
+    assert stats["skipped_active_downgrade"] == 1
+    assert stats["upgraded"] == 0 and stats["acquired"] == 0
+    assert captured == {}                            # nothing queued — the 1080p is left alone
+
+
+def test_cold_series_still_downgrades_to_earned_tier():
+    """Control: with no recent watch the SAME owned 1080p next-up downgrades to its earned 720 tier,
+    so the guard protects only actively-watched series, not everything."""
+    old = (datetime.now(tz=timezone.utc) - timedelta(days=120)).isoformat()
+    df = pd.DataFrame([
+        _owned_1080(10, 1, 3, 1003),                 # candidate, no own ts
+        _watched_anchor(10, 1, 2, 1002, old),        # last series watch 120 days ago → cold
+    ])
+    captured = {}
+    stats = _jit_manager(df, captured).run_jit_quality_upgrades("inst")
+    assert stats["skipped_active_downgrade"] == 0
+    assert stats["upgraded"] == 1                    # the downgrade proceeds
+    assert set(captured[10].keys()) == {720}         # re-qualitied down to the 720 earned tier
+
+
+def test_jit_live_stamps_pre_upgrade_quality_into_float64_column():
+    """Regression (live-only crash): a parquet loaded with pre_upgrade_quality all-null comes back
+    float64; the live grab path stamps a json.dumps STRING into it. Strict pandas rejected that
+    ('Invalid value {...} for dtype float64') and crashed the WHOLE JIT pass — and dry-run tests
+    never caught it because the stamp lives in the not-dry_run branch. Coercing to object fixes it."""
+    df = pd.DataFrame([_row(10, 1, 1, 1001)])                      # on-disk 720p next-up → UPGRADE
+    df["pre_upgrade_quality"] = pd.Series([float("nan")], dtype="float64")   # the float64 trap
+    captured = {}
+
+    class _Api:
+        def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+            return list(_PROFILES) if endpoint == "qualityprofile" else fallback
+
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.config = {"free_space_limit": 100, "watch_likelihood": _WL,
+                "jit_per_episode_tiers": {"enabled": True}}
+    m.dry_run = False                                             # LIVE → the stamp actually runs
+    m.global_cache = None
+    m.sonarr_api = _Api()
+    m.load = lambda inst: df
+    m.save = lambda inst, d: None
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_free_space_gb = lambda inst: 5000.0                    # ample → 2160 target → UPGRADE from 720
+    m._get_total_space_gb = lambda inst: 1000.0
+    m._get_episode_id = lambda inst, sid, sn, en: 9000 + en
+    m._spawn_jit_search_worker = lambda inst, work: captured.update(work)
+
+    stats = m.run_jit_quality_upgrades("inst")                    # must NOT raise
+
+    assert stats["upgraded"] == 1
+    val = df.at[0, "pre_upgrade_quality"]
+    assert isinstance(val, str) and "quality_name" in val        # json snapshot stamped, not crashed
+
+
+def test_episodes_in_queue_uses_repeated_episodeids_param():
+    """Regression: Sonarr's /queue/details wants repeated episodeIds params (?episodeIds=1&
+    episodeIds=2), not a comma-joined value (which 400s). The broken poll made the JIT step-down
+    worker never see its grab land, so it churned the profile DOWN the ladder on false negatives."""
+    captured = {}
+
+    class _Api:
+        def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+            captured["endpoint"] = endpoint
+            return [{"episodeId": 911794}, {"episodeId": 911795}]
+
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = _Api()
+
+    # Call the REAL class method explicitly: BaseManager.__new__ returns a process singleton, and a
+    # sibling test (test_jit_search_worker) leaves an instance-level _episodes_in_queue stub on it,
+    # which would otherwise shadow the method under test.
+    found = SonarrCacheEpisodeFilesManager._episodes_in_queue(
+        m, "inst", [911794, 911795, 911796], attempts=1
+    )
+
+    ep = captured["endpoint"]
+    assert "episodeIds=911794,911795" not in ep                       # NOT comma-joined
+    assert "episodeIds=911794" in ep and "episodeIds=911795" in ep    # repeated params
+    assert "&" in ep
+    assert found == {911794, 911795}
 
 
 def test_jit_plan_routes_into_run_summary():
