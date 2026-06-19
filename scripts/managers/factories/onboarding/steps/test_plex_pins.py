@@ -433,6 +433,45 @@ def test_profile_ages_adult_not_stored(monkeypatch):
         "Wyatt" not in cfg["plex"].get("playlists", {}).get("profile_ages", {})
 
 
+# ── _configure_playlists (the opt-in playlist toggles) ────────────────────────
+class _ConfirmPrompter:
+    """Per-key confirm answers (default when a key is absent), plus notice capture."""
+    def __init__(self, answers): self.a = answers; self.notices = []
+    def notice(self, m): self.notices.append(m)
+    def confirm(self, path, label, default=False): return self.a.get(path, default)
+
+
+def test_configure_playlists_writes_toggles():
+    p = _ConfirmPrompter({
+        "plex.has_playlist_options": True,
+        "plex.playlists.writeback.enabled": True,
+        "plex.playlists.recency_boost.enabled": False,
+        "plex.playlists.cold_start_kids_prior": True,
+    })
+    cfg = {"plex": {"episodes": {"enabled": True}}}      # scans on → no notice
+    PlexStep(logger=None)._configure_playlists(p, cfg)
+    pl = cfg["plex"]["playlists"]
+    assert pl["writeback"]["enabled"] is True
+    assert pl["recency_boost"]["enabled"] is False
+    assert pl["cold_start_kids_prior"] is True
+    assert not any("scans" in n or "episodes" in n for n in p.notices)
+
+
+def test_configure_playlists_declined_writes_nothing():
+    p = _ConfirmPrompter({"plex.has_playlist_options": False})
+    cfg = {"plex": {}}
+    PlexStep(logger=None)._configure_playlists(p, cfg)
+    assert "playlists" not in cfg["plex"]
+
+
+def test_configure_playlists_notices_when_scans_off():
+    p = _ConfirmPrompter({"plex.has_playlist_options": True})   # all toggles default off
+    cfg = {"plex": {}}                                          # episodes/movies off
+    PlexStep(logger=None)._configure_playlists(p, cfg)
+    assert any("episodes.enabled" in n for n in p.notices)      # points at the prerequisite
+    assert cfg["plex"]["playlists"]["writeback"]["enabled"] is False
+
+
 def test_profile_ages_declined_writes_nothing():
     p = _Prompter(confirm=False)
     cfg = {"plex": {}}

@@ -194,6 +194,9 @@ class PlexStep(Step):
         # Optional: per-profile age ratings (parental controls) → playlist age-gating.
         self._configure_profile_ages(prompter, cfg, roster)
 
+        # Optional: personal "Up Next" playlist behaviour (build tuning + opt-in write-back).
+        self._configure_playlists(prompter, cfg)
+
         ok = bool(res["ok"])
         detail = res["version"] if res["ok"] else (res["error"] or "unreachable")
         if res["ok"] and not scope["ok"]:
@@ -283,6 +286,53 @@ class PlexStep(Step):
             pl.pop("profile_ages", None)
         if pl:
             cfg["plex"]["playlists"] = pl
+
+    # ── personal playlist behaviour (build tuning + opt-in write-back) ─────────
+    def _configure_playlists(self, prompter, cfg):
+        """Opt-in per-user "Up Next" playlist behaviour → ``plex.playlists.*``. One entry
+        prompt gates three toggles, ALL default-OFF so the default path is unchanged:
+          • writeback.enabled        — actually WRITE the playlists into Plex (also needs
+                                       ``dry_run=false`` to actuate);
+          • recency_boost.enabled    — lift a show you're caught up on when a new
+                                       season/episode lands;
+          • cold_start_kids_prior    — seed a no-history kid profile from the household's
+                                       age-appropriate viewing.
+        Playlists build on the owned-media scans (``plex.episodes.enabled`` /
+        ``plex.movies.enabled``); a notice points there when they're off. No-op when the
+        operator declines the entry prompt."""
+        plex = cfg.get("plex", {}) or {}
+        pl = dict(plex.get("playlists") or {})
+        wb = dict(pl.get("writeback") or {})
+        rb = dict(pl.get("recency_boost") or {})
+        already = bool(wb.get("enabled") or rb.get("enabled") or pl.get("cold_start_kids_prior"))
+
+        if not prompter.confirm("plex.has_playlist_options",
+                                "Set up personal 'Up Next' playlists for each profile?",
+                                default=already):
+            return
+        scans_on = (bool((plex.get("episodes", {}) or {}).get("enabled"))
+                    or bool((plex.get("movies", {}) or {}).get("enabled")))
+        if not scans_on:
+            prompter.notice("   Note: playlists need the owned-media scans — set "
+                            "plex.episodes.enabled / plex.movies.enabled to build them.")
+
+        wb["enabled"] = bool(prompter.confirm(
+            "plex.playlists.writeback.enabled",
+            "   Write the playlists INTO Plex (create real playlists)? Also needs dry_run=false.",
+            default=bool(wb.get("enabled", False))))
+        rb["enabled"] = bool(prompter.confirm(
+            "plex.playlists.recency_boost.enabled",
+            "   Surface a show you're caught up on when a new season/episode arrives?",
+            default=bool(rb.get("enabled", False))))
+        cold = bool(prompter.confirm(
+            "plex.playlists.cold_start_kids_prior",
+            "   Seed a no-history kid profile from the household's kid-show viewing?",
+            default=bool(pl.get("cold_start_kids_prior", False))))
+
+        pl["writeback"] = wb
+        pl["recency_boost"] = rb
+        pl["cold_start_kids_prior"] = cold
+        cfg["plex"]["playlists"] = pl
 
     @staticmethod
     def _pins_from_roster(prompter, pins, roster, token, client_identifier):
