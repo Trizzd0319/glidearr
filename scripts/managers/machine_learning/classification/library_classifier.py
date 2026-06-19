@@ -30,11 +30,27 @@ Signals, in precedence order:
                   the lifestyle veto, so genuine toddler content always reaches Kids.
   • anime       — a source hint (MAL/AniList candidate) OR a genre in ``anime_genres`` OR
                   *anime-language animation* (animated AND ``original_language`` is
-                  Japanese, Korean, or Chinese — donghua). A bare Sonarr
-                  ``seriesType == "anime"`` is honoured ONLY when nothing contradicts it
-                  (no known non-anime language) — Western cartoons get mistyped as anime
-                  (e.g. Curious George), so it is not trusted on its own. This same test
-                  backs :func:`is_anime_media` for Sonarr ``seriesType``, so a
+                  Japanese, Korean, or Chinese — donghua) OR a curated ``seriesType ==
+                  "anime"`` TOGETHER WITH the literal 'anime' genre. Each of the bare
+                  'anime' genre and the bare ``seriesType == "anime"`` is honoured only
+                  when no known non-anime language contradicts it — Western cartoons pick up
+                  a stray 'Anime' tag / mistyped seriesType (Avatar: TLA, Curious George).
+                  But the two signals AGREEING override an English ``original_language``
+                  (common for dubbed/older/mislabeled anime — Space Dandy, Afro Samurai)
+                  UNLESS the title is a WESTERN cartoon. A Western cartoon is flagged when its
+                  language is a known non-anime one AND EITHER (a) its dev-house/network is a
+                  known Western animation house (Rooster Teeth / Nickelodeon / Hanna-Barbera —
+                  catches non-kids cartoons like RWBY / Castlevania / Teen Titans that carry no
+                  kids genre) OR (b) it carries a HARD kids genre (Children/Kids/Preschool —
+                  catches cartoons whose network is absent, e.g. Barbie Dream Squad). Two
+                  narrowings: a known anime network/distributor (TV Tokyo / NHK / Crunchyroll /
+                  any TheTVDB ``(JA)``/``(JP)`` broadcaster) VETOES the demotion so dubbed
+                  Japanese kids anime stay anime; and on dual-use networks that ALSO air imported
+                  anime (Cartoon Network/Toonami, Disney+) the dev-house tell alone is not enough
+                  — a hard kids genre must corroborate, so imports (Blue Submarine No. 6, Star
+                  Wars: Visions) are spared while the genuine Western cartoons there (Craig of the
+                  Creek, Transformers: Armada — both 'Children'-tagged) are still demoted. This
+                  same test backs :func:`is_anime_media` for Sonarr ``seriesType``, so a
                   children-genre anime routes to Kids but still keeps anime episode parsing.
   • CSM age     — Common Sense Media ``recommended_age`` (e.g. from MDBList) as a kids
                   CEILING ONLY: OLDER than the cutoff → NOT Kids (suppressing the genre +
@@ -79,6 +95,10 @@ CATEGORY_ORDER: tuple[str, ...] = ("anime", "kids", "reality", "documentary", "s
 # crime / war / history dramas are NOT swept into the Documentaries library.
 DEFAULT_ANIME_GENRES = frozenset({"anime"})
 DEFAULT_KIDS_GENRES = frozenset({"children", "family", "kids", "preschool"})
+# The HARD, unambiguous child-oriented genres (the soft 'family' is excluded — a real anime is
+# often tagged Family). Used to corroborate a Western-cartoon demotion on dual-use networks that
+# ALSO air imported anime (see DUAL_USE_ANIME_NETWORKS / _anime_match).
+HARD_KIDS_GENRES = frozenset({"children", "kids", "preschool"})
 # Matches sd_replace.py / SonarrSeriesQualityManager.KIDS_CERTS — keep in sync.
 DEFAULT_KIDS_CERTS = frozenset({"tv-y", "tv-y7", "tv-g", "g", "pg"})
 # Kid-safe ratings (≤ TV-PG/PG) that let the SOFT 'Family' genre route to Kids. On
@@ -195,26 +215,146 @@ _CHINESE = frozenset({"chinese", "zh", "zho", "cmn", "mandarin", "cantonese", "y
 # shows in a known OTHER language (English/French/…) do not.
 _ANIME_LANGUAGES = _JAPANESE | _KOREAN | _CHINESE
 
+# WESTERN animation dev-houses + kids/animation networks — the "Western studio" tell. Together
+# with a known non-anime original language, a Western dev house marks an 'Anime'-mistagged title
+# (often also seriesType=anime: Craig of the Creek, Transformers: Armada, RWBY, Castlevania, Teen
+# Titans) as a WESTERN cartoon, NOT anime. Matched against Radarr's `studio` (movies) or Sonarr's
+# `network` (shows). CRITICAL: every anime MAKER and anime DISTRIBUTOR is excluded — Toei/OLM/
+# ufotable/Kyoto/Madhouse/Bones/MAPPA/Sunrise/…, Aniplex/Sony, Funimation, Crunchyroll, Netflix,
+# Adult Swim/Toonami — so a dubbed Japanese anime whose originalLanguage is merely reported English
+# (and whose house is Japanese/streaming/unknown) is NEVER demoted. DEFAULT_KIDS_STUDIOS already
+# excludes anime houses, so it is reused as the base; the extras add Western NON-kids animation.
+WESTERN_STUDIOS = DEFAULT_KIDS_STUDIOS | frozenset({
+    # Western kids / animation NETWORKS (Sonarr `network`) not already in the studio set
+    "boomerang", "pbs", "pbs kids", "teletoon", "ytv", "treehouse tv", "nicktoons",
+    "the hub", "hub network", "discovery kids", "qubo", "kabillion",
+    # Western NON-kids animation houses (RWBY / Castlevania / Teen Titans / Adult Swim originals)
+    "rooster teeth", "rooster teeth productions", "powerhouse animation",
+    "powerhouse animation studios", "frederator", "frederator studios", "williams street",
+    "hanna-barbera", "hanna-barbera productions", "klasky csupo", "film roman", "titmouse",
+    "bento box entertainment", "9 story", "9 story media group", "dhx media", "nelvana",
+    "bardel entertainment", "warner bros. television animation", "dc entertainment",
+})
+# Brand substrings safe to match ANYWHERE in the dev-house string (none distribute anime).
+WESTERN_STUDIO_TOKENS = KIDS_STUDIO_TOKENS | frozenset({
+    "cartoon network", "rooster teeth", "powerhouse animation", "frederator",
+    "hanna-barbera", "nelvana",
+})
+# Known JAPANESE anime TV networks + anime-only distributors — a POSITIVE anime signal. When the
+# dev-house is one of these, a hard kids genre is a genuine (dubbed) Japanese kids anime, NOT a
+# Western cartoon, so it must NOT trigger the kids-genre demotion tell (see _anime_match). This is
+# future-proofing — no genuine anime currently owned carries a hard kids genre — and it spares the
+# dubbed-kids-anime case (Pokémon-type: English-reported, 'Children'-tagged, on TV Tokyo/TV Asahi).
+# Deliberately EXCLUDES ambiguous/dual-use strings: "ytv" (Canadian kids YTV AND Japan's Yomiuri
+# TV), "abc", "spike", and the general platforms Netflix/Hulu/Amazon — and the Western blocks that
+# merely AIR anime (Cartoon Network/Toonami, Adult Swim, Disney+) which are handled as dual-use.
+ANIME_NETWORKS = frozenset({
+    "tv tokyo", "tv asahi", "tokyo mx", "tv aichi", "tv osaka", "mbs", "tbs",
+    "fuji tv", "fuji television", "nippon tv", "ntv", "wowow", "bs11", "bs fuji",
+    "animax", "at-x", "kids station", "tokyo broadcasting system",
+    "crunchyroll", "funimation", "aniplus", "aniplus asia",
+    # Japanese/Chinese/Korean networks TheTVDB carries that the country-tag rule below doesn't cover
+    "bilibili", "niconico", "teletama", "tvk", "anime oav", "chubu-nippon broadcasting",
+    "nagoya broadcasting network", "sky perfectv!", "sky perfectv", "ebs",
+})
+# Substrings safe to match ANYWHERE (unambiguous anime/Japanese-broadcaster brands only). 'nhk'
+# catches NHK / NHK Educational TV / NHK General TV / NHK BS…; 'asahi' catches TV Asahi / Kyushu
+# Asahi Broadcasting / Asahi Broadcasting (all Japanese). No Western network contains these.
+ANIME_NETWORK_TOKENS = frozenset({
+    "tv tokyo", "tokyo mx", "animax", "at-x", "crunchyroll", "funimation", "nhk", "asahi",
+})
 
-def _anime_match(g: set, stype: str, olang: str, anime_g: set, is_anime_hint: bool) -> tuple[bool, str]:
+
+def _is_western_studio(studio) -> bool:
+    """True if the dev-house string (Radarr ``studio`` / Sonarr ``network``) is a known WESTERN
+    animation house or kids/animation network. Empty/unknown → False (so missing data never
+    demotes a real anime). Excludes every anime maker/distributor by construction."""
+    s = (studio or "").strip().lower()
+    if not s:
+        return False
+    return s in WESTERN_STUDIOS or any(tok in s for tok in WESTERN_STUDIO_TOKENS)
+
+
+def _is_dual_use_anime_network(studio) -> bool:
+    """True for the Western networks that ALSO air IMPORTED Japanese anime, so the network alone
+    can't tell a Western original from an anime that merely aired there: Cartoon Network (Toonami)
+    and Disney+ (Star Wars: Visions + licensed anime). For these, a Western-cartoon demotion needs
+    a corroborating HARD kids genre (see _anime_match) — otherwise a real anime such as Blue
+    Submarine No. 6 (Gonzo, aired on Toonami) would be wrongly demoted. Disney Channel / XD /
+    Junior are NOT flagged here — those are Western kids networks, not anime importers."""
+    s = (studio or "").strip().lower()
+    if not s:
+        return False
+    if "cartoon network" in s:
+        return True
+    return "disney" in s and ("+" in s or "plus" in s)
+
+
+def _is_anime_house(studio) -> bool:
+    """True if the dev-house is a known Japanese anime network / anime-only distributor — a POSITIVE
+    anime signal that vetoes the kids-genre demotion tell, so a dubbed Japanese kids anime
+    (English-reported, 'Children'-tagged, on TV Tokyo / TV Asahi / …) is NOT demoted as a Western
+    cartoon. Empty/unknown → False (so a null network like Barbie Dream Squad's still demotes on its
+    kids genre). Excludes ambiguous/dual-use strings by construction (see ANIME_NETWORKS)."""
+    s = (studio or "").strip().lower()
+    if not s:
+        return False
+    # TheTVDB disambiguates same-named networks by country suffix — "ABC (JA)", "CTC (JA)",
+    # "YTV (JP)" are the Japanese broadcasters (Asahi/Chukyo/Yomiuri), distinct from "ABC (US)" etc.
+    if "(ja)" in s or "(jp)" in s:
+        return True
+    return s in ANIME_NETWORKS or any(tok in s for tok in ANIME_NETWORK_TOKENS)
+
+
+def _anime_match(g: set, stype: str, olang: str, anime_g: set, is_anime_hint: bool,
+                 studio: str | None = None) -> tuple[bool, str]:
     """
     Genuine-anime detection, returning ``(is_anime, reason)``. This is the truth
     for Sonarr ``seriesType`` and is independent of kids routing — a children-genre
     anime is still "anime media" here even though it lands in the Kids library.
+    ``studio`` is the dev-house string (Radarr ``studio`` / Sonarr ``network``).
     """
     if is_anime_hint:
         return True, "hint:source"
     # Typed/tagged anime with unknown language is kept (don't demote on missing data); a
     # KNOWN non-anime language (English/French/…) is the demotion signal.
     known_non_anime_lang = bool(olang) and olang not in _ANIME_LANGUAGES
+    has_anime_genre = bool(g & anime_g)
+    # A WESTERN cartoon TheTVDB has mistagged 'Anime' (Craig of the Creek, Transformers: Armada,
+    # RWBY, Castlevania, Teen Titans) is indistinguishable from a genuine anime on the seriesType +
+    # 'anime'-genre signals alone — TheTVDB gives those cartoons BOTH and reports them English. The
+    # tell is the DEV HOUSE: a Western studio/network AND a known non-anime original language. A
+    # dubbed Japanese anime reported English keeps its Japanese/streaming/unknown house, so it is
+    # NOT flagged a Western cartoon — only an English-language title from a Western house is.
+    # EITHER tell flags a Western cartoon, because each catches what the other misses: the Western
+    # DEV-HOUSE catches non-kids cartoons carrying no kids genre (RWBY/Castlevania/Teen Titans),
+    # while a HARD kids genre catches cartoons whose network metadata is absent (Barbie Dream Squad,
+    # network=None — the dev-house tell alone would leave it in /anime). Two EXCEPTIONS narrow it:
+    #   • dual-use networks that ALSO air imported anime (Cartoon Network/Toonami, Disney+) are not a
+    #     sufficient dev-house tell on their own, so there demotion rides on the kids-genre tell —
+    #     which the genuine Western cartoons carry (Craig/Transformers → 'Children') while the
+    #     imported anime do not (Blue Submarine No. 6, Star Wars: Visions → no kids genre → stay).
+    #   • a known anime network/distributor (TV Tokyo, …) VETOES the kids-genre tell, so a dubbed
+    #     Japanese kids anime reported English with a 'Children' tag is NOT demoted as Western.
+    western_house = _is_western_studio(studio) and not _is_dual_use_anime_network(studio)
+    western_cartoon = known_non_anime_lang and not _is_anime_house(studio) and (
+        western_house or bool(g & HARD_KIDS_GENRES))
+    # Two anime signals AGREEING — a curated Sonarr seriesType=anime AND the literal 'anime'
+    # genre — keep a title in anime even when its originalLanguage is reported non-anime (English
+    # is very common for dubbed/older/mislabeled anime: Space Dandy, Afro Samurai, Robotech),
+    # UNLESS it is a Western cartoon (English + Western dev house). One signal alone is NOT enough:
+    # a bare 'anime' genre with English (Avatar: TLA, no seriesType) is still demoted, as is a bare
+    # seriesType — those fall through to the language-gated branches below.
+    if stype == "anime" and has_anime_genre and not western_cartoon:
+        return True, "seriesType+genre:anime"
     # A bare 'anime' GENRE is trusted UNLESS the original language is a known non-anime one.
     # TheTVDB tags some Western cartoons (Avatar: The Last Airbender, RWBY, Castlevania, Teen
     # Titans) under an 'Anime' genre; without this guard a literal 'anime' tag pulls an
     # English-language animated show out of Kids into the Anime library and flips its
     # seriesType. Mirrors the seriesType=anime discipline below (unknown language still trusts).
-    if (g & anime_g) and not known_non_anime_lang:
+    if has_anime_genre and not known_non_anime_lang:
         return True, "genre:anime"
-    animated = ("animation" in g) or (stype == "anime") or bool(g & anime_g)
+    animated = ("animation" in g) or (stype == "anime") or has_anime_genre
     if animated and olang in _JAPANESE:
         return True, "japanese-animation"
     if animated and olang in _KOREAN:
@@ -233,12 +373,15 @@ def is_anime_media(
     original_language: str | None = None,
     is_anime_hint: bool = False,
     anime_genres=None,
+    studio: str | None = None,
 ) -> bool:
     """
     True if a show is genuinely anime for *parsing* purposes (Sonarr
     ``seriesType``), independent of which library it routes to. A Japanese/Korean
     kids anime routes to the Kids library but is anime media here, so callers keep
     its seriesType at ``anime`` instead of demoting it to ``standard``.
+    ``studio`` is the dev-house string (Sonarr ``network`` for shows): with a known
+    non-anime language it marks a Western cartoon mistagged 'Anime' for demotion.
     """
     g = {str(x).strip().lower() for x in (genres or []) if str(x).strip()}
     return _anime_match(
@@ -247,6 +390,7 @@ def is_anime_media(
         (original_language or "").strip().lower(),
         _as_set(anime_genres, DEFAULT_ANIME_GENRES),
         is_anime_hint,
+        studio=studio,
     )[0]
 
 
@@ -376,7 +520,7 @@ def classify_show_explained(
         return "kids", f"preschool:{sorted(pre_genre_hit)[0]}"
 
     # ── 2. Anime — beats the children/family kids genres (step 3) ─────────────
-    anime_ok, anime_reason = _anime_match(g, stype, olang, anime_g, is_anime_hint)
+    anime_ok, anime_reason = _anime_match(g, stype, olang, anime_g, is_anime_hint, studio=netw)
     if anime_ok:
         return "anime", anime_reason
 
@@ -532,7 +676,7 @@ def classify_movie_explained(
 
     # 1. Anime — the 'anime' genre or Japanese/Korean/Chinese animation (the ONLY
     #    genre/language route kept for movies). No seriesType for movies → "".
-    anime_ok, anime_reason = _anime_match(g, "", olang, anime_g, is_anime_hint)
+    anime_ok, anime_reason = _anime_match(g, "", olang, anime_g, is_anime_hint, studio=studio_l)
     if anime_ok:
         return "anime", anime_reason
 

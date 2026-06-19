@@ -14,6 +14,7 @@ from __future__ import annotations
 from scripts.managers.machine_learning.classification.library_classifier import (
     classify_movie_explained,
     classify_show_explained,
+    is_anime_media,
 )
 
 
@@ -82,6 +83,143 @@ def test_anime_genre_tag_vetoed_by_known_non_anime_language():
     # Real anime is untouched: a known anime language, or an unknown/missing one still trusts.
     assert _show(["Anime"], original_language="Japanese") == "anime"
     assert _show(["Anime", "Family"], "TV-PG") == "anime"                       # unknown lang trusts genre
+
+
+# ── seriesType=anime + the literal 'anime' genre AGREEING override an English original
+#    language (common for dubbed/older anime), but a HARD kids genre still demotes a Western
+#    cartoon TheTVDB mistagged with BOTH signals (Craig of the Creek / Transformers / Barbie). ──
+def test_seriestype_plus_anime_genre_survive_english_original_language():
+    # Genuine Japanese anime whose Sonarr originalLanguage is (wrongly) reported English: the
+    # seriesType=anime + 'Anime' genre pair overrides the language → stays in the Anime library.
+    assert _show(["Animation", "Anime", "Science Fiction"],
+                 series_type="anime", original_language="English") == "anime"   # Space Dandy
+    assert _show(["Action", "Adventure", "Anime", "Fantasy"],
+                 series_type="anime", original_language="English") == "anime"   # Tales of Phantasia
+    # The SOFT 'Family' genre is not a Western tell — a Family-tagged anime keeps its anime route.
+    assert _show(["Animation", "Anime", "Family", "Romance"],
+                 series_type="anime", original_language="English") == "anime"   # Gakuen Alice
+
+
+def test_western_cartoon_with_western_dev_house_demoted_despite_seriestype():
+    # A WESTERN dev house (Sonarr network / Radarr studio) + English marks a cartoon mistagged
+    # 'Anime' + seriesType=anime → NOT anime; routes to Kids on its Children genre (seriesType is
+    # corrected elsewhere). Without a Western dev house the pair is trusted, protecting dubbed anime.
+    assert _show(["Adventure", "Animation", "Anime", "Children", "Comedy", "Drama", "Family"],
+                 series_type="anime", original_language="English",
+                 network="Cartoon Network") == "kids"   # Craig of the Creek
+    assert _show(["Animation", "Anime", "Children", "Comedy"],
+                 series_type="anime", original_language="English",
+                 network="Nickelodeon") == "kids"       # Barbie Dream Squad
+    # A KNOWN anime network (TV Tokyo) vetoes the demotion → a dubbed Japanese kids anime reported
+    # English with a 'Children' tag stays anime; a NULL network falls through to the kids-genre tell
+    # and IS demoted (the Barbie Dream Squad case — covered fully in its own test below).
+    assert _show(["Animation", "Anime", "Children", "Comedy"],
+                 series_type="anime", original_language="English",
+                 network="TV Tokyo") == "anime"
+    assert _show(["Animation", "Anime", "Children", "Comedy"],
+                 series_type="anime", original_language="English") == "kids"   # null network → demoted
+
+
+def test_western_nonkids_cartoon_demoted_by_dev_house():
+    # RWBY / Castlevania / Teen Titans: seriesType=anime + 'Anime' + English + a Western dev house
+    # but NO kids genre → demoted to series (the case the kids-genre-only tell missed entirely).
+    assert _show(["Animation", "Anime", "Action", "Fantasy"], series_type="anime",
+                 original_language="English", network="Rooster Teeth") == "series"   # RWBY
+    assert _movie(["Animation", "Anime", "Action"], original_language="English",
+                  studio="Rooster Teeth Productions") == "standard"   # movie bucket, not anime
+    # Dubbed Japanese anime reported English from a non-Western (Japanese) house → KEPT anime.
+    assert _show(["Animation", "Anime", "Science Fiction"], series_type="anime",
+                 original_language="English", network="Tokyo MX") == "anime"
+
+
+def test_dual_use_anime_network_needs_kids_genre_corroboration():
+    # Cartoon Network (Toonami) and Disney+ AIR imported anime, so the network alone is not proof
+    # of Western origin: a Western-cartoon demotion there requires a HARD kids genre. A genuine
+    # Western cartoon carries one (Craig/Transformers → 'Children') and is still demoted; an
+    # imported anime that merely aired there does NOT (Blue Submarine No. 6, Star Wars: Visions) and
+    # is spared. Unambiguous Western houses (Rooster Teeth, Nickelodeon) keep demoting on English.
+    # -- imported anime on a dual-use network, NO kids genre → KEPT anime --
+    assert _show(["Action", "Animation", "Anime", "Science Fiction"], series_type="anime",
+                 original_language="English", network="Cartoon Network") == "anime"   # Blue Submarine No.6
+    assert _show(["Action", "Adventure", "Animation", "Anime", "Fantasy", "Science Fiction"],
+                 series_type="anime", original_language="English",
+                 network="Disney+") == "anime"                                        # Star Wars: Visions
+    # -- genuine Western cartoon on a dual-use network, hard Children genre → still demoted --
+    assert _show(["Animation", "Anime", "Children", "Science Fiction"], series_type="anime",
+                 original_language="English", network="Cartoon Network") == "kids"    # Transformers: Armada
+    # -- unambiguous Western house (NOT dual-use) demotes on English alone, no genre needed --
+    assert _show(["Animation", "Anime", "Action", "Fantasy"], series_type="anime",
+                 original_language="English", network="Rooster Teeth") == "series"    # RWBY
+    # is_anime_media mirrors it: the dual-use guard spares the import, keeps anime parsing.
+    assert is_anime_media(genres=["Action", "Animation", "Anime", "Science Fiction"],
+                          series_type="anime", original_language="English",
+                          studio="Cartoon Network") is True                           # Blue Submarine No.6
+    # Disney CHANNEL (not Disney+) is a Western kids network, not an anime importer → demotes.
+    assert is_anime_media(genres=["Animation", "Anime", "Comedy"], series_type="anime",
+                          original_language="English", studio="Disney Channel") is False
+
+
+def test_western_cartoon_with_missing_network_demoted_by_hard_kids_genre():
+    # The dev-house tell is a UNION with the hard-kids-genre tell, because each catches what the
+    # other misses. A real Western cartoon whose Sonarr `network` is missing/None (Barbie Dream
+    # Squad — confirmed network=None in the live cache) has NO dev-house signal, so the dev-house
+    # tell ALONE would wrongly leave it in /anime; the hard 'Children' genre still demotes it.
+    assert _show(["Animation", "Anime", "Children", "Comedy"], series_type="anime",
+                 original_language="English", network=None) == "kids"          # Barbie Dream Squad
+    assert is_anime_media(genres=["Animation", "Anime", "Children"], series_type="anime",
+                          original_language="English", studio=None) is False
+    # The SOFT 'Family' genre is NOT a hard tell — with no network it can't demote a real anime.
+    assert _show(["Animation", "Anime", "Family", "Romance"], series_type="anime",
+                 original_language="English", network=None) == "anime"
+    # And the two tells are independent: a Western dev-house with NO kids genre still demotes
+    # (RWBY), while a hard kids genre with NO/!Western house still demotes (Barbie) — proven above.
+
+
+def test_anime_house_veto_protects_dubbed_anime_on_japanese_networks():
+    # A KNOWN anime network/distributor vetoes the kids-genre demotion tell, so a dubbed Japanese
+    # kids anime reported English with a 'Children' tag stays anime. Covers TheTVDB's country-tag
+    # convention ("ABC (JA)" / "CTC (JA)" / "YTV (JP)" = Japanese broadcasters), the 'nhk'/'asahi'
+    # tokens (so "NHK Educational TV" / "Kyushu Asahi Broadcasting" match), and donghua platforms.
+    for net in ["ABC (JA)", "CTC (JA)", "YTV (JP)", "NHK Educational TV",
+                "Kyushu Asahi Broadcasting", "Bilibili", "Niconico", "TV Tokyo"]:
+        assert _show(["Animation", "Anime", "Children", "Comedy"], series_type="anime",
+                     original_language="English", network=net) == "anime", net
+        assert is_anime_media(genres=["Animation", "Anime", "Children"], series_type="anime",
+                              original_language="English", studio=net) is True, net
+    # The country tag is Japan-specific: "ABC (US)" is NOT an anime house, so a 'Children'-tagged
+    # English cartoon there is still demoted; plain Canadian "YTV" stays a Western house (NOT an
+    # anime house), so an English cartoon there is demoted out of anime (it then routes to kids on
+    # YTV being a kids network — the point here is only that the anime-house veto does NOT apply).
+    assert _show(["Animation", "Anime", "Children", "Comedy"], series_type="anime",
+                 original_language="English", network="ABC (US)") == "kids"
+    assert is_anime_media(genres=["Animation", "Anime", "Action"], series_type="anime",
+                          original_language="English", studio="YTV") is False   # Canadian YTV → Western
+
+
+def test_is_anime_media_seriestype_genre_pair_vs_western_kids():
+    # is_anime_media drives the Sonarr seriesType correction in the re-organizer. The pair
+    # (seriesType=anime + 'anime' genre) is genuine anime even reported English; a hard kids
+    # genre flips it to a Western cartoon; and ONE signal alone is never enough.
+    assert is_anime_media(genres=["Animation", "Anime", "Science Fiction"],
+                          series_type="anime", original_language="English") is True   # FIXED (was False)
+    assert is_anime_media(genres=["Animation", "Anime", "Science Fiction"],
+                          series_type="anime", original_language="Japanese") is True
+    assert is_anime_media(genres=["Animation", "Anime", "Science Fiction"],
+                          series_type="anime", original_language=None) is True
+    # Hard 'Children' genre + English: NOT anime media on a Western/dual-use house (Cartoon Network)
+    # OR a null house (Barbie Dream Squad — via the kids-genre tell); but a KNOWN anime network
+    # (TV Tokyo) vetoes that tell, so a dubbed Japanese kids anime reported English stays anime.
+    assert is_anime_media(genres=["Animation", "Anime", "Children"], series_type="anime",
+                          original_language="English", studio="Cartoon Network") is False
+    assert is_anime_media(genres=["Animation", "Anime", "Children"], series_type="anime",
+                          original_language="English", studio=None) is False           # Barbie (null house)
+    assert is_anime_media(genres=["Animation", "Anime", "Children"], series_type="anime",
+                          original_language="English", studio="TV Tokyo") is True       # dubbed JP kids anime
+    # One signal alone is not enough: a bare 'anime' genre + English with no seriesType is demoted,
+    # as is a bare seriesType=anime (mistyped Western cartoon) carrying no 'anime' genre.
+    assert is_anime_media(genres=["Anime", "Family"], original_language="English") is False
+    assert is_anime_media(genres=["Animation", "Comedy"],
+                          series_type="anime", original_language="English") is False
 
 
 # ── shows: CSM age is a kids CEILING ONLY — never routes to Kids by itself ────────

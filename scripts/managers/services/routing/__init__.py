@@ -177,4 +177,5 @@ class RoutingManager:
     def _anime_media(self, it):
         return is_anime_media(
             genres=it.get("genres"), series_type=it.get("seriesType"),
-            original_language=self._olang(it), anime_genres=self._anime_genres)
+            original_language=self._olang(it), anime_genres=self._anime_genres,
+            studio=it.get("network"))

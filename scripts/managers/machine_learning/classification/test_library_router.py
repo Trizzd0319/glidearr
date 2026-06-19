@@ -82,3 +82,44 @@ def test_plan_moves_normalises_trailing_slash_and_case():
                        movie_root_folders={"standard": "/m/std", "kids": "/m/kids"},
                        classify=lambda it: "kids")
     assert plans == []                                                    # treated as already in place
+
+
+# ── regression: don't demote genuine anime that merely report an English originalLanguage ──────
+def test_plan_moves_keeps_genuine_anime_reported_english_but_demotes_western_cartoon():
+    """End-to-end through the REAL classifier (wired as the routing service wires it): a genuine
+    Japanese anime whose Sonarr originalLanguage is reported English keeps its /anime folder AND
+    its seriesType=anime, while a Western cartoon TheTVDB mistagged 'Anime' (hard Children genre)
+    is still demoted to /kids + seriesType standard."""
+    from scripts.managers.machine_learning.classification.library_classifier import (
+        classify_show, is_anime_media,
+    )
+
+    def _olang(it):
+        ol = it.get("originalLanguage")
+        return ol.get("name") if isinstance(ol, dict) else ol
+
+    def classify(it):
+        return classify_show(genres=it.get("genres"), series_type=it.get("seriesType"),
+                             original_language=_olang(it), network=it.get("network"))
+
+    def anime_media(it):
+        return is_anime_media(genres=it.get("genres"), series_type=it.get("seriesType"),
+                              original_language=_olang(it), studio=it.get("network"))
+
+    rf = {"series": "/data/media/tv/series", "anime": "/data/media/tv/anime", "kids": "/data/media/tv/kids"}
+    routing = {"movies": {}, "tv": {"anime_policy": "series_type_plus_folder", "kids_bucket_enabled": True}}
+    items = [
+        {"id": 1, "title": "Space Dandy", "rootFolderPath": "/data/media/tv/anime", "seriesType": "anime",
+         "originalLanguage": {"name": "English"}, "network": "Tokyo MX",   # Japanese network → kept anime
+         "genres": ["Action", "Adventure", "Animation", "Anime", "Comedy", "Science Fiction"]},
+        {"id": 2, "title": "Craig of the Creek", "rootFolderPath": "/data/media/tv/anime", "seriesType": "anime",
+         "originalLanguage": {"name": "English"}, "network": "Cartoon Network",   # Western → demoted
+         "genres": ["Adventure", "Animation", "Anime", "Children", "Comedy", "Drama", "Family"]},
+    ]
+    plans = plan_moves(items, is_show=True, routing=routing, root_folders=rf,
+                       movie_root_folders={}, classify=classify, anime_media=anime_media)
+    by_id = {p["id"]: p for p in plans}
+    assert 1 not in by_id                                              # Space Dandy: no move, no type flip
+    craig = by_id[2]                                                   # Craig: demoted to kids + standard
+    assert craig["target_root"] == "/data/media/tv/kids"
+    assert craig["new_series_type"] == "standard"

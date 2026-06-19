@@ -106,6 +106,7 @@ class Resolver:
                 original_language=original_language,
                 is_anime_hint=bool(cand.get("is_anime")),
                 anime_genres=self._anime_genres,
+                studio=obj.get("network"),
             )
         else:
             # Movie library bucket: kids → anime → 4k → standard (content wins).
