@@ -126,11 +126,39 @@ class PlexUsersManager(BaseManager):
         #    persist the PII-minimized roster and identity map.
         self._build_tracked(roster, identity_map)
         self._persist(roster, identity_map)
+        self._warn_ungated_managed_users(roster)
         stats["users_tracked"] = len(self.tracked_users)
         self.logger.log_info(
             f"[PlexUsers] {len(self.tracked_users)} user(s) tracked "
             f"({pin_skipped} pin-skipped) of {len(roster)} Home user(s).")
         return stats
+
+    def _warn_ungated_managed_users(self, roster: list) -> None:
+        """Surface managed (kid/teen) Home profiles whose age tier could NOT be resolved.
+
+        Plex's /api/v2/home/users payload frequently OMITS ``restrictionProfile``; without it
+        (and without a ``plex.playlists.profile_ages`` override) the playlist age-gate falls
+        OPEN to ADULT, so a managed child profile silently receives the full, unfiltered
+        household plan. We never guess a tier (that would over-gate a legitimate adult Home
+        member like a spouse), so instead we warn LOUDLY — once per run — naming each profile
+        so the operator can add a profile_ages entry for any that are children."""
+        pl = ((self.config.get("plex", {}) if self.config else {}).get("playlists", {}) or {})
+        overrides = {str(k).strip().lower() for k in (pl.get("profile_ages") or {})}
+        ungated = []
+        for u in roster:
+            if not u.get("is_managed") or u.get("restriction_profile"):
+                continue                                  # not managed, or Plex gave us a tier
+            title = (u.get("title") or "").strip()
+            if title.lower() in overrides or str(u.get("uuid") or "").lower() in overrides:
+                continue                                  # operator already set an explicit age
+            ungated.append(title or str(u.get("uuid") or "?"))
+        if ungated:
+            self.logger.log_warning(
+                f"[PlexUsers] age tier UNKNOWN for managed profile(s): {', '.join(ungated)}. "
+                "Plex reported no restrictionProfile and no plex.playlists.profile_ages "
+                "override is set, so their Up Next playlists fail OPEN to ADULT (unfiltered). "
+                "Add a profile_ages entry (little_kid / older_kid / teen) for any that are "
+                "children.")
 
     # ── network steps ─────────────────────────────────────────────────────────
     def _probe_scope(self) -> bool:

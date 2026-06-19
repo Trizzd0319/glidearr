@@ -159,6 +159,48 @@ def test_server_write_token_managed_derives_per_server_token_not_owner():
     assert m.server_write_token(kid) == "PER-SERVER-KID"
 
 
+# ── age-gate fail-open warning for managed profiles with no resolved tier ──
+class _CapLogger:
+    def __init__(self): self.warnings = []
+    def log_info(self, *a, **k): pass
+    def log_debug(self, *a, **k): pass
+    def log_warning(self, msg, *a, **k): self.warnings.append(msg)
+
+
+def _users_mgr(config):
+    m = object.__new__(PlexUsersManager)
+    m.logger = _CapLogger()
+    m.config = config
+    return m
+
+
+def test_warn_ungated_managed_users_fires_for_managed_without_tier_or_override():
+    m = _users_mgr({"plex": {"playlists": {"profile_ages": {"Wyatt": "little_kid"}}}})
+    roster = [
+        {"uuid": "a", "title": "Trizzd", "is_admin": True, "is_managed": False, "restriction_profile": None},
+        {"uuid": "b", "title": "Wyatt", "is_managed": True, "restriction_profile": None},        # has override
+        {"uuid": "c", "title": "Kidd", "is_managed": True, "restriction_profile": "little_kid"}, # Plex tier known
+        {"uuid": "d", "title": "Aiden", "is_managed": True, "restriction_profile": None},        # UNGATED
+        {"uuid": "e", "title": "Mom", "is_managed": True, "restriction_profile": None},          # UNGATED
+    ]
+    m._warn_ungated_managed_users(roster)
+    assert len(m.logger.warnings) == 1
+    w = m.logger.warnings[0]
+    assert "Aiden" in w and "Mom" in w                       # only the ungated managed profiles
+    assert "Wyatt" not in w and "Kidd" not in w and "Trizzd" not in w
+
+
+def test_warn_ungated_managed_users_silent_when_all_gated():
+    m = _users_mgr({"plex": {"playlists": {"profile_ages": {"Aiden": "older_kid"}}}})
+    roster = [
+        {"uuid": "d", "title": "Aiden", "is_managed": True, "restriction_profile": None},   # override
+        {"uuid": "c", "title": "Kidd", "is_managed": True, "restriction_profile": "teen"},  # Plex tier
+        {"uuid": "a", "title": "Trizzd", "is_admin": True, "is_managed": False, "restriction_profile": None},
+    ]
+    m._warn_ungated_managed_users(roster)
+    assert m.logger.warnings == []
+
+
 def test_server_write_token_managed_no_token_returns_none_never_owner():
     class _API:
         token = "ADMIN-TOKEN"
