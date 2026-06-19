@@ -62,6 +62,7 @@ from scripts.managers.machine_learning.acquisition.pilot_stepping import (
     profile_max_resolution,
     rank_pilot_profiles,
 )
+from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.managers.machine_learning.lifecycle.grace_policy import (
     episode_grace_decision,
     grace_mark,
@@ -625,7 +626,66 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             f"[ShowScore] Scored {len(score_by_series)} series for '{instance}' "
             f"(range: {min(vals)}-{max(vals)})"
         )
+        try:
+            self.report_size_anomalies(instance, df)
+        except Exception as e:
+            self.logger.log_debug(f"[SizeAnomaly] report failed for '{instance}': {e}")
         return len(score_by_series)
+
+    @timeit("report_size_anomalies")
+    def report_size_anomalies(self, instance: str, df=None) -> list:
+        """Flag episode files WILDLY out of size profile for their graded quality (the Sonarr
+        twin of the Radarr check — e.g. a 45-minute episode graded 1080p at 30 GiB). Read-only:
+        logs a count and records a detail table in the end-of-run summary. Returns the anomaly
+        rows. Off via size_anomaly.enabled=false."""
+        from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
+
+        cfg = size_anomaly.config_for(self.config)
+        if not cfg.get("enabled", True):
+            return []
+        instance = self._resolve_instance(instance)
+        if df is None:
+            df = self.load(instance)
+        if df is None or getattr(df, "empty", True):
+            return []
+
+        rows = size_anomaly.find_size_anomalies(
+            df, id_cols=("series_title", "season_number", "episode_number"),
+            size_col="size_bytes", runtime_col="runtime_seconds", runtime_unit="seconds",
+            quality_col="quality_name", resolution_col="resolution",
+            over_ratio=cfg["over_ratio"], under_ratio=cfg["under_ratio"],
+            min_samples=cfg["min_samples"],
+        )
+        if not rows:
+            return []
+        over = [r for r in rows if r["verdict"] == "oversized"]
+        reclaim = sum(r["reclaim_gb"] for r in over)
+        self.logger.log_info(
+            f"[SizeAnomaly] '{instance}': {len(rows)} episode file(s) wildly out of size "
+            f"profile — {len(over)} oversized (~{reclaim:.0f} GB reclaimable), "
+            f"{len(rows) - len(over)} undersized."
+        )
+        _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
+        if _rs is not None:
+            table = [[self._fmt_episode_label(r), r["quality_name"], r["looks_like"],
+                      f"{r['size_gb']:.1f} GB", f"{r['expected_gb']:.1f} GB", f"x{r['ratio']:.1f}",
+                      f"{r['reclaim_gb']:.1f} GB", r["verdict"]] for r in rows[:cfg["report_limit"]]]
+            _rs.add_rows(
+                "sonarr", "Size anomalies", instance,
+                ["Episode", "Graded", "Looks like", "Size", "Expected", "Ratio", "Reclaim", "Verdict"],
+                table, order=35,
+            )
+        return rows
+
+    @staticmethod
+    def _fmt_episode_label(r: dict) -> str:
+        """'Series SxxExx' for the size-anomaly table; degrades to the title when s/e absent."""
+        title = str(r.get("series_title") or "?")[:24]
+        try:
+            sn, en = int(r.get("season_number")), int(r.get("episode_number"))
+            return f"{title} S{sn:02d}E{en:02d}"
+        except (TypeError, ValueError):
+            return title
 
     @timeit("refresh_enrichment")
     def refresh_enrichment(self, instance: str) -> int:
@@ -1052,7 +1112,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             done.add(fid)
             size = float(df.at[idx, "size_bytes"]) if ("size_bytes" in df.columns and pd.notna(df.at[idx, "size_bytes"])) else 0.0
             title = df.at[idx, "series_title"] if "series_title" in df.columns else f"series {sid}"
-            if self.dry_run:
+            if effective_dry_run(self.dry_run, self.global_cache):    # also dry when backup gate disarmed
                 self.logger.log_info(f"  🗑️ [dry_run] Would delete episode file: '{title}' (fid={fid}, {self._fmt_bytes(size)})")
                 _del_rows.append([str(title), _se, str(fid), self._fmt_bytes(size), "would delete"])
                 stats["deleted"] += 1

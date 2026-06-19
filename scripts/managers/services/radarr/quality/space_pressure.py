@@ -60,6 +60,8 @@ from scripts.managers.machine_learning.space.downgrade_planner import (
 from scripts.managers.machine_learning.space.upgrade_planner import (
     plan_movie_upgrades,
 )
+from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
+from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.watch_likelihood import (
     affinity_boost as _affinity_boost,
 )
@@ -774,7 +776,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             self._stamp_plan(df, idx, "delete", reason, size_gb)
             stamped = True
 
-            if self.dry_run:
+            if effective_dry_run(self.dry_run, self.global_cache):    # also dry when backup gate disarmed
                 self.logger.log_info(f"  🗑️ [dry_run] Would delete: '{title}' ({self._fmt_bytes(size)}) — {reason}")
                 freed_gb += size_gb
                 stats["bytes_freed"] += size
@@ -993,7 +995,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             idx, fid, size = c["idx"], c["fid"], float(c.get("size_bytes") or 0.0)
             title = c.get("title") or f"movie {fid}"
             self._stamp_plan(df, idx, "delete", c.get("reason") or "coordinator pool", size / (1024 ** 3))
-            if self.dry_run:
+            if effective_dry_run(self.dry_run, self.global_cache):    # also dry when backup gate disarmed
                 self.logger.log_info(f"  🗑️ [dry_run] Would delete movie: '{title}' ({self._fmt_bytes(size)})")
                 stats["deleted"] += 1
                 stats["bytes_freed"] += size
@@ -1274,7 +1276,132 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             f"[SpacePressure] Scored {len(score_map)} movies for '{instance}' "
             f"(range: {min(score_map.values())}–{max(score_map.values())})"
         )
+        try:
+            _rows = self.report_size_anomalies(instance, df)
+            self.remediate_size_anomalies(instance, _rows)
+        except Exception as e:
+            self.logger.log_debug(f"[SizeAnomaly] report/remediate failed for '{instance}': {e}")
         return len(score_map)
+
+    @timeit("report_size_anomalies")
+    def report_size_anomalies(self, instance: str, df=None) -> list:
+        """Flag movies whose file is WILDLY out of size profile for their graded quality (e.g.
+        a 45 GiB file graded 720p ≈ 6x its expected size). Read-only diagnostic: logs a count
+        and records a detail table in the end-of-run summary. Returns the anomaly rows (sorted
+        biggest-reclaim first) so a space pass can act on them. Off via size_anomaly.enabled=false."""
+        cfg = size_anomaly.config_for(self.config)
+        if not cfg.get("enabled", True):
+            return []
+        instance = self._resolve_instance(instance)
+        if df is None:
+            mfm = self._get_movie_files_manager()
+            df = mfm.load(instance) if mfm is not None else None
+        if df is None or getattr(df, "empty", True):
+            return []
+
+        rows = size_anomaly.find_size_anomalies(
+            df, id_cols=("title", "year", "movie_id", "movie_file_id"),
+            size_col="size_bytes", runtime_col="runtime_minutes", runtime_unit="minutes",
+            quality_col="quality_name", resolution_col="resolution",
+            over_ratio=cfg["over_ratio"], under_ratio=cfg["under_ratio"],
+            min_samples=cfg["min_samples"],
+        )
+        if not rows:
+            return []
+        over = [r for r in rows if r["verdict"] == "oversized"]
+        reclaim = sum(r["reclaim_gb"] for r in over)
+        self.logger.log_info(
+            f"[SizeAnomaly] '{instance}': {len(rows)} file(s) wildly out of size profile — "
+            f"{len(over)} oversized (~{reclaim:.0f} GB reclaimable at the in-profile size), "
+            f"{len(rows) - len(over)} undersized."
+        )
+        _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
+        if _rs is not None:
+            table = [[str(r.get("title"))[:30], r["quality_name"], r["looks_like"],
+                      f"{r['size_gb']:.1f} GB", f"{r['expected_gb']:.1f} GB", f"x{r['ratio']:.1f}",
+                      f"{r['reclaim_gb']:.1f} GB", r["verdict"]] for r in rows[:cfg["report_limit"]]]
+            _rs.add_rows(
+                "radarr", "Size anomalies", instance,
+                ["Title", "Graded", "Looks like", "Size", "Expected", "Ratio", "Reclaim", "Verdict"],
+                table, order=35,
+            )
+        return rows
+
+    @timeit("remediate_size_anomalies")
+    def remediate_size_anomalies(self, instance: str, rows: "list | None") -> dict:
+        """ACT on the size anomalies (opt-in: ``size_anomaly.remediate=true``).
+
+          * MIS-GRADED (junk/SD grade, really HD) → ``RefreshMovie`` rescans mediainfo to fix the
+            grade. Non-destructive.
+          * BLOATED (oversized at a real HD/UHD grade) → re-grab at the profile target: DELETE the
+            oversized file + ``MoviesSearch`` so Radarr re-acquires a properly-sized release.
+            DESTRUCTIVE — only for MONITORED movies (else the delete would orphan the slot), and
+            only when the backup gate is armed (``effective_dry_run`` False); otherwise logged as
+            'would …'. Honours the run's dry_run AND the degrade-to-dry-run backup gate."""
+        cfg = size_anomaly.config_for(self.config)
+        if not cfg.get("remediate", False) or not rows:
+            return {}
+        instance = self._resolve_instance(instance)
+        eff_dry = effective_dry_run(self.dry_run, self.global_cache)
+        stats = {"rescanned": 0, "regrabbed": 0, "skipped_unmonitored": 0, "failed": 0}
+
+        # ── rescan mis-graded (non-destructive) ──────────────────────────────────
+        mids = [int(r["movie_id"]) for r in rows
+                if r.get("action") == "rescan" and r.get("movie_id") is not None]
+        if mids:
+            if eff_dry:
+                self.logger.log_info(f"[SizeAnomaly] [dry_run] would RefreshMovie (rescan) "
+                                     f"{len(mids)} mis-graded movie(s) on '{instance}'.")
+            else:
+                try:
+                    self.radarr_api._make_request(instance, "command", method="POST",
+                                                  payload={"name": "RefreshMovie", "movieIds": mids})
+                    stats["rescanned"] = len(mids)
+                    self.logger.log_info(f"[SizeAnomaly] rescanned {len(mids)} mis-graded "
+                                         f"movie(s) on '{instance}' to fix the grade.")
+                except Exception as e:
+                    stats["failed"] += 1
+                    self.logger.log_warning(f"[SizeAnomaly] rescan batch failed on '{instance}': {e}")
+
+        # ── re-grab bloated (destructive: delete + search) ───────────────────────
+        for r in rows:
+            if r.get("action") != "regrab":
+                continue
+            mid, fid = r.get("movie_id"), r.get("movie_file_id")
+            if mid is None or fid is None:
+                continue
+            # Only re-grab MONITORED movies — deleting an unmonitored movie's file leaves it gone
+            # with nothing to re-acquire it.
+            mv = self.radarr_api._make_request(instance, f"movie/{int(mid)}", fallback=None)
+            if not (isinstance(mv, dict) and mv.get("monitored")):
+                stats["skipped_unmonitored"] += 1
+                self.logger.log_info(f"[SizeAnomaly] skip re-grab '{r.get('title')}' — not monitored.")
+                continue
+            if eff_dry:
+                self.logger.log_info(
+                    f"[SizeAnomaly] [dry_run] would re-grab '{r.get('title')}' "
+                    f"({r.get('size_gb')} GB {r.get('quality_name')} -> profile target, "
+                    f"~{r.get('reclaim_gb')} GB reclaim): delete file {fid} + MoviesSearch.")
+                continue
+            try:
+                self.radarr_api._make_request(instance, f"moviefile/{int(fid)}", method="DELETE")
+                self.radarr_api._make_request(instance, "command", method="POST",
+                                              payload={"name": "MoviesSearch", "movieIds": [int(mid)]})
+                stats["regrabbed"] += 1
+                self.logger.log_info(f"[SizeAnomaly] re-grabbing '{r.get('title')}': deleted "
+                                     f"bloated file, searching at profile target.")
+            except Exception as e:
+                stats["failed"] += 1
+                self.logger.log_warning(f"[SizeAnomaly] re-grab failed for '{r.get('title')}': {e}")
+
+        acted = stats["rescanned"] + stats["regrabbed"]
+        if acted or stats["skipped_unmonitored"]:
+            self.logger.log_info(
+                f"[SizeAnomaly] '{instance}' remediation: {stats['rescanned']} rescanned, "
+                f"{stats['regrabbed']} re-grabbed, {stats['skipped_unmonitored']} skipped "
+                f"(unmonitored), {stats['failed']} failed."
+            )
+        return stats
 
     @LoggerManager().log_function_entry
     @timeit("run_space_pressure")
