@@ -286,6 +286,10 @@ def empty_config() -> dict:
                  #   exclude_users: profile titles / safe_users to skip entirely.
                  #   profile_ages: operator override of a profile's age tier (parental gate).
                  #   recency_boost: lift recently-aired/added items (window_days) — UNREAD, inert.
+                 #   fresh_arrivals: a per-profile "Fresh Arrivals" playlist of GENUINELY-new
+                 #     acquisitions (movies) added within acquired_window_days — keyed on Radarr's
+                 #     churn-immune movie.added (NOT the file date, which upgrades/re-grabs bump).
+                 #     OFF by default → no fresh plan is built/cached.
                  #   cold_start_kids_prior: for a restricted profile with no watch history of its
                  #     own, seed its playlist from the household's engagement with age-appropriate
                  #     content (a parent co-viewing kid shows) instead of a flat household order.
@@ -305,6 +309,7 @@ def empty_config() -> dict:
                      "exclude_users": [],
                      "profile_ages": {},
                      "recency_boost": {"enabled": False, "window_days": 30},
+                     "fresh_arrivals": {"enabled": False, "acquired_window_days": 45},
                  }},
         "mdblist": {"apikey": ""},   # opt-in: aggregated ratings + lists. apikey -> keyring.
         "dry_run": True,

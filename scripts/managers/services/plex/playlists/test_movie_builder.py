@@ -1,7 +1,10 @@
 """Tests for the per-user MOVIE playlist builder core (_build_for_users)."""
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from scripts.managers.services.plex.playlists.movie_builder import (
+    _FRESH_PLAN_KEY,
     _PLAN_KEY,
     _PROTECTED_KEY,
     MoviePlaylistBuilderManager,
@@ -134,3 +137,44 @@ def test_nan_watchability_score_dropped_and_hh_max_safe():
     items = _items(cache, "rob")
     assert items[0] == "b"                                    # scored movie ranks (hh_max not NaN)
     assert items[-1] == "a"                                   # un-scored dropped to last, not 0.1
+
+
+# ── Fresh Arrivals (opt-in second plan) ─────────────────────────────────────────
+def _movie_added(tmdb, title, year, score, added_at, cert=None):
+    return {"tmdb_id": tmdb, "title": title, "year": year, "watchability_score": score,
+            "certification": cert, "in_cinemas_date": f"{year}-01-01", "added_at": added_at}
+
+
+def test_fresh_arrivals_built_only_when_enabled_and_filtered_to_recent():
+    # Dates relative to today so the builder's internal date.today() agrees with the test.
+    recent = (date.today() - timedelta(days=5)).isoformat()
+    stale = (date.today() - timedelta(days=100)).isoformat()
+    owned = [_movie_added(1, "Fresh", 2000, 50, recent),
+             _movie_added(2, "OldAcq", 2010, 90, stale)]      # high score but acquired long ago
+    inv = {"1": {"rating_key": "fr"}, "2": {"rating_key": "ol"}}
+
+    # default-OFF → no fresh plan cached; the up_next plan is unaffected.
+    c0 = _Cache()
+    _mgr(c0)._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
+    assert c0.get(f"{_FRESH_PLAN_KEY}/rob") is None
+    assert c0.get(f"{_PLAN_KEY}/rob") is not None
+
+    # enabled → a SECOND 'fresh' plan holding ONLY the recently-acquired movie (the high-scored
+    # old acquisition is excluded — freshness is the acquisition date, not the score).
+    c1 = _Cache()
+    cfg = {"plex": {"playlists": {"fresh_arrivals": {"enabled": True, "acquired_window_days": 45}}}}
+    _mgr(c1, config=cfg)._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
+    fresh = c1.get(f"{_FRESH_PLAN_KEY}/rob")
+    assert fresh is not None and fresh["family"] == "fresh"
+    assert [it["rating_key"] for it in fresh["items"]] == ["fr"]
+    assert c1.get(f"{_PLAN_KEY}/rob") is not None             # up_next still built alongside
+
+
+def test_fresh_arrivals_picks_join_the_delete_shield():
+    recent = (date.today() - timedelta(days=3)).isoformat()
+    owned = [_movie_added(7, "Fresh", 2000, 80, recent)]
+    inv = {"7": {"rating_key": "a"}}
+    cache = _Cache()
+    cfg = {"plex": {"playlists": {"fresh_arrivals": {"enabled": True}}}}
+    _mgr(cache, config=cfg)._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
+    assert cache.get(_PROTECTED_KEY) == {"tmdbs": [7]}        # recommended in fresh → shielded too

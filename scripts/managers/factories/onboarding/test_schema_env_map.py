@@ -24,6 +24,7 @@ def test_playlists_block_is_fully_keyed_and_inert():
     # New write-back knobs exist and are OFF by default.
     assert pl["writeback"] == {"enabled": False}
     assert pl["recency_boost"] == {"enabled": False, "window_days": 30}
+    assert pl["fresh_arrivals"] == {"enabled": False, "acquired_window_days": 45}
     # Captured builder knobs mirror the inline defaults.
     assert pl["max_items"] == 100
     assert pl["episode_cap"] == 5
@@ -93,6 +94,8 @@ def test_doc_leaves_cover_the_headless_playlist_knobs():
         "plex.playlists.max_items",
         "plex.playlists.exclude_users",
         "plex.playlists.recency_boost.enabled",
+        "plex.playlists.fresh_arrivals.enabled",
+        "plex.playlists.fresh_arrivals.acquired_window_days",
     ):
         assert p in paths
 

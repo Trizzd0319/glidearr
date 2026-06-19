@@ -25,12 +25,14 @@ from scripts.managers.machine_learning.playlists.rationale import explain_reason
 from scripts.managers.services.plex.playlists.builder import PlexPlaylistBuilderManager
 from scripts.managers.services.plex.playlists.movie_resolver import (
     _coll_key,
+    build_fresh_movie_plan,
     build_movie_plan,
     watched_movie_keys,
 )
 
 _INVENTORY_KEY = "plex/movies/owned_inventory"
 _PLAN_KEY = "plex/playlists/movie_plan"          # + /{safe_user}
+_FRESH_PLAN_KEY = "plex/playlists/fresh_movie_plan"   # + /{safe_user} (Fresh Arrivals; opt-in)
 # Union of movie tmdbIds recommended this run — the space coordinator reads it to SHIELD
 # them from the delete pool (never delete a title we are actively recommending).
 _PROTECTED_KEY = "plex/playlists/protected_movie_tmdbs/movie"
@@ -66,6 +68,19 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
             return out
         except Exception:
             return {}
+
+    # ── Fresh Arrivals knobs (plex.playlists.fresh_arrivals.*) — default OFF ──────
+    def _fresh_enabled(self) -> bool:
+        """plex.playlists.fresh_arrivals.enabled — default OFF → no fresh plan is built/cached,
+        byte-identical to today."""
+        return bool((self._pl_cfg().get("fresh_arrivals", {}) or {}).get("enabled", False))
+
+    def _acquired_window_days(self) -> int:
+        """plex.playlists.fresh_arrivals.acquired_window_days — how far back counts as 'fresh'."""
+        try:
+            return int((self._pl_cfg().get("fresh_arrivals", {}) or {}).get("acquired_window_days", 45))
+        except (TypeError, ValueError):
+            return 45
 
     def _build_for_users(self, tracked, owned, inventory, watched_by_user, affinity_by_user,
                          csm_ages=None) -> dict:
@@ -133,6 +148,20 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                              if (t := rk_to_tmdb.get(str(i.rating_key))) is not None)
             reasons = self._movie_reasons(user_owned, inventory, user_aff)
             self._log_preview(u, plan, stats, display, reasons, label="movie")
+
+            # Fresh Arrivals (opt-in): a SECOND per-user plan, filtered to genuinely-new
+            # acquisitions (churn-immune movie.added) within the window, ranked by the same
+            # per-user scores. Cached under its own key; its picks join the delete shield too.
+            if self._fresh_enabled():
+                fplan, fstats = build_fresh_movie_plan(
+                    user_owned, inventory, watched, movie_scores,
+                    acquired_window_days=self._acquired_window_days(), max_items=self._max_items())
+                if self.global_cache:
+                    self.global_cache.set(f"{_FRESH_PLAN_KEY}/{u['safe_user']}", self._serialize(fplan))
+                protected.update(t for i in fplan.items
+                                 if (t := rk_to_tmdb.get(str(i.rating_key))) is not None)
+                self._log_preview(u, fplan, fstats, display, reasons, label="movie",
+                                  family_label="Fresh Arrivals")
             built += 1
         self._publish_protected_movie_tmdbs(_PROTECTED_KEY, protected)
         self.logger.log_info(f"[MoviePlaylists] built {built} per-user movie plan(s) (dry-run — no Plex writes).")
@@ -249,7 +278,8 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
         base = self.global_cache.key_builder.base_dir
         want = ["tmdb_id", "title", "year", "watchability_score", "genres", "certification",
                 "collection_tmdb_id", "collection_name", "universe_name",
-                "in_cinemas_date", "digital_release_date", "physical_release_date", "has_file"]
+                "in_cinemas_date", "digital_release_date", "physical_release_date",
+                "added_at", "has_file"]
         seen: dict = {}
         for path in sorted((base / "radarr").glob("*/movie_files.parquet")):
             try:

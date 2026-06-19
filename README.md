@@ -147,7 +147,7 @@ A snapshot after ~6 months of development. Glidearr is already a working engine 
 - **Size-anomaly remediation** — flags files far outside their expected size profile and acts on the worst offenders: re-grabs the bloated, rescans the mis-graded.
 
 **Per-user & multi-instance**
-- **Personalized playlists** — a deterministic, spoiler-safe "Up Next" ordering engine ranked by each viewer's taste, with opt-in write-back to each member's *own* Plex account (default-off, fail-closed, per-server token; movies end-to-end today).
+- **Personalized playlists** — a deterministic, spoiler-safe "Up Next" ordering engine ranked by each viewer's taste, with opt-in write-back to each member's *own* Plex account (default-off, fail-closed, per-server token; movies fully end-to-end, TV built and gated on episode-data coverage).
 - **Multi-instance Sonarr/Radarr** — routes each title to the right instance and root folder (standard / 4K / anime).
 
 **Integrations & automation**
@@ -164,6 +164,7 @@ A snapshot after ~6 months of development. Glidearr is already a working engine 
 - [ ] **Watchlist-driven acquisition** — the multi-user watchlist union is already snapshotted and a forward-validation harness now measures whether it actually predicts what you watch; wiring it in as a live next-watch signal follows once it proves a real lift.
 - [ ] **Smarter decisions under pressure** — a space-aware quality ceiling and scoring-order fixes, building on the recency- and likelihood-aware delete ranker already in place.
 - [ ] **Sharper acquisition tuning** — runtime-scaled episode budgets and recency-ordered prefetch.
+- [ ] **Fresh Arrivals playlist** — a per-profile, taste-ranked list of *genuinely* new acquisitions. Its edge over Plex's built-in *Recently Added*: **churn-immune** (Glidearr's own upgrades / re-grabs / library moves bump Plex's `addedAt`, so that row is noisy — Fresh Arrivals keys on real acquisitions) and a **kid-safe**, age-gated "new for you" surface (kids see playlists, not collections).
 
 ### 🔭 Planned / exploring
 - [ ] **Learned next-watch re-ranker** — a household-specific model trained on what you actually watched next, layered on top of the deterministic scorer (with a calibrated 0–1 "watch probability"); the forward-validation harness is the first piece of groundwork. Cheap wins first — diversity passes and broader candidate sourcing.
@@ -171,7 +172,7 @@ A snapshot after ~6 months of development. Glidearr is already a working engine 
 - [ ] **Series & saga resumption** — circle back to catch you up: re-acquire and re-queue the last *N* episodes when you add a show to your watchlist or a new season is announced, and re-grab the prior film when a favoured sequel is dated — priority ramping as the release nears. *(Detailed under **How it works** above.)*
 - [ ] **Known-universe expansion** — start one corner of a shared universe (the MCU, Star Trek, the Arrowverse…) and Glidearr begins acquiring the rest of that universe in **timeline order** from where you are, weaving each connected show and film into your Up Next playlist in proper in-universe sequence.
 - [ ] **Per-device codec-aware quality** — prefer the codecs each viewer's devices direct-play (no transcoding), tuned per title.
-- [ ] **TV personalized playlists** — "Fresh Arrivals" and "Finish the Saga," once full episode data is in place.
+- [ ] **Finish the Saga + full TV Up Next** — resume a part-watched series or film franchise, and complete TV *Up Next*, once episode-data coverage is in place.
 - [ ] **Per-user taste throughout** — personal re-ranking that can override household defaults, plus per-profile kids-safe gating.
 - [ ] **Plex, deepened** — on-deck / continue-watching, per-user ratings, an orphan/missing reconciler, and collections — all opt-in and validated before they influence any decision.
 - [ ] **Performance** — vectorized batch scoring for very large libraries.

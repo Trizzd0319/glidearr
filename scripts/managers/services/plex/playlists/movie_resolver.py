@@ -18,6 +18,8 @@ is simpler than the TV resolver: build inputs, hand them straight to order_items
 """
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from scripts.managers.machine_learning.playlists.models import PlaylistInput
 from scripts.managers.machine_learning.playlists.ordering import order_items
 
@@ -57,6 +59,37 @@ def _release_date(mv: dict):
             if s and s.lower() not in ("nat", "none", "nan"):
                 return s[:10]
     return None
+
+
+def _iso_or_none(v):
+    """Clean a date-ish cell → an ISO string or None. The parquet round-trip turns a missing
+    value into float NaN (truthy!) or the strings 'NaT'/'None'/'nan' — all must read as None."""
+    if v is None or (isinstance(v, float) and v != v):       # None or NaN
+        return None
+    s = str(v).strip()
+    return s if s and s.lower() not in ("nat", "none", "nan") else None
+
+
+def _parse_added_date(v):
+    """Parse the library-added timestamp (Radarr ``movie.added``, ISO) to a ``date``. None when
+    absent/garbage — so a movie with no acquisition stamp can never count as a 'fresh arrival'."""
+    s = _iso_or_none(v)
+    if s is None:
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        return None
+
+
+def _within_window(added_at, now: date, window_days: int) -> bool:
+    """True when ``added_at`` is on/after ``now - window_days`` — a GENUINELY recent acquisition.
+    Missing/unparseable → False (can't prove freshness, so exclude). A future stamp (clock skew)
+    still counts as fresh."""
+    d = _parse_added_date(added_at)
+    if d is None:
+        return False
+    return d >= now - timedelta(days=max(0, window_days))
 
 
 def watched_movie_keys(history: list, *, min_pct: float = 85.0) -> set:
@@ -120,6 +153,7 @@ def movie_inputs(owned_movies: list, owned_inventory: dict, watched, movie_score
             universes=((uni.lower(),) if uni else ()),
             release_date=_release_date(mv),
             year=year,
+            added_at=_iso_or_none(mv.get("added_at")),
             cert=mv.get("certification"),
         ))
 
@@ -133,5 +167,30 @@ def build_movie_plan(owned_movies: list, owned_inventory: dict, watched, movie_s
     Returns ``(PlaylistPlan, stats)``."""
     inputs, stats = movie_inputs(owned_movies, owned_inventory, watched, movie_scores)
     plan = order_items(inputs, family=family, max_items=max_items)
+    stats["in_plan"] = len(plan.items)
+    return plan, stats
+
+
+def build_fresh_movie_plan(owned_movies: list, owned_inventory: dict, watched, movie_scores: dict,
+                           *, acquired_window_days: int = 45, now: date | None = None,
+                           max_items: int = 100):
+    """Fresh Arrivals (movies): a per-user, taste-ranked list of GENUINELY-new acquisitions.
+
+    Candidates are first FILTERED to movies whose Radarr ``added_at`` (``movie.added``) falls
+    within ``acquired_window_days`` — a churn-immune stamp, set once when the movie record is
+    created and NOT bumped by quality upgrades, size-anomaly re-grabs, or the re-organizer's
+    file moves (unlike the file ``date_added`` or Plex ``addedAt``, which all are). The survivors
+    are then ordered by watchability (with the caught-up recency boost lifting a fresh saga the
+    user is current on). This is what makes it more than Plex's built-in 'Recently Added': it's
+    per-profile, age-gated (the builder pre-gates candidates), unwatched-only, and churn-immune.
+
+    Pure given ``now`` (the builder passes today). Returns ``(PlaylistPlan, stats)``."""
+    now = now or date.today()
+    inputs, stats = movie_inputs(owned_movies, owned_inventory, watched, movie_scores)
+    fresh = [it for it in inputs if _within_window(it.added_at, now, acquired_window_days)]
+    stats["fresh_window_days"] = acquired_window_days
+    stats["fresh_candidates"] = len(fresh)
+    plan = order_items(fresh, family="fresh", max_items=max_items,
+                       recency_boost=True, window_days=acquired_window_days, now=now)
     stats["in_plan"] = len(plan.items)
     return plan, stats

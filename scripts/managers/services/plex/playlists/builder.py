@@ -196,7 +196,7 @@ class PlexPlaylistBuilderManager(BaseManager):
         }
 
     def _log_preview(self, user, plan, stats, display: dict, reasons=None, *,
-                     kinds=None, label: str = "episode"):
+                     kinds=None, label: str = "episode", family_label: str = "Up Next"):
         """Preview grid: ``# | Title | [Kind] | Rank | Why``.
 
         ``Rank`` = the per-user priority_score the block is ordered on (affinity > JIT >
@@ -216,7 +216,7 @@ class PlexPlaylistBuilderManager(BaseManager):
             if show_kind:
                 row.append(kinds.get(rk, "?"))
             rows.append(row + [score, why])
-        header = (f"[dry-run] '{title}' Up Next - {len(plan.items)} {label}(s), "
+        header = (f"[dry-run] '{title}' {family_label} - {len(plan.items)} {label}(s), "
                   f"{stats.get('unresolved', 0)} unmatched")
         cols = ["#", "Title"] + (["Kind"] if show_kind else []) + ["Rank", "Why"]
         grid = getattr(self.logger, "log_grid", None)

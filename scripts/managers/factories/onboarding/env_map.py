@@ -134,6 +134,8 @@ _DOC_LEAVES = [
     ("plex.playlists.max_items", "100", "Max items per per-user playlist"),
     ("plex.playlists.exclude_users", "", "Comma-separated profile titles / safe_users to skip when building playlists"),
     ("plex.playlists.recency_boost.enabled", "false", "Lift recently-aired/added items in the per-user ordering (inert until enabled)"),
+    ("plex.playlists.fresh_arrivals.enabled", "false", "Build a per-profile 'Fresh Arrivals' playlist of genuinely-new movie acquisitions (churn-immune; off until enabled)"),
+    ("plex.playlists.fresh_arrivals.acquired_window_days", "45", "How many days back counts as a 'fresh arrival' for that playlist"),
     ("plex.playlists.cold_start_kids_prior", "true", "Seed a kid profile's empty playlist from the household's kid-show taste (cold-start prior)"),
     ("tvdb.api", "<secret>", "SECRET — optional"),
     ("mal.client_id", "<secret>", "SECRET — optional"),
