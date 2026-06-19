@@ -293,6 +293,27 @@ class Main(BaseManager, ComponentManagerMixin):
     def run(self):
         summary = RunSummaryCollector(dry_run=self.dry_run)
 
+        # ── Pre-destructive backups (real runs only) ──────────────────────────────
+        # Before any service can delete or re-grab a file, snapshot each Radarr/Sonarr DB+config
+        # via its native Backup command and validate the result is loadable. On ANY failure the
+        # gate DISARMS and the whole run DEGRADES TO DRY-RUN (every destructive primitive then
+        # logs "would …" via support/utilities/backup_gate). No-op on a dry run (nothing
+        # destructive to guard) or when backup_before_destructive=false. Fail-safe: if the
+        # pre-flight itself errors on a real run, disarm rather than risk an unguarded delete.
+        try:
+            from scripts.managers.services.backup import ServiceBackupManager
+            ServiceBackupManager(self.logger, self.config, self.global_cache,
+                                 dry_run=self.dry_run).ensure_backups()
+        except Exception as e:
+            self.logger.log_warning(
+                f"[Main] backup pre-flight errored — degrading to dry-run for safety: {e}")
+            if not self.dry_run and self.global_cache:
+                try:
+                    from scripts.managers.services.backup import GATE_KEY
+                    self.global_cache.set(GATE_KEY, {"armed": False, "reason": "preflight_error"})
+                except Exception:
+                    pass
+
         # Warm the size-model MiB/min overlay from the last run's calibration
         # (instant cache read) so space-pressure / acquisition size estimates are
         # accurate from the first phase. Refreshed from fresh caches after Phase 2.
