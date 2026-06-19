@@ -13,14 +13,17 @@ make the *same* decision.
 
 A show maps to exactly one category. Precedence is fixed and intentional:
 
-    preschool(genre) → anime → CSM age → kids(genre) → reality → documentary → kids(cert) → series
+    preschool(genre) → anime → kids(genre) → kids(network) → reality → documentary → kids(cert) → series
 
 The 'Preschool' GENRE wins outright — genuine toddler content stays in Kids even when it
 is also anime. ANIME then beats the soft children/family genres, so mainstream anime (One
-Piece/Pokémon, often rated TV-Y7) lands in the Anime library rather than Kids. Common Sense
-Media age, when known, is the PRIMARY kids signal beneath those two. A kids *certificate*
-alone (TV-G/…) does NOT override anime/reality/documentary — it applies only when nothing
-else matched ("kids if flagged for children, not just the TV-G certificate").
+Piece/Pokémon, often rated TV-Y7) lands in the Anime library rather than Kids. A title only
+reaches Kids on a genuine child-oriented signal — a kids/family GENRE, a kids NETWORK, or a
+kid-safe CERTIFICATE. Common Sense Media age is a kids CEILING ONLY: an age over the cutoff
+demotes a show OUT of Kids, but a low/absent CSM age never routes it INTO Kids on its own
+(operator policy: "never trust Common Sense alone" — Star Trek: DS9 is CSM-rated ~age 10 yet
+is an adult drama, so a borderline age must be corroborated). A kids *certificate* alone
+(TV-G/…) does NOT override anime/reality/documentary — it applies only when nothing else matched.
 
 Signals, in precedence order:
   • preschool   — the 'Preschool' GENRE only (NOT a cert). TOP precedence: beats anime and
@@ -33,13 +36,19 @@ Signals, in precedence order:
                   (e.g. Curious George), so it is not trusted on its own. This same test
                   backs :func:`is_anime_media` for Sonarr ``seriesType``, so a
                   children-genre anime routes to Kids but still keeps anime episode parsing.
-  • CSM age     — Common Sense Media ``recommended_age`` (e.g. from MDBList), the PRIMARY
-                  kids signal when known: ``<=`` the cutoff → Kids; OLDER → NOT Kids
-                  (suppressing the genre + cert Kids routes, but reality/documentary/series
-                  still resolve). Absent → the genre/cert flow runs unchanged.
+  • CSM age     — Common Sense Media ``recommended_age`` (e.g. from MDBList) as a kids
+                  CEILING ONLY: OLDER than the cutoff → NOT Kids (suppressing the genre +
+                  network + cert Kids routes, but reality/documentary/series still resolve).
+                  At/under the cutoff or absent it neither routes to Kids nor blocks it — a
+                  child-oriented signal must corroborate ("never trust Common Sense alone").
   • kids(genre) — a genre in ``kids_genres`` (Children/Family/Kids). A hard Children/Kids
                   genre beats the lifestyle veto; the soft 'Family' genre is veto- and
-                  rating-gated. Used only when no CSM age decided the show.
+                  rating-gated. Skipped when CSM rates the show over the cutoff.
+  • kids(network) — the show airs on a genuine KIDS network (``kids_networks``: Disney
+                  Junior/Channel/XD, Nickelodeon, Cartoon Network, PBS Kids, …). A strong
+                  made-for-children signal that catches kids shows with sparse genre/cert
+                  metadata; gated like the cert route (skipped when vetoed, CSM-over-cutoff,
+                  or an adult certificate).
   • reality     — a genre in ``reality_genres``.
   • documentary — a genre in ``documentary_genres``.
   • kids(cert)  — a US certification in ``kids_certs`` (TV-Y/TV-Y7/TV-G/G/PG),
@@ -61,8 +70,8 @@ both as ``scripts.support.utilities.library_classifier`` (in-app) and as
 from __future__ import annotations
 
 # Display / grouping order — NOT the routing precedence. The actual precedence is
-# encoded in the check order of classify_show_explained (kids-genre → anime →
-# reality → documentary → kids-cert → series).
+# encoded in the check order of classify_show_explained (preschool → anime → kids-genre →
+# kids-network → reality → documentary → kids-cert → series; CSM age is a kids ceiling only).
 CATEGORY_ORDER: tuple[str, ...] = ("anime", "kids", "reality", "documentary", "series")
 
 # Sensible defaults so routing stays correct even when a config list is empty or
@@ -93,6 +102,25 @@ DEFAULT_PRESCHOOL_GENRES = frozenset({"preschool"})
 DEFAULT_NON_KIDS_GENRES = frozenset(
     {"reality", "game show", "talk show", "food", "home and garden", "soap"}
 )
+# Genuine KIDS networks/channels — a show airing on one is strong "made for children"
+# evidence, used to route kids shows whose genre/cert metadata is sparse. Matched as a
+# lower-cased SUBSTRING against the show's single ``network`` string, so "Disney Junior",
+# "Disney Channel", and "Disney XD" all match the "disney …" entries. DELIBERATELY excludes
+# general networks and late-night adult blocks (Adult Swim is its own network string), and
+# the route is additionally cert-gated. Override per-deployment via the ``kidsNetworks`` config.
+DEFAULT_KIDS_NETWORKS = frozenset({
+    "disney junior", "disney channel", "disney xd", "playhouse disney", "toon disney",
+    "nickelodeon", "nick jr", "nickjr", "nicktoons", "teennick",
+    "cartoon network", "cartoonito", "boomerang",
+    "pbs kids", "pbs kids sprout", "sprout", "universal kids", "nbc kids",
+    "cbeebies", "cbbc", "kids' wb", "kids wb", "fox kids", "jetix",
+    "the hub", "hub network", "discovery kids", "baby tv", "babytv",
+    "treehouse", "ytv", "teletoon", "family jr", "qubo", "kidsclick",
+})
+# Certificates that BLOCK the kids-network route — a grown-up show mislabeled onto a kids
+# feed is not kids. (CSM-over-cutoff already covers the common case; this is the belt-and-
+# braces for titles that carry no CSM age.)
+_ADULT_TV_CERTS = frozenset({"tv-14", "tv-ma", "r", "nc-17", "ma15+", "18", "16"})
 # 'Not Rated' / 'Unrated' is NOT an adult rating — normalise to UNRATED so a kid-safe
 # 'Family' title (e.g. Disney animated shorts carry the literal cert "NR") still routes to
 # Kids instead of being treated as adult-rated. (Empty/missing cert is already unrated.)
@@ -258,12 +286,14 @@ def classify_show_explained(
     certification: str | None = None,
     series_type: str | None = None,
     original_language: str | None = None,
+    network: str | None = None,
     is_anime_hint: bool = False,
     recommended_age: "int | None" = None,
-    kids_age_max: int = 11,        # oldest CSM age that still counts as 'kids' (mirrors movies)
+    kids_age_max: int = 11,        # CSM CEILING: an age OVER this demotes a show out of Kids
     anime_genres=None,
     kids_genres=None,
     kids_certs=None,
+    kids_networks=None,
     reality_genres=None,
     documentary_genres=None,
     preschool_genres=None,
@@ -273,10 +303,10 @@ def classify_show_explained(
     Return ``(category, reason)``. ``category`` is one of :data:`CATEGORY_ORDER`;
     the first matching rule wins, so the order of the checks encodes precedence:
 
-        preschool → anime → CSM age → kids(genre) → reality → documentary → kids(cert) → series
+        preschool → anime → kids(genre) → kids(network) → reality → documentary → kids(cert) → series
 
-    ``reason`` is a short tag (e.g. ``"japanese-animation"``, ``"genre:animated-family"``)
-    explaining the match. All genre/cert arguments are optional; when omitted (or
+    ``reason`` is a short tag (e.g. ``"japanese-animation"``, ``"network:nickelodeon"``)
+    explaining the match. All genre/cert/network arguments are optional; when omitted (or
     empty) the module defaults are used.
 
     Key rules:
@@ -284,20 +314,26 @@ def classify_show_explained(
         lifestyle veto, so genuine toddler content stays in Kids; ANIME beats the
         children/family kids genres so mainstream anime (One Piece/Pokémon, often
         rated TV-Y7) → the anime library.
-      • COMMON SENSE MEDIA age (``recommended_age``, e.g. from MDBList) is the PRIMARY
-        kids signal when known, mirroring movies: ``<= kids_age_max`` → Kids outright;
-        OLDER than the cutoff → NOT Kids, which SUPPRESSES the genre + cert Kids routes
-        below (the show still resolves to reality/documentary/series). It sits BELOW
-        preschool + anime (an explicit Preschool tag or genuine anime still wins) and
-        ABOVE the genre/cert routes; absent (None) → the genre/cert flow runs unchanged.
+      • COMMON SENSE MEDIA age (``recommended_age``, e.g. from MDBList) is a kids
+        CEILING ONLY (operator policy: "never trust Common Sense alone"). An age OVER
+        ``kids_age_max`` means CSM says NOT kids and SUPPRESSES every Kids route below
+        (genre + network + cert); the show still resolves to reality/documentary/series.
+        A low/absent CSM age neither routes to Kids nor blocks it — CSM can demote a show
+        OUT of Kids but never promotes one INTO it. (Star Trek: DS9 is CSM-rated ~age 10
+        yet is an adult drama — so a borderline age must be corroborated by a real signal.)
       • A HARD kids genre (Children/Kids) routes to Kids and BEATS the lifestyle veto
         — an explicit children's tag is unambiguous (a 'Children, Food' kids cooking
         show is still kids). ``Family`` also routes to Kids on its own (no longer
         animation-gated), but ONLY when not vetoed AND kid-safe rated (≤ TV-PG/PG or
         unrated) — so adult 'family drama' (TV-14/TV-MA) stays out of the Kids library.
+      • A kids NETWORK (``network`` ∈ ``kids_networks``: Disney Junior/Channel/XD,
+        Nickelodeon, Cartoon Network, PBS Kids, …) routes to Kids — a strong made-for-
+        children signal that rescues kids shows with sparse genre/cert metadata (e.g.
+        Star Trek: Prodigy on Nickelodeon → Kids, while the adult Treks → series). Gated
+        like the cert route: skipped when vetoed, CSM-over-cutoff, or an adult cert.
       • The lifestyle/reality veto (``non_kids_genres``: reality/game show/talk show/
-        food/home and garden/soap) blocks the SOFT Kids routes (``Family`` genre and
-        the kids certificate) but NOT a hard Children/Kids/Preschool genre.
+        food/home and garden/soap) blocks the SOFT Kids routes (``Family`` genre, the
+        kids network, and the kids certificate) but NOT a hard Children/Kids/Preschool genre.
       • A kids *certificate* (TV-G/G/PG) is applied LAST — and only to NON-anime,
         NON-documentary, non-vetoed shows (so it can't pull anime/docs into Kids).
     """
@@ -305,10 +341,12 @@ def classify_show_explained(
     cert = (certification or "").strip().lower()
     stype = (series_type or "").strip().lower()
     olang = (original_language or "").strip().lower()
+    netw = (network or "").strip().lower()
 
     anime_g = _as_set(anime_genres, DEFAULT_ANIME_GENRES)
     kids_g = _as_set(kids_genres, DEFAULT_KIDS_GENRES)
     kids_c = _as_set(kids_certs, DEFAULT_KIDS_CERTS)
+    kids_nets = _as_set(kids_networks, DEFAULT_KIDS_NETWORKS)
     reality_g = _as_set(reality_genres, DEFAULT_REALITY_GENRES)
     doc_g = _as_set(documentary_genres, DEFAULT_DOCUMENTARY_GENRES)
     pre_g = _as_set(preschool_genres, DEFAULT_PRESCHOOL_GENRES)
@@ -319,10 +357,11 @@ def classify_show_explained(
     # The soft 'Family' genre only routes to Kids when kid-safe rated (≤ TV-PG/PG) or
     # unrated (incl. 'NR') — keeps adult 'family DRAMA' (TV-14/TV-MA/…) out of the Kids library.
     family_rating_ok = _family_rating_ok(cert)
-    # Common Sense Media age (recommended_age) is the PRIMARY kids signal when known.
-    # An age OVER the cutoff means CSM says NOT kids: it suppresses the genre + cert Kids
-    # routes below (but the show stays eligible for reality/documentary/series). The
-    # <= cutoff → Kids decision itself is made right after anime (step 2.5 below).
+    # Common Sense Media age (recommended_age) is a kids CEILING ONLY (operator policy:
+    # "never trust Common Sense alone"). An age OVER the cutoff means CSM says NOT kids and
+    # SUPPRESSES every Kids route below (genre + network + cert); the show stays eligible for
+    # reality/documentary/series. A low/absent CSM age does NOT route to Kids on its own — a
+    # child-oriented signal (kids genre, kids network, or kid-safe cert) must corroborate.
     csm_blocks_kids = recommended_age is not None and recommended_age > kids_age_max
 
     # ── 1. Preschool GENRE → Kids (beats anime AND the lifestyle veto) ─────────
@@ -335,31 +374,35 @@ def classify_show_explained(
     if anime_ok:
         return "anime", anime_reason
 
-    # ── 2.5. Common Sense Media age → Kids (PRIMARY when known; below preschool/anime) ─
-    if recommended_age is not None and recommended_age <= kids_age_max:
-        return "kids", f"csm:age{recommended_age}"
-
     # ── 3. Kids by GENRE: Children/Kids beat the veto; Family is veto- + rating-gated ─
     #    Skipped when CSM has rated this show OVER the kids cutoff (csm_blocks_kids).
     kids_ok, kids_reason = _kids_by_genre(g, kids_g, vetoed, family_rating_ok)
     if kids_ok and not csm_blocks_kids:
         return "kids", kids_reason
 
-    # ── 4. Reality ────────────────────────────────────────────────────────────
+    # ── 4. Kids by NETWORK — a genuine kids network is strong made-for-children evidence,
+    #    rescuing kids shows with sparse genre/cert metadata (Star Trek: Prodigy on
+    #    Nickelodeon → Kids). Gated like the cert route: skipped when lifestyle/reality-
+    #    vetoed, when CSM rates it over the cutoff, or when the cert is adult. ──────────────
+    if (netw and not vetoed and not csm_blocks_kids and cert not in _ADULT_TV_CERTS
+            and any(tok in netw for tok in kids_nets)):
+        return "kids", f"network:{netw}"
+
+    # ── 5. Reality ────────────────────────────────────────────────────────────
     real_hit = g & reality_g
     if real_hit:
         return "reality", f"genre:{sorted(real_hit)[0]}"
 
-    # ── 5. Documentary ────────────────────────────────────────────────────────
+    # ── 6. Documentary ────────────────────────────────────────────────────────
     doc_hit = g & doc_g
     if doc_hit:
         return "documentary", f"genre:{sorted(doc_hit)[0]}"
 
-    # ── 6. Kids by CERTIFICATE (TV-G/G/PG) — last; skipped if vetoed or CSM>cutoff ─
+    # ── 7. Kids by CERTIFICATE (TV-G/G/PG) — last; skipped if vetoed or CSM>cutoff ─
     if not vetoed and not csm_blocks_kids and cert and cert in kids_c:
         return "kids", f"cert:{cert}"
 
-    # ── 7. Default catch-all ──────────────────────────────────────────────────
+    # ── 8. Default catch-all ──────────────────────────────────────────────────
     return "series", "default"
 
 
@@ -382,11 +425,13 @@ def classify_from_config(show: dict, config_get, *, is_anime_hint: bool = False,
         certification=show.get("certification"),
         series_type=show.get("seriesType"),
         original_language=ol.get("name") if isinstance(ol, dict) else ol,
+        network=show.get("network"),
         is_anime_hint=is_anime_hint or bool(show.get("is_anime")),
         recommended_age=recommended_age,
         anime_genres=config_get("animeGenres", None),
         kids_genres=config_get("kidsGenres", None),
         kids_certs=config_get("kidsCertifications", None),
+        kids_networks=config_get("kidsNetworks", None),
         reality_genres=config_get("realityGenres", None),
         documentary_genres=config_get("documentaryGenres", None),
         preschool_genres=config_get("preschoolGenres", None),
@@ -455,19 +500,19 @@ def classify_movie_explained(
 
       1. anime    — the 'anime' genre, a Japanese/Korean/Chinese animated film, or a
                     source hint. This is the ONLY genre/language route kept.
-      2. kids     — Common Sense Media recommended age (``recommended_age``, e.g. from
-                    MDBList): ``<= kids_age_max`` → Kids; older → NOT Kids. CSM is the
-                    PRIMARY, authoritative kids signal — when present it decides outright
-                    and overrides the studio fallback.
-      3. kids     — FALLBACK, only when no CSM age is known: a typical kids/family STUDIO
-                    (``kids_studios``, cert-gated by :data:`MOVIE_ADULT_CERTS`).
-      4. 4k       — the file is 2160p/UHD (``is_uhd``) and it is neither kids nor anime.
-      5. standard — everything else (the default movie library).
+      2. kids     — a typical kids/family STUDIO (``kids_studios``, cert-gated by
+                    :data:`MOVIE_ADULT_CERTS`) — the ONLY positive kids signal for movies.
+                    Common Sense Media age is a kids CEILING ONLY (operator policy: "never
+                    trust Common Sense alone"): an age OVER ``kids_age_max`` blocks this
+                    studio route, but a low/absent CSM age never routes a movie to Kids by
+                    itself — a kids studio must identify it.
+      3. 4k       — the file is 2160p/UHD (``is_uhd``) and it is neither kids nor anime.
+      4. standard — everything else (the default movie library).
 
     GENRE is deliberately NOT a kids route for movies: TMDB 'Family'/'Children'/etc. tags
     are spread across far too much general/foreign/adult cinema (Bollywood dramas, classics,
-    sports dramas) and flooded the Kids library. CSM age is the clean primary signal; a kids
-    STUDIO is the only fallback for titles CSM hasn't rated. ``kids_genres`` / ``kids_certs``
+    sports dramas) and flooded the Kids library. A kids STUDIO is the only positive signal;
+    CSM age only DEMOTES a studio match that CSM rates too old. ``kids_genres`` / ``kids_certs``
     / ``preschool_genres`` / ``non_kids_genres`` / ``adult_veto_genres`` are accepted for
     signature compatibility but UNUSED.
     """
@@ -485,19 +530,18 @@ def classify_movie_explained(
     if anime_ok:
         return "anime", anime_reason
 
-    # 2. Common Sense Media recommended age — the PRIMARY, authoritative kids signal.
-    #    <= cutoff → Kids; older → NOT Kids (overrides the studio fallback). No CSM age
-    #    → fall through to the studio fallback in step 3.
-    if recommended_age is not None:
-        if recommended_age <= kids_age_max:
-            return "kids", f"csm:age{recommended_age}"
-    else:
-        # 3. FALLBACK only when CSM has no rating: a typical kids/family STUDIO, cert-gated
-        #    by MOVIE_ADULT_CERTS. GENRE is deliberately NOT a kids route for movies.
-        if studio_l and cert not in MOVIE_ADULT_CERTS and (
-            studio_l in kids_s or any(tok in studio_l for tok in KIDS_STUDIO_TOKENS)
-        ):
-            return "kids", f"studio:{studio_l}"
+    # 2. Common Sense Media recommended age is a kids CEILING ONLY (operator policy: "never
+    #    trust Common Sense alone"). An age OVER the cutoff says NOT kids and blocks the studio
+    #    route below; CSM never routes a movie to Kids by itself.
+    csm_blocks_kids = recommended_age is not None and recommended_age > kids_age_max
+
+    # 3. Kids/family STUDIO (cert-gated by MOVIE_ADULT_CERTS) — the ONLY positive kids signal
+    #    for movies (GENRE is deliberately NOT a movie kids route: TMDB Family tags flood the
+    #    Kids library). Suppressed when CSM rates the film over the cutoff.
+    if not csm_blocks_kids and studio_l and cert not in MOVIE_ADULT_CERTS and (
+        studio_l in kids_s or any(tok in studio_l for tok in KIDS_STUDIO_TOKENS)
+    ):
+        return "kids", f"studio:{studio_l}"
 
     # 4. Resolution split for everything else.
     if is_uhd:

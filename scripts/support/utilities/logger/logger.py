@@ -47,7 +47,9 @@ _SECRET_SCRUB_PATTERNS = [
      r'\1<redacted>'),
     # Plex profile PIN: pin=NNNN (the /home/users/{uuid}/switch credential — never
     # build a log/exception string containing a raw PIN, but redact defensively).
-    (re.compile(r'(?i)\bpin=\d+'), 'pin=<redacted>'),
+    # Mirror the api_key shape so a NON-numeric PIN and an ampersand-terminated PIN
+    # (pin=12ab&foo) are caught too, not just the bare-numeric pin=1234 case.
+    (re.compile(r'(?i)\b(pin=)[^&\s"\'#}]+'), r'\1<redacted>'),
     # Authorization / api-key / plex headers: "Bearer xxx", "X-Api-Key: xxx"
     (re.compile(
         r'(?i)((?:bearer|x[-_]?api[-_]?key|x[-_]?plex[-_]?token|authorization)\s*[:=]\s*)'
@@ -249,13 +251,42 @@ class LoggerManager:
     _file_lock = threading.Lock()
     _scrub_values: set = set()   # exact secret strings registered at config load
 
+    # Below this length a value is treated as noise for the GENERAL register path
+    # (an 8-char floor keeps common short words/ids from over-scrubbing every line).
+    _SCRUB_MIN_LEN = 8
+
+    @classmethod
+    def register_secret(cls, value, allow_short=False):
+        """Register ONE exact secret string so it is redacted from every subsequent
+        log line, even outside a known pattern.
+
+        ``allow_short=True`` bypasses the ``_SCRUB_MIN_LEN`` floor for a KNOWN short
+        credential (e.g. a resolved 4-digit Plex profile PIN), so the exact value is
+        value-scrubbed everywhere — in ``pin=1234`` form, in dict-repr, and bare in a
+        sentence. Use it ONLY for confirmed credentials; the general
+        :meth:`register_secrets` path keeps the floor to avoid over-scrubbing noise."""
+        if not isinstance(value, str) or not value:
+            return
+        if allow_short or len(value) >= cls._SCRUB_MIN_LEN:
+            cls._scrub_values.add(value)
+
+    @classmethod
+    def register_short_secrets(cls, values):
+        """Register exact KNOWN short credentials (PINs, short codes) so the floor in
+        :meth:`register_secrets` is bypassed and each value is redacted everywhere."""
+        for v in values:
+            cls.register_secret(v, allow_short=True)
+
     @classmethod
     def register_secrets(cls, values):
         """Register exact secret strings (api keys, tokens, webhook URLs) so they
-        are redacted from every subsequent log line, even outside a known pattern."""
+        are redacted from every subsequent log line, even outside a known pattern.
+
+        Values under ``_SCRUB_MIN_LEN`` chars are IGNORED here to avoid over-scrubbing
+        short noise; register a known short credential via :meth:`register_short_secrets`
+        (or ``register_secret(value, allow_short=True)``) instead."""
         for v in values:
-            if isinstance(v, str) and len(v) >= 8:
-                cls._scrub_values.add(v)
+            cls.register_secret(v, allow_short=False)
 
     def _scrub(self, message):
         """Redact credentials from a log message. Best-effort; never raises."""

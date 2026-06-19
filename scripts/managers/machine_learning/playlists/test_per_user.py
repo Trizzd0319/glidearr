@@ -5,9 +5,25 @@ from __future__ import annotations
 
 from scripts.managers.machine_learning.playlists.per_user import (
     genre_match,
+    kids_household_affinity,
     priority_score,
     tilt_score,
 )
+
+
+def test_kids_household_affinity_weights_genres_by_score():
+    # Genres accumulate weighted by household score; emitted in the genre_match-consumable shape.
+    aff = kids_household_affinity([(["Animation", "Family"], 80), (["Animation", "Adventure"], 40),
+                                  (["Comedy"], 0)])
+    assert aff == {"animation": 120.0, "family": 80.0, "adventure": 40.0}   # zero-score show dropped
+    # … and it tilts the kid's ranking toward the household's kid genres.
+    assert genre_match(["Animation"], aff) > genre_match(["Comedy"], aff)
+
+
+def test_kids_household_affinity_ignores_unusable_scores():
+    assert kids_household_affinity([]) == {}
+    assert kids_household_affinity([(["A"], None), (["B"], "x"), (["C"], -5)]) == {}
+    assert kids_household_affinity([(["A"], float("nan"))]) == {}            # NaN = no signal
 
 
 def test_no_tilt_or_missing_signal_returns_household():

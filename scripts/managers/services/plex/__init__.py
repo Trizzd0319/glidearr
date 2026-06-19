@@ -41,6 +41,7 @@ from scripts.managers.services.plex.playlists import PlexPlaylistsManager
 from scripts.managers.services.plex.playlists.builder import PlexPlaylistBuilderManager
 from scripts.managers.services.plex.playlists.combined_builder import CombinedPlaylistBuilderManager
 from scripts.managers.services.plex.playlists.movie_builder import MoviePlaylistBuilderManager
+from scripts.managers.services.plex.playlists.writeback import PlaylistWritebackManager
 from scripts.managers.services.plex.ratings import PlexRatingsManager
 from scripts.managers.services.plex.users import PlexUsersManager
 from scripts.managers.services.plex.validator import PlexValidatorManager
@@ -68,6 +69,7 @@ class PlexManager(BaseManager, ComponentManagerMixin):
     playlist_builder:  Optional[PlexPlaylistBuilderManager] = None
     movie_playlist_builder: Optional[MoviePlaylistBuilderManager] = None
     combined_playlist_builder: Optional[CombinedPlaylistBuilderManager] = None
+    playlist_writeback: Optional[PlaylistWritebackManager] = None
 
     @LoggerManager().log_function_entry
     @timeit("__init__")
@@ -131,6 +133,7 @@ class PlexManager(BaseManager, ComponentManagerMixin):
             "playlist_builder": [],
             "movie_playlist_builder": [],
             "combined_playlist_builder": [],
+            "playlist_writeback": [],
             "validator_manager": [],
         }
 
@@ -148,6 +151,7 @@ class PlexManager(BaseManager, ComponentManagerMixin):
             "playlist_builder": PlexPlaylistBuilderManager,
             "movie_playlist_builder": MoviePlaylistBuilderManager,
             "combined_playlist_builder": CombinedPlaylistBuilderManager,
+            "playlist_writeback": PlaylistWritebackManager,
             "validator_manager": PlexValidatorManager,
         }
 
@@ -423,6 +427,18 @@ class PlexManager(BaseManager, ComponentManagerMixin):
                 self.combined_playlist_builder.run()
         except Exception as e:
             self.logger.log_error(f"[Plex] combined playlist builder failed: {e}")
+
+        # Per-user playlist WRITE-BACK (P2-5c) — runs LAST, after the dry-run builders have
+        # cached the per-user plans this phase. DEFAULT-OFF / fail-closed: the manager runs the
+        # full re-resolution + diff + summary banner every run, but performs ZERO Plex writes
+        # unless writeback_armed() (config plex.playlists.writeback.enabled AND not dry_run).
+        # Gated on the same episodes/movies build flags so a build-disabled install never even
+        # constructs a write attempt — with both off there are no plans to write.
+        try:
+            if self.playlist_writeback and (self._cap_enabled("episodes") or self._cap_enabled("movies")):
+                self.playlist_writeback.run()
+        except Exception as e:
+            self.logger.log_error(f"[Plex] playlist write-back failed: {e}")
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _cap_enabled(self, cap: str) -> bool:

@@ -17,15 +17,25 @@ so a golden corpus pins the exact order regardless of input order.
 """
 from __future__ import annotations
 
+from datetime import date
+
 from scripts.managers.machine_learning.playlists.caps import apply_size_cap
-from scripts.managers.machine_learning.playlists.grouping import coverage_stats, group_items
+from scripts.managers.machine_learning.playlists.grouping import (
+    _affinity_keys,
+    coverage_stats,
+    group_items,
+)
 from scripts.managers.machine_learning.playlists.models import (
     STANDALONE,
     PlaylistInput,
     PlaylistItemPlan,
     PlaylistPlan,
 )
-from scripts.managers.machine_learning.playlists.timeline import chrono_value, order_within_group
+from scripts.managers.machine_learning.playlists.timeline import (
+    chrono_value,
+    order_within_group,
+    recency_value,
+)
 
 _NEG_INF = float("-inf")
 
@@ -65,11 +75,67 @@ def _score_resolver(items: list[PlaylistInput], normalize_per_medium: bool):
     return lambda it: pct.get(it.rating_key)
 
 
+def _group_recency_boost(members: list[PlaylistInput], watched: list[PlaylistInput],
+                         *, window_days: int, now: date) -> bool:
+    """Does THIS group earn the caught-up recency boost? True only when BOTH hold:
+
+      (a) CAUGHT UP — the group's surviving (unwatched) members are its FRESHEST: no
+          unwatched item is older than a watched one in the same group. Formally
+          ``min(recency of unwatched) >= max(recency of watched)``. An undated
+          unwatched member (``recency -inf``) fails this, which is the safe direction
+          — we can't prove it's the freshest, so we don't boost.
+      (b) FRESH — the freshest unwatched member landed within ``window_days`` of
+          ``now`` (by the added_at / air-date recency blend).
+
+    ``watched`` is the watched items that share this group's affinity (the saga the
+    user has already burned through). A standalone with nothing watched before it is
+    trivially "caught up" — it qualifies purely on freshness."""
+    live_rec = [recency_value(m, now=now) for m in members]
+    freshest = max(live_rec)
+    if freshest == _NEG_INF:                       # no usable date → never "fresh"
+        return False
+    if now.toordinal() - freshest > window_days:   # freshest member is stale
+        return False
+    if watched:                                    # caught-up: nothing newer is unseen
+        seen = max(recency_value(w, now=now) for w in watched)
+        if min(live_rec) < seen:
+            return False
+    return True
+
+
+def _watched_by_group(groups, watched: list[PlaylistInput]):
+    """Map each group → the watched items sharing ANY of its affinity tokens (the
+    already-seen part of that saga). A watched item that bridges two un-merged live
+    groups counts against both — conservatively safe for the caught-up test."""
+    out = {id(g): [] for g in groups}
+    if not watched:
+        return out
+    keys_by_group = {id(g): {k for m in g.members for k in _affinity_keys(m)}
+                     for g in groups}
+    for w in watched:
+        wkeys = set(_affinity_keys(w))
+        if not wkeys:
+            continue
+        for g in groups:
+            if wkeys & keys_by_group[id(g)]:
+                out[id(g)].append(w)
+    return out
+
+
 def order_items(items: list[PlaylistInput], *, family: str = "up_next",
                 max_items: int | None = None, normalize_per_medium: bool = False,
-                include_specials: bool = False) -> PlaylistPlan:
+                include_specials: bool = False, recency_boost: bool = False,
+                window_days: int = 30, now: date | None = None) -> PlaylistPlan:
     """Order candidate items into a spoiler-safe, group-contiguous, watchability-ranked
-    :class:`PlaylistPlan`. See module docstring for the pipeline."""
+    :class:`PlaylistPlan`. See module docstring for the pipeline.
+
+    ``recency_boost`` (default OFF → byte-identical output) lifts a GROUP above
+    higher-watchability groups, but ONLY when the user is CAUGHT UP on it (its unwatched
+    items are its freshest) AND its freshest item is RECENT (within ``window_days`` by
+    the added_at / air-date blend). It is a GROUP-rank tiebreak that sits ABOVE
+    watchability for qualifying groups — never an item-level sort, so group contiguity
+    and spoiler order are untouched. ``now`` overrides "today" (clamps future dates;
+    testability)."""
     items = list(items)
     considered = len(items)
 
@@ -86,6 +152,19 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
     coverage = coverage_stats(groups)
     score_of = _score_resolver(live, normalize_per_medium)
 
+    # the caught-up boost (when enabled) needs the watched history per group.
+    boosted: dict[int, bool] = {}
+    if recency_boost:
+        clock = now or date.today()
+        # mirror the live filter on watched items: a watched SPECIAL carries no
+        # "must precede" relationship (see spoiler.py), so it must not fail caught-up.
+        seen = [it for it in items if it.watched
+                and (include_specials or not (it.is_special or it.season == 0))]
+        watched_for = _watched_by_group(groups, seen)
+        boosted = {id(g): _group_recency_boost(
+            order_within_group(list(g.members)), watched_for[id(g)],
+            window_days=window_days, now=clock) for g in groups}
+
     # order within each group, compute the group's ranking score (max over members)
     rendered = []
     for g in groups:
@@ -95,11 +174,16 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
         rendered.append((g, members, top))
 
     # rank groups: watchability DESC, then size DESC, then earliest lead date,
-    # then lead title, then group key — fully deterministic.
+    # then lead title, then group key — fully deterministic. When the recency boost
+    # is on, a qualifying (caught-up + fresh) group sorts ABOVE everything else first
+    # (0 < 1), THEN watchability orders within each tier — so OFF is byte-identical.
     def _rank(entry):
         g, members, top = entry
         lead = members[0]
-        return (-top, -len(members), chrono_value(lead), lead.title.casefold(), g.key)
+        base = (-top, -len(members), chrono_value(lead), lead.title.casefold(), g.key)
+        if not recency_boost:
+            return base
+        return (0 if boosted[id(g)] else 1,) + base
 
     rendered.sort(key=_rank)
 

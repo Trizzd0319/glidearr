@@ -53,6 +53,9 @@ class PlaylistInput:
     air_date: str | None = None           # ISO-8601 (episodes)
     release_date: str | None = None       # ISO-8601 — service picks THEATRICAL-priority
     year: int | None = None               # last-resort chrono when no date present
+    added_at: str | None = None           # ISO-8601 — when it landed in the library
+    #                                       (blended with air/release date for the
+    #                                       caught-up recency BOOST; never spoiler order)
 
     # ── safety / display ──────────────────────────────────────────────────────
     cert: str | None = None               # content rating (kids cert-gating, later PR)

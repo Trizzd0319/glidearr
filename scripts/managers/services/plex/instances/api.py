@@ -111,6 +111,10 @@ class PlexAPI:
         self.ext_calls     = 0
         self.rate_limited  = False
 
+        # Local-PMS machineIdentifier (lazy, from GET /identity) — required to build the
+        # ``server://{machineId}/…`` uri for playlist writes. Cached so writes don't re-probe.
+        self._machine_id: str | None = None
+
     # ── headers ─────────────────────────────────────────────────────────────
     def _headers(self, token: str | None = None) -> dict:
         return {
@@ -270,17 +274,85 @@ class PlexAPI:
         return self._request("GET", f"{self.base_url}/library/collections/{rating_key}/children",
                              fallback=fallback)
 
-    def get_playlists(self, fallback=None):
-        """GET /playlists — all playlists (we keep only video playlists)."""
-        return self._request("GET", f"{self.base_url}/playlists", fallback=fallback)
+    def get_playlists(self, token: str | None = None, fallback=None):
+        """GET /playlists — all playlists (we keep only video playlists). ``token`` scopes the
+        listing to a specific member's OWN playlists (a managed user's per-server accessToken),
+        so the write-back path resolves/adopts only THAT user's playlists, not the owner's."""
+        return self._request("GET", f"{self.base_url}/playlists", token=token, fallback=fallback)
 
-    def get_playlist_items(self, rating_key, fallback=None):
-        """GET /playlists/{rk}/items — playlist members."""
-        return self._request("GET", f"{self.base_url}/playlists/{rating_key}/items", fallback=fallback)
+    def get_playlist_items(self, rating_key, token: str | None = None, fallback=None):
+        """GET /playlists/{rk}/items — playlist members. ``token`` scopes to a member so a
+        per-user playlist (private to that account) is readable by its owner — without it a
+        managed user's anchor reads as the OWNER and 404s, churning a duplicate every run."""
+        return self._request("GET", f"{self.base_url}/playlists/{rating_key}/items",
+                             token=token, fallback=fallback)
 
     def get_sessions(self, fallback=None):
         """GET /status/sessions — current now-playing (1-call diagnostic stub only)."""
         return self._request("GET", f"{self.base_url}/status/sessions", fallback=fallback)
+
+    # ── LOCAL PMS WRITES (playlists) ─────────────────────────────────────────
+    # Thin POST/PUT/DELETE wrappers for the per-user playlist write-back pass. UNREFERENCED
+    # until that pass is wired — adding them here keeps the verb/URI/param contract (and its
+    # tests) in one place. Every write takes a per-user ``token`` so the playlist lands on
+    # THAT member's account; passing the owner token would create owner-side playlists.
+    def get_machine_id(self, fallback=None):
+        """The local-PMS ``machineIdentifier`` (from GET /identity), cached after the first
+        hit. Needed to build the ``server://{machineId}/…`` uri every playlist write uses."""
+        if self._machine_id:
+            return self._machine_id
+        ident = self.get_identity(fallback={}) or {}
+        mc = ident.get("MediaContainer", ident) if isinstance(ident, dict) else {}
+        self._machine_id = (mc or {}).get("machineIdentifier") or None
+        return self._machine_id or fallback
+
+    def _library_uri(self, rating_keys) -> str:
+        """``server://{machineId}/com.plexapp.plugins.library/library/metadata/{rk1,rk2,…}`` —
+        the item-list uri Plex's create/add endpoints take (in the QUERY string, never a body)."""
+        keys = ",".join(str(k) for k in rating_keys)
+        return f"server://{self.get_machine_id() or ''}/com.plexapp.plugins.library/library/metadata/{keys}"
+
+    def create_playlist(self, title: str, rating_keys, token: str | None = None, fallback=None):
+        """POST /playlists — create a non-smart VIDEO playlist of ``rating_keys`` (in order)
+        owned by the ``token`` member. Items go in the ``uri`` QUERY param, NOT a JSON body.
+
+        NOTE: Plex returns the new playlist as XML, so ``_request`` (JSON-only) yields
+        ``fallback`` even on success — the caller re-GETs /playlists to capture the new
+        ratingKey rather than reading this response body."""
+        params = {"type": "video", "title": title, "smart": 0,
+                  "uri": self._library_uri(rating_keys)}
+        return self._request("POST", f"{self.base_url}/playlists", token=token,
+                             params=params, fallback=fallback)
+
+    def add_playlist_items(self, playlist_rk, rating_keys, token: str | None = None, fallback=None):
+        """PUT /playlists/{rk}/items?uri=… — append ``rating_keys`` (insertion order)."""
+        return self._request("PUT", f"{self.base_url}/playlists/{playlist_rk}/items",
+                             token=token, params={"uri": self._library_uri(rating_keys)},
+                             fallback=fallback)
+
+    def remove_playlist_item(self, playlist_rk, playlist_item_id, token: str | None = None, fallback=None):
+        """DELETE /playlists/{rk}/items/{playlistItemID} — remove ONE member. Takes the
+        per-playlist ``playlistItemID`` (distinct from the item's ratingKey — read it from
+        get_playlist_items first), NOT the ratingKey."""
+        return self._request("DELETE",
+                             f"{self.base_url}/playlists/{playlist_rk}/items/{playlist_item_id}",
+                             token=token, fallback=fallback)
+
+    def move_playlist_item(self, playlist_rk, playlist_item_id, after_id=None,
+                           token: str | None = None, fallback=None):
+        """PUT /playlists/{rk}/items/{playlistItemID}/move[?after={afterPlaylistItemID}] —
+        reorder. Both ids are playlistItemIDs (not ratingKeys); omitting ``after_id`` moves
+        the item to the front."""
+        params = {"after": after_id} if after_id is not None else None
+        return self._request("PUT",
+                             f"{self.base_url}/playlists/{playlist_rk}/items/{playlist_item_id}/move",
+                             token=token, params=params, fallback=fallback)
+
+    def delete_playlist(self, playlist_rk, token: str | None = None, fallback=None):
+        """DELETE /playlists/{rk} — remove an entire playlist (used by the clear-and-recreate
+        write strategy, since the cached plan is already fully ranked)."""
+        return self._request("DELETE", f"{self.base_url}/playlists/{playlist_rk}",
+                             token=token, fallback=fallback)
 
     # ── plex.tv ACCOUNT v2 (UNSTABLE) ───────────────────────────────────────
     def get_account(self, fallback=None):
@@ -300,6 +372,29 @@ class PlexAPI:
         params = {"pin": pin} if pin else None
         return self._request("POST", f"{_PLEX_TV}/api/v2/home/users/{user_uuid}/switch",
                              params=params, external=True, fallback=fallback)
+
+    def get_resources(self, token: str, fallback=None):
+        """GET plex.tv/api/v2/resources — the account's reachable servers/devices for ``token``
+        (a JSON LIST). Used to obtain a PER-SERVER access token: a managed Home user's
+        ``switch_home_user`` authToken is REJECTED (401) by the LOCAL PMS, but the per-server
+        ``accessToken`` carried here IS accepted. ``token`` is that user's account authToken."""
+        return self._request("GET", f"{_PLEX_TV}/api/v2/resources", token=token,
+                             params={"includeHttps": 1}, external=True, fallback=fallback)
+
+    def server_access_token(self, user_auth: str, fallback=None):
+        """Derive THIS PMS's per-user access token from a user's account authToken: find the
+        resource whose ``clientIdentifier`` == our ``machineIdentifier`` and return its
+        ``accessToken`` — the token the LOCAL PMS accepts for that managed user (the raw switch
+        authToken 401s on local writes). Returns ``fallback`` when our server isn't in the user's
+        resource list (e.g. not shared to them). One external call; the caller should cache the
+        result per user per run (tokens are in-memory only)."""
+        mid = self.get_machine_id()
+        if not mid or not user_auth:
+            return fallback
+        for res in (self.get_resources(user_auth, fallback=[]) or []):
+            if isinstance(res, dict) and res.get("clientIdentifier") == mid:
+                return res.get("accessToken") or fallback
+        return fallback
 
     # ── Discover / metadata provider (UNSTABLE) ─────────────────────────────
     def get_watchlist(self, token: str, start: int = 0, size: int = 100, fallback=None):

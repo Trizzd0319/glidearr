@@ -49,12 +49,43 @@ class PlexUsersManager(BaseManager):
     def prepare(self):
         pass
 
+    # ── per-server write token (PR-5 playlist write-back) ─────────────────────
+    def server_write_token(self, tracked_user: dict) -> str | None:
+        """The token the LOCAL PMS accepts for WRITING this member's playlists, derived
+        from their in-memory account authToken via ``PlexAPI.server_access_token`` and
+        cached per user FOR THIS RUN (in-memory only — never persisted, like every minted
+        token here).
+
+        The owner reuses the account token directly (it already writes owner-side). For a
+        managed user the raw switch authToken 401s on the local PMS, so we exchange it for
+        the per-server ``accessToken``; if that exchange yields nothing we return ``None``
+        and the caller SKIPS — we NEVER fall back to the owner token for a non-admin (that
+        would write their playlist onto the owner's account)."""
+        safe = tracked_user.get("safe_user")
+        if not safe:
+            return None
+        if tracked_user.get("is_admin"):
+            # The owner's account token IS the local-PMS write token for owner playlists.
+            return self.user_tokens.get(safe) or (self.plex_api.token if self.plex_api else None)
+        cache = getattr(self, "_server_tokens", None)
+        if cache is None:
+            cache = self._server_tokens = {}
+        if safe in cache:
+            return cache[safe]
+        auth = self.user_tokens.get(safe)
+        token = self.plex_api.server_access_token(auth) if (auth and self.plex_api) else None
+        if token:
+            LoggerManager.register_secrets([token])   # scrub from every later log line
+        cache[safe] = token
+        return token
+
     # ── run ──────────────────────────────────────────────────────────────────
     def run(self) -> dict:
         stats = {"scope_ok": False, "users_tracked": 0, "users_pin_skipped": 0}
         self.tracked_users = []
         self.user_tokens.clear()
         self._safe_by_uuid = {}
+        self._server_tokens = {}      # per-run cache of derived per-server write tokens
 
         # 1. Token-scope probe — the HARD gate (DESIGN §4.2). On failure: warn once,
         #    write empty roster, degrade to owner-only; NEVER fall through to broader

@@ -28,6 +28,7 @@ from scripts.managers.machine_learning.playlists.cert_gate import (
 from scripts.managers.machine_learning.playlists.per_user import (
     GENRE_MATCH_MODES,
     genre_match,
+    kids_household_affinity,
     priority_score,
 )
 from scripts.managers.machine_learning.playlists.rationale import explain_reason
@@ -136,6 +137,11 @@ class PlexPlaylistBuilderManager(BaseManager):
                 user_owned = [ep for ep in owned_eps
                               if cert_allowed(series_certs.get(ep.get("series_id")), level,
                                               csm_age=series_csm_ages.get(ep.get("series_id")))]
+
+            # Cold-start: a restricted profile with no affinity of its own inherits a prior from
+            # the household's engagement with its age-appropriate owned content (parent co-views).
+            user_aff = self._apply_cold_kids_prior(
+                user_aff, level, self._series_genre_scores(user_owned, series_genres, series_scores))
 
             # One self-explaining diagnostic per user so per-user differentiation (or its
             # absence) is VISIBLE: which Tautulli account matched, how much affinity +
@@ -333,6 +339,34 @@ class PlexPlaylistBuilderManager(BaseManager):
         jit_w = max(jit_w, hh_w + _GAP)
         aff_w = max(aff_w, jit_w + _GAP)
         return aff_w, hh_w, jit_w
+
+    # ── cold-start prior for kid profiles (config plex.playlists.cold_start_kids_prior) ──
+    def _cold_kids_prior_enabled(self) -> bool:
+        """plex.playlists.cold_start_kids_prior — default OFF. When on, a RESTRICTED profile
+        with no affinity of its own is seeded from the household's engagement with its
+        age-appropriate content (a parent co-viewing kid shows) instead of a flat household
+        order. Off → byte-identical to today."""
+        return bool(self._pl_cfg().get("cold_start_kids_prior", False))
+
+    def _apply_cold_kids_prior(self, user_aff, level, genre_score_pairs) -> dict:
+        """Substitute a household-kids cold-start prior for a restricted profile that has NO
+        affinity of its own (see :func:`kids_household_affinity`). A no-op — returns ``user_aff``
+        unchanged — for adults, for any user that already has affinity, or when the feature is
+        off, so the default ranking path is untouched."""
+        if user_aff or not is_restricted(level) or not self._cold_kids_prior_enabled():
+            return user_aff
+        return kids_household_affinity(genre_score_pairs)
+
+    @staticmethod
+    def _series_genre_scores(eps, series_genres, series_scores) -> list:
+        """``[(genres, household_score)]`` over the DISTINCT series in ``eps`` (so a long-running
+        show contributes its genres ONCE, not per episode) — the TV input to the kids prior."""
+        seen: dict = {}
+        for e in eps or []:
+            sid = e.get("series_id")
+            if sid is not None and sid not in seen:
+                seen[sid] = (series_genres.get(sid), series_scores.get(sid))
+        return list(seen.values())
 
     # ── I/O gather (defensive — degrade to empty, never raise) ──────────────────
     def _cache_get(self, key, default):

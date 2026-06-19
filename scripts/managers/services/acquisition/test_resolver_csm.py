@@ -1,12 +1,14 @@
 """Tests that the acquisition Resolver wires the Common Sense Media age cache into
-add-time classification — the PRIMARY kids signal for BOTH movies and shows.
+add-time classification — a kids CEILING for BOTH movies and shows (operator policy:
+"never trust Common Sense alone", so a low CSM age never routes to Kids by itself).
 
 These are integration-ish: a real ``Resolver`` (its ``__init__`` only reads a config
 dict, no network) with a fake gateway that returns one lookup ``obj``. The CSM cache is
 injected directly onto the Resolver's lazy holder (``_movie_age_cache`` / ``_show_age_cache``)
 so no on-disk cache file is read. This pins the full chain: the cache read, the
-``isinstance(int)`` filter, the id used (``obj.get("tmdbId")`` for BOTH media), and that the
-resolved ``category`` reflects CSM — plus that ``studio`` is still passed for the no-CSM fallback.
+``isinstance(int)`` filter, the id used (``obj.get("tmdbId")`` for BOTH media), that a CSM age
+over the cutoff DEMOTES out of Kids, and that the positive kids signals reach the classifier
+(``studio`` for movies, ``network`` for shows).
 """
 from __future__ import annotations
 
@@ -50,9 +52,18 @@ def _show_resolver(obj, age_cache_dict):
 
 
 # ── movies ──────────────────────────────────────────────────────────────────────
-def test_movie_csm_kid_age_routes_kids():
+def test_movie_csm_kid_age_alone_not_kids():
+    # CSM age is a kids CEILING ONLY: a low CSM age with no kids studio does NOT route to Kids.
     obj = {"tmdbId": 603, "genres": ["Drama"], "certification": "PG-13", "studio": "A24"}
-    r = _movie_resolver(obj, {"603": 8})                       # CSM age 8 → kids (overrides cert/studio)
+    r = _movie_resolver(obj, {"603": 8})
+    out = r.prepare({"type": "movie", "ids": {"tmdb": 603}, "title": "X"})
+    assert out["category"] == "standard"
+
+
+def test_movie_kids_studio_in_csm_range_routes_kids():
+    # The kids STUDIO is the positive signal; a CSM age within the cutoff does not block it.
+    obj = {"tmdbId": 603, "genres": ["Comedy"], "certification": "G", "studio": "Pixar"}
+    r = _movie_resolver(obj, {"603": 8})
     out = r.prepare({"type": "movie", "ids": {"tmdb": 603}, "title": "X"})
     assert out["category"] == "kids"
 
@@ -73,9 +84,21 @@ def test_movie_no_csm_uses_studio_fallback():
 
 
 # ── shows (TV cache keyed by Sonarr series tmdbId, read off obj.tmdbId) ───────────
-def test_show_csm_kid_age_routes_kids():
-    obj = {"tvdbId": 121361, "tmdbId": 1399, "genres": ["Drama"], "certification": "TV-MA"}
-    r = _show_resolver(obj, {"1399": 8})                       # CSM age 8 → kids (beats TV-MA drama)
+def test_show_csm_kid_age_alone_not_kids():
+    # CSM age alone no longer routes a show to Kids (Star Trek: DS9 pattern — adult drama, CSM ~10).
+    obj = {"tvdbId": 121361, "tmdbId": 1399, "genres": ["Drama", "Science Fiction"],
+           "certification": "TV-PG"}
+    r = _show_resolver(obj, {"1399": 10})
+    out = r.prepare({"type": "show", "ids": {"tvdb": 121361}, "title": "X"})
+    assert out["category"] == "series"
+
+
+def test_show_kids_network_reaches_classifier():
+    # The show ``network`` reaches the classifier: a kids network routes to Kids even at a
+    # CSM tween age and a non-kids cert (Star Trek: Prodigy on Nickelodeon, CSM ~10).
+    obj = {"tvdbId": 121361, "tmdbId": 1399, "genres": ["Drama"],
+           "certification": "TV-PG", "network": "Nickelodeon"}
+    r = _show_resolver(obj, {"1399": 10})
     out = r.prepare({"type": "show", "ids": {"tvdb": 121361}, "title": "X"})
     assert out["category"] == "kids"
 

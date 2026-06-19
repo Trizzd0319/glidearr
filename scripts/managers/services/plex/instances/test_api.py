@@ -88,6 +88,109 @@ def test_401_returns_fallback_no_retry():
     assert a._session.calls == 1                      # never falls through to broader scope
 
 
+# ── playlist WRITE verbs (PR-2: verbs only — unreferenced until the writeback pass) ──
+class _CapSession:
+    """Like _Session but captures each request()'s kwargs so we can assert verb/url/params."""
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self.headers = {}
+    def request(self, **kwargs):
+        self.calls.append(kwargs)
+        item = self.script.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+    def close(self): pass
+
+
+def _cap_api(script):
+    a = PlexAPI(logger=_Logger(), instance_config={"plex_token": "T", "url": "h", "port": 32400},
+                client_identifier="cid-1")
+    a._session = _CapSession(script)
+    return a
+
+
+def test_get_machine_id_parses_and_caches():
+    a = _cap_api([_Resp(200, {"MediaContainer": {"machineIdentifier": "MID-123", "version": "1.0"}})])
+    assert a.get_machine_id() == "MID-123"
+    assert a.get_machine_id() == "MID-123"             # cached — no second identity fetch
+    assert len(a._session.calls) == 1
+
+
+def test_create_playlist_puts_items_in_uri_query_not_body():
+    a = _cap_api([_Resp(200, {})])
+    a._machine_id = "MID"                               # prime so no identity round-trip
+    a.create_playlist("Aiden Up Next", ["10", "20", "30"], token="USERTOK")
+    call = a._session.calls[0]
+    assert call["method"] == "POST" and call["url"].endswith("/playlists")
+    p = call["params"]
+    assert p["type"] == "video" and p["title"] == "Aiden Up Next" and p["smart"] == 0
+    assert p["uri"] == "server://MID/com.plexapp.plugins.library/library/metadata/10,20,30"
+    assert "json" not in call and "data" not in call   # items ride the QUERY param (red-team CRITICAL)
+    assert call["headers"]["X-Plex-Token"] == "USERTOK"   # per-user scoping → member's account
+
+
+def test_add_playlist_items_uri():
+    a = _cap_api([_Resp(200, {})])
+    a._machine_id = "MID"
+    a.add_playlist_items("777", ["5", "6"], token="UT")
+    call = a._session.calls[0]
+    assert call["method"] == "PUT" and call["url"].endswith("/playlists/777/items")
+    assert call["params"]["uri"] == "server://MID/com.plexapp.plugins.library/library/metadata/5,6"
+    assert "json" not in call and "data" not in call
+
+
+def test_remove_playlist_item_uses_playlist_item_id():
+    a = _cap_api([_Resp(200, {})])
+    a.remove_playlist_item("777", "9001", token="UT")
+    call = a._session.calls[0]
+    assert call["method"] == "DELETE" and call["url"].endswith("/playlists/777/items/9001")
+
+
+def test_move_playlist_item_after_and_to_front():
+    a = _cap_api([_Resp(200, {}), _Resp(200, {})])
+    a.move_playlist_item("777", "9001", after_id="9000", token="UT")
+    a.move_playlist_item("777", "9001", token="UT")    # no after → move to front
+    c0, c1 = a._session.calls
+    assert c0["method"] == "PUT" and c0["url"].endswith("/playlists/777/items/9001/move")
+    assert c0["params"] == {"after": "9000"}
+    assert c1["params"] is None
+
+
+def test_delete_playlist():
+    a = _cap_api([_Resp(200, {})])
+    a.delete_playlist("777", token="UT")
+    call = a._session.calls[0]
+    assert call["method"] == "DELETE" and call["url"].endswith("/playlists/777")
+
+
+# ── per-server access token (the managed-user write enabler) ──────────────────
+def test_get_resources_is_external_and_token_scoped():
+    a = _cap_api([_Resp(200, [{"clientIdentifier": "MID", "accessToken": "ACC"}])])
+    out = a.get_resources("USERAUTH", fallback=[])
+    call = a._session.calls[0]
+    assert call["method"] == "GET" and call["url"].endswith("/api/v2/resources")
+    assert call["headers"]["X-Plex-Token"] == "USERAUTH"          # scoped to the user's account
+    assert out == [{"clientIdentifier": "MID", "accessToken": "ACC"}]
+
+
+def test_server_access_token_picks_matching_machine_id():
+    # resources lists several servers/players; pick the one == our PMS machineIdentifier.
+    a = _cap_api([_Resp(200, [
+        {"clientIdentifier": "OTHER", "accessToken": "wrong"},
+        {"clientIdentifier": "MID", "accessToken": "ACC"},
+    ])])
+    a._machine_id = "MID"                                          # prime so no /identity round-trip
+    assert a.server_access_token("USERAUTH") == "ACC"
+
+
+def test_server_access_token_absent_server_returns_fallback():
+    a = _cap_api([_Resp(200, [{"clientIdentifier": "OTHER", "accessToken": "wrong"}])])
+    a._machine_id = "MID"
+    assert a.server_access_token("USERAUTH", fallback=None) is None
+
+
 def test_404_returns_fallback():
     a = _api([_Resp(404)])
     assert a.get_sections(fallback=[]) == []

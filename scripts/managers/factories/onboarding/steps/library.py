@@ -12,9 +12,16 @@ from scripts.managers.factories.onboarding.steps.base import Step, StepResult, c
 # Suggestions are shown to the user; the *_DEFAULT seeds the editable default so
 # Enter accepts a sensible set. These match against a title's genre tags, so only
 # values your library actually uses will ever map.
-_DOC_SUGGESTIONS = ["documentary", "biography", "history", "nature", "reality",
-                    "crime", "war", "science", "music", "sport", "news", "travel"]
-_DOC_DEFAULT = ["documentary", "reality", "nature", "history", "biography"]
+#
+# Documentary is kept DELIBERATELY TIGHT: a title only routes to the Documentaries
+# library if it carries the 'documentary' genre. Broad story genres (crime, war,
+# history, sport, …) are NOT documentary tags — including them sweeps scripted crime
+# / war / period dramas (FBI, The Sopranos, Masters of the Air) into Documentaries.
+# 'reality' is its OWN bucket below — never fold it into documentary.
+_DOC_SUGGESTIONS = ["documentary", "biography", "nature"]
+_DOC_DEFAULT = ["documentary"]
+_REALITY_SUGGESTIONS = ["reality", "reality-tv", "game show", "talk show"]
+_REALITY_DEFAULT = ["reality"]
 _ANIME_SUGGESTIONS = ["anime", "animation"]
 _ANIME_DEFAULT = ["anime"]
 
@@ -36,7 +43,8 @@ class LibraryStep(Step):
 
         discovered = sorted({p for p in ctx.get("root_folders", []) if p})
         rf = cfg.setdefault("rootFolders", {})
-        for key, label in (("series", "Series"), ("anime", "Anime"), ("documentary", "Documentary")):
+        for key, label in (("series", "Series"), ("anime", "Anime"),
+                           ("documentary", "Documentary"), ("reality", "Reality")):
             cur = rf.get(key, "")
             if prompter.is_interactive and discovered:
                 rf[key] = prompter.choice(
@@ -55,6 +63,10 @@ class LibraryStep(Step):
             prompter, "documentaryGenres", "Documentary genres (comma-separated, must include 'documentary')",
             cfg.get("documentaryGenres") or [], suggestions=_DOC_SUGGESTIONS, fallback=_DOC_DEFAULT,
             require="documentary")
+        cfg["realityGenres"] = csv_field(
+            prompter, "realityGenres", "Reality genres (comma-separated, must include 'reality')",
+            cfg.get("realityGenres") or [], suggestions=_REALITY_SUGGESTIONS, fallback=_REALITY_DEFAULT,
+            require="reality")
 
         set_roots = sum(1 for v in rf.values() if v)
-        return [StepResult("library", ok=True, detail=f"root folders {set_roots}/3, dry_run={cfg['dry_run']}")]
+        return [StepResult("library", ok=True, detail=f"root folders {set_roots}/4, dry_run={cfg['dry_run']}")]

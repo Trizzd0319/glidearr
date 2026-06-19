@@ -57,14 +57,15 @@ def _show(obj, cfg, age=None):
 
 # ── movie kids bucket ─────────────────────────────────────────────────────────
 def test_movie_kids_routes_to_kids_folder_when_enabled():
-    out = _movie({"tmdbId": 1, "genres": ["Drama"]},
-                 _cfg({"movies": {"kids_bucket_enabled": True}, "tv": {}}), age=8)
+    # A kids STUDIO is the movie kids signal (CSM age alone no longer routes to Kids).
+    out = _movie({"tmdbId": 1, "genres": ["Comedy"], "studio": "Pixar", "certification": "G"},
+                 _cfg({"movies": {"kids_bucket_enabled": True}, "tv": {}}))
     assert out["category"] == "kids" and out["root_folder"] == "/m/kids"
 
 
 def test_movie_kids_collapses_to_standard_when_disabled():
-    out = _movie({"tmdbId": 1, "genres": ["Drama"]},
-                 _cfg({"movies": {"kids_bucket_enabled": False}, "tv": {}}), age=8)
+    out = _movie({"tmdbId": 1, "genres": ["Comedy"], "studio": "Pixar", "certification": "G"},
+                 _cfg({"movies": {"kids_bucket_enabled": False}, "tv": {}}))
     assert out["category"] == "kids"                       # still classified kids …
     assert out["root_folder"] == "/m/std"                  # … but routed to the standard folder
 
@@ -101,8 +102,9 @@ def test_tv_anime_series_type_uses_series_folder_but_keeps_anime_parsing():
 
 # ── TV kids bucket ────────────────────────────────────────────────────────────
 def test_tv_kids_collapses_to_series_when_disabled():
-    out = _show({"tvdbId": 11, "tmdbId": 11, "genres": ["Drama"]},
-                _cfg({"movies": {}, "tv": {"kids_bucket_enabled": False}}), age=8)
+    # A hard 'Children' genre is the TV kids signal (CSM age alone no longer routes to Kids).
+    out = _show({"tvdbId": 11, "tmdbId": 11, "genres": ["Children"]},
+                _cfg({"movies": {}, "tv": {"kids_bucket_enabled": False}}))
     assert out["category"] == "kids" and out["root_folder"] == "/t/series"
 
 
@@ -110,6 +112,6 @@ def test_tv_kids_collapses_to_series_when_disabled():
 def test_prefs_ignored_without_configured_stamp():
     # kids_bucket_enabled False WOULD collapse to standard if configured — but no stamp means
     # the resolver routes exactly as before (uses the kids folder it found).
-    out = _movie({"tmdbId": 1, "genres": ["Drama"]},
-                 _cfg({"movies": {"kids_bucket_enabled": False}, "tv": {}}, configured=False), age=8)
+    out = _movie({"tmdbId": 1, "genres": ["Comedy"], "studio": "Pixar", "certification": "G"},
+                 _cfg({"movies": {"kids_bucket_enabled": False}, "tv": {}}, configured=False))
     assert out["category"] == "kids" and out["root_folder"] == "/m/kids"

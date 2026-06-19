@@ -106,6 +106,7 @@ def empty_config() -> dict:
         "relocation_consent": False,
         "animeGenres": [],
         "documentaryGenres": [],
+        "realityGenres": [],
         "free_space_limit": 0,
         # Owned-movie monitoring: how the repair pass decides which has-file but
         # unmonitored movies to monitor. "watchability" (default) monitors only
@@ -200,12 +201,18 @@ def empty_config() -> dict:
         # one group at a time, so a lower-target episode is never grabbed at a higher tier. OFF =
         # one profile per series (byte-identical to the pre-per-episode behavior).
         "jit_per_episode_tiers": {"enabled": True},
-        # Pilot search: best_tier_first (default ON) makes a stub pilot target the HIGHEST tier
-        # whose grab keeps the space reserve, diverting DOWN one rung per empty run for availability
-        # (never likelihood-gated — a pilot earns max tier on space alone). OFF = legacy
-        # floor-first/step-up. force_floor (default FALSE): when even the floor would breach the
-        # reserve, grab at the floor anyway vs skip + re-probe next run. A pilot is NEVER deleted.
-        "pilot_best_tier_first": {"enabled": True, "force_floor": False},
+        # Pilot search: floor_climb (default ON) grabs each stub pilot at its LOWEST available
+        # resolution — a background worker flips the series profile UP an ascending floor→widest
+        # ladder, searches S01E01 at each tier, and STOPS at the first tier with a release, leaving
+        # the series there so the watch-based upgrade path raises it later. This supersedes the two
+        # legacy strategies below.
+        "pilot_floor_climb": {"enabled": True},
+        # Legacy escape hatch (only used when pilot_floor_climb is OFF). best_tier_first ON makes a
+        # stub pilot target the HIGHEST tier whose grab keeps the space reserve, diverting DOWN one
+        # rung per empty run (never likelihood-gated). OFF = legacy floor-first/step-up across runs.
+        # force_floor (default FALSE): when even the floor would breach the reserve, grab at the floor
+        # anyway vs skip + re-probe next run. A pilot is NEVER deleted. Default OFF — superseded.
+        "pilot_best_tier_first": {"enabled": False, "force_floor": False},
         "large_file_gb": 30,
         "firstRunCompleted": False,
         "radarr_instances": {"default_instance": {"name": ""}},
@@ -237,7 +244,45 @@ def empty_config() -> dict:
         # Heavy local-PMS scans, so opt-in; a fresh install gets the keys (discoverable)
         # but off.
         "plex": {"url": "", "port": 32400, "plex_token": "", "plex_media_path": "",
-                 "episodes": {"enabled": False}, "movies": {"enabled": False}},
+                 "episodes": {"enabled": False}, "movies": {"enabled": False},
+                 # Per-user playlist BUILD + (opt-in) WRITE-BACK knobs. Every value below
+                 # mirrors the literal default the builder hard-codes inline today
+                 # (services/plex/playlists/builder.py: _max_items / _episode_cap /
+                 # _genre_match_opts / _priority_weights / _personal_tilt / _profile_ages),
+                 # so deep_merge over an existing config is a NO-OP and behaviour is
+                 # byte-identical until the user edits a knob. ``writeback`` and
+                 # ``recency_boost`` are NEW and currently UNREAD — purely inert placeholders.
+                 #   writeback.enabled: WRITE the per-user plans into Plex (create/update the
+                 #     real playlists). OFF by default; also requires dry_run=false to actuate.
+                 #   max_items / episode_cap: playlist length + per-series episode cap.
+                 #   genre_match_mode: precision (legacy) | soft | coverage | blend; the
+                 #     _genre_match_opts lambdas tune soft/blend.
+                 #   affinity_weight / household_weight / jit_weight / personal_tilt: per-user
+                 #     ranking weights (affinity > JIT > household; personal_tilt is the legacy
+                 #     0-100 alias for affinity_weight = tilt/100).
+                 #   exclude_users: profile titles / safe_users to skip entirely.
+                 #   profile_ages: operator override of a profile's age tier (parental gate).
+                 #   recency_boost: lift recently-aired/added items (window_days) — UNREAD, inert.
+                 #   cold_start_kids_prior: for a restricted profile with no watch history of its
+                 #     own, seed its playlist from the household's engagement with age-appropriate
+                 #     content (a parent co-viewing kid shows) instead of a flat household order.
+                 #     OFF by default → byte-identical.
+                 "playlists": {
+                     "writeback": {"enabled": False},
+                     "cold_start_kids_prior": False,
+                     "max_items": 100,
+                     "episode_cap": 5,
+                     "genre_match_mode": "precision",
+                     "genre_match_soft_lambda": 0.5,
+                     "genre_match_blend_weight": 0.85,
+                     "affinity_weight": 0.9,
+                     "household_weight": 0.1,
+                     "jit_weight": 0.65,
+                     "personal_tilt": 90,
+                     "exclude_users": [],
+                     "profile_ages": {},
+                     "recency_boost": {"enabled": False, "window_days": 30},
+                 }},
         "mdblist": {"apikey": ""},   # opt-in: aggregated ratings + lists. apikey -> keyring.
         "dry_run": True,
         "notifications": {"discord": dict(_DISCORD_DEFAULTS)},

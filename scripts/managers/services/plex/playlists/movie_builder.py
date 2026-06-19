@@ -99,6 +99,11 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                               if cert_allowed(m.get("certification"), level,
                                               csm_age=csm_ages.get(self._coerce_int(m.get("tmdb_id"))))]
 
+            # Cold-start prior from the household's age-appropriate engagement (see builder.py).
+            user_aff = self._apply_cold_kids_prior(
+                user_aff, level,
+                [(self._as_genre_list(m.get("genres")), self._score(m)) for m in user_owned])
+
             tier_name = self._TIER_NAMES[level] if 0 <= level < len(self._TIER_NAMES) else str(level)
             top_genres = ",".join(g for g, _ in sorted(
                 user_aff.items(), key=lambda kv: -kv[1])[:3]) if user_aff else "-"

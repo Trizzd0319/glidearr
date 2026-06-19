@@ -21,9 +21,12 @@ there is no dependence on input order.
 """
 from __future__ import annotations
 
+from datetime import date
+
 from scripts.managers.machine_learning.playlists.models import PlaylistInput
 
 _INF = float("inf")
+_NEG_INF = float("-inf")
 
 
 def _parse_date(s: str | None) -> int | None:
@@ -41,6 +44,19 @@ def _parse_date(s: str | None) -> int | None:
     return y * 10000 + m * 100 + d
 
 
+def _parse_ordinal(s: str | None) -> int | None:
+    """ISO-8601 date → proleptic-Gregorian ordinal (so day deltas are real day counts,
+    not YYYYMMDD arithmetic which jumps at month/year edges). Unparseable / impossible
+    calendar dates (e.g. month 13) → None."""
+    ymd = _parse_date(s)
+    if ymd is None:
+        return None
+    try:
+        return date(ymd // 10000, (ymd // 100) % 100, ymd % 100).toordinal()
+    except ValueError:                         # out-of-range month/day → unusable
+        return None
+
+
 def chrono_value(it: PlaylistInput) -> float:
     """Absolute real-date sort value shared across media (so a film and an episode
     interleave on one axis). Episode → air_date; movie → release_date (the service
@@ -52,6 +68,33 @@ def chrono_value(it: PlaylistInput) -> float:
     if it.year is not None:
         return float(it.year * 10000)
     return _INF
+
+
+def recency_value(it: PlaylistInput, *, now: date | None = None) -> float:
+    """Freshness as a proleptic-Gregorian ordinal (higher = newer), for the OPTIONAL
+    caught-up recency BOOST. The mirror image of :func:`chrono_value`, and deliberately
+    NOT interchangeable with it:
+
+      * ``chrono_value`` sinks missing dates to ``+inf`` so they tail an ASCENDING
+        spoiler-safe sort. Reusing it for a DESCENDING recency rank would float an
+        UNDATED item to the very TOP — exactly backwards. So here, missing → ``-inf``
+        (an undated item can never out-rank a dated one and never reads as "fresh").
+      * The value BLENDS ``added_at`` (when it entered the library) with the air/release
+        date, taking the MAX (whichever is fresher) — a long-owned but newly-aired
+        episode and a freshly-acquired old film both read as recent.
+      * FUTURE-stamped dates are clamped to ``now`` so an unaired episode with a
+        forward air date can't win the boost.
+
+    Returns ``-inf`` when neither ``added_at`` nor the air/release date is usable.
+    ``year`` is intentionally NOT a fallback here — it is a coarse spoiler-order
+    last resort, far too imprecise to drive a day-window freshness decision."""
+    today = (now or date.today()).toordinal()
+    primary = it.air_date if it.medium == "episode" else it.release_date
+    candidates = [v for v in (_parse_ordinal(it.added_at), _parse_ordinal(primary))
+                  if v is not None]
+    if not candidates:
+        return _NEG_INF
+    return float(min(max(candidates), today))  # freshest, but never beyond now
 
 
 def _num(x: int | None) -> float:

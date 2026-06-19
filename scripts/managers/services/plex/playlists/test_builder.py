@@ -1,10 +1,23 @@
 """Tests for the per-user TV playlist builder core (_build_for_users)."""
 from __future__ import annotations
 
+from scripts.managers.machine_learning.playlists.cert_gate import ADULT, LITTLE_KID
 from scripts.managers.services.plex.playlists.builder import (
     _PLAN_KEY,
     PlexPlaylistBuilderManager,
 )
+
+
+def test_cold_kids_prior_gating():
+    """The cold-start kids prior is OFF by default and a no-op except for a cold restricted
+    profile with the flag on (so the default ranking path is byte-identical)."""
+    pairs = [(["Animation", "Family"], 80)]
+    off = _mgr(config={"plex": {"playlists": {}}})                       # flag absent → off
+    assert off._apply_cold_kids_prior({}, LITTLE_KID, pairs) == {}       # no prior even for a cold kid
+    on = _mgr(config={"plex": {"playlists": {"cold_start_kids_prior": True}}})
+    assert on._apply_cold_kids_prior({}, ADULT, pairs) == {}             # adult → no-op
+    assert on._apply_cold_kids_prior({"comedy": 1}, LITTLE_KID, pairs) == {"comedy": 1}  # has affinity → no-op
+    assert on._apply_cold_kids_prior({}, LITTLE_KID, pairs) == {"animation": 80.0, "family": 80.0}
 
 
 class _Log:

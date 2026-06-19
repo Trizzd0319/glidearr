@@ -39,6 +39,7 @@ class RoutingManager:
         self._anime_genres = {str(g).lower() for g in (self.config.get("animeGenres", []) or []) if g}
         self._kids_genres = [str(g) for g in (self.config.get("kidsGenres", []) or []) if g]
         self._kids_certs = [str(c) for c in (self.config.get("kidsCertifications", []) or []) if c]
+        self._kids_networks = [str(n) for n in (self.config.get("kidsNetworks", []) or []) if n]
         self._reality_genres = [str(g) for g in (self.config.get("realityGenres", []) or []) if g]
         self._doc_genres = [str(g) for g in (self.config.get("documentaryGenres", []) or []) if g]
         self._preschool_genres = [str(g) for g in (self.config.get("preschoolGenres", []) or []) if g]
@@ -154,9 +155,11 @@ class RoutingManager:
                 return classify_show(
                     genres=it.get("genres"), certification=it.get("certification"),
                     series_type=it.get("seriesType"), original_language=self._olang(it),
+                    network=it.get("network"),
                     recommended_age=self._show_age(it.get("tmdbId")),
                     anime_genres=self._anime_genres, kids_genres=self._kids_genres,
-                    kids_certs=self._kids_certs, reality_genres=self._reality_genres,
+                    kids_certs=self._kids_certs, kids_networks=self._kids_networks,
+                    reality_genres=self._reality_genres,
                     documentary_genres=self._doc_genres, preschool_genres=self._preschool_genres,
                     non_kids_genres=self._non_kids_genres)
             return classify

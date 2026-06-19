@@ -89,6 +89,13 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                           if cert_allowed(m.get("certification"), level,
                                           csm_age=movie_csm_ages.get(self._coerce_int(m.get("tmdb_id"))))]
 
+            # Cold-start prior from the household's age-appropriate engagement across BOTH media
+            # (a restricted profile with no affinity of its own — e.g. a parent co-views).
+            user_aff = self._apply_cold_kids_prior(
+                user_aff, level,
+                self._series_genre_scores(eps, series_genres, series_scores)
+                + [(self._as_genre_list(m.get("genres")), self._score(m)) for m in movies])
+
             # Per-user scores (shared helpers) → candidate inputs (shared resolvers).
             gm_opts = self._genre_match_opts()
             tv_scores = self._per_user_series_scores(series_scores, series_genres, user_aff, user_jit, tv_hh_max, weights, gm_opts)

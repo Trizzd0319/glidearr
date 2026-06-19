@@ -128,6 +128,48 @@ def test_mint_tokens_in_memory_only_and_registered():
     assert all("token" not in k for k in m.global_cache.d)
 
 
+# ── server_write_token (per-server PMS write token for the playlist write-back) ──
+def test_server_write_token_owner_reuses_account_token():
+    class _API:
+        token = "ADMIN-TOKEN"
+    m = object.__new__(PlexUsersManager)
+    m.logger = _Logger(); m.plex_api = _API()
+    m.user_tokens = {"Rob": "ADMIN-TOKEN"}
+    rob = {"safe_user": "Rob", "title": "Rob", "is_admin": True}
+    assert m.server_write_token(rob) == "ADMIN-TOKEN"
+
+
+def test_server_write_token_managed_derives_per_server_token_not_owner():
+    from scripts.support.utilities.logger.logger import LoggerManager
+
+    class _API:
+        token = "ADMIN-TOKEN"
+        def server_access_token(self, user_auth, fallback=None):
+            assert user_auth == "minted-kid"        # the kid's account authToken, not the owner's
+            return "PER-SERVER-KID"
+    m = object.__new__(PlexUsersManager)
+    m.logger = _Logger(); m.plex_api = _API()
+    m.user_tokens = {"Kid": "minted-kid"}
+    kid = {"safe_user": "Kid", "title": "Kid", "is_admin": False}
+    tok = m.server_write_token(kid)
+    assert tok == "PER-SERVER-KID" and tok != "ADMIN-TOKEN"   # NEVER the owner token
+    assert "PER-SERVER-KID" in LoggerManager._scrub_values    # registered with the scrubber
+    # cached per run — a second call does NOT re-derive (would assert again / blow up if it did)
+    m.plex_api = None
+    assert m.server_write_token(kid) == "PER-SERVER-KID"
+
+
+def test_server_write_token_managed_no_token_returns_none_never_owner():
+    class _API:
+        token = "ADMIN-TOKEN"
+        def server_access_token(self, user_auth, fallback=None):
+            return None                              # our server not shared to this user
+    m = object.__new__(PlexUsersManager)
+    m.logger = _Logger(); m.plex_api = _API()
+    m.user_tokens = {"Kid": "minted-kid"}
+    assert m.server_write_token({"safe_user": "Kid", "is_admin": False}) is None
+
+
 def test_extract_token_accepts_all_known_keys():
     f = PlexUsersManager._extract_token
     assert f({"authenticationToken": "X"}) == "X"     # the documented field (python-plexapi)

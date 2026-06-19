@@ -33,6 +33,7 @@ class Resolver:
         }
         self._kids_genres = [str(g) for g in (config.get("kidsGenres", []) or []) if g]
         self._kids_certs = [str(c) for c in (config.get("kidsCertifications", []) or []) if c]
+        self._kids_networks = [str(n) for n in (config.get("kidsNetworks", []) or []) if n]
         self._reality_genres = [str(g) for g in (config.get("realityGenres", []) or []) if g]
         self._doc_genres = [str(g) for g in (config.get("documentaryGenres", []) or []) if g]
         self._preschool_genres = [str(g) for g in (config.get("preschoolGenres", []) or []) if g]
@@ -87,11 +88,13 @@ class Resolver:
                 certification=certification,
                 series_type=obj.get("seriesType"),
                 original_language=original_language,
+                network=obj.get("network"),
                 is_anime_hint=bool(cand.get("is_anime")),
                 recommended_age=self._csm_show_age(obj.get("tmdbId")),
                 anime_genres=self._anime_genres,
                 kids_genres=self._kids_genres,
                 kids_certs=self._kids_certs,
+                kids_networks=self._kids_networks,
                 reality_genres=self._reality_genres,
                 documentary_genres=self._doc_genres,
                 preschool_genres=self._preschool_genres,

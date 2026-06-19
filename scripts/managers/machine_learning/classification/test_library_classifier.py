@@ -73,12 +73,36 @@ def test_anime_beats_family():
     assert _show(["Anime", "Family"], "TV-PG") == "anime"
 
 
-# ── shows: CSM recommended age is the PRIMARY kids signal (parity with movies) ───
-def test_show_csm_age_drives_kids():
-    # A CSM kid-safe age routes to Kids even with a genre that would otherwise be 'series'
-    # or 'reality' — CSM is authoritative, beating the lifestyle veto like a hard kids genre.
-    assert _show(["Drama"], recommended_age=8) == "kids"
-    assert _show(["Reality"], recommended_age=6) == "kids"             # CSM beats the reality veto
+# ── shows: CSM age is a kids CEILING ONLY — never routes to Kids by itself ────────
+def test_show_csm_age_alone_does_not_route_to_kids():
+    # "Never trust Common Sense alone": a low CSM age no longer pulls a show into Kids
+    # without a corroborating kids signal. Star Trek: DS9 (adult drama, CSM ~10) → series.
+    assert _show(["Drama"], recommended_age=8) == "series"
+    assert _show(["Drama", "Science Fiction"], "TV-PG", recommended_age=10) == "series"   # DS9
+    # CSM permits but does not promote: a Reality show at CSM 6 stays Reality (no kids signal).
+    assert _show(["Reality"], recommended_age=6) == "reality"
+    # A corroborating signal is still required AND honoured: a kid-safe cert at a low CSM age → kids.
+    assert _show(["Comedy"], "TV-Y7", recommended_age=8) == "kids"
+
+
+# ── shows: a genuine KIDS NETWORK is a positive kids signal (the Trek franchise split) ──
+def test_show_kids_network_routes_to_kids():
+    # A kids network routes to Kids even with no kids genre/cert (sparse metadata).
+    assert _show(["Drama"], network="Disney Junior") == "kids"
+    assert _show(["Adventure"], network="Nickelodeon") == "kids"
+    # Star Trek: Prodigy (Nickelodeon kids Trek, CSM ~10) → Kids via the network…
+    assert _show(["Science Fiction", "Adventure"], network="Nickelodeon", recommended_age=10) == "kids"
+    # …while the adult Treks on general networks (no kids signal) stay in Series.
+    assert _show(["Science Fiction", "Drama"], "TV-PG", network="Syndication", recommended_age=10) == "series"
+    assert _show(["Science Fiction", "Drama"], "TV-PG", network="Paramount+", recommended_age=10) == "series"
+
+
+def test_show_kids_network_is_gated():
+    # The network route respects the same gates as the cert route.
+    assert _show(["Reality"], network="Nickelodeon") == "reality"                     # lifestyle veto wins
+    assert _show(["Drama"], network="Cartoon Network", recommended_age=16) == "series"  # CSM over cutoff
+    assert _show(["Drama"], "TV-MA", network="Cartoon Network") == "series"           # adult cert (Adult Swim-style)
+    assert _show(["Drama"], network="HBO") == "series"                               # not a kids network
 
 
 def test_show_csm_over_cutoff_blocks_soft_family():
@@ -119,12 +143,16 @@ def test_show_no_csm_leaves_genre_cert_flow_unchanged():
     assert _show(["Drama"]) == "series"
 
 
-# ── movies: CSM recommended age is the PRIMARY (authoritative) kids signal ───────
-def test_movie_csm_age_drives_kids():
-    assert _movie(["Drama"], recommended_age=8) == "kids"               # CSM kid-safe → kids
-    assert _movie(["Family", "Comedy"], "PG", recommended_age=7) == "kids"
-    assert _movie(["Drama"], recommended_age=15) == "standard"          # CSM too old → not kids
-    assert _movie(["Family", "Comedy"], "G", recommended_age=14) == "standard"
+# ── movies: CSM age is a kids CEILING ONLY — a kids STUDIO is the only positive ───
+def test_movie_csm_age_alone_does_not_route_to_kids():
+    # "Never trust Common Sense alone": a low CSM age no longer routes a movie to Kids
+    # without a kids studio (genre is not a movie kids route).
+    assert _movie(["Drama"], recommended_age=8) == "standard"
+    assert _movie(["Family", "Comedy"], "PG", recommended_age=7) == "standard"
+    # CSM still DEMOTES: an age over the cutoff blocks even a kids studio.
+    assert _movie(["Comedy"], "G", studio="Pixar", recommended_age=15) == "standard"
+    # A kids studio at an in-range CSM age → kids (the studio is the positive signal).
+    assert _movie(["Comedy"], "G", studio="Pixar", recommended_age=8) == "kids"
 
 
 # ── movies: GENRE is no longer a kids route (only anime keeps genre/language) ────
@@ -167,8 +195,9 @@ def test_movie_anime_includes_chinese():
     assert _movie(["Animation"], original_language="Korean") == "anime"
     assert _movie(["Animation"], original_language="Chinese") == "anime"    # NEW: donghua
     assert _movie(["Anime"]) == "anime"
-    # English animation is NOT anime; CSM still decides kids vs standard for it.
-    assert _movie(["Animation"], original_language="English", recommended_age=8) == "kids"
+    # English animation is NOT anime; with no kids studio it is standard (CSM age alone no
+    # longer routes a movie to Kids).
+    assert _movie(["Animation"], original_language="English", recommended_age=8) == "standard"
     assert _movie(["Animation"], original_language="English") == "standard"
 
 

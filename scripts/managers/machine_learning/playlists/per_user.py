@@ -81,6 +81,37 @@ def genre_match(series_genres, user_genre_affinity, *, mode: str = "precision",
     return _clamp(precision)                       # unknown mode → safe default
 
 
+def kids_household_affinity(genre_score_pairs) -> dict:
+    """A COLD-START genre-affinity prior for a restricted (kid) profile that has no watch
+    history of its OWN, inferred from the household's engagement with AGE-APPROPRIATE content.
+
+    A young kid is often watched FOR — the parent presses play on their own profile — so the
+    kid's personal affinity is empty and the ranking would otherwise fall back to the household
+    watchability of ALL content (adult-dominated). Instead, this aggregates the genres of the
+    kid's AGE-GATED owned set weighted by each title's HOUSEHOLD watchability score (which already
+    reflects who in the house actually watches it, including a parent co-viewing kid shows). The
+    result tilts the cold kid's playlist toward the kid genres the household engages with.
+
+    ``genre_score_pairs`` is an iterable of ``(genres, household_score)``. Returns
+    ``{genre_lower: weight}`` in the same shape :func:`genre_match` consumes (it normalises by the
+    max internally, so the absolute scale is free). Titles with a missing / non-positive / NaN
+    score contribute nothing (no engagement signal); returns ``{}`` when there's no usable signal,
+    so the caller keeps its existing fallback."""
+    out: dict = {}
+    for genres, score in (genre_score_pairs or []):
+        try:
+            w = float(score)
+        except (TypeError, ValueError):
+            continue
+        if w != w or w <= 0.0:                     # NaN (w != w) or non-positive → no signal
+            continue
+        for g in (genres or []):
+            k = str(g).strip().lower()
+            if k:
+                out[k] = out.get(k, 0.0) + w
+    return out
+
+
 def priority_score(household_norm, affinity_match, *, is_jit: bool = False,
                    affinity_weight: float = 0.9, jit_weight: float = 0.5,
                    household_weight: float = 0.1) -> float:
