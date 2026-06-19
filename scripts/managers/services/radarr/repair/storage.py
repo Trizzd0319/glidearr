@@ -133,7 +133,11 @@ class RadarrRepairStorageManager(BaseManager, ComponentManagerMixin):
             free_bytes = rf.get("freeSpace", 0) or 0
             total_bytes = (rf.get("totalSpace") or 0)
             free_gb    = free_bytes / (1024 ** 3)
-            total_gb   = total_bytes / (1024 ** 3)
+            # Radarr reports per-rootfolder totalSpace as 0 for Docker/mapped mounts, so a bare
+            # "0.0 GB total" line looks like a disk emergency when it is just a missing field.
+            # Prefer the REAL mount total (disk_total_gb via /diskspace, mount-deduped). The status
+            # is decided by FREE vs the floor regardless — total never enters the verdict.
+            total_gb = (total_bytes / (1024 ** 3)) or float(_total_gb or 0.0)
 
             if free_gb < crit_gb:
                 status = "critical"
@@ -150,9 +154,13 @@ class RadarrRepairStorageManager(BaseManager, ComponentManagerMixin):
             })
 
             log_fn = self.logger.log_warning if status != "ok" else self.logger.log_debug
+            total_str = f"{total_gb:.0f} GB total" if total_gb > 0 else "total n/a"
+            # "CRITICAL" here means below the configured free_space_limit floor (a reclaim policy),
+            # NOT a full disk — name the floor so the line can't be misread as an emergency.
+            note = f" (below {crit_gb:.0f} GB free_space_limit floor)" if status == "critical" else ""
             log_fn(
                 f"[Storage] '{instance}' root '{path}': "
-                f"{free_gb:.1f} GB free / {total_gb:.1f} GB total — {status.upper()}"
+                f"{free_gb:.1f} GB free / {total_str} — {status.upper()}{note}"
             )
 
         return results
@@ -166,6 +174,7 @@ class RadarrRepairStorageManager(BaseManager, ComponentManagerMixin):
         instance: str,
         target_free_gb: float = 100.0,
         limit: int = 20,
+        space_info: "list[dict] | None" = None,
     ) -> list[dict]:
         """
         When storage is below threshold, recommend movies for deletion
@@ -181,7 +190,10 @@ class RadarrRepairStorageManager(BaseManager, ComponentManagerMixin):
         """
         instance = self._resolve_instance(instance)
 
-        space_info = self.check_free_space(instance)
+        # Reuse the caller's space scan when given (run() computes it once) so a root folder's
+        # status isn't logged twice per pass; fall back to scanning if called standalone.
+        if space_info is None:
+            space_info = self.check_free_space(instance)
         if not space_info:
             return []
 
@@ -298,8 +310,10 @@ class RadarrRepairStorageManager(BaseManager, ComponentManagerMixin):
         except (TypeError, ValueError):
             fsl = 0.0
         target_free_gb = fsl if fsl > 0 else 100.0
+        space_info = self.check_free_space(instance)          # scan ONCE; reused below
         return {
-            "free_space":           self.check_free_space(instance),
-            "deletion_candidates":  self.recommend_deletions(instance, target_free_gb=target_free_gb),
+            "free_space":           space_info,
+            "deletion_candidates":  self.recommend_deletions(
+                instance, target_free_gb=target_free_gb, space_info=space_info),
             "large_movies":         self.find_large_movies(instance),
         }

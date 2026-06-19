@@ -78,3 +78,30 @@ def test_deepest_fallback_keeps_legacy_20_50_band():
     assert _status({}, free_gb=10.0, total_gb=float("inf")) == "critical"
     assert _status({}, free_gb=35.0, total_gb=float("inf")) == "warn"
     assert _status({}, free_gb=80.0, total_gb=float("inf")) == "ok"
+
+
+def test_zero_rootfolder_total_displays_real_mount_total_not_zero():
+    # Radarr reports per-rootfolder totalSpace=0 for Docker mounts; the row must surface the
+    # REAL mount total (disk_total_gb), never a misleading 0.0, and still classify by FREE.
+    m = _mk({"free_space_limit": 2500}, free_gb=2271.0, total_gb=23301.0)
+    m.radarr_api = _Radarr(2271.0, float("inf"))   # rootfolder totalSpace=0, disk_total_gb=23301
+    row = m.check_free_space("standard")[0]
+    assert row["status"] == "critical"             # 2271 < 2500 floor — verdict unaffected by total
+    assert row["total_space_gb"] == 23301.0        # not 0.0
+
+
+def test_run_scans_free_space_only_once():
+    # run() must not log every root twice: it scans once and feeds the result into
+    # recommend_deletions instead of letting it re-scan.
+    m = _mk({"free_space_limit": 2500}, free_gb=2271.0, total_gb=8000.0)
+    calls = {"n": 0}
+    real = m.check_free_space
+
+    def _counting(inst):
+        calls["n"] += 1
+        return real(inst)
+
+    m.check_free_space = _counting
+    m.find_large_movies = lambda inst: []          # isolate from the large-movie scan
+    m.run("standard")
+    assert calls["n"] == 1                          # one scan, not two
