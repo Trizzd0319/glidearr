@@ -204,7 +204,15 @@ def _anime_match(g: set, stype: str, olang: str, anime_g: set, is_anime_hint: bo
     """
     if is_anime_hint:
         return True, "hint:source"
-    if g & anime_g:
+    # Typed/tagged anime with unknown language is kept (don't demote on missing data); a
+    # KNOWN non-anime language (English/French/…) is the demotion signal.
+    known_non_anime_lang = bool(olang) and olang not in _ANIME_LANGUAGES
+    # A bare 'anime' GENRE is trusted UNLESS the original language is a known non-anime one.
+    # TheTVDB tags some Western cartoons (Avatar: The Last Airbender, RWBY, Castlevania, Teen
+    # Titans) under an 'Anime' genre; without this guard a literal 'anime' tag pulls an
+    # English-language animated show out of Kids into the Anime library and flips its
+    # seriesType. Mirrors the seriesType=anime discipline below (unknown language still trusts).
+    if (g & anime_g) and not known_non_anime_lang:
         return True, "genre:anime"
     animated = ("animation" in g) or (stype == "anime") or bool(g & anime_g)
     if animated and olang in _JAPANESE:
@@ -213,8 +221,6 @@ def _anime_match(g: set, stype: str, olang: str, anime_g: set, is_anime_hint: bo
         return True, "korean-animation"
     if animated and olang in _CHINESE:
         return True, "chinese-animation"
-    # Typed anime with unknown language — keep (don't demote on missing data).
-    known_non_anime_lang = bool(olang) and olang not in _ANIME_LANGUAGES
     if animated and stype == "anime" and not known_non_anime_lang:
         return True, "seriesType=anime"
     return False, ""

@@ -73,6 +73,17 @@ def test_anime_beats_family():
     assert _show(["Anime", "Family"], "TV-PG") == "anime"
 
 
+# ── a bare 'Anime' genre is vetoed by a KNOWN non-anime language (Avatar: TLA) ──
+def test_anime_genre_tag_vetoed_by_known_non_anime_language():
+    # TheTVDB tags some Western cartoons under an 'Anime' genre; an English/French original
+    # language must veto the bare-genre anime route so they don't leave Kids for the Anime lib.
+    assert _show(["Anime", "Family"], original_language="English") == "kids"    # Avatar: TLA
+    assert _show(["Anime", "Drama"], original_language="French") == "series"    # no kids signal
+    # Real anime is untouched: a known anime language, or an unknown/missing one still trusts.
+    assert _show(["Anime"], original_language="Japanese") == "anime"
+    assert _show(["Anime", "Family"], "TV-PG") == "anime"                       # unknown lang trusts genre
+
+
 # ── shows: CSM age is a kids CEILING ONLY — never routes to Kids by itself ────────
 def test_show_csm_age_alone_does_not_route_to_kids():
     # "Never trust Common Sense alone": a low CSM age no longer pulls a show into Kids
