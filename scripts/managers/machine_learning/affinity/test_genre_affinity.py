@@ -52,3 +52,26 @@ def test_per_user_threads_half_life():
     users = [{"username": "A"}]
     out = per_user_affinity(hist, _META, users, half_life_days=30, now=_NOW)
     assert list(out["A"]["genres"])[0] == "Recent"   # decay applied per-user
+
+
+def test_per_user_joins_on_user_id_when_friendly_name_differs_from_username():
+    # Regression: a Tautulli account whose history `user` (friendly name) differs from its
+    # login `username` must still get its affinity — joined on the stable user_id. The old
+    # code bucketed history by the friendly name 'Aiden / Raina' but looked it up by the
+    # username 'Aiden', so this user matched nothing and silently lost all affinity.
+    hist = [
+        {"user": "Aiden / Raina", "user_id": 9, "rating_key": "1", "date": _ts(0)},
+        {"user": "Aiden / Raina", "user_id": 9, "rating_key": "2", "date": _ts(1)},
+    ]
+    users = [{"username": "Aiden", "user_id": 9, "friendly_name": "Aiden / Raina"}]
+    out = per_user_affinity(hist, _META, users)
+    assert "Aiden" in out                              # keyed by login username (cache path stable)
+    assert set(out["Aiden"]["genres"]) == {"Recent", "Old"}   # history reached the user
+
+
+def test_per_user_friendly_name_fallback_when_history_lacks_user_id():
+    # No user_id on the history rows -> fall back to the friendly-name `user` match.
+    hist = [{"user": "Mom", "rating_key": "1", "date": _ts(0)}]
+    users = [{"username": "Mom", "friendly_name": "Mom"}]
+    out = per_user_affinity(hist, _META, users)
+    assert out["Mom"]["genres"] == {"Recent": 1}

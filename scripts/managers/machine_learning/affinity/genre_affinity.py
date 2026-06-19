@@ -150,25 +150,42 @@ def per_user_affinity(
     half_life_days=None,
     now=None,
 ) -> dict:
-    """Per-user affinity matrices: group ``history_entries`` by the ``user`` field,
-    then run :func:`aggregate_affinity` independently for every user in
-    ``user_list``. Returns ``{username: affinity}``; users with zero matching
-    entries are omitted. Pure (the service keeps the surrounding logging)."""
+    """Per-user affinity matrices: join ``history_entries`` to ``user_list`` and run
+    :func:`aggregate_affinity` independently for every user. Returns ``{username: affinity}``
+    (keyed by login username so the cache path / builder lookup are unchanged); users with
+    zero matching entries are omitted. Pure (the service keeps the surrounding logging).
+
+    The join is on the STABLE Tautulli ``user_id`` (present on both the history rows and the
+    user_list, and the same key the playlist builder's watched-set uses), falling back to the
+    friendly-name ``user`` field. Grouping by ``user_id`` rather than the name fixes the silent
+    drop when an account's Tautulli friendly_name (e.g. ``Aiden / Raina``) differs from its
+    login username (e.g. ``Aiden``): the old code bucketed history by the friendly name but
+    looked it up by the username, so every such user matched nothing and lost its affinity."""
     if half_life_days and now is None:
         now = datetime.now(tz=timezone.utc)
 
-    user_entries: dict[str, list] = defaultdict(list)
+    by_id: dict[str, list] = defaultdict(list)
+    by_name: dict[str, list] = defaultdict(list)
     for entry in history_entries:
-        username = str(entry.get("user") or "")
-        if username:
-            user_entries[username].append(entry)
+        uid = str(entry.get("user_id") or "")
+        if uid:
+            by_id[uid].append(entry)
+        name = str(entry.get("user") or "")
+        if name:
+            by_name[name].append(entry)
 
     result: dict[str, dict] = {}
     for user in user_list:
-        username = str(user.get("username") or user.get("user_id", ""))
+        username = str(user.get("username") or user.get("user_id") or "")
         if not username:
             continue
-        entries = user_entries.get(username, [])
+        # user_id join first (stable); then the history `user` friendly name; then the
+        # username itself (legacy match for accounts whose friendly_name == username).
+        entries = (
+            by_id.get(str(user.get("user_id") or ""))
+            or by_name.get(str(user.get("friendly_name") or ""))
+            or by_name.get(username)
+        )
         if not entries:
             continue
         result[username] = aggregate_affinity(
