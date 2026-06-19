@@ -51,12 +51,14 @@ As you watch, the whole window glides forward. Freed space is simply the wake it
 ## Features
 
 - **🪟 Per-viewer rolling window** — every viewer gets their own horizon; the library follows each person's progress, not a single global state.
+- **📺 Personalized "Up Next"** — a spoiler-safe, taste-ranked playlist for each viewer, written back to that member's own Plex account (opt-in, default-off).
 - **🧠 Taste-aware** — scores every title for *watchability* (your history, recency, ratings) so the window keeps what you'll actually watch next.
 - **🎬 Franchise & universe aware** — follows you in order through series, franchises, and shared universes (think the MCU or Star Trek in sequence).
 - **⏭️ Just-in-time acquisition** — fetches the next item as you approach it, at a sensible quality, instead of stockpiling.
 - **♻️ Guarded, restorable pruning** — releases watched/low-value media only as needed, with protections so it never removes the wrong thing — and every removal can be undone.
 - **💾 Space as a side-effect** — set the free-space headroom you want; Glidearr keeps you above it automatically.
 - **📦 Right-sized quality** — avoids oversized files and keeps quality sane across the library.
+- **🗂️ Library auto-organization** — sorts TV and movies into anime / kids / docs / 4K / standard for new adds *and* reconciles titles already filed in the wrong place (dubbed anime stays anime even when the metadata claims English).
 - **🔌 Fits your stack** — works with Plex, Sonarr/Radarr (multi-instance), Tautulli, Trakt, MyAnimeList, MDBList and more; every integration is optional and degrades gracefully.
 - **🛩️ Your pilot is always aboard** — pilot episodes stay in Plex at the best available quality, so you can jump back into any show at any time.
 - **🗓️ Runs on your schedule** — hourly, every few hours, or whatever cadence you set, so your library stays constantly fresh.
@@ -80,6 +82,7 @@ Glidearr slots into the stack you already run. **None of these are hard requirem
 - **Tautulli** — playback history and watch statistics.
 - **Trakt**, **MyAnimeList**, and **MDBList** — taste signals, ratings, and list/availability data.
 - **TheTVDB** and **Common Sense Media** — episode metadata and content/age ratings.
+- **Discord** *(optional)* — end-of-run report card and run notifications.
 
 > Your API keys never get committed to git — see **[Security](#security)** for how Glidearr stores them.
 
@@ -144,7 +147,7 @@ A snapshot after ~6 months of development. Glidearr is already a working engine 
 - **Size-anomaly remediation** — flags files far outside their expected size profile and acts on the worst offenders: re-grabs the bloated, rescans the mis-graded.
 
 **Per-user & multi-instance**
-- **Personalized playlists** — a deterministic, spoiler-safe "Up Next" ordering engine ranked by each viewer's taste (movies end-to-end today, with dry-run preview).
+- **Personalized playlists** — a deterministic, spoiler-safe "Up Next" ordering engine ranked by each viewer's taste, with opt-in write-back to each member's *own* Plex account (default-off, fail-closed, per-server token; movies end-to-end today).
 - **Multi-instance Sonarr/Radarr** — routes each title to the right instance and root folder (standard / 4K / anime).
 
 **Integrations & automation**
@@ -158,13 +161,12 @@ A snapshot after ~6 months of development. Glidearr is already a working engine 
 
 ### 🚧 In progress
 - [ ] **First public release** — published Docker image + setup & configuration docs.
-- [ ] **Plex watchlist as a first-class next-watch signal** — multi-user watchlist union, plus a forward-validation harness that proves which signals actually predict what you watch.
-- [ ] **Playlist write-back to Plex** — movies first; create/update with snapshot + restore safety.
-- [ ] **Smarter decisions under pressure** — recency-aware delete ordering, likelihood-tiered deletion, and a space-aware quality ceiling.
+- [ ] **Watchlist-driven acquisition** — the multi-user watchlist union is already snapshotted and a forward-validation harness now measures whether it actually predicts what you watch; wiring it in as a live next-watch signal follows once it proves a real lift.
+- [ ] **Smarter decisions under pressure** — a space-aware quality ceiling and scoring-order fixes, building on the recency- and likelihood-aware delete ranker already in place.
 - [ ] **Sharper acquisition tuning** — runtime-scaled episode budgets and recency-ordered prefetch.
 
 ### 🔭 Planned / exploring
-- [ ] **Learned next-watch re-ranker** — a household-specific model trained on what you actually watched next, layered on top of the deterministic scorer (with a calibrated 0–1 "watch probability"); cheap wins first — diversity passes and broader candidate sourcing.
+- [ ] **Learned next-watch re-ranker** — a household-specific model trained on what you actually watched next, layered on top of the deterministic scorer (with a calibrated 0–1 "watch probability"); the forward-validation harness is the first piece of groundwork. Cheap wins first — diversity passes and broader candidate sourcing.
 - [ ] **Cast & crew discovery** — a people co-occurrence matrix so "you love this actor/director" surfaces their other work, for both scoring and acquisition.
 - [ ] **Series & saga resumption** — circle back to catch you up: re-acquire and re-queue the last *N* episodes when you add a show to your watchlist or a new season is announced, and re-grab the prior film when a favoured sequel is dated — priority ramping as the release nears. *(Detailed under **How it works** above.)*
 - [ ] **Known-universe expansion** — start one corner of a shared universe (the MCU, Star Trek, the Arrowverse…) and Glidearr begins acquiring the rest of that universe in **timeline order** from where you are, weaving each connected show and film into your Up Next playlist in proper in-universe sequence.
