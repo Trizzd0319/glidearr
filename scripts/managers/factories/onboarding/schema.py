@@ -153,6 +153,9 @@ def empty_config() -> dict:
         # UI session auth; otherwise creation is size-verified — see services/backup).
         "backup_before_destructive": True,
         "backup_deep_validate": False,
+        # Reuse a backup younger than this many hours instead of dumping a new one every run
+        # (a library barely changes between short scheduled runs; 0 = a fresh backup every run).
+        "backup_max_age_hours": 24,
         # Wildly-out-of-size-profile detector (read-only report by default): flags files whose
         # bitrate is wildly inconsistent with their graded quality (e.g. a 45 GiB "720p" carries a
         # 4K-remux bitrate). remediate (opt-in, DESTRUCTIVE) acts: rescan mis-graded files to fix

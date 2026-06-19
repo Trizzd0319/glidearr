@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+from datetime import datetime, timedelta, timezone
 
 from scripts.managers.services.backup import GATE_KEY, ServiceBackupManager
 from scripts.support.utilities.backup_gate import effective_dry_run, writes_armed
@@ -100,6 +101,56 @@ def test_any_backup_failure_disarms_gate_and_warns():
     m.ensure_backups()
     assert m.global_cache.get(GATE_KEY)["armed"] is False
     assert any("DEGRADING" in w for w in m.logger.warns)
+
+
+# ── freshness window: don't dump a new backup every run ───────────────────────
+def _iso(hours_ago: float) -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+
+
+def _backup(hours_ago: float, *, size: int = 200_000_000, name: str = "b.zip") -> dict:
+    return {"name": name, "path": f"/backup/manual/{name}", "size": size, "time": _iso(hours_ago)}
+
+
+def test_fresh_enough_window():
+    m = ServiceBackupManager(_Log(), {"backup_max_age_hours": 24}, _GC(), dry_run=False)
+    assert m._fresh_enough(_backup(1)) is True              # 1h old → reuse
+    assert m._fresh_enough(_backup(48)) is False            # 48h old → too stale
+    assert m._fresh_enough(_backup(1, size=1000)) is False  # present but trivially small → don't trust
+    m0 = ServiceBackupManager(_Log(), {"backup_max_age_hours": 0}, _GC(), dry_run=False)
+    assert m0._fresh_enough(_backup(1)) is False            # 0 disables reuse (fresh every run)
+
+
+def test_reuses_recent_backup_without_creating_a_new_one():
+    m = ServiceBackupManager(_Log(), {"backup_max_age_hours": 24}, _GC(), dry_run=False)
+    posts: list = []
+    m._conn = lambda s, i: ("http://x", "k")
+    m._list_backups = lambda base, key: [_backup(2, name="recent.zip")]
+    m._api_post = lambda *a, **k: posts.append(a) or {"id": 1}
+    res = m._backup_one("radarr", "standard")
+    assert res["ok"] is True and res["reused"] is True
+    assert res["name"] == "recent.zip"
+    assert posts == []                                      # NO new Backup command was triggered
+
+
+def test_creates_new_when_newest_backup_is_stale():
+    m = ServiceBackupManager(_Log(), {"backup_max_age_hours": 24}, _GC(), dry_run=False)
+    state = {"n": 0}
+
+    def _list(base, key):
+        state["n"] += 1
+        old = _backup(72, name="old.zip")
+        return [old] if state["n"] == 1 else [old, _backup(0.0, name="new.zip")]
+
+    posts: list = []
+    m._conn = lambda s, i: ("http://x", "k")
+    m._list_backups = _list
+    m._api_post = lambda *a, **k: posts.append(a) or {"id": 1}
+    m._wait_command = lambda base, key, cid: True
+    res = m._backup_one("radarr", "standard")
+    assert res["ok"] is True and res["reused"] is False
+    assert res["name"] == "new.zip"
+    assert len(posts) == 1                                   # exactly one Backup command
 
 
 # ── the write gate destructive primitives read ────────────────────────────────

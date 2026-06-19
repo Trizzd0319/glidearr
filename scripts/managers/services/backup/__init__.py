@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import time
 import zipfile
+from datetime import datetime, timezone
 
 import requests
 
@@ -34,6 +35,7 @@ class ServiceBackupManager:
     POLL_INTERVAL_S = 3.0
     BACKUP_TIMEOUT_S = 300.0          # native backups of a big DB can take a minute+
     MIN_BACKUP_BYTES = 64 * 1024      # below this a "backup" is empty/garbage, not a real DB dump
+    DEFAULT_MAX_AGE_HOURS = 24.0      # reuse a backup younger than this instead of making a new one
     _DONE = ("completed", "failed", "aborted", "cancelled")
 
     def __init__(self, logger, config, global_cache=None, *, dry_run: bool = False):
@@ -67,7 +69,9 @@ class ServiceBackupManager:
         all_ok = bool(results) and all(r.get("ok") for r in results.values())
         self._set_gate(all_ok, reason="ok" if all_ok else "backup_failed", results=results)
         if all_ok:
-            names = ", ".join(f"{k} ({v.get('size_mb', 0):.0f} MB)" for k, v in results.items())
+            names = ", ".join(
+                f"{k} ({v.get('size_mb', 0):.0f} MB{', reused' if v.get('reused') else ''})"
+                for k, v in results.items())
             self.logger.log_success(
                 f"[Backup] validated loadable pre-destructive backups: {names}."
             )
@@ -86,45 +90,90 @@ class ServiceBackupManager:
         if not base or not key:
             return {"ok": False, "detail": "no base_url / api key in config"}
         try:
-            before = {b.get("path") for b in (self._list_backups(base, key) or [])}
+            existing = self._list_backups(base, key) or []
+            newest = self._pick_newest(existing)
+            # FRESHNESS: reuse a recent, valid backup instead of dumping a new ~300 MB one every
+            # run — a library barely changes between short scheduled runs (e.g. every 3h), so this
+            # caps backups at one per backup_max_age_hours window. Picks the newest backup of ANY
+            # kind (our manual OR the *arr's own scheduled backup), so churn drops further.
+            if newest and self._fresh_enough(newest):
+                res = self._finalize(service, inst, base, key, newest, reused=True)
+                if res.get("ok"):
+                    return res
+                # present but failed validation → fall through and create a fresh one
+
+            before = {b.get("path") for b in existing}
             cmd = self._api_post(base, key, "command", {"name": "Backup"})
             cid = (cmd or {}).get("id")
             if not self._wait_command(base, key, cid):
                 return {"ok": False, "detail": "Backup command did not complete"}
             backups = self._list_backups(base, key) or []
-            newest = self._pick_newest(backups, exclude_paths=before) or self._pick_newest(backups)
-            if not newest:
+            fresh = self._pick_newest(backups, exclude_paths=before) or self._pick_newest(backups)
+            if not fresh:
                 return {"ok": False, "detail": "no backup file appeared"}
-
-            # CREATION check: a completed Backup command produced a NEW, non-trivial file
-            # (the *arr only lists a backup once it has finished writing it; its reported size
-            # is the file size). This alone is a strong, restorable rollback point.
-            api_size = int(newest.get("size") or 0)
-            size_mb = api_size / 1e6
-            created_ok = api_size >= self.MIN_BACKUP_BYTES
-
-            # DEEP loadability (valid zip, CRCs pass, contains the DB + config.xml) — only when
-            # asked AND the static /backup file is actually fetchable. Many installs gate that
-            # route behind UI session auth the API key can't satisfy (the download is then the
-            # login page, not the zip), so a non-zip download is NOT a failure: we fall back to
-            # the API-size creation check rather than disarm a validly-created backup.
-            deep = None
-            if created_ok and self._cfg("backup_deep_validate", False):
-                content = self._download(base, newest.get("path"), key)
-                if self._looks_like_zip(content):
-                    deep = self.validate_backup_zip(content, service)
-                    size_mb = len(content) / 1e6
-
-            loadable = bool(deep) if deep is not None else created_ok
-            how = "zip-verified" if deep else ("size-verified" if loadable else "invalid")
-            (self.logger.log_info if loadable else self.logger.log_warning)(
-                f"[Backup] {service}/{inst}: {newest.get('name')} ({size_mb:.1f} MB) — "
-                f"{'loadable' if loadable else 'NOT loadable'} ({how})."
-            )
-            return {"ok": bool(loadable), "name": newest.get("name"), "size_mb": round(size_mb, 1),
-                    "path": newest.get("path"), "validated": how}
+            return self._finalize(service, inst, base, key, fresh, reused=False)
         except Exception as e:
             return {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+
+    def _finalize(self, service: str, inst: str, base: str, key: str, newest: dict, *, reused: bool) -> dict:
+        """Validate a listed backup and log it — shared by the REUSE and the just-CREATED paths.
+
+        CREATION/size check: the *arr only lists a backup once it has finished writing it, and its
+        reported size is the file size — a non-trivial size is a strong, restorable rollback point.
+        DEEP loadability (valid zip, CRCs pass, DB + config.xml present) is opt-in AND only when the
+        static /backup file is actually fetchable; many installs gate that route behind UI session
+        auth the API key can't satisfy (download = login page), so a non-zip download is NOT a
+        failure — we fall back to the size check rather than disarm a validly-created backup."""
+        api_size = int(newest.get("size") or 0)
+        size_mb = api_size / 1e6
+        created_ok = api_size >= self.MIN_BACKUP_BYTES
+        deep = None
+        if created_ok and self._cfg("backup_deep_validate", False):
+            content = self._download(base, newest.get("path"), key)
+            if self._looks_like_zip(content):
+                deep = self.validate_backup_zip(content, service)
+                size_mb = len(content) / 1e6
+        loadable = bool(deep) if deep is not None else created_ok
+        how = "zip-verified" if deep else ("size-verified" if loadable else "invalid")
+        if reused:
+            detail = (f"reusing {newest.get('name')} from {self._age_hours(newest):.1f}h ago "
+                      f"({size_mb:.1f} MB, {how}) — within the {self._max_age_hours():.0f}h freshness window")
+        else:
+            detail = (f"{newest.get('name')} ({size_mb:.1f} MB) — "
+                      f"{'loadable' if loadable else 'NOT loadable'} ({how})")
+        (self.logger.log_info if loadable else self.logger.log_warning)(f"[Backup] {service}/{inst}: {detail}.")
+        return {"ok": bool(loadable), "name": newest.get("name"), "size_mb": round(size_mb, 1),
+                "path": newest.get("path"), "validated": how, "reused": reused}
+
+    # ── freshness window ─────────────────────────────────────────────────────────
+    def _max_age_hours(self) -> float:
+        try:
+            return float(self._cfg("backup_max_age_hours", self.DEFAULT_MAX_AGE_HOURS))
+        except (TypeError, ValueError):
+            return self.DEFAULT_MAX_AGE_HOURS
+
+    def _age_hours(self, backup: dict) -> float:
+        """Hours since a listed backup's ``time`` (ISO-8601, possibly Z-suffixed); +inf if unknown."""
+        t = str((backup or {}).get("time") or "")
+        if not t:
+            return float("inf")
+        try:
+            bt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+            if bt.tzinfo is None:
+                bt = bt.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - bt).total_seconds() / 3600.0
+        except Exception:
+            return float("inf")
+
+    def _fresh_enough(self, backup: dict) -> bool:
+        """True if ``backup`` is younger than the configured window AND non-trivial in size.
+        ``backup_max_age_hours <= 0`` disables reuse (back to a fresh backup every run)."""
+        max_age = self._max_age_hours()
+        if max_age <= 0:
+            return False
+        if int((backup or {}).get("size") or 0) < self.MIN_BACKUP_BYTES:
+            return False
+        return self._age_hours(backup) <= max_age
 
     @staticmethod
     def _looks_like_zip(content: "bytes | None") -> bool:

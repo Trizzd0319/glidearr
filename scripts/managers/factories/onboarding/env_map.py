@@ -79,6 +79,7 @@ _DOC_LEAVES = [
     ("large_file_gb", "30", "Flag movies larger than this (GB) in the storage report"),
     ("backup_before_destructive", "true", "Native Radarr/Sonarr backup before any destructive change (real runs); on failure the run degrades to dry-run"),
     ("backup_deep_validate", "false", "Also CRC-check the downloaded backup zip (only when the *arr /backup route isn't UI-auth-gated; else creation is size-verified)"),
+    ("backup_max_age_hours", "24", "Reuse a backup younger than this instead of making a new one every run (0 = always fresh)"),
     ("size_anomaly.enabled", "true", "Report files wildly out of size profile for their graded quality (e.g. a 45 GB '720p')"),
     ("size_anomaly.remediate", "false", "ACT on size anomalies: rescan mis-graded + re-grab bloated at profile target (DESTRUCTIVE; needs a valid backup)"),
     ("size_anomaly.over_ratio", "3.0", "Flag oversized at >= this multiple of the expected size for the quality"),
