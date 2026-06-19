@@ -67,6 +67,7 @@ Glidearr removes media — so it's built to never surprise you:
 
 - **Dry-run first.** Preview every decision before a single file is touched.
 - **Off until you opt in.** Nothing is ever deleted unless you explicitly set a free-space target.
+- **Backed up first.** Before any destructive change, Glidearr triggers and verifies a native Sonarr/Radarr backup — and if one can't be created, it automatically degrades to dry-run instead of touching your data.
 - **Deeply guarded.** Pilots, franchise entries, recently-watched, soon-to-air, keep-tagged, and multi-episode files are never removed.
 - **Always reversible.** Every removal is ledgered and can be re-acquired if its value recovers.
 
@@ -105,7 +106,7 @@ Full installation and configuration docs: _coming soon._
 
 ## Configuration
 
-Glidearr connects to your existing Plex + *arr services and reads your viewing activity to drive the window. Detailed configuration (service URLs/keys, headroom targets, protection rules) will be documented as the project firms up. <!-- TODO -->
+Glidearr connects to your existing Plex + *arr services and reads your viewing activity to drive the window. A **guided onboarding** walks you through connecting each service and writes a complete config for you — and it can generate that config non-interactively, so a Docker container can come up pre-configured. Detailed configuration (service URLs/keys, headroom targets, protection rules) will be documented as the project firms up. <!-- TODO -->
 
 ## Security
 
@@ -127,6 +128,7 @@ A snapshot after ~6 months of development. Glidearr is already a working engine 
 - **Pilot always aboard** — every show's pilot stays in Plex at the best available quality (and is never deleted), so you can sample or resume any series anytime.
 - **Per-episode quality targeting** — each episode earns its own quality tier by watch-likelihood, so the window never over-fetches.
 - **Guarded, restorable reclamation** — when disk gets tight, the least-valuable *watched* media is released first (it tries quality downgrades before deleting), with deep protections (keep tags, franchises, pilots, recently-watched, soon-to-air, multi-episode files) and full restore.
+- **Pre-flight service backups** — before any destructive change, a native Sonarr/Radarr backup is triggered and validated; if it can't be verified, the run degrades to dry-run. Recent backups are reused, so it doesn't dump a new archive every run.
 - **Hard safety floor** — nothing is ever deleted unless you explicitly set a free-space target.
 
 **Taste & curation**
@@ -139,6 +141,7 @@ A snapshot after ~6 months of development. Glidearr is already a working engine 
 - **Kids-safe routing & age-gating** — soft certificate gating with a Common Sense Media fallback for uncertified titles.
 - **English-audio prioritization** — across all quality profiles, with dedicated English-locked upgrade ladders for foreign films.
 - **Quality right-sizing** — a calibrated, codec-aware size model so files are never over- or under-sized.
+- **Size-anomaly remediation** — flags files far outside their expected size profile and acts on the worst offenders: re-grabs the bloated, rescans the mis-graded.
 
 **Per-user & multi-instance**
 - **Personalized playlists** — a deterministic, spoiler-safe "Up Next" ordering engine ranked by each viewer's taste (movies end-to-end today, with dry-run preview).
@@ -146,6 +149,7 @@ A snapshot after ~6 months of development. Glidearr is already a working engine 
 
 **Integrations & automation**
 - **Connected services** — Plex, Sonarr, Radarr, Tautulli, Trakt, MyAnimeList, MDBList, TheTVDB, Common Sense Media — all optional, all degrade gracefully.
+- **Guided onboarding** — an interactive setup walks you through connecting each service and writes a complete config for you; it can also generate that config non-interactively, so a Docker container comes up pre-configured.
 - **Write-back** — keeps your Trakt collection/history and MyAnimeList progress in sync.
 - **Background enrichment daemon** — continuously enriches metadata out-of-band (opt-in).
 - **End-of-run report** — one consolidated grid of every decision and movement (with optional Discord notification).
