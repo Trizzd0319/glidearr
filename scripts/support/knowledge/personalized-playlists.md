@@ -11,12 +11,13 @@
 2. [How a show or movie gets sorted into a library](#how-a-show-or-movie-gets-sorted-into-a-library)
 3. [Personal "Up Next" playlists (one per profile)](#personal-up-next-playlists-one-per-profile)
 4. [Family "Up Next" collections (age-tiered rows on Home)](#family-up-next-collections-age-tiered-rows-on-home)
-5. [What each profile sees](#what-each-profile-sees)
-6. [How age restrictions are decided](#how-age-restrictions-are-decided)
-7. [Safety & privacy](#safety--privacy)
-8. [Turning it on (for the server operator)](#turning-it-on-for-the-server-operator)
-9. [Known limits (and why)](#known-limits-and-why)
-10. [Glossary](#glossary)
+5. [A worked example: one household, every tier](#a-worked-example-one-household-every-tier)
+6. [What each profile sees](#what-each-profile-sees)
+7. [How age restrictions are decided](#how-age-restrictions-are-decided)
+8. [Safety & privacy](#safety--privacy)
+9. [Turning it on (for the server operator)](#turning-it-on-for-the-server-operator)
+10. [Known limits (and why)](#known-limits-and-why)
+11. [Glossary](#glossary)
 
 ---
 
@@ -118,6 +119,111 @@ If your household has no restricted profiles at all, only the Household collecti
 These rows are **pinned to the top of the Home screen** and **floated to the top of the Collections tab** (so they don't get buried among hundreds of other collections), sitting just below Plex's own *Continue Watching* and *On Deck*.
 
 > **Important:** these collections are a **parental aid on the adult/family Home** — they help a grown-up pick something safe. **Kids do not see collections on their own profiles** (a Plex limitation, explained below). A child's own curated row is their **playlist**.
+
+---
+
+## A worked example: one household, every tier
+
+To make the two surfaces concrete, here is one make-believe household and the exact rows and playlists Glidearr would build for it.
+
+**The household (4 profiles):**
+
+| Profile | Plex tier | Rating ceiling |
+|---|---|---|
+| **Dad** (owner) | Adult | everything |
+| **Riley** (14) | Teen | PG-13 / TV-14 |
+| **Sam** (9) | Older Kid | PG / TV-PG / TV-Y7 |
+| **Max** (4) | Little Kid | G / TV-G / TV-Y |
+
+**What the household owns and hasn't finished:**
+
+| Title | Type | Rating | Lowest tier that may see it |
+|---|---|---|---|
+| Toy Story | Movie | G | Little Kid |
+| Finding Nemo | Movie | G | Little Kid |
+| Bluey | TV | TV-Y | Little Kid |
+| Sesame Street | TV | TV-Y | Little Kid |
+| Encanto | Movie | PG | Older Kid |
+| Spider-Man: Into the Spider-Verse | Movie | PG | Older Kid |
+| Gravity Falls | TV | TV-Y7 | Older Kid |
+| Avatar: The Last Airbender | TV | TV-Y7 | Older Kid |
+| Spider-Man: No Way Home | Movie | PG-13 | Teen |
+| Dune: Part Two | Movie | PG-13 | Teen |
+| The Mandalorian | TV | TV-14 | Teen |
+| Stranger Things | TV | TV-14 | Teen |
+| Oppenheimer | Movie | R | Adult |
+| The Last of Us | TV | TV-MA | Adult |
+
+### The age-tiered collections (rows on the adult / family Home)
+
+Collections are **movie-focused** (a Plex collection can't mix Movies + TV — see [Known limits](#known-limits-and-why)), so each row is the owned **movies** that tier may see, ranked by what the household actually watches, with the strictest tier nested inside the looser ones:
+
+```
+DAD'S HOME  (adult / family view)
+──────────────────────────────────────────────────────────────────────
+▶ Continue Watching   ·   On Deck          ← Plex's own rows, always on top
+▶ Up Next - Household    Oppenheimer · Dune: Part Two · No Way Home · Encanto · Spider-Verse · Finding Nemo · Toy Story
+▶ Up Next - Teens        Dune: Part Two · No Way Home · Encanto · Spider-Verse · Finding Nemo · Toy Story
+▶ Up Next - Older Kids   Encanto · Spider-Verse · Finding Nemo · Toy Story
+▶ Up Next - Little Kids  Finding Nemo · Toy Story
+```
+
+Each lower row is a strict subset of the one above it — *Household* keeps the R-rated **Oppenheimer**, *Teens* drops it (PG-13 and below), *Older Kids* drops the PG-13 pair, *Little Kids* keeps only the G titles. If this household had no teen profile, the *Teens* row simply wouldn't be built.
+
+**How a collection row is generated:**
+1. Start from every owned **movie** that's unwatched in the house.
+2. Keep only titles at or below that tier's rating ceiling.
+3. Rank by **household watchability** (what this house tends to watch).
+4. Pin the top of the list as the `Up Next - <Tier>` row, floated to the top of Home and the Collections tab.
+
+### The per-profile "Up Next" playlists (mixed movie + TV, one per person)
+
+A playlist is the **only** curated row a kid sees, and it's the place **movies and TV mix**. Each is filtered to that profile's tier, then ranked *for that person*:
+
+```
+MAX'S PROFILE  (Little Kid · no history yet → cold-start seed)
+──────────────────────────────────────────────
+★ Up Next (Max)
+   1. Bluey — S3E5             TV-Y    ← the house watches a lot of Bluey
+   2. Toy Story                G
+   3. Finding Nemo             G
+   4. Sesame Street — S54E2    TV-Y
+
+SAM'S PROFILE  (Older Kid)
+──────────────────────────────────────────────
+★ Up Next (Sam)
+   1. Avatar: TLA — S2E1       TV-Y7   ← Sam is mid-binge (active-show lift)
+   2. Gravity Falls — S1E3     TV-Y7
+   3. Spider-Verse             PG      ← matches Sam's superhero affinity
+   4. Encanto                  PG
+   5. Toy Story                G
+
+RILEY'S PROFILE  (Teen)
+──────────────────────────────────────────────
+★ Up Next (Riley)
+   1. Stranger Things — S5E1   TV-14   ← caught up + new season → recency boost
+   2. Dune: Part Two           PG-13   ← matches Riley's sci-fi affinity
+   3. The Mandalorian — S3E1   TV-14
+   4. Spider-Man: No Way Home  PG-13
+   5. Encanto                  PG
+
+DAD'S PROFILE  (Adult — sees everything)
+──────────────────────────────────────────────
+★ Up Next (Dad)
+   1. The Last of Us — S2E1    TV-MA   ← actively watching
+   2. Oppenheimer              R
+   3. Dune: Part Two           PG-13
+   4. The Mandalorian — S3E1   TV-14
+```
+
+Notice each playlist is **ranked differently** even where titles overlap: *Dune: Part Two* sits near the top for sci-fi-leaning Riley but lower for Dad, and Max's list is seeded from the **household's** kid-watching because Max has no history of his own yet. And the tier filter is absolute — **Max never sees a PG title, Riley never sees an R one** — regardless of how the ranking shakes out.
+
+**How a playlist is generated:**
+1. Start from that profile's owned, **unwatched** titles — **movies *and* TV**.
+2. Keep only what the profile's tier allows.
+3. Rank by **that profile's taste (affinity)** → a lift for **shows they're actively watching** → a gentle **household baseline** → the **"new season of a show you finished"** recency boost.
+4. (A brand-new kid profile with no history → optionally **seed from the household's kid taste**.)
+5. Write the top `max_items` to **that member's own account**.
 
 ---
 
