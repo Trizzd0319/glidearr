@@ -5,7 +5,7 @@ interactive, and ends with a resolved-routing summary that flags buckets with no
 from __future__ import annotations
 
 from scripts.managers.factories.onboarding.steps.routing import RoutingStep, _auto_match
-from scripts.managers.factories.onboarding.steps import STEP_CLASSES, build_steps, step_names
+from scripts.managers.factories.onboarding.steps import LEAF_CLASSES, build_steps, step_names
 
 
 class _FakePrompter:
@@ -51,8 +51,8 @@ def _notices(p) -> str:
 
 # ── registration ─────────────────────────────────────────────────────────────
 def test_registered_and_runnable_as_service():
-    assert "routing" in step_names()
-    assert RoutingStep in STEP_CLASSES
+    assert "routing" in step_names()                 # leaf name still addressable via --service
+    assert RoutingStep in LEAF_CLASSES               # routing is a leaf under the Library & routing phase
     only = build_steps(only_service="routing")
     assert len(only) == 1 and only[0].name == "routing"
 
@@ -183,12 +183,19 @@ def test_same_instance_without_consent_warns():
     assert res.ok is False
 
 
-def test_headless_same_instance_does_not_prompt_consent():
+def test_headless_same_instance_honours_relocation_consent_env():
+    # Headless now RECORDS relocation_consent from RECOMMENDARR_RELOCATION_CONSENT (no TTY
+    # prompt); moves still only happen at run-time (gated on consent + same_instance + not dry_run).
     p = _FakePrompter(choices={"routing.reorg_mode": "same_instance"},
                       confirms={"relocation_consent": True}, interactive=False)
-    cfg, res = _run(p)
-    assert "relocation_consent" not in cfg
-    assert res.ok is False
+    cfg, _ = _run(p)
+    assert cfg["relocation_consent"] is True                # env honoured (was silently dropped before)
+
+
+def test_headless_same_instance_consent_defaults_off_when_unset():
+    p = _FakePrompter(choices={"routing.reorg_mode": "same_instance"}, interactive=False)
+    cfg, _ = _run(p)
+    assert cfg.get("relocation_consent") is False           # unset env → stays off (safe default)
 
 
 def test_off_mode_is_skipped_row():

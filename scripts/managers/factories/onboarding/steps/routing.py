@@ -317,12 +317,14 @@ class RoutingStep(Step):
                 "   Destructive-adjacent, so it needs explicit consent — OFF until you opt in (or set\n"
                 "   RECOMMENDARR_RELOCATION_CONSENT=true for headless / Docker)."
             )
-            if getattr(prompter, "is_interactive", False):
-                cfg["relocation_consent"] = bool(prompter.confirm(
-                    "relocation_consent",
-                    "Allow the re-organizer to MOVE owned files between folders to fix placement?",
-                    default=bool(cfg.get("relocation_consent", False)),
-                ))
+            # Records the consent flag only (no moves happen at onboarding — the routing
+            # manager actuates at run-time, gated on this + reorg_mode + not dry_run). Read
+            # from env headlessly too, so RECOMMENDARR_RELOCATION_CONSENT is honoured for Docker.
+            cfg["relocation_consent"] = bool(prompter.confirm(
+                "relocation_consent",
+                "Allow the re-organizer to MOVE owned files between folders to fix placement?",
+                default=bool(cfg.get("relocation_consent", False)),
+            ))
 
         # Stamp that routing has been configured, so the resolver honours these preferences
         # (a never-onboarded install with the schema defaults keeps today's add-time routing).

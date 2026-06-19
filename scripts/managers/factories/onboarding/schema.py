@@ -56,7 +56,7 @@ def empty_config() -> dict:
             "username": "",
         },
         "tvdb": {"api": "", "pin": "", "token": ""},
-        "rootFolders": {"series": "", "anime": "", "documentary": ""},
+        "rootFolders": {"series": "", "anime": "", "documentary": "", "reality": ""},
         # Movie library buckets (classify_movie: kids/anime/4k/standard). Read by
         # resolver._pick_root_folder + router_movie.py; absent in older configs (then
         # movie placement falls back to the *arr's first reported root folder).
@@ -146,6 +146,26 @@ def empty_config() -> dict:
         "space_coordinator_enabled": True,
         "tv_downgrade_enabled": True,
         "tv_space_pressure_score_ceiling": 20,
+        # Pre-destructive safety: before a REAL run (dry_run=false) makes any delete / re-grab,
+        # snapshot each Radarr/Sonarr DB+config via its native Backup command and validate it is
+        # loadable. On failure the run DEGRADES TO DRY-RUN (no destructive changes). deep_validate
+        # additionally CRC-checks the downloaded zip (only when the *arr /backup route isn't behind
+        # UI session auth; otherwise creation is size-verified — see services/backup).
+        "backup_before_destructive": True,
+        "backup_deep_validate": False,
+        # Wildly-out-of-size-profile detector (read-only report by default): flags files whose
+        # bitrate is wildly inconsistent with their graded quality (e.g. a 45 GiB "720p" carries a
+        # 4K-remux bitrate). remediate (opt-in, DESTRUCTIVE) acts: rescan mis-graded files to fix
+        # the label, re-grab genuinely-bloated ones at their profile target (delete + research);
+        # monitored-only and gated by the backup gate + dry_run.
+        "size_anomaly": {
+            "enabled": True,
+            "remediate": False,
+            "over_ratio": 3.0,
+            "under_ratio": 0.3,
+            "min_samples": 8,
+            "report_limit": 25,
+        },
         # Watch-likelihood-gated quality upgrades (Radarr universe + active-watcher,
         # Sonarr JIT). Likelihood = max(engagement floor, affinity propensity):
         # engagement floors it (rewatch 90 / watched 50 / started 40 / abandoned <=25)
@@ -316,6 +336,17 @@ def empty_config() -> dict:
         # Background workers — the Trakt enrichment daemon is OFF by default. When
         # enabled, main.py (re)spawns it and runs become cache-only.
         "daemons": {"enrich": {"enabled": False, "scope": [], "owned_first": True}},
+        # English-audio (dub) prioritization — all five pieces ON by default ("recommended";
+        # absent/{} also reads as recommended). Normalized into the skeleton so a step-free
+        # headless overlay yields a complete config (the EnglishDubStep otherwise creates it
+        # ad-hoc); set RECOMMENDARR_ENGLISH_DUB_MODE=off / customize to change.
+        "english_dub": {
+            "cf_scoring":      {"enabled": True},
+            "theatrical_seek": {"enabled": True},
+            "english_ladder":  {"enabled": True},
+            "lock_owned_dubs": {"enabled": True},
+            "auto_enroll":     {"enabled": True},
+        },
     })
 
 

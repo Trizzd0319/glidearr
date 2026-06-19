@@ -97,6 +97,48 @@ def test_doc_leaves_cover_the_headless_playlist_knobs():
         assert p in paths
 
 
+# ── backup safety + size-anomaly schema + headless contract ───────────────────
+def test_backup_and_size_anomaly_schema_defaults():
+    cfg = empty_config()
+    assert cfg["backup_before_destructive"] is True
+    assert cfg["backup_deep_validate"] is False
+    assert cfg["size_anomaly"] == {
+        "enabled": True, "remediate": False, "over_ratio": 3.0,
+        "under_ratio": 0.3, "min_samples": 8, "report_limit": 25,
+    }
+
+
+def test_skeleton_overlay_preserves_size_anomaly_overrides():
+    merged = deep_merge(empty_config(), {"size_anomaly": {"remediate": True, "over_ratio": 2.5}})
+    assert merged["size_anomaly"]["remediate"] is True          # operator override wins
+    assert merged["size_anomaly"]["over_ratio"] == 2.5
+    assert merged["size_anomaly"]["min_samples"] == 8           # untouched default fills in
+
+
+def test_doc_leaves_cover_backup_and_size_anomaly():
+    paths = _doc_paths()
+    for p in ("backup_before_destructive", "backup_deep_validate",
+              "size_anomaly.enabled", "size_anomaly.remediate"):
+        assert p in paths
+
+
+# ── skeleton completeness for the headless/Docker overlay ─────────────────────
+def test_english_dub_and_reality_normalized_into_skeleton():
+    cfg = empty_config()
+    assert cfg["rootFolders"]["reality"] == ""                      # was step-only drift
+    assert set(cfg["english_dub"]) == {
+        "cf_scoring", "theatrical_seek", "english_ladder", "lock_owned_dubs", "auto_enroll"}
+    assert cfg["english_dub"]["cf_scoring"] == {"enabled": True}    # recommended default
+
+
+def test_doc_leaves_cover_routing_consent_and_feature_knobs():
+    paths = _doc_paths()
+    for p in ("relocation_consent", "deletions_consent", "routing.reorg_mode",
+              "routing.movies.4k_policy", "routing.tv.kids_bucket_enabled",
+              "english_dub.mode", "plex.playlists.cold_start_kids_prior"):
+        assert p in paths
+
+
 def test_writeback_doc_row_warns_about_dry_run_and_writes():
     note = next(n for path, _ex, n in env_map._DOC_LEAVES
                 if path == "plex.playlists.writeback.enabled")

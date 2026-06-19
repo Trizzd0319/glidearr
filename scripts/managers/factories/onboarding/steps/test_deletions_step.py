@@ -61,3 +61,47 @@ def test_explanation_always_shown():
     _run(p)
     text = "\n".join(p.notices)
     assert "DELETE" in text and "downgrade" in text.lower() and "dry_run" in text
+
+
+# ── backup safety + size-anomaly knobs ────────────────────────────────────────
+def test_backup_and_size_anomaly_defaults_on_when_unscripted():
+    cfg, _ = _run(_FakePrompter(confirms={"deletions_consent": True},
+                                integers={"free_space_limit": 2500}))
+    assert cfg["backup_before_destructive"] is True
+    assert cfg["size_anomaly"]["enabled"] is True
+    assert cfg["size_anomaly"]["remediate"] is False        # remediation is opt-in
+
+
+def test_size_anomaly_remediate_opt_in():
+    cfg, _ = _run(_FakePrompter(confirms={
+        "deletions_consent": True, "size_anomaly.enabled": True, "size_anomaly.remediate": True,
+    }, integers={"free_space_limit": 2500}))
+    assert cfg["size_anomaly"]["remediate"] is True
+
+
+def test_size_anomaly_disabled_skips_remediate_prompt():
+    asked: list[str] = []
+
+    class _P(_FakePrompter):
+        def confirm(self, path, label, default=False):
+            asked.append(path)
+            return self.confirms.get(path, default)
+
+    cfg, _ = _run(_P(confirms={"deletions_consent": True, "size_anomaly.enabled": False},
+                     integers={"free_space_limit": 2500}))
+    assert cfg["size_anomaly"]["enabled"] is False
+    assert cfg["size_anomaly"]["remediate"] is False
+    assert "size_anomaly.remediate" not in asked            # never offered when detection is off
+
+
+def test_backup_can_be_declined():
+    cfg, _ = _run(_FakePrompter(
+        confirms={"deletions_consent": True, "backup_before_destructive": False},
+        integers={"free_space_limit": 2500}))
+    assert cfg["backup_before_destructive"] is False
+
+
+def test_headless_leaves_backup_and_size_anomaly_to_schema_defaults():
+    cfg, _ = _run(_FakePrompter(interactive=False))
+    assert "backup_before_destructive" not in cfg
+    assert "size_anomaly" not in cfg

@@ -75,6 +75,44 @@ class DeletionsStep(Step):
             floor = 0
         cfg["free_space_limit"] = floor
 
+        # ── Pre-destructive backup safety net ────────────────────────────────────
+        prompter.notice(
+            "   Before any REAL run deletes or re-grabs a file, glidearr can trigger each\n"
+            "   Radarr/Sonarr's NATIVE backup (DB + config) and verify it is loadable. If a\n"
+            "   backup fails, the whole run DEGRADES TO DRY-RUN — nothing destructive happens.\n"
+            "   This is your rollback point; recommended whenever deletion / remediation is on."
+        )
+        cfg["backup_before_destructive"] = bool(prompter.confirm(
+            "backup_before_destructive",
+            "Back up each Radarr/Sonarr before any destructive change (real runs)?",
+            default=bool(cfg.get("backup_before_destructive", True)),
+        ))
+
+        # ── Wildly-out-of-size-profile detector + (opt-in) remediation ───────────
+        prompter.notice(
+            "   Size check: flag files whose size is WILDLY out of profile for their graded\n"
+            "   quality (a 45 GB file graded 720p carries a 4K-remux bitrate — almost always a\n"
+            "   mis-grade or a bloated encode). The report is read-only. Remediation (opt-in)\n"
+            "   ACTS: rescan mis-graded files to fix the label, and re-grab genuinely-bloated\n"
+            "   ones at their profile target (DESTRUCTIVE: deletes then re-searches; monitored-\n"
+            "   only, and only with a valid backup)."
+        )
+        sa = dict(cfg.get("size_anomaly") or {}) if isinstance(cfg.get("size_anomaly"), dict) else {}
+        sa["enabled"] = bool(prompter.confirm(
+            "size_anomaly.enabled",
+            "Report files wildly out of size profile for their quality?",
+            default=bool(sa.get("enabled", True)),
+        ))
+        if sa["enabled"]:
+            sa["remediate"] = bool(prompter.confirm(
+                "size_anomaly.remediate",
+                "Also ACT on them (rescan mis-graded, re-grab bloated)? DESTRUCTIVE — needs a backup.",
+                default=bool(sa.get("remediate", False)),
+            ))
+        else:
+            sa.setdefault("remediate", False)
+        cfg["size_anomaly"] = sa
+
         if consent and floor > 0:
             return [StepResult("deletions", ok=True, detail=f"deletion ARMED (floor {floor} GB)")]
         if consent and floor <= 0:
