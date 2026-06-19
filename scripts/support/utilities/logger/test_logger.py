@@ -7,7 +7,32 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.support.utilities.logger.logger import LoggerManager
+from scripts.support.utilities.logger.logger import LoggerManager, _rotate_run_logs
+
+
+# ──────────────── per-run log rotation (Kometa-style) ──────────────── #
+def test_run_log_rotation_keeps_backups_and_trashes_rest(tmp_path):
+    (tmp_path / "default.log").write_text("CUR")
+    for n in range(1, 6):
+        (tmp_path / f"default-{n}.log").write_text(f"P{n}")
+    (tmp_path / "default-7.log").write_text("STRAGGLER")          # leftover from a larger setting
+
+    _rotate_run_logs(tmp_path / "default.log", backups=5)
+
+    assert not (tmp_path / "default.log").exists()               # the handler recreates it fresh
+    assert (tmp_path / "default-1.log").read_text() == "CUR"     # last run rolled to -1
+    assert (tmp_path / "default-2.log").read_text() == "P1"      # each previous shifted up one
+    assert (tmp_path / "default-5.log").read_text() == "P4"      # oldest kept = old -4
+    assert not (tmp_path / "default-6.log").exists()             # old -5 aged out (trashed)
+    assert not (tmp_path / "default-7.log").exists()             # straggler trashed
+    assert sorted(p.name for p in tmp_path.glob("default-*.log")) == [
+        f"default-{n}.log" for n in range(1, 6)]                 # exactly 5 backups remain
+
+
+def test_run_log_rotation_first_run_no_existing_files(tmp_path):
+    # Nothing to roll yet — must not raise and must create nothing.
+    _rotate_run_logs(tmp_path / "default.log", backups=5)
+    assert list(tmp_path.glob("*.log")) == []
 
 
 @pytest.fixture

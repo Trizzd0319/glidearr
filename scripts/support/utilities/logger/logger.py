@@ -33,6 +33,37 @@ LOG_FILES = {
     "tvdb_trace": LOG_DIR / "TVDB_enrichment_trace.log",
 }
 
+# ── Per-run log rotation (Kometa-style) ───────────────────────────────────────
+# At the start of each run the previous run's file is rolled aside
+# (default.log -> default-1.log, -1 -> -2, …). The current run PLUS this many
+# previous runs are kept; anything older is trashed. Bump to retain more history.
+RUN_LOG_BACKUPS = 5                           # current + 5 previous = 6 logs retained
+
+
+def _rotate_run_logs(log_path: Path, backups: int = RUN_LOG_BACKUPS) -> None:
+    """Roll ``<name>.log`` -> ``<name>-1.log`` -> ``<name>-2.log`` … keeping ``backups``
+    previous runs (so ``backups`` + the fresh current = ``backups`` + 1 files), and delete
+    any older numbered backups. Best-effort — a missing/locked file never raises. MUST run
+    before the file handler opens the log (an open file can't be renamed on Windows)."""
+    try:
+        parent, stem, suffix = log_path.parent, log_path.stem, log_path.suffix
+        # Trash anything at/beyond the retention window: the oldest kept slot is overwritten
+        # by the shift below, and leftovers from a previously-larger setting are removed here.
+        for p in parent.glob(f"{stem}-*{suffix}"):
+            m = re.fullmatch(rf"{re.escape(stem)}-(\d+){re.escape(suffix)}", p.name)
+            if m and int(m.group(1)) >= backups:
+                p.unlink(missing_ok=True)
+        # Shift survivors up one slot: (backups-1) -> backups, … , 1 -> 2.
+        for n in range(backups - 1, 0, -1):
+            src = parent / f"{stem}-{n}{suffix}"
+            if src.exists():
+                src.replace(parent / f"{stem}-{n + 1}{suffix}")
+        # The just-finished run's file becomes -1; the new run opens a fresh <name>.log.
+        if log_path.exists():
+            log_path.replace(parent / f"{stem}-1{suffix}")
+    except OSError:
+        pass                                  # never let log rotation break the run
+
 # ──────────────── Secret scrubbing ──────────────── #
 # Defense-in-depth: every log line passes through LoggerManager._scrub() so a
 # credential that slips into a message, exception string, or request URL never
@@ -325,6 +356,10 @@ class LoggerManager:
         if not self.logger.handlers:
             log_path = LOG_DIR / f"{log_name}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
+            # Kometa-style: roll the previous run's log aside before opening this run's fresh
+            # file. Skipped under pytest so test runs never churn the real run logs.
+            if "pytest" not in sys.modules:
+                _rotate_run_logs(log_path)
 
             file_handler = logging.FileHandler(log_path)
             file_handler.setFormatter(JsonFormatter())
