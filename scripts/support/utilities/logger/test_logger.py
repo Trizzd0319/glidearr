@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import pytest
 
-from scripts.support.utilities.logger.logger import LoggerManager, _rotate_run_logs
+from scripts.support.utilities.logger import logger as logger_mod
+from scripts.support.utilities.logger.logger import (
+    LoggerManager, _rotate_run_logs, rotate_run_artifacts,
+)
 
 
 # ──────────────── per-run log rotation (Kometa-style) ──────────────── #
@@ -33,6 +36,61 @@ def test_run_log_rotation_first_run_no_existing_files(tmp_path):
     # Nothing to roll yet — must not raise and must create nothing.
     _rotate_run_logs(tmp_path / "default.log", backups=5)
     assert list(tmp_path.glob("*.log")) == []
+
+
+# ── unified run-artifact rotation (logger + routing + timings on the same -N) ── #
+def test_rotate_run_artifacts_rolls_all_three_with_same_suffix(tmp_path, monkeypatch):
+    monkeypatch.setattr(logger_mod, "LOG_DIR", tmp_path)
+    for name in ("default.log", "routing.log", "timings.json"):
+        (tmp_path / name).write_text(f"CUR-{name}")
+    # a prior run already at slot -1 for each family …
+    (tmp_path / "default-1.log").write_text("D1")
+    (tmp_path / "routing-1.log").write_text("R1")
+    (tmp_path / "timings-1.json").write_text("T1")
+    # … plus a leftover from the OLD unbounded profiler naming, which must be swept.
+    (tmp_path / "timings.run-007.json").write_text("LEGACY")
+
+    rotate_run_artifacts(backups=5)
+
+    # this run's file rolled to -1 for ALL three, sharing the same suffix
+    assert (tmp_path / "default-1.log").read_text() == "CUR-default.log"
+    assert (tmp_path / "routing-1.log").read_text() == "CUR-routing.log"
+    assert (tmp_path / "timings-1.json").read_text() == "CUR-timings.json"
+    # the prior -1 shifted up to -2 for all three
+    assert (tmp_path / "default-2.log").read_text() == "D1"
+    assert (tmp_path / "routing-2.log").read_text() == "R1"
+    assert (tmp_path / "timings-2.json").read_text() == "T1"
+    # current slots cleared so the fresh run opens new files
+    assert not (tmp_path / "default.log").exists()
+    assert not (tmp_path / "routing.log").exists()
+    assert not (tmp_path / "timings.json").exists()
+    # legacy unbounded profiler file is gone
+    assert not (tmp_path / "timings.run-007.json").exists()
+
+
+# ── daemon must never touch / rotate the orchestrator's default.log ── #
+def test_default_logger_redirected_off_default_in_daemon(monkeypatch):
+    monkeypatch.setenv("GLIDEARR_DAEMON", "1")
+    assert LoggerManager._effective_log_name("default") == "enrich_daemon_run"
+    assert LoggerManager._effective_log_name("routing") == "routing"   # non-default untouched
+
+
+def test_default_logger_not_redirected_outside_daemon(monkeypatch):
+    monkeypatch.delenv("GLIDEARR_DAEMON", raising=False)
+    assert LoggerManager._effective_log_name("default") == "default"
+
+
+# ── profiler joins the rotation window as timings.json (no unbounded run-NNN) ── #
+def test_log_profiled_run_writes_timings_json_no_run_number(tmp_path, monkeypatch):
+    monkeypatch.setattr(logger_mod, "LOG_DIR", tmp_path)
+    prof = tmp_path / "tmp_profile.json"
+    prof.write_text('{"calls": [1, 2, 3]}')
+
+    LoggerManager().log_profiled_run(profile_path=str(prof))
+
+    assert (tmp_path / "timings.json").read_text() == '{"calls": [1, 2, 3]}'
+    assert not prof.exists()                                   # moved, not copied
+    assert list(tmp_path.glob("timings.run-*.json")) == []     # old unbounded naming gone
 
 
 @pytest.fixture

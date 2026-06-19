@@ -39,9 +39,23 @@ LOG_FILES = {
 # previous runs are kept; anything older is trashed. Bump to retain more history.
 RUN_LOG_BACKUPS = 5                           # current + 5 previous = 6 logs retained
 
+# Every run-scoped artifact rotates TOGETHER on this one shift scheme so a given run's
+# main log, routing plan, and call-graph timings all carry the same -N suffix
+# (default-2.log <-> routing-2.log <-> timings-2.json are the same run). Rolled in a
+# single pass at orchestrator start by rotate_run_artifacts(). 'timings.json' replaces
+# the old unbounded 'timings.run-NNN.json' so the profiler now honours retention too.
+RUN_LOG_ARTIFACTS = ("default.log", "routing.log", "timings.json")
+
+# Set in the detached enrich daemon's environment (EnrichDaemonSupervisor.spawn). The
+# daemon is a SEPARATE process that briefly constructs the 'default' LoggerManager via
+# ConfigLoader; without this guard it would (a) rotate the orchestrator's just-finished
+# run log out from under it and (b) write its config-load lines into default.log. When
+# set, the daemon's default logger is redirected to its own sink and never rotates.
+DAEMON_ENV = "GLIDEARR_DAEMON"
+
 
 def _rotate_run_logs(log_path: Path, backups: int = RUN_LOG_BACKUPS) -> None:
-    """Roll ``<name>.log`` -> ``<name>-1.log`` -> ``<name>-2.log`` … keeping ``backups``
+    """Roll ``<name>.<ext>`` -> ``<name>-1.<ext>`` -> ``<name>-2.<ext>`` … keeping ``backups``
     previous runs (so ``backups`` + the fresh current = ``backups`` + 1 files), and delete
     any older numbered backups. Best-effort — a missing/locked file never raises. MUST run
     before the file handler opens the log (an open file can't be renamed on Windows)."""
@@ -58,11 +72,28 @@ def _rotate_run_logs(log_path: Path, backups: int = RUN_LOG_BACKUPS) -> None:
             src = parent / f"{stem}-{n}{suffix}"
             if src.exists():
                 src.replace(parent / f"{stem}-{n + 1}{suffix}")
-        # The just-finished run's file becomes -1; the new run opens a fresh <name>.log.
+        # The just-finished run's file becomes -1; the new run opens a fresh <name>.<ext>.
         if log_path.exists():
             log_path.replace(parent / f"{stem}-1{suffix}")
     except OSError:
         pass                                  # never let log rotation break the run
+
+
+def rotate_run_artifacts(backups: int = RUN_LOG_BACKUPS) -> None:
+    """Roll EVERY run-scoped artifact (default.log, routing.log, timings.json) aside in ONE
+    pass so a given run keeps the same -N suffix across all three. Also trashes any legacy
+    ``timings.run-*.json`` left by the old unbounded profiler naming. Best-effort. MUST run
+    before this run's handlers/writers open their files (an open file can't be renamed on
+    Windows). Called ONCE at orchestrator start — never from the daemon or a subprocess."""
+    for name in RUN_LOG_ARTIFACTS:
+        _rotate_run_logs(LOG_DIR / name, backups=backups)
+    # One-time migration: the profiler used to write unbounded timings.run-NNN.json with no
+    # retention; sweep that backlog now that timings.json joins the rotation window.
+    try:
+        for legacy in LOG_DIR.glob("timings.run-*.json"):
+            legacy.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 # ──────────────── Secret scrubbing ──────────────── #
 # Defense-in-depth: every log line passes through LoggerManager._scrub() so a
@@ -343,11 +374,21 @@ class LoggerManager:
             cls._instance._initialized = False
         return cls._instance
 
+    @staticmethod
+    def _effective_log_name(log_name: str) -> str:
+        """In the detached enrich daemon, the run-scoped 'default' log belongs to the
+        orchestrator — redirect to a daemon-owned sink so the daemon neither rotates nor
+        writes default.log. A no-op for every other log_name and outside the daemon."""
+        if log_name == "default" and os.environ.get(DAEMON_ENV):
+            return "enrich_daemon_run"
+        return log_name
+
     def __init__(self, log_name="default", level=logging.INFO):
         if getattr(self, "_initialized", False):
             return
         self._initialized = True
 
+        log_name = self._effective_log_name(log_name)
         self.log_name = log_name
         self.level = level or logging.INFO
         self.logger = logging.getLogger(log_name)
@@ -356,10 +397,12 @@ class LoggerManager:
         if not self.logger.handlers:
             log_path = LOG_DIR / f"{log_name}.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            # Kometa-style: roll the previous run's log aside before opening this run's fresh
-            # file. Skipped under pytest so test runs never churn the real run logs.
-            if "pytest" not in sys.modules:
-                _rotate_run_logs(log_path)
+            # Kometa-style: roll the previous run's default/routing/timings aside TOGETHER
+            # (same -N suffix) before opening this run's fresh files. Only the orchestrator's
+            # 'default' logger rotates; skipped under pytest, and the daemon never reaches here
+            # as 'default' (redirected by _effective_log_name above) so it can't clobber.
+            if log_name == "default" and "pytest" not in sys.modules:
+                rotate_run_artifacts()
 
             file_handler = logging.FileHandler(log_path)
             file_handler.setFormatter(JsonFormatter())
@@ -550,15 +593,18 @@ class LoggerManager:
             profile_file.write_text(json.dumps({"calls": [], "summary": "No profiled calls recorded."}, indent=2))
             self.log_warning(f"⚠️ Profiling file missing — generated placeholder at: {profile_path}")
 
-        # Determine next available run number
-        logs_dir = Path("support/logs")
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        existing = list(logs_dir.glob("timings.run-*.json"))
-        run_numbers = [int(f.stem.split("-")[-1]) for f in existing if f.stem.split("-")[-1].isdigit()]
-        next_run = max(run_numbers, default=0) + 1
-
-        target_path = logs_dir / f"timings.run-{next_run:03d}.json"
-        profile_file.rename(target_path)
+        # The call-graph profile joins the per-run rotation window as 'timings.json' (rolled
+        # to timings-1.json … at the next run start, kept current + RUN_LOG_BACKUPS — see
+        # rotate_run_artifacts). Resolved against the absolute LOG_DIR so it lands beside
+        # default.log / routing.log regardless of CWD and shares their -N suffix, replacing
+        # the old unbounded 'timings.run-NNN.json' that never pruned.
+        target_path = LOG_DIR / "timings.json"
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            profile_file.replace(target_path)        # atomic overwrite of this run's slot
+        except OSError as e:
+            self.log_warning(f"⚠️ could not save call-graph profile: {e}")
+            return
 
         self.log_info(f"📊 Call graph profiler saved to: {target_path}")
 

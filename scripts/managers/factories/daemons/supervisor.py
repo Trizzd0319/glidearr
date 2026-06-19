@@ -151,6 +151,11 @@ class EnrichDaemonSupervisor:
         # Leak the log handle to the child intentionally (it owns its stdout/stderr).
         logf = open(LOG_PATH, "a", encoding="utf-8")
 
+        # Mark the child as the enrich daemon so its 'default' LoggerManager (built by
+        # ConfigLoader) is redirected to a daemon-owned sink and never rotates/clobbers the
+        # orchestrator's run log (LoggerManager.DAEMON_ENV / _effective_log_name).
+        child_env = {**os.environ, "GLIDEARR_DAEMON": "1"}
+
         def _popen(flags: int):
             return subprocess.Popen(
                 [sys.executable, str(DAEMON_SCRIPT)],
@@ -160,6 +165,7 @@ class EnrichDaemonSupervisor:
                 creationflags=flags,
                 close_fds=True,
                 cwd=str(REPO_ROOT),
+                env=child_env,
                 **extra,
             )
 
