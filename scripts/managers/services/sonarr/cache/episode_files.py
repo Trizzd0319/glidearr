@@ -1041,6 +1041,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             sid = df.at[idx, "series_id"]
             sn = df.at[idx, "season_number"] if "season_number" in df.columns else None
             en = df.at[idx, "episode_number"] if "episode_number" in df.columns else None
+            # Which season/episode this file backs, for the deletions summary (S##E##; a
+            # multi-episode file shows its first episode, "—" when the indices are unknown).
+            _se = f"S{int(sn):02d}E{int(en):02d}" if (pd.notna(sn) and pd.notna(en)) else "—"
             if pd.notna(sid) and pd.notna(sn) and pd.notna(en):
                 ent = restore_add.setdefault(str(int(sid)), {"episodes": [], "ts": now.isoformat()})
                 ent["episodes"].append([int(sn), int(en)])
@@ -1051,7 +1054,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             title = df.at[idx, "series_title"] if "series_title" in df.columns else f"series {sid}"
             if self.dry_run:
                 self.logger.log_info(f"  🗑️ [dry_run] Would delete episode file: '{title}' (fid={fid}, {self._fmt_bytes(size)})")
-                _del_rows.append([str(title), str(fid), self._fmt_bytes(size), "would delete"])
+                _del_rows.append([str(title), _se, str(fid), self._fmt_bytes(size), "would delete"])
                 stats["deleted"] += 1
                 stats["bytes_freed"] += size
                 deleted_fids.add(fid)
@@ -1062,7 +1065,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 stats["bytes_freed"] += size
                 deleted_fids.add(fid)
                 self.logger.log_info(f"  🗑️ Deleted episode file: '{title}' (fid={fid}, {self._fmt_bytes(size)})")
-                _del_rows.append([str(title), str(fid), self._fmt_bytes(size), "deleted"])
+                _del_rows.append([str(title), _se, str(fid), self._fmt_bytes(size), "deleted"])
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ Episode-file delete failed for '{title}' (fid={fid}): {e}")
                 stats["failed"] += 1
@@ -1070,7 +1073,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
         if _rs is not None and _del_rows:
             _rs.add_rows("sonarr", "Deletions & movements", instance,
-                         ["Title", "FileId", "Size", "Action"], _del_rows, order=40)
+                         ["Title", "Ep", "FileId", "Size", "Action"], _del_rows, order=40)
 
         # Record deletions for restore_recovered_episode_deletions (skip in dry_run
         # so we don't track files that were never actually removed).

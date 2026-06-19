@@ -57,8 +57,9 @@ def test_sonarr_deletes_route_into_movements_table():
     grids = {t: (h, r) for t, h, r in cap.grids}
     assert "Deletions & movements" in grids, list(grids)
     headers, rows = grids["Deletions & movements"]
-    assert headers == ["Instance", "Title", "FileId", "Size", "Action"]
+    assert headers == ["Instance", "Title", "Ep", "FileId", "Size", "Action"]
     assert rows[0][0] == "sonarr"
     assert rows[0][1] == "My Show"
-    assert rows[0][2] == "1001"
-    assert rows[0][4] == "would delete"
+    assert rows[0][2] == "S01E01"             # season/episode of the deleted file
+    assert rows[0][3] == "1001"
+    assert rows[0][5] == "would delete"
