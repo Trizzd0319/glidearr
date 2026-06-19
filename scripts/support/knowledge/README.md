@@ -9,6 +9,10 @@ written for the people who run the server and the families who use it, not just 
   playlists, the age-tiered family collections, and the library classification work; what
   each profile sees; how age restrictions are decided; safety/privacy; and how to turn it on.
 
+> **Developer reference (not plain-language):** the full **watchability scoring** logic — the
+> 0–100 score's signal groups, their point values, and the score-to-quality tiers — is documented
+> alongside the code in [`SCORING_GROUPS.md`](../../managers/machine_learning/scoring/SCORING_GROUPS.md).
+
 ## Read every doc in one place — `_mirror/`
 
 To browse **all** of the repository's Markdown in one folder, run:

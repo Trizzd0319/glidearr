@@ -88,6 +88,17 @@ The list is ranked by a blend of signals, strongest first:
 
 On top of that ranking sits a **"new season of a show you finished" boost**: if you're **caught up** on a show you like (you watched the last episode that was available) and a **new** episode or season has just landed — measured by a blend of *when it aired* and *when it arrived in your library* — that show floats toward the top. It's the "there's finally a new season!" nudge, and it never breaks up a show into spoiler order.
 
+### The two scores behind the picks: *affinity* and *watchability*
+
+Two different scores work together here, and it helps to keep them straight:
+
+- **Affinity is personal.** It's *your* taste — how closely a title's genres, cast, and crew match what **you** (this profile) have actually watched. Affinity is what orders **your** playlist, which is why two people get different lists out of the same library.
+- **Watchability is for the household.** It's a single **0–100 score** of how worth-watching a title is for the **house as a whole** — blended from explicit keep tags, how much the household actually watched it, taste match, collection/franchise progress, device fit, and critic ratings, minus penalties (abandoned, panned, wrong-language). It's what ranks the **family collections**, and the *same* score decides what gets **acquired, upgraded, kept, or released** when space runs low.
+
+In a playlist the two combine: your affinity leads, with the household's watchability as a gentle baseline so broadly-loved titles still surface.
+
+> **Want the exact recipe?** The full signal-by-signal breakdown — every scoring group, its points, the score-to-quality-tier table, and worked examples — lives in the developer reference: [`SCORING_GROUPS.md`](../../managers/machine_learning/scoring/SCORING_GROUPS.md).
+
 ### Cold start: a brand-new kid profile
 
 A young child is usually watched *for* — the parent presses play on their *own* profile. So a new kid profile often has no history of its own, and a plain ranking would just show "whatever the whole house watches most" (which skews adult).
@@ -314,8 +325,8 @@ The same settings are available headlessly (Docker/unraid) as `RECOMMENDARR_PLEX
 
 - **Profile / managed user** — a person's account inside your Plex Home. "Managed" profiles are the ones the owner controls (typically kids).
 - **Restriction profile / parental tier** — Plex's per-profile age setting (Little Kid / Older Kid / Teen), which we read to decide what each profile may see.
-- **Affinity** — a profile's genre taste, learned from its viewing history.
-- **Watchability** — a household-level score for how worth-watching a title is, learned from what the house watches.
+- **Affinity** — a profile's *personal* genre/cast/crew taste, learned from that profile's own viewing history; it's what orders that profile's playlist.
+- **Watchability** — a household-level **0–100 score** for how worth-watching a title is, blended from keep tags, household viewing, taste match, collection/franchise progress, device fit, and critic ratings (minus penalties). It ranks the family collections and drives every keep / grab / delete / upgrade decision. Full breakdown: [`SCORING_GROUPS.md`](../../managers/machine_learning/scoring/SCORING_GROUPS.md).
 - **Collection** — a curated *row* in a Plex library / on Home (e.g. "Marvel Cinematic Universe"). Visible to adults; not to managed kids.
 - **Playlist** — a personal, ordered list on a profile's account. Visible to that profile, including kids.
 - **Write-back** — the (opt-in) step where computed playlists are actually written into Plex, as opposed to only previewed.
