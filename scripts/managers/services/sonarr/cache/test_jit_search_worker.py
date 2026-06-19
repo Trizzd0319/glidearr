@@ -9,6 +9,8 @@ while the profile sits at a higher tier (the over-grab the group-by-tier split p
 """
 from __future__ import annotations
 
+import threading
+
 from scripts.managers.services.sonarr.cache.episode_files import SonarrCacheEpisodeFilesManager
 
 
@@ -160,3 +162,107 @@ def test_step_down_within_group_searches_only_that_groups_eps():
     assert {pid for pid, _ in searches} == {13, 12, 11}
     for _pid, ep_ids in searches:
         assert ep_ids == {100}
+
+
+# ── readable series label (no raw `series <id>` in the log) ───────────────────────
+class _CapLogger:
+    def __init__(self): self.infos: list[str] = []
+    def log_info(self, msg, *a, **k): self.infos.append(str(msg))
+    def log_debug(self, *a, **k): pass
+    def log_warning(self, *a, **k): pass
+    def log_success(self, *a, **k): pass
+
+
+class _TitledApi(_FakeApi):
+    """Like _FakeApi but the series GET also carries title + tvdbId (as Sonarr's does)."""
+    def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+        r = super()._make_request(instance, endpoint, method, payload, fallback)
+        if endpoint.startswith("series/") and method == "GET" and isinstance(r, dict):
+            return dict(r, title="Attack on Titan", tvdbId=1429)
+        return r
+
+
+def test_step_down_logs_use_readable_series_label():
+    # series 17208 must surface as sonarr/<inst> 'Attack on Titan' (tvdb-1429), not the raw id.
+    items = [(17208, [(1080, [(200, 1, 2)], [12, 11])])]
+    api = _TitledApi(original_pid=5)
+    m = _mgr(api, grab=False)
+    m.logger = cap = _CapLogger()
+    m._jit_search_worker("inst", items)
+    blob = "\n".join(cap.infos)
+    assert "sonarr/inst 'Attack on Titan' (tvdb-1429)" in blob
+    assert "series 17208" not in blob          # raw id no longer leaks into step-down/∅/revert lines
+
+
+def test_label_falls_back_to_raw_id_when_title_unknown():
+    # No title on the GET → graceful `series <id>` fallback (never crashes the log).
+    items = [(17208, [(1080, [(200, 1, 2)], [12, 11])])]
+    api = _FakeApi(original_pid=5)                # plain GET: no title/tvdbId
+    m = _mgr(api, grab=False)
+    m.logger = cap = _CapLogger()
+    m._jit_search_worker("inst", items)
+    assert any("series 17208" in s for s in cap.infos)
+
+
+# ── concurrent multi-series path (the new parallelism) ────────────────────────────
+class _MultiFakeApi:
+    """Per-series profile state + thread-safe call log — models series running CONCURRENTLY.
+    A shared-_pid fake would let one series' PUT clobber another's view; this keeps them isolated."""
+    def __init__(self, originals):                 # originals: {sid: pid}
+        self._pid = dict(originals)
+        self._lock = threading.Lock()
+        self.calls: list = []
+        self._cmd = 0
+
+    def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+        with self._lock:
+            self.calls.append((endpoint, method, payload))
+            if endpoint.startswith("series/") and method == "GET":
+                sid = int(endpoint.split("/")[1])
+                return {"id": sid, "qualityProfileId": self._pid.get(sid),
+                        "title": f"Show {sid}", "tvdbId": 1000 + sid}
+            if endpoint.startswith("series/") and method == "PUT":
+                sid = int(endpoint.split("/")[1])
+                self._pid[sid] = payload.get("qualityProfileId")
+                return payload
+            if endpoint == "command" and method == "POST":
+                self._cmd += 1
+                return {"id": self._cmd}
+            if endpoint.startswith("command/") and method == "GET":
+                return {"status": "completed"}
+            return fallback
+
+    def final_pid(self, sid):
+        with self._lock:
+            return self._pid[sid]
+
+
+class _StubCache:
+    def __init__(self): self.store: dict = {}
+    def get(self, k): return self.store.get(k)
+    def set(self, k, v): self.store[k] = v
+
+
+def test_multiple_series_run_concurrently_and_each_reverts_independently():
+    # Three series, three DIFFERENT pre-flip profiles. Nothing grabs (full step-down), so each
+    # ladders then reverts — the load-bearing check is that every series restores its OWN original
+    # despite the ladders overlapping, and that all not-grabbed eps merge into one retry ledger.
+    originals = {1: 5, 2: 6, 3: 7}
+    items = [
+        (1, [(1080, [(200, 1, 2)], [12, 11])]),
+        (2, [(1080, [(300, 2, 5)], [12, 11])]),
+        (3, [(2160, [(400, 1, 1)], [13])]),
+    ]
+    api = _MultiFakeApi(originals)
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = api
+    m.global_cache = cache = _StubCache()
+    m._episodes_in_queue = lambda instance, ep_ids, attempts=3, delay_s=2.0: set()
+    m._jit_search_worker("inst", items)
+
+    # Each series reverted to its own pre-flip profile (no cross-contamination from parallel PUTs).
+    assert (api.final_pid(1), api.final_pid(2), api.final_pid(3)) == (5, 6, 7)
+    # Every series' not-grabbed episode landed in the shared retry ledger exactly once.
+    failed = cache.get("sonarr/inst/jit/failed_upgrades") or []
+    assert {(f["series_id"], f["episode"]) for f in failed} == {(1, 2), (2, 5), (3, 1)}

@@ -79,9 +79,13 @@ def _run(config, *, free_gb, series_qp=99, last_pid=None):
     return df, stats, api
 
 
-_ON = {"free_space_limit": 100, "pilot_best_tier_first": {"enabled": True}}
-_ON_FORCE = {"free_space_limit": 100, "pilot_best_tier_first": {"enabled": True, "force_floor": True}}
-_OFF = {"free_space_limit": 100, "pilot_best_tier_first": {"enabled": False}}
+# NOTE: the within-run floor-first climb is now the DEFAULT pilot strategy; these tests pin the
+# LEGACY escape-hatch strategies, so they explicitly disable the climb. The climb itself is covered
+# by test_pilot_climb_worker.py and test_climb_default_collects_items_and_spawns_worker below.
+_CLIMB_OFF = {"pilot_floor_climb": {"enabled": False}}
+_ON = {"free_space_limit": 100, "pilot_best_tier_first": {"enabled": True}, **_CLIMB_OFF}
+_ON_FORCE = {"free_space_limit": 100, "pilot_best_tier_first": {"enabled": True, "force_floor": True}, **_CLIMB_OFF}
+_OFF = {"free_space_limit": 100, "pilot_best_tier_first": {"enabled": False}, **_CLIMB_OFF}
 
 
 # ── best-tier-first ───────────────────────────────────────────────────────────────
@@ -285,4 +289,104 @@ def test_flag_off_reproduces_legacy_floor_first():
     # (which targets 2160). This is the byte-identical legacy behavior.
     df, stats, _ = _run(_OFF, free_gb=5000)
     assert int(df.at[0, "pilot_last_profile_id"]) == 11
+    assert stats["searched"] == 1
+
+
+# ── DEFAULT: within-run floor-first climb ─────────────────────────────────────────
+def test_climb_default_collects_items_and_spawns_worker():
+    """By default (no pilot_floor_climb key → enabled), the main loop resolves S01E01 and hands it
+    to the BACKGROUND climb worker with the ascending floor→widest ladder; it does NO profile flips
+    itself (the worker owns those). The worker is stubbed to capture its arguments."""
+    df = _stub_df()
+    api = _FakeApi(series_qp=99)
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = api
+    m.sonarr_cache = None
+    m.global_cache = None
+    m.config = {"free_space_limit": 100}          # no pilot_floor_climb key → default ON
+    m.dry_run = False                              # LIVE so the worker is actually spawned
+    m._resolve_instance = lambda inst: inst
+    m.load = lambda inst: df
+    m.save = lambda inst, d: None
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_episode_id = lambda *a, **k: 999
+
+    spawned: dict = {}
+    m._spawn_pilot_climb_worker = lambda inst, items, ladder: spawned.update(
+        instance=inst, items=list(items), ladder=list(ladder)
+    )
+
+    stats = m.run_pilot_search("inst")
+
+    assert spawned["items"] == [(1, 999)]                       # (sid, s01e01 id) handed to worker
+    # Ascending floor→widest ladder, one rung per resolution tier (720 → 1080 → 2160).
+    assert [pid for pid, _res in spawned["ladder"]] == [11, 12, 13]
+    assert [res for _pid, res in spawned["ladder"]] == [720, 1080, 2160]
+    assert api.puts == []                                       # main thread flips NO profiles
+    assert stats["searched"] == 1
+    # interval guard tracking stamped at the floor tier (so the 24 h guard works next run)
+    assert int(df.at[0, "pilot_last_profile_id"]) == 11
+
+
+def test_climb_unresolved_id_defers_instead_of_series_search():
+    """When S01E01's id can't be resolved (cache AND live miss), the stub is DEFERRED — never a
+    whole-series SeriesSearch (which would over-grab every monitored episode at the floor)."""
+    df = _stub_df()
+    api = _FakeApi(series_qp=99)
+    posts: list = []
+    _orig = api._make_request
+    def _track(instance, endpoint, method="GET", payload=None, fallback=None):
+        if endpoint == "command" and method == "POST":
+            posts.append(payload)                     # a SeriesSearch here would be the over-grab
+        return _orig(instance, endpoint, method, payload, fallback)
+    api._make_request = _track
+
+    spawned: list = []
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = api
+    m.sonarr_cache = None
+    m.global_cache = None
+    m.config = {"free_space_limit": 100, "pilot_floor_climb": {"enabled": True}}
+    m.dry_run = False
+    m._resolve_instance = lambda inst: inst
+    m.load = lambda inst: df
+    m.save = lambda inst, d: None
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_episode_id = lambda *a, **k: None          # never resolves, even live
+    m._spawn_pilot_climb_worker = lambda *a, **k: spawned.append(True)
+
+    stats = m.run_pilot_search("inst")
+
+    assert posts == []            # NO command POST at all — no whole-series SeriesSearch
+    assert spawned == []          # nothing climbable
+    assert stats["searched"] == 0
+
+
+def test_climb_dry_run_does_not_spawn_or_write():
+    """Dry-run climb plans but never spawns the worker, PUTs a profile, or saves the df."""
+    df = _stub_df()
+    api = _FakeApi(series_qp=99)
+    saved: list = []
+    spawned: list = []
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = api
+    m.sonarr_cache = None
+    m.global_cache = None
+    m.config = {"free_space_limit": 100, "pilot_floor_climb": {"enabled": True}}
+    m.dry_run = True
+    m._resolve_instance = lambda inst: inst
+    m.load = lambda inst: df
+    m.save = lambda inst, d: saved.append(True)
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_episode_id = lambda *a, **k: 999
+    m._spawn_pilot_climb_worker = lambda *a, **k: spawned.append(True)
+
+    stats = m.run_pilot_search("inst")
+
+    assert spawned == []          # no background worker in dry-run
+    assert saved == []            # df not persisted in dry-run
+    assert api.puts == []         # no profile writes
     assert stats["searched"] == 1

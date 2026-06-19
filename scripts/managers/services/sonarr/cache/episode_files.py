@@ -103,6 +103,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     JIT_ACTIVE_WATCH_DAYS = 30    # a series watched within this window is "actively watched" — its
                                    # next-up episodes are NEVER JIT-downgraded (same recency the
                                    # prefetch uses for 'upgrade-eligible'); cold shows still calibrate
+    JIT_SEARCH_MAX_WORKERS = 6    # background step-down search runs series CONCURRENTLY (each owns its
+                                   # own profile + revert, so series are independent); this bounds how
+                                   # many ladders search at once so we overlap the long command waits
+                                   # without flooding the one Sonarr instance with EpisodeSearch tasks
 
     # Fallback size model (MiB per minute) used by JIT space estimates when a
     # quality has no measured samples in the library yet. Now sourced from the
@@ -3705,11 +3709,41 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         ranked             = rank_pilot_profiles(raw_profiles)
         profile_id_to_rank = {p["id"]: i for i, p in enumerate(ranked)}
 
-        # ── Best-tier-first (deliverable C) ───────────────────────────────────
-        # ON (default): the pilot targets the highest tier whose grab keeps the JIT space reserve,
-        # diverting DOWN across empty runs. OFF: legacy floor-first/step-up, byte-identical.
+        # ── Within-run floor-first climb (default) ────────────────────────────
+        # The pilot grabs at the LOWEST resolution actually available: a background worker flips the
+        # series profile UP an ascending floor→widest ladder one tier at a time, searches S01E01, and
+        # STOPS at the first tier that yields a release — leaving the series at that low tier so the
+        # watch-based upgrade path (run_active_watcher_upgrades / JIT) raises it later. This supersedes
+        # best-tier-first, which pinned every never-watched pilot to the highest tier space allowed.
+        _climb_cfg  = (self.config or {}).get("pilot_floor_climb", {}) or {}
+        pilot_climb = bool(_climb_cfg.get("enabled", True))
+        # Ascending ladder: one rung per resolution tier (dedupe profiles sharing a max resolution),
+        # dropping profiles that allow nothing. ladder[0] = floor (lowest res), ladder[-1] = widest.
+        _climb_ladder: list = []
+        _seen_res: set = set()
+        for _p in ranked:
+            _r = profile_max_resolution(_p)
+            if _r <= 0 or _r in _seen_res or _p.get("id") is None:
+                continue
+            _seen_res.add(_r)
+            _climb_ladder.append((int(_p["id"]), int(_r)))
+        if not _climb_ladder:   # degenerate profile set → fall back to every usable ranked id, ascending
+            _climb_ladder = [(int(p["id"]), int(profile_max_resolution(p)))
+                             for p in ranked
+                             if p.get("id") is not None and profile_max_resolution(p) > 0]
+        _floor_pid = _climb_ladder[0][0] if _climb_ladder else None
+        if pilot_climb and not _climb_ladder:
+            self.logger.log_warning(
+                f"[PilotSearch] No usable quality profiles for '{instance}' — cannot climb; "
+                f"nothing searched."
+            )
+            return stats
+
+        # ── Legacy strategies (escape hatch — only when pilot_floor_climb is OFF) ──
+        # best-tier-first: target the highest tier the space reserve allows, divert DOWN across empty
+        # runs. OFF that too: floor-first/step-up across runs. Both are superseded by the climb above.
         _pbtf = (self.config or {}).get("pilot_best_tier_first", {}) or {}
-        pilot_best_tier   = bool(_pbtf.get("enabled", True))
+        pilot_best_tier   = (not pilot_climb) and bool(_pbtf.get("enabled", False))
         # force_floor: when even the floor breaches the reserve, grab at the floor anyway (always
         # seed the pilot) vs skip-and-re-probe. Default FALSE — never breach the configured floor;
         # a skipped pilot is re-probed when space frees (it is never deleted, just not grabbed yet).
@@ -3776,8 +3810,18 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
         # Searches are collected here and pushed in batches after the loop,
         # rather than one Sonarr command per series.
-        queued        = []   # (idx, episode_id, new_pid, title) → batched EpisodeSearch
-        series_queued = []   # (idx, series_id,  new_pid, title) → individual SeriesSearch
+        queued        = []   # (idx, episode_id, new_pid, title) → batched EpisodeSearch  (legacy)
+        series_queued = []   # (idx, series_id,  new_pid, title) → individual SeriesSearch (legacy)
+        # Within-run climb collects (sid, s01e01_id) for the background worker; a stub whose S01E01
+        # id can't be resolved (rare cache miss) falls back to a single floor SeriesSearch.
+        climb_items: list     = []   # (sid, episode_id) → background floor-first climb
+        series_fallback: list = []   # (idx, sid, title) → floor SeriesSearch fallback
+
+        def _mark_searched(idx: int, pid) -> None:
+            prev = df.at[idx, "pilot_search_attempts"]
+            df.at[idx, "pilot_search_attempts"]  = (int(prev) + 1) if prev and pd.notna(prev) else 1
+            df.at[idx, "pilot_last_searched_at"] = now_utc.isoformat()
+            df.at[idx, "pilot_last_profile_id"]  = pid
 
         # ── Series source (bulk snapshot, BOTH modes) ─────────────────────────
         # The tier DECISION (current profile + runtime) is read from a single O(1) snapshot of
@@ -3875,6 +3919,31 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             series = series_by_id.get(sid)
             if not series or not isinstance(series, dict):
                 stats["failed"] += 1
+                continue
+
+            # ── Within-run floor-first climb (default) ────────────────────────
+            # Resolve S01E01 and hand it to the background climb worker; the worker walks the
+            # ascending ladder and grabs at the lowest tier with a release. Mark the stub searched
+            # (at the floor, for the 24 h interval guard) whether or not the id resolves.
+            if pilot_climb:
+                ep_id = self._get_episode_id(
+                    instance, sid, 1, 1, series_ep_cache=_ep_cache,
+                    log_cache_miss=not use_tqdm, log_expired=not use_tqdm,
+                    allow_live=(not self.dry_run) and not use_tqdm,
+                )
+                _mark_searched(idx, _floor_pid)
+                changed = True
+                if ep_id:
+                    climb_items.append((sid, int(ep_id)))
+                else:
+                    series_fallback.append((idx, sid, title))
+                if self.dry_run:
+                    _what = "S01E01" if ep_id else "SeriesSearch (S01E01 id n/a)"
+                    _log(
+                        f"  [dry_run] PilotSearch would climb '{title}' {_what} floor-first "
+                        f"(≤{_climb_ladder[0][1]}p → ≤{_climb_ladder[-1][1]}p), grabbing at the "
+                        f"lowest available tier | why: stub pilot, no file"
+                    )
                 continue
 
             current_pid  = series.get("qualityProfileId")
@@ -4069,19 +4138,69 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     f"(≤{_tres}p, ~{_est:.2f} GB est) | why: stub pilot, no file"
                 )
 
-        # ── Batched search push ───────────────────────────────────────────────
+        # ── Dispatch: within-run floor-first climb (default) ──────────────────
+        if pilot_climb:
+            _unresolved = 0
+            if self.dry_run:
+                stats["searched"] = len(climb_items) + len(series_fallback)
+            else:
+                # Last-resort LIVE S01E01 id resolution for the few stubs the cache missed, so the
+                # climb only ever searches S01E01. A SeriesSearch would over-grab the WHOLE monitored
+                # series (every season) at the floor — the opposite of a single lowest-tier pilot probe.
+                # Still unresolved after a live GET → skip this run (re-probed next run), never
+                # whole-series searched.
+                for _idx, _sid, _title in series_fallback:
+                    try:
+                        _ep = self._get_episode_id(
+                            instance, _sid, 1, 1, allow_live=True,
+                            log_cache_miss=False, log_expired=False,
+                        )
+                    except Exception:
+                        _ep = None
+                    if _ep:
+                        climb_items.append((_sid, int(_ep)))
+                    else:
+                        _unresolved += 1
+                        self.logger.log_info(
+                            f"  ⏭️ PilotSearch '{_title}': S01E01 id unresolved — skipping this "
+                            f"run (re-probe next run; never whole-series searched)"
+                        )
+                if climb_items:
+                    self._spawn_pilot_climb_worker(instance, climb_items, _climb_ladder)
+                stats["searched"] = len(climb_items)
+            if changed and not self.dry_run:
+                self.save(instance, df)
+            _prefix = "[dry_run] " if self.dry_run else ""
+            self.logger.log_table(
+                ["Outcome", "Count"],
+                [
+                    ["climb searched",     stats["searched"]],
+                    ["id unresolved",      _unresolved],
+                    ["skipped recent",     stats["skipped_recent"]],
+                    ["failed",             stats["failed"]],
+                ],
+                title=f"[PilotSearch] {_prefix}'{instance}' floor-first climb "
+                      f"(≤{_climb_ladder[0][1]}p → ≤{_climb_ladder[-1][1]}p)",
+                caption="Within-run floor-first pilot climb: each pilot is searched UP the resolution "
+                        "ladder and grabbed at the LOWEST tier with a release, then left there for the "
+                        "watch-based upgrade path. Stubs whose S01E01 id can't be resolved are deferred "
+                        "(never whole-series searched).",
+                descriptions=[
+                    "pilots handed to the background climb worker (grab at lowest available tier)",
+                    "stubs whose S01E01 id stayed unresolved (cache + live miss) → deferred to next run",
+                    f"stubs skipped: searched within last {PILOT_SEARCH_INTERVAL_H}h",
+                    "search or profile-set calls that errored",
+                ],
+            )
+            return stats
+
+        # ── Batched search push (legacy escape-hatch paths) ───────────────────
         # EpisodeSearch accepts a list of episode ids, so issue one command per
         # chunk instead of one per series; SeriesSearch only takes a single id,
         # so the (rare) id-unavailable fallbacks are pushed individually. df
         # tracking is updated only for series whose push actually succeeded, so a
         # failed push leaves them eligible for retry on the next run.
         EPISODE_SEARCH_CHUNK = 100
-
-        def _mark_searched(idx: int, pid) -> None:
-            prev = df.at[idx, "pilot_search_attempts"]
-            df.at[idx, "pilot_search_attempts"]  = (int(prev) + 1) if prev and pd.notna(prev) else 1
-            df.at[idx, "pilot_last_searched_at"] = now_utc.isoformat()
-            df.at[idx, "pilot_last_profile_id"]  = pid
 
         if self.dry_run:
             stats["searched"] = len(queued) + len(series_queued)
@@ -4168,6 +4287,187 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             instance, f"series/{sid}", method="PUT", payload=fresh
         )
         return True
+
+    def _spawn_pilot_climb_worker(self, instance: str, items: list, ladder: list) -> None:
+        """Fire-and-forget background worker that grabs each stub pilot at its LOWEST available
+        resolution. ``items`` is ``[(sid, s01e01_episode_id), ...]``; ``ladder`` is the ascending
+        ``[(profile_id, max_resolution), ...]`` floor→widest tier list. Per series the worker flips
+        the series profile UP the ladder one tier at a time, searches S01E01, and STOPS at the first
+        tier that yields a grab — leaving the series at that low tier so the watch-based upgrade path
+        (run_active_watcher_upgrades / JIT) can raise it later. It is the mirror of the JIT step-DOWN
+        worker (:meth:`_jit_search_worker`).
+
+        Runs as a NON-daemon thread: it never blocks the pipeline (we do not join it), but the
+        interpreter waits for it on exit, so a half-climbed series is always left coherent (either at
+        the grabbed tier or reverted to its pre-climb profile)."""
+        import threading
+
+        items  = [(int(s), int(e)) for s, e in items if s is not None and e is not None]
+        ladder = [(int(p), int(r)) for p, r in ladder if p is not None]
+        if not items or not ladder:
+            return
+        threading.Thread(
+            target=self._pilot_climb_worker,
+            args=(instance, items, ladder),
+            name="pilot-climb-search",
+            daemon=False,
+        ).start()
+        self.logger.log_info(
+            f"[PilotSearch] Background floor-first climb started for {len(items)} pilot(s) "
+            f"across up to {min(self.JIT_SEARCH_MAX_WORKERS, len(items))} parallel worker(s) "
+            f"(ladder ≤{ladder[0][1]}p → ≤{ladder[-1][1]}p, {len(ladder)} tier(s))."
+        )
+
+    def _pilot_climb_worker(self, instance: str, items: list, ladder: list) -> None:
+        """Per stub pilot: climb the ascending profile ``ladder`` (floor→widest), searching S01E01 at
+        each tier and STOPPING at the first (lowest) tier that yields a grab — the series is LEFT at
+        that tier (NOT reverted), so it sits at the lowest available quality until the watch-based
+        upgrade path raises it. When no tier yields a release the series is reverted to its pre-climb
+        profile and re-probed next run.
+
+        Series climb CONCURRENTLY (each owns its own profile, so they are independent); each series'
+        ladder is strictly SEQUENTIAL (the shared series profile means tier N must finish before the
+        flip to tier N+1). Mirror of :meth:`_jit_search_worker` — see it for the concurrency model.
+
+        Mechanism assumption: setting a series to a profile whose max resolution is ≤Np makes Sonarr's
+        EpisodeSearch grab only releases ≤Np (profiles gate which qualities are valid for selection),
+        so flipping floor→up and stopping at the first grab yields the LOWEST available resolution.
+
+        Safe alongside the JIT step-down worker (also a background thread this run): the two never
+        contend for the same series' profile in any HARMFUL way. A never-watched series — the case
+        this feature targets — has NO ``next_episode`` flag (``_compute_next_episodes`` only walks
+        forward from a watched episode), so it is never a JIT candidate; the climb owns it outright.
+        The only overlap is a *watched* series that still has a missing S01E01 stub, and there JIT
+        keeping the series at its watch-appropriate tier is the desired outcome anyway."""
+        POLL_INTERVAL_S = 3.0
+        CMD_TIMEOUT_S   = 180.0
+        DONE_STATES     = ("completed", "failed", "aborted", "cancelled")
+
+        def _label(sid, info=None):
+            """Readable series id: ``sonarr/<instance> '<title>' (tvdb-<id>)``; ``info`` is any
+            already-fetched series dict (carries title + tvdbId) so it costs no extra request."""
+            if isinstance(info, dict):
+                title = (info.get("title") or "").strip()
+                if title:
+                    tvdb = info.get("tvdbId")
+                    tvdb_s = f"tvdb-{tvdb}" if tvdb else f"sid-{sid}"
+                    return f"sonarr/{instance} '{title}' ({tvdb_s})"
+            return f"sonarr/{instance} series {sid}"
+
+        def _wait_command(cid):
+            if not cid:
+                return
+            start = time.time()
+            while time.time() - start < CMD_TIMEOUT_S:
+                cmd = self.sonarr_api._make_request(instance, f"command/{cid}", fallback=None)
+                if (cmd or {}).get("status") in DONE_STATES:
+                    return
+                time.sleep(POLL_INTERVAL_S)
+
+        def _set_profile(sid, pid):
+            """Flip series ``sid`` to ``pid`` against fresh state (only PUTs when it actually
+            differs). Returns False if the fresh GET came back empty OR the PUT failed — so a
+            caller never searches at a tier it could not actually set (a silently-failed floor
+            flip would otherwise search at the series' original, possibly higher, profile and
+            grab high: the exact over-grab this feature exists to prevent)."""
+            s = self.sonarr_api._make_request(instance, f"series/{sid}", fallback=None)
+            if not (s and isinstance(s, dict)):
+                return False
+            if s.get("qualityProfileId") != pid:
+                s = dict(s)
+                s["qualityProfileId"] = pid
+                # _make_request returns the updated series on success, the fallback (None) on a
+                # failed write — so a None result means the flip did not land.
+                if self.sonarr_api._make_request(
+                    instance, f"series/{sid}", method="PUT", payload=s
+                ) is None:
+                    return False
+            return True
+
+        def _process_pilot(sid, ep_id):
+            original_pid = None
+            revert_pid = None
+            label = _label(sid)
+            try:
+                base = self.sonarr_api._make_request(instance, f"series/{sid}", fallback=None)
+                if not (base and isinstance(base, dict)):
+                    return
+                label = _label(sid, base)
+                # The pre-climb profile, captured ONCE, so a no-grab climb reverts to the TRUE
+                # original (never an intermediate rung). ``current`` tracks the ACTUAL profile (may
+                # be None if the series has none — then the first flip always PUTs); ``revert_pid``
+                # is the safe restore target, falling back to the floor when there's no original.
+                original_pid = base.get("qualityProfileId")
+                current = original_pid
+                revert_pid = original_pid if original_pid is not None else (
+                    ladder[0][0] if ladder else None)
+
+                # Already downloading (a prior run's grab still in the queue)? Leave it untouched —
+                # re-climbing would see that queue item and falsely "grab" at the floor, downgrading
+                # the series profile under an in-flight higher-tier download.
+                if self._episodes_in_queue(instance, [ep_id]):
+                    self.logger.log_info(
+                        f"  ⏳ Pilot {label}: S01E01 already in the download queue — skipping climb"
+                    )
+                    return
+
+                for pid, res in ladder:
+                    if current != pid:
+                        if not _set_profile(sid, pid):
+                            break
+                        current = pid
+                    # EpisodeSearch carries ONLY S01E01, so the climb can never grab another episode.
+                    _cmd = self.sonarr_api._make_request(
+                        instance, "command", method="POST",
+                        payload={"name": "EpisodeSearch", "episodeIds": [ep_id]},
+                    )
+                    _wait_command(_cmd.get("id") if isinstance(_cmd, dict) else None)
+                    if self._episodes_in_queue(instance, [ep_id]):
+                        self.logger.log_info(
+                            f"  ✅ Pilot grab: {label} grabbed S01E01 at ≤{res}p (profile {pid}) — "
+                            f"lowest available tier; left here for the watch-based upgrade path"
+                        )
+                        return   # SUCCESS — leave the series at this tier (do NOT revert)
+                    self.logger.log_info(
+                        f"  ⏫ Pilot climb: {label} found no S01E01 release at ≤{res}p "
+                        f"(profile {pid}) — climbing one tier"
+                    )
+
+                # Exhausted every tier with no grab → restore the pre-climb profile, retry next run.
+                self.logger.log_info(
+                    f"  ∅ Pilot: {label} found no S01E01 release across {len(ladder)} tier(s); "
+                    f"reverted, will re-probe next run"
+                )
+                if revert_pid is not None and current != revert_pid:
+                    _set_profile(sid, revert_pid)
+            except Exception as e:
+                self.logger.log_warning(
+                    f"[PilotSearch] Background climb failed for {label}: {e}"
+                )
+                try:  # best-effort revert — captured before any flip (floor if no original)
+                    if revert_pid is not None:
+                        _set_profile(sid, revert_pid)
+                except Exception:
+                    pass
+
+        # Run the climbs CONCURRENTLY (each pilot owns its own profile); writes to the one Sonarr
+        # instance still serialize on the per-instance write lock, but the long command/queue waits
+        # overlap instead of one pilot blocking the next. A single pilot stays on the sequential path.
+        if len(items) <= 1:
+            for sid, ep_id in items:
+                _process_pilot(sid, ep_id)
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            max_workers = min(self.JIT_SEARCH_MAX_WORKERS, len(items))
+            with ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="pilot-climb"
+            ) as ex:
+                futures = [ex.submit(_process_pilot, sid, ep_id) for sid, ep_id in items]
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:  # _process_pilot shouldn't raise, but stay defensive
+                        self.logger.log_warning(f"[PilotSearch] climb task crashed: {e}")
 
     def _get_total_space_gb(self, instance: str) -> float:
         """
@@ -4867,7 +5167,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         ).start()
         self.logger.log_info(
             f"[JIT] Background step-down search worker started for {len(items)} series "
-            f"({_group_count} tier-group(s))."
+            f"({_group_count} tier-group(s)) across up to "
+            f"{min(self.JIT_SEARCH_MAX_WORKERS, len(items))} parallel worker(s)."
         )
 
     def _jit_search_worker(self, instance: str, items: list) -> None:
@@ -4888,6 +5189,18 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         POLL_INTERVAL_S = 3.0
         CMD_TIMEOUT_S   = 180.0
         DONE_STATES     = ("completed", "failed", "aborted", "cancelled")
+
+        def _label(sid, info=None):
+            """Readable series id for the log: ``sonarr/<instance> '<title>' (tvdb-<id>)``.
+            ``info`` is any series dict already fetched (it carries title + tvdbId), so this
+            costs no extra request; falls back to the raw id when the title is unknown."""
+            if isinstance(info, dict):
+                title = (info.get("title") or "").strip()
+                if title:
+                    tvdb = info.get("tvdbId")
+                    tvdb_s = f"tvdb-{tvdb}" if tvdb else f"sid-{sid}"
+                    return f"sonarr/{instance} '{title}' ({tvdb_s})"
+            return f"sonarr/{instance} series {sid}"
 
         def _wait_command(cid):
             if not cid:
@@ -4910,17 +5223,26 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     instance, f"series/{sid}", method="PUT", payload=fresh
                 )
                 self.logger.log_info(
-                    f"  ↩️ JIT QP revert: series {sid} → profile {original_pid}"
+                    f"  ↩️ JIT QP revert: {_label(sid, fresh)} → profile {original_pid}"
                 )
 
-        failed_all: list = []
+        def _process_series(sid, groups) -> list:
+            """Run ONE series' step-down ladder and return its not-grabbed episodes.
 
-        for sid, groups in items:
+            Every series owns its own profile (flip + revert) and its own
+            episodeIds, so series are independent and run concurrently. The
+            ladder WITHIN a series stays strictly sequential — that is what
+            preserves the group-by-tier invariant (a lower-target episode is
+            never searched while the profile is flipped to a higher tier).
+            """
+            failed: list = []
             original_pid = None
+            label = _label(sid)
             try:
                 base = self.sonarr_api._make_request(instance, f"series/{sid}", fallback=None)
                 if not (base and isinstance(base, dict)):
-                    continue
+                    return failed
+                label = _label(sid, base)
                 # Capture the pre-flip profile ONCE, before any group bumps the QP, so the
                 # end-of-series revert always restores the true original (never an intermediate
                 # group's tier).
@@ -4952,34 +5274,58 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                         if grabbed_now:
                             remaining -= grabbed_now
                             self.logger.log_info(
-                                f"  ✅ JIT grab: series {sid} grabbed {len(grabbed_now)} ep(s) "
+                                f"  ✅ JIT grab: {label} grabbed {len(grabbed_now)} ep(s) "
                                 f"at profile {pid} (≤{tier_res}p tier, {len(remaining)} still searching)"
                             )
                         else:
                             self.logger.log_info(
-                                f"  ⏬ JIT step-down: series {sid} found nothing at profile {pid}"
+                                f"  ⏬ JIT step-down: {label} found nothing at profile {pid}"
                             )
 
                     if remaining:
                         self.logger.log_info(
-                            f"  ∅ JIT: series {sid} — {len(remaining)} ep(s) in the ≤{tier_res}p "
+                            f"  ∅ JIT: {label} — {len(remaining)} ep(s) in the ≤{tier_res}p "
                             f"tier found no release across {len(step_pids)} profile(s); "
                             f"queued for retry next run"
                         )
                         for _eid in remaining:
                             _sn, _en = ep_meta[_eid]
-                            failed_all.append({"series_id": sid, "season": _sn, "episode": _en})
+                            failed.append({"series_id": sid, "season": _sn, "episode": _en})
 
                 # Revert ONCE per series, after the last group, to the captured pre-flip profile.
                 _revert(sid, original_pid)
             except Exception as e:
                 self.logger.log_warning(
-                    f"[JIT] Background step-down search failed for series {sid}: {e}"
+                    f"[JIT] Background step-down search failed for {label}: {e}"
                 )
                 try:  # best-effort revert on error — original_pid was captured before any flip
                     _revert(sid, original_pid)
                 except Exception:
                     pass
+            return failed
+
+        # Run the series ladders CONCURRENTLY. Each ladder is independent (its own
+        # profile + episodeIds); writes to the one Sonarr instance still serialize on
+        # the per-instance write lock, but the long command/queue waits now overlap
+        # instead of one series blocking the next. Each _process_series swallows its
+        # own errors and returns its failed list, so a single bad series can't sink
+        # the pool, and the QP is reverted on every path.
+        failed_all: list = []
+        if len(items) <= 1:
+            for sid, groups in items:
+                failed_all.extend(_process_series(sid, groups))
+        else:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            max_workers = min(self.JIT_SEARCH_MAX_WORKERS, len(items))
+            with ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="jit-search"
+            ) as ex:
+                futures = [ex.submit(_process_series, sid, groups) for sid, groups in items]
+                for fut in as_completed(futures):
+                    try:
+                        failed_all.extend(fut.result() or [])
+                    except Exception as e:  # _process_series shouldn't raise, but stay defensive
+                        self.logger.log_warning(f"[JIT] step-down series task crashed: {e}")
 
         # Persist not-grabbed episodes so the next run re-enables them.
         if failed_all and self.global_cache:
