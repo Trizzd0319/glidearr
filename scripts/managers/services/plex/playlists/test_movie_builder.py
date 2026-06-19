@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from scripts.managers.services.plex.playlists.movie_builder import (
     _PLAN_KEY,
+    _PROTECTED_KEY,
     MoviePlaylistBuilderManager,
 )
 
@@ -51,6 +52,26 @@ def test_builds_movie_plan_ranked_by_score():
     res = _mgr(cache)._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
     assert res == {"users": 1, "built": 1, "can_build": True}
     assert _items(cache, "rob") == ["hi", "lo"]               # higher household score leads
+
+
+def test_publishes_protected_tmdbs_for_the_delete_shield():
+    # The movie builder must publish the union of recommended movie tmdbIds so the space
+    # coordinator can shield them from deletion (don't delete what we recommend).
+    cache = _Cache()
+    owned = [_movie(7, "A", 2000, 80), _movie(8, "B", 2010, 90)]
+    inv = {"7": {"rating_key": "a"}, "8": {"rating_key": "b"}}
+    _mgr(cache)._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
+    assert cache.get(_PROTECTED_KEY) == {"tmdbs": [7, 8]}     # both planned movies, by tmdb_id
+
+
+def test_protected_tmdbs_exclude_age_gated_movies():
+    # A kid's plan excludes the R-rated movie, so its tmdb must NOT be published as protected.
+    cache = _Cache()
+    owned = [_movie(7, "Kids", 2000, 50, cert="G"), _movie(8, "Adult", 2010, 90, cert="R")]
+    inv = {"7": {"rating_key": "k"}, "8": {"rating_key": "r"}}
+    tracked = [{"safe_user": "wyatt", "title": "Wyatt", "restriction_profile": "little_kid"}]
+    _mgr(cache)._build_for_users(tracked, owned, inv, {"wyatt": set()}, {"wyatt": {}})
+    assert cache.get(_PROTECTED_KEY) == {"tmdbs": [7]}        # only the kid-safe movie is recommended
 
 
 def test_no_inventory_short_circuits_with_actionable_warn():

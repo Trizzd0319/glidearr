@@ -31,6 +31,9 @@ from scripts.managers.services.plex.playlists.movie_resolver import (
 
 _INVENTORY_KEY = "plex/movies/owned_inventory"
 _PLAN_KEY = "plex/playlists/movie_plan"          # + /{safe_user}
+# Union of movie tmdbIds recommended this run — the space coordinator reads it to SHIELD
+# them from the delete pool (never delete a title we are actively recommending).
+_PROTECTED_KEY = "plex/playlists/protected_movie_tmdbs/movie"
 
 
 class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
@@ -84,6 +87,8 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
         display = {str(v.get("rating_key")):
                    (f"{v.get('title', '')} ({v.get('year')})" if v.get("year") else (v.get("title", "") or str(v.get("rating_key"))))
                    for v in inventory.values() if v.get("rating_key")}
+        rk_to_tmdb = self._inventory_rk_to_tmdb(inventory)   # plan ratingKey -> Radarr tmdbId
+        protected: set = set()                               # recommended movie tmdbIds (delete shield)
         built = 0
         for u in tracked:
             watched = watched_by_user.get(u["safe_user"], set())
@@ -124,11 +129,43 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                                            family="up_next", max_items=self._max_items())
             if self.global_cache:
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))
+            protected.update(t for i in plan.items
+                             if (t := rk_to_tmdb.get(str(i.rating_key))) is not None)
             reasons = self._movie_reasons(user_owned, inventory, user_aff)
             self._log_preview(u, plan, stats, display, reasons, label="movie")
             built += 1
+        self._publish_protected_movie_tmdbs(_PROTECTED_KEY, protected)
         self.logger.log_info(f"[MoviePlaylists] built {built} per-user movie plan(s) (dry-run — no Plex writes).")
         return {"users": len(tracked), "built": built, "can_build": True}
+
+    # ── space-coordinator delete shield ──────────────────────────────────────────
+    @staticmethod
+    def _inventory_rk_to_tmdb(inventory) -> dict:
+        """ratingKey(str) → tmdb_id(int), inverted from the owned-movie inventory (keyed by
+        tmdb_id). Lets a built plan's opaque rating_keys be mapped back to the Radarr tmdbIds
+        the space-coordinator delete pool keys on."""
+        out: dict = {}
+        for k, v in (inventory or {}).items():
+            rk = v.get("rating_key") if isinstance(v, dict) else None
+            if rk is None:
+                continue
+            try:
+                out[str(rk)] = int(k)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _publish_protected_movie_tmdbs(self, key, tmdbs) -> None:
+        """Publish (overwrite, per run) the union of movie tmdbIds recommended across every
+        user's plan, so the space coordinator can SHIELD them from deletion — never delete a
+        title we are actively recommending, most importantly a child's top Up Next pick.
+        Best-effort; stored as ``{"tmdbs": [...]}`` so the JSON cache layer never sees a bare list."""
+        if not self.global_cache:
+            return
+        try:
+            self.global_cache.set(key, {"tmdbs": sorted({int(t) for t in tmdbs if t is not None})})
+        except Exception:
+            pass
 
     # ── movie-specific I/O ──────────────────────────────────────────────────────
     @staticmethod

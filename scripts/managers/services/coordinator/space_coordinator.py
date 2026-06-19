@@ -258,6 +258,18 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                             f"[SpaceCoordinator] {added} reclaimable 4K copy(ies) on '{uhd_inst}' "
                             f"(1080p baseline survives → reclaimed before any whole title).")
 
+        # Shield titles the per-user playlists are actively recommending (esp. a kid's top
+        # picks) from the delete pool. The household-blended watchability score can dilute a
+        # child's clear favourite below the delete ceiling, and deleting what we just put in
+        # someone's Up Next is self-defeating. Whole titles only — reclaimable 4K bonus copies
+        # still go (their 1080p baseline survives). Opt out via space_protect_playlist_picks=false.
+        pool, _shielded = self._shield_protected_picks(pool)
+        if _shielded:
+            self.logger.log_info(
+                f"[SpaceCoordinator] shielded {_shielded} recommended title(s) from the delete "
+                f"pool (currently in a user's Up Next playlist)."
+            )
+
         if not pool:
             self.logger.log_info("[SpaceCoordinator] no eligible delete candidates — nothing to do.")
             stats["action"] = "no_candidates"
@@ -331,6 +343,54 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         # ── Stage 3: restore recovered ──────────────────────────────────────────
         stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, uhd_inst=uhd_inst)
         return stats
+
+    # ── playlist-pick delete shield ──────────────────────────────────────────────
+    @staticmethod
+    def _as_int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    def _protected_playlist_tmdbs(self) -> set:
+        """Union of movie tmdbIds the movie + combined playlist builders published this run as
+        currently-recommended (per-user Up Next plans). Empty when the builders did not run /
+        published nothing — in which case the shield is a no-op (fail-open is fine: it only ever
+        REMOVES candidates from deletion, never adds)."""
+        out: set = set()
+        cache = getattr(self, "global_cache", None)
+        if not cache:
+            return out
+        for key in ("plex/playlists/protected_movie_tmdbs/movie",
+                    "plex/playlists/protected_movie_tmdbs/combined"):
+            try:
+                blob = cache.get(key) or {}
+            except Exception:
+                blob = {}
+            for v in (blob.get("tmdbs") or []):
+                iv = self._as_int(v)
+                if iv is not None:
+                    out.add(iv)
+        return out
+
+    def _shield_protected_picks(self, pool: "list[dict]") -> "tuple[list[dict], int]":
+        """Drop whole-title movie candidates whose tmdb_id is in the current per-user playlist
+        plans from the delete pool. 4K bonus copies (``is_uhd_copy``) are NOT shielded — their
+        1080p baseline survives, so reclaiming them loses no recommended title. No-op when the
+        ``space_protect_playlist_picks`` flag is off (default ON) or no plans were published."""
+        if not (self.config or {}).get("space_protect_playlist_picks", True):
+            return pool, 0
+        protected = self._protected_playlist_tmdbs()
+        if not protected:
+            return pool, 0
+        kept, shielded = [], 0
+        for c in pool:
+            if (c.get("service") == "movie" and not c.get("is_uhd_copy")
+                    and self._as_int(c.get("tmdb_id")) in protected):
+                shielded += 1
+                continue
+            kept.append(c)
+        return kept, shielded
 
     # ── Helpers ──────────────────────────────────────────────────────────────────
     def _read_free(self, radarr_sp, radarr_inst, sonarr_sp, sonarr_inst) -> float:

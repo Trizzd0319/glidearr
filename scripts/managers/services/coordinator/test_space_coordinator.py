@@ -88,6 +88,44 @@ def test_select_for_target():
     _check("empty pool -> empty", sel5 == [] and proj5 == 0.0)
 
 
+# ── playlist-pick delete shield ───────────────────────────────────────────────
+class _Cache:
+    def __init__(self, d): self.d = d
+    def get(self, key, default=None): return self.d.get(key, default)
+
+
+def test_shield_protected_picks():
+    print("test_shield_protected_picks:")
+    cache = _Cache({
+        "plex/playlists/protected_movie_tmdbs/movie": {"tmdbs": [12, 34]},
+        "plex/playlists/protected_movie_tmdbs/combined": {"tmdbs": [34, 56]},
+    })
+    pool = [
+        _cand("movie", 5, 2.0, tmdb_id=12, fid=1),                       # recommended -> shielded
+        _cand("movie", 5, 2.0, tmdb_id=99, fid=2),                       # not recommended -> kept
+        _cand("movie", 5, 2.0, tmdb_id=56, is_uhd_copy=True, fid=3),     # reclaimable 4K copy -> kept
+        _cand("episode", 5, 2.0, tmdb_id=34, fid=4),                     # episode -> not movie-shielded
+    ]
+    mgr = object.__new__(C)
+    mgr.config = {}
+    mgr.global_cache = cache
+    kept, shielded = mgr._shield_protected_picks(pool)
+    kept_ids = [c["fid"] for c in kept]
+    _check("shields recommended whole movie", 1 not in kept_ids and shielded == 1, f"kept={kept_ids}")
+    _check("keeps non-recommended movie", 2 in kept_ids)
+    _check("keeps reclaimable 4K copy even when recommended", 3 in kept_ids)
+    _check("keeps episode candidate (movie shield only)", 4 in kept_ids)
+
+    mgr.config = {"space_protect_playlist_picks": False}            # opt-out disables the shield
+    kept2, shielded2 = mgr._shield_protected_picks(pool)
+    _check("flag off disables shield", len(kept2) == 4 and shielded2 == 0)
+
+    mgr.config = {}
+    mgr.global_cache = _Cache({})                                  # no published plans -> no-op
+    kept3, shielded3 = mgr._shield_protected_picks(pool)
+    _check("no plans -> no-op", len(kept3) == 4 and shielded3 == 0)
+
+
 def test_critic_sort():
     print("test_critic_sort:")
     _check("None -> 5.0", C._critic_sort(None) == 5.0)

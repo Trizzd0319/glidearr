@@ -27,6 +27,9 @@ from scripts.managers.services.plex.playlists.tv_resolver import tv_inputs
 _TV_INVENTORY_KEY = "plex/episodes/owned_inventory"
 _MOVIE_INVENTORY_KEY = "plex/movies/owned_inventory"
 _PLAN_KEY = "plex/playlists/combined_plan"          # + /{safe_user}
+# Union of movie tmdbIds in the combined plans — the space coordinator reads it (alongside
+# the movie-only key) to shield recommended titles from the delete pool.
+_PROTECTED_KEY = "plex/playlists/protected_movie_tmdbs/combined"
 
 
 class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
@@ -69,6 +72,8 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                       (f"{v.get('title', '')} ({v.get('year')})" if v.get("year") else (v.get("title", "") or str(v.get("rating_key"))))
                       for v in (movie_inv or {}).values() if v.get("rating_key")}
         display = {**tv_display, **mv_display}
+        rk_to_tmdb = self._inventory_rk_to_tmdb(movie_inv)   # plan ratingKey -> Radarr tmdbId
+        protected: set = set()                               # recommended movie tmdbIds (delete shield)
         built = 0
         for u in tracked:
             user_aff = affinity.get(u["safe_user"]) or {}
@@ -108,6 +113,8 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                                               max_items=self._max_items())
             if self.global_cache:
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))
+            protected.update(t for i in plan.items
+                             if (t := rk_to_tmdb.get(str(i.rating_key))) is not None)
 
             reasons = {**self._tv_reasons(eps, tv_inv, series_genres, user_aff, user_jit),
                        **self._movie_reasons(movies, movie_inv, user_aff)}
@@ -119,5 +126,6 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                 f"{bm.get('movie', 0)} movie candidate(s), {len(plan.items)} in plan.")
             self._log_preview(u, plan, stats, display, reasons, kinds=kinds, label="item")
             built += 1
+        self._publish_protected_movie_tmdbs(_PROTECTED_KEY, protected)
         self.logger.log_info(f"[ComboPlaylists] built {built} per-user combined plan(s) (dry-run — no Plex writes).")
         return {"users": len(tracked), "built": built, "can_build": True}
