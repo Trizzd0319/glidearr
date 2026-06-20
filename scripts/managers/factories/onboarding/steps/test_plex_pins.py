@@ -424,13 +424,16 @@ def test_profile_ages_auto_detect_and_operator_pick(monkeypatch):
         "Wyatt": "little_kid", "Aiden / Raina": "teen"}     # owner excluded; adult not stored
 
 
-def test_profile_ages_adult_not_stored(monkeypatch):
-    p = _Prompter(choices={"plex.profile_ages.Wyatt": "adult"})   # override detected → adult
+def test_profile_ages_adult_stored_only_when_plex_unrestricted(monkeypatch):
+    # Adult chosen for Wyatt (Plex restricts him → little_kid): NOT stored — we never override a
+    # real Plex restriction and un-gate a kid. Aiden/Raina (no Plex restriction) default to adult
+    # and ARE stored, so the ungated-managed-profile warning knows it's an intentional adult.
+    p = _Prompter(choices={"plex.profile_ages.Wyatt": "adult"})
     cfg = {"plex": {}}
     PlexStep(logger=None)._configure_profile_ages(p, cfg, _AGE_ROSTER)
-    # Wyatt overridden to adult → dropped; Aiden/Raina defaults to adult (None) → dropped
-    assert cfg["plex"].get("playlists", {}).get("profile_ages") == {} or \
-        "Wyatt" not in cfg["plex"].get("playlists", {}).get("profile_ages", {})
+    ages = cfg["plex"].get("playlists", {}).get("profile_ages", {})
+    assert "Wyatt" not in ages                        # adult-over-restriction → not persisted
+    assert ages.get("Aiden / Raina") == "adult"       # explicit adult, no Plex tier → recorded
 
 
 # ── _configure_playlists (the opt-in playlist toggles) ────────────────────────

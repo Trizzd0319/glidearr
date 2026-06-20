@@ -254,9 +254,10 @@ class PlexStep(Step):
         """Per-profile age tier → ``plex.playlists.profile_ages`` so playlists are gated
         to age-appropriate content. Auto-DETECTS each managed profile's tier from Plex's
         restriction profile and lets the operator confirm/adjust (the auto-detect isn't
-        guaranteed on every PMS, so the confirm is the reliable path). Only non-adult
-        tiers are stored (adult is the default). No-op headless / when no managed
-        profiles were listed."""
+        guaranteed on every PMS, so the confirm is the reliable path). Non-adult tiers are
+        stored; an explicit 'adult' is stored ONLY for a profile Plex does NOT restrict (so the
+        ungated-managed-profile warning knows it's intentional) — never as an override of a real
+        Plex restriction. No-op headless / when no managed profiles were listed."""
         managed = [u for u in (roster or []) if isinstance(u, dict)
                    and not u.get("is_admin") and (u.get("title") or "").strip()]
         if not managed:
@@ -278,8 +279,14 @@ class PlexStep(Step):
                 _AGE_TIERS, default=ages.get(title) or detected) or "adult").strip().lower()
             if tier in _AGE_TIERS and tier != "adult":
                 ages[title] = tier
+            elif tier == "adult" and not u.get("restriction_profile"):
+                # Explicit adult for a profile Plex does NOT restrict: RECORD it. Without an entry
+                # the ungated-managed-profile warning keeps nagging (it reads a missing entry as
+                # "forgot to gate", not "intentionally adult"). We do NOT store adult OVER a Plex
+                # restriction — that would override Plex and un-gate a real kid.
+                ages[title] = "adult"
             else:
-                ages.pop(title, None)        # adult = default → don't persist
+                ages.pop(title, None)        # adult over a Plex-restricted profile → don't override
         if ages:
             pl["profile_ages"] = ages
         else:
