@@ -22,6 +22,7 @@ from scripts.managers.machine_learning.playlists.cert_gate import (
 )
 from scripts.managers.machine_learning.playlists.per_user import genre_match, priority_score
 from scripts.managers.machine_learning.playlists.rationale import explain_reason
+from scripts.managers.services.plex._common import anon_label
 from scripts.managers.services.plex.playlists.builder import PlexPlaylistBuilderManager
 from scripts.managers.services.plex.playlists.movie_resolver import (
     _coll_key,
@@ -105,7 +106,7 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
         rk_to_tmdb = self._inventory_rk_to_tmdb(inventory)   # plan ratingKey -> Radarr tmdbId
         protected: set = set()                               # recommended movie tmdbIds (delete shield)
         built = 0
-        for u in tracked:
+        for idx, u in enumerate(tracked, 1):
             watched = watched_by_user.get(u["safe_user"], set())
             user_aff = affinity_by_user.get(u["safe_user"]) or {}
 
@@ -131,9 +132,10 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
             gate_note = (f", age-gated {len(user_owned)}/{len(owned)} movie(s)"
                          if is_restricted(level) else "")
             self.logger.log_info(
-                f"[MoviePlaylists] '{u.get('title')}' -> tautulli={u.get('tautulli_username') or '-'}, "
-                f"affinity={len(user_aff)} genre(s) [{top_genres}], watched={n_watched} movie(s), "
-                f"tier={tier_name}{gate_note}")
+                f"[MoviePlaylists] {anon_label(u.get('title'), tier_name, idx)} -> "
+                f"tautulli={'matched' if u.get('tautulli_username') else '-'}, "
+                f"affinity={len(user_aff)} genre(s) [{top_genres}], watched={n_watched} movie(s)"
+                f"{gate_note}")
 
             # RANK: user-affinity > household (no JIT for movies). household normalised so a
             # household-favourite can't dominate by raw magnitude.

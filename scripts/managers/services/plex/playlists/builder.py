@@ -32,6 +32,7 @@ from scripts.managers.machine_learning.playlists.per_user import (
     priority_score,
 )
 from scripts.managers.machine_learning.playlists.rationale import explain_reason
+from scripts.managers.services.plex._common import anon_label
 from scripts.managers.services.plex.playlists.readiness import diagnose_tv_readiness
 from scripts.managers.services.plex.playlists.tv_resolver import (
     build_tv_plan,
@@ -123,7 +124,7 @@ class PlexPlaylistBuilderManager(BaseManager):
 
         display = self._display_map(inventory)
         built = 0
-        for u in tracked:
+        for idx, u in enumerate(tracked, 1):
             watched = watched_by_user.get(u["safe_user"], set())
             user_aff = affinity_by_user.get(u["safe_user"]) or {}
             user_jit = jit_by_user.get(u["safe_user"], set())
@@ -157,9 +158,10 @@ class PlexPlaylistBuilderManager(BaseManager):
             # episode) + (series,title)); count the ratingKey strings for the episode tally.
             n_watched = sum(1 for x in watched if isinstance(x, str))
             self.logger.log_info(
-                f"[Playlists] '{u.get('title')}' -> tautulli={u.get('tautulli_username') or '-'}, "
+                f"[Playlists] {anon_label(u.get('title'), tier_name, idx)} -> "
+                f"tautulli={'matched' if u.get('tautulli_username') else '-'}, "
                 f"affinity={len(user_aff)} genre(s) [{top_genres}], watched={n_watched} ep, "
-                f"jit={len(user_jit)}, tier={tier_name}{gate_note}")
+                f"jit={len(user_jit)}{gate_note}")
 
             # RANK each series for this user: user-affinity > JIT > household (weighted).
             # household is normalised so a household-favourite can't dominate by raw

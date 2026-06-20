@@ -12,6 +12,16 @@ _TYPE = {"1": "movie", "2": "show", "movie": "movie", "show": "show",
          "episode": "episode", "season": "show", "4": "episode"}
 
 
+def anon_label(title, tier: str, index: int) -> str:
+    """De-identified profile handle for LOGS: ``'{initial} - {tier} {n}'`` (e.g. ``'W - little_kid
+    1'``). A profile NAME is PII (like a token/PIN) and shouldn't land in a shareable run log, but
+    the operator still needs to act ("which profile do I age-gate?") and tell two apart. So we log
+    the first INITIAL + the resolved age tier + a stable 1-based number — enough to recognise your
+    own household, nothing a stranger can use. ``tier`` is the resolved tier (or ``'unknown'``)."""
+    initial = (str(title or "?").strip()[:1] or "?").upper()
+    return f"{initial} - {tier} {index}"
+
+
 def metadata_items(resp) -> list:
     """The ``Metadata`` list from a MediaContainer response (or ``[]``)."""
     if not isinstance(resp, dict):

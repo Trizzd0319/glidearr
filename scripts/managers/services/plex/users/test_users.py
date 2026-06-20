@@ -186,7 +186,11 @@ def test_warn_ungated_managed_users_fires_for_managed_without_tier_or_override()
     m._warn_ungated_managed_users(roster)
     assert len(m.logger.warnings) == 1
     w = m.logger.warnings[0]
-    assert "Aiden" in w and "Mom" in w                       # only the ungated managed profiles
+    # DE-IDENTIFIED: full names are PII and must NOT appear; the two ungated profiles show as
+    # '{initial} - unknown {n}', sorted (Aiden, Mom) and numbered.
+    assert "Aiden" not in w and "Mom" not in w
+    assert "A - unknown 1" in w and "M - unknown 2" in w
+    assert "2 managed profile(s)" in w
     assert "Wyatt" not in w and "Kidd" not in w and "Trizzd" not in w
 
 

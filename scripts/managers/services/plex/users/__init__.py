@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.cache.key_builder import _sanitize_part
+from scripts.managers.services.plex._common import anon_label
 from scripts.support.utilities.logger.logger import LoggerManager
 
 _USERS_KEY = "plex/users"
@@ -140,8 +141,9 @@ class PlexUsersManager(BaseManager):
         (and without a ``plex.playlists.profile_ages`` override) the playlist age-gate falls
         OPEN to ADULT, so a managed child profile silently receives the full, unfiltered
         household plan. We never guess a tier (that would over-gate a legitimate adult Home
-        member like a spouse), so instead we warn LOUDLY — once per run — naming each profile
-        so the operator can add a profile_ages entry for any that are children."""
+        member like a spouse), so instead we warn LOUDLY — once per run — DE-IDENTIFYING each profile in the
+        log (initial + tier + number, never the full name — a name is PII), numbered so the
+        operator can tell which to add a profile_ages entry for."""
         pl = ((self.config.get("plex", {}) if self.config else {}).get("playlists", {}) or {})
         overrides = {str(k).strip().lower() for k in (pl.get("profile_ages") or {})}
         ungated = []
@@ -153,12 +155,14 @@ class PlexUsersManager(BaseManager):
                 continue                                  # operator already set an explicit age
             ungated.append(title or str(u.get("uuid") or "?"))
         if ungated:
+            # De-identify for the log: '{initial} - unknown {n}', sorted for a stable number.
+            labels = [anon_label(t, "unknown", i) for i, t in enumerate(sorted(ungated), 1)]
             self.logger.log_warning(
-                f"[PlexUsers] age tier UNKNOWN for managed profile(s): {', '.join(ungated)}. "
-                "Plex reported no restrictionProfile and no plex.playlists.profile_ages "
-                "override is set, so their Up Next playlists fail OPEN to ADULT (unfiltered). "
-                "Add a profile_ages entry (little_kid / older_kid / teen) for any that are "
-                "children.")
+                f"[PlexUsers] age tier UNKNOWN for {len(labels)} managed profile(s): "
+                f"{', '.join(labels)}. Plex reported no restrictionProfile and no "
+                "plex.playlists.profile_ages override is set, so their Up Next playlists fail "
+                "OPEN to ADULT (unfiltered). Add a profile_ages entry (little_kid / older_kid / "
+                "teen) for any that are children.")
 
     # ── network steps ─────────────────────────────────────────────────────────
     def _probe_scope(self) -> bool:
