@@ -290,6 +290,11 @@ def empty_config() -> dict:
                  #     acquisitions (movies) added within acquired_window_days — keyed on Radarr's
                  #     churn-immune movie.added (NOT the file date, which upgrades/re-grabs bump).
                  #     OFF by default → no fresh plan is built/cached.
+                 #   home_collections: build the age-tiered "Up Next - <Tier>" Plex COLLECTIONS and
+                 #     pin them to Home (the adult/family view). REAL Plex writes (create + managed-
+                 #     hub promotion), so OFF by default AND gated on dry_run=false. promote_home →
+                 #     the owner's Home; promote_shared → managed/friends' Homes (managed kids can't
+                 #     render promoted collections — a Plex limit — so it's an owner/family aid).
                  #   cold_start_kids_prior: for a restricted profile with no watch history of its
                  #     own, seed its playlist from the household's engagement with age-appropriate
                  #     content (a parent co-viewing kid shows) instead of a flat household order.
@@ -310,6 +315,7 @@ def empty_config() -> dict:
                      "profile_ages": {},
                      "recency_boost": {"enabled": False, "window_days": 30},
                      "fresh_arrivals": {"enabled": False, "acquired_window_days": 45},
+                     "home_collections": {"enabled": False, "promote_home": True, "promote_shared": False},
                  }},
         "mdblist": {"apikey": ""},   # opt-in: aggregated ratings + lists. apikey -> keyring.
         "dry_run": True,

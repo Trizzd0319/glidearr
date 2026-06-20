@@ -25,6 +25,7 @@ def test_playlists_block_is_fully_keyed_and_inert():
     assert pl["writeback"] == {"enabled": False}
     assert pl["recency_boost"] == {"enabled": False, "window_days": 30}
     assert pl["fresh_arrivals"] == {"enabled": False, "acquired_window_days": 45}
+    assert pl["home_collections"] == {"enabled": False, "promote_home": True, "promote_shared": False}
     # Captured builder knobs mirror the inline defaults.
     assert pl["max_items"] == 100
     assert pl["episode_cap"] == 5
@@ -96,6 +97,9 @@ def test_doc_leaves_cover_the_headless_playlist_knobs():
         "plex.playlists.recency_boost.enabled",
         "plex.playlists.fresh_arrivals.enabled",
         "plex.playlists.fresh_arrivals.acquired_window_days",
+        "plex.playlists.home_collections.enabled",
+        "plex.playlists.home_collections.promote_home",
+        "plex.playlists.home_collections.promote_shared",
     ):
         assert p in paths
 

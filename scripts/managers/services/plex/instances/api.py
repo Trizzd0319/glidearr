@@ -354,6 +354,59 @@ class PlexAPI:
         return self._request("DELETE", f"{self.base_url}/playlists/{playlist_rk}",
                              token=token, fallback=fallback)
 
+    # ── library COLLECTIONS: write + Home promotion (owner-token; the managed-hub API) ──
+    # Mirrors python-plexapi's Collection.create + ManagedHub.updateVisibility (the proven path):
+    # a collection is a section-scoped, non-smart item list; promoting it to Home is the separate
+    # /hubs/sections/{key}/manage call keyed by the collection's ratingKey (metadataItemId).
+    def create_collection(self, section_key, title: str, rating_keys, *, item_type: int = 1,
+                          token: str | None = None, fallback=None):
+        """POST /library/collections — create a NON-smart collection of ``rating_keys`` in the
+        library SECTION ``section_key``. Items ride the ``uri`` QUERY param (the same
+        ``server://…/library/metadata/{rk,…}`` shape playlists use), never a body. ``item_type``
+        is the Plex search type of the members (1=movie, 2=show) — a movie collection is type 1.
+        Like create_playlist, Plex answers in XML so the JSON client yields ``fallback`` even on
+        success; the caller re-GETs the section's collections to capture the new ratingKey."""
+        params = {"uri": self._library_uri(rating_keys), "type": item_type,
+                  "title": title, "smart": 0, "sectionId": section_key}
+        return self._request("POST", f"{self.base_url}/library/collections", token=token,
+                             params=params, fallback=fallback)
+
+    def add_collection_items(self, collection_rk, rating_keys, token: str | None = None, fallback=None):
+        """PUT /library/collections/{rk}/items?uri=… — append ``rating_keys`` to an existing
+        (non-smart) collection."""
+        return self._request("PUT", f"{self.base_url}/library/collections/{collection_rk}/items",
+                             token=token, params={"uri": self._library_uri(rating_keys)},
+                             fallback=fallback)
+
+    def remove_collection_item(self, collection_rk, item_rk, token: str | None = None, fallback=None):
+        """DELETE /library/collections/{rk}/items/{itemRatingKey} — remove ONE member by its
+        ratingKey (unlike playlists, whose items take a per-playlist playlistItemID)."""
+        return self._request("DELETE",
+                             f"{self.base_url}/library/collections/{collection_rk}/items/{item_rk}",
+                             token=token, fallback=fallback)
+
+    def get_managed_hubs(self, section_key, fallback=None):
+        """GET /hubs/sections/{key}/manage — the section's managed-Recommendations rows + their
+        visibility flags (promotedToOwnHome / promotedToSharedHome / …), so a promoted collection's
+        hub can be found and its state read before re-promoting."""
+        return self._request("GET", f"{self.base_url}/hubs/sections/{section_key}/manage",
+                             fallback=fallback)
+
+    def promote_collection_home(self, section_key, collection_rk, *, home: bool = True,
+                                shared: bool = False, recommended: bool = False,
+                                token: str | None = None, fallback=None):
+        """POST /hubs/sections/{key}/manage — promote a (not-yet-managed) collection onto a Home
+        screen by its ratingKey. Plex keys a brand-new managed hub by ``metadataItemId`` (the
+        collection's rk). ``promotedToOwnHome`` surfaces it on the OWNER's Home; ``promotedToShared
+        Home`` on managed/friends' Homes (managed kids can't render promoted collections — a Plex
+        limit — so this is an owner/family aid). Booleans go as 0/1 query params (per plexapi)."""
+        params = {"metadataItemId": collection_rk,
+                  "promotedToRecommended": int(bool(recommended)),
+                  "promotedToOwnHome": int(bool(home)),
+                  "promotedToSharedHome": int(bool(shared))}
+        return self._request("POST", f"{self.base_url}/hubs/sections/{section_key}/manage",
+                             token=token, params=params, fallback=fallback)
+
     # ── plex.tv ACCOUNT v2 (UNSTABLE) ───────────────────────────────────────
     def get_account(self, fallback=None):
         """GET plex.tv/api/v2/user — token-scope probe. The HARD gate (DESIGN §4.2)."""

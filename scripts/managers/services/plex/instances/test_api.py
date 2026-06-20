@@ -165,6 +165,54 @@ def test_delete_playlist():
     assert call["method"] == "DELETE" and call["url"].endswith("/playlists/777")
 
 
+# ── library COLLECTIONS write + Home promotion (managed-hub API) ──────────────
+def test_create_collection_section_scoped_items_in_uri_query():
+    a = _cap_api([_Resp(200, {})])
+    a._machine_id = "MID"
+    a.create_collection("2", "Up Next - Household", ["10", "20", "30"])
+    call = a._session.calls[0]
+    assert call["method"] == "POST" and call["url"].endswith("/library/collections")
+    p = call["params"]
+    assert p["type"] == 1 and p["smart"] == 0 and p["sectionId"] == "2"
+    assert p["title"] == "Up Next - Household"
+    assert p["uri"] == "server://MID/com.plexapp.plugins.library/library/metadata/10,20,30"
+    assert "json" not in call and "data" not in call             # items ride the QUERY param
+
+
+def test_add_collection_items_uri():
+    a = _cap_api([_Resp(200, {})])
+    a._machine_id = "MID"
+    a.add_collection_items("555", ["7", "8"])
+    call = a._session.calls[0]
+    assert call["method"] == "PUT" and call["url"].endswith("/library/collections/555/items")
+    assert call["params"]["uri"] == "server://MID/com.plexapp.plugins.library/library/metadata/7,8"
+
+
+def test_remove_collection_item_by_rating_key():
+    a = _cap_api([_Resp(200, {})])
+    a.remove_collection_item("555", "8")
+    call = a._session.calls[0]
+    assert call["method"] == "DELETE" and call["url"].endswith("/library/collections/555/items/8")
+
+
+def test_promote_collection_home_keys_by_metadata_item_id():
+    a = _cap_api([_Resp(200, {})])
+    a.promote_collection_home("2", "555", home=True, shared=False)
+    call = a._session.calls[0]
+    assert call["method"] == "POST" and call["url"].endswith("/hubs/sections/2/manage")
+    p = call["params"]
+    assert p["metadataItemId"] == "555"                          # not-yet-managed hub keyed by rk
+    assert p["promotedToOwnHome"] == 1 and p["promotedToSharedHome"] == 0
+    assert p["promotedToRecommended"] == 0
+
+
+def test_get_managed_hubs_section_scoped():
+    a = _cap_api([_Resp(200, {"MediaContainer": {}})])
+    a.get_managed_hubs("2")
+    call = a._session.calls[0]
+    assert call["method"] == "GET" and call["url"].endswith("/hubs/sections/2/manage")
+
+
 # ── per-server access token (the managed-user write enabler) ──────────────────
 def test_get_resources_is_external_and_token_scoped():
     a = _cap_api([_Resp(200, [{"clientIdentifier": "MID", "accessToken": "ACC"}])])
