@@ -24,12 +24,19 @@ class _Log:
         self.warns: list = []
         self.errors: list = []
         self.audits: list = []
+        self.files: dict = {}                  # category -> [lines]  (the dedicated-file sink)
 
     def log_info(self, m): self.infos.append(m)
     def log_warning(self, m): self.warns.append(m)
     def log_error(self, m): self.errors.append(m)
     def log_debug(self, m): pass
     def log_audit(self, m): self.audits.append(m)
+
+    def log_to_file(self, category, message, *, reset=False):
+        bucket = self.files.setdefault(category, [])
+        if reset:
+            bucket.clear()
+        bucket.append(message)
 
 
 class _Cache:
@@ -139,6 +146,36 @@ def test_dry_run_true_performs_zero_writes_even_if_enabled():
     assert m.writeback_armed() is False
     m._writeback([_KID_USER], [], users, _TV_INV, {})
     assert api.writes == []
+
+
+def test_disarmed_previews_route_to_dedicated_file_not_main_log():
+    # The user's request: dry-run per-playlist previews belong in support/logs/playlists.log
+    # (the dedicated file sink), keeping the main run log to the one-line summary banner.
+    cache = _Cache({"plex/playlists/tv_plan/kid": _plan("a", "b")})
+    api = _FakeAPI()
+    m = _mgr(cache, api, dry_run=True)                # disarmed
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    files = m.logger.files.get("playlists", [])
+    assert any("would be CREATED" in ln for ln in files)             # preview → dedicated file
+    assert not any("would be CREATED" in i for i in m.logger.infos)  # ...not the main run log
+    assert any("disarmed" in i and "support/logs/playlists.log" in i  # banner still summarizes
+               for i in m.logger.infos)
+
+
+def test_run_log_lines_are_de_identified():
+    # Privacy: profile names must NOT reach the shareable run log (log_info/warn/error). An
+    # EXCLUDED user emits a run-log line — it must carry the de-identified handle, not 'Kid'.
+    cfg = {"plex": {"playlists": {"writeback": {"enabled": True},
+                                  "exclude_users": ["kid"],
+                                  "profile_ages": {"Kid": "older_kid"}}}}
+    m = _mgr(_Cache(), _FakeAPI(), config=cfg)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    runlog = " ".join(m.logger.infos + m.logger.warns + m.logger.errors)
+    assert "excluded" in runlog                     # the line fired
+    assert "'Kid'" not in runlog                     # ...without the real name
+    assert "K - older_kid 1" in runlog               # ...using the de-identified handle
 
 
 def test_armed_requires_enabled_and_not_dry_run():
@@ -296,6 +333,104 @@ def test_orphan_left_alone_when_user_still_in_roster_pin_skipped():
     stats = m._writeback([], roster, users, {}, {})
     assert not any(w[0] == "delete" for w in api.writes)  # left alone
     assert stats["orphans"] == 0
+
+
+def test_anchor_get_treats_empty_dict_cache_sentinel_as_no_anchor():
+    # REGRESSION: the real file cache returns {} (not None) for a MISSING key. _anchor_get must
+    # treat that as "no anchor", else _handle_empty logs a bogus "would DELETE" for a playlist that
+    # was never created (seen in a real dry-run: a 'would DELETE' per user for the disabled family).
+    m = _mgr(_Cache({f"{_ANCHOR_KEY}/kid::Fresh Arrivals": {}}), _FakeAPI())
+    assert m._anchor_get("kid", "Fresh Arrivals") is None
+    # and end-to-end: a disabled family whose anchor key is the {} sentinel → no spurious delete.
+    cache = _Cache({
+        "plex/playlists/combined_plan/kid": _plan("a"),
+        f"{_ANCHOR_KEY}/kid::Fresh Arrivals": {},
+    })
+    api = _FakeAPI(token="OWNER")
+    cfg = {"plex": {"playlists": {"writeback": {"enabled": True}, "mood_lists": {"enabled": True}}}}
+    mm = _mgr(cache, api, config=cfg)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    stats = mm._writeback([_KID_USER], [], users, _TV_INV, {})
+    spew = mm.logger.infos + mm.logger.files.get("playlists", [])
+    assert not any("would DELETE" in i for i in spew) and stats["deleted"] == 0
+
+
+def test_large_drift_leaves_existing_playlist_untouched():
+    # REGRESSION (review): a transient >50% drift run must NOT delete the user's existing managed
+    # playlist — it returns None (skip), the next clean run rewrites it.
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan("a", "y", "z"),    # 2/3 stale (>50%)
+        f"{_ANCHOR_KEY}/kid": "555",
+        f"{_ANCHOR_KEY}/_index": {"kid": "555"},
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [{"ratingKey": "a", "playlistItemID": "p1"}]})
+    m = _mgr(cache, api)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [{"uuid": "u-kid"}], users, _TV_INV, {})
+    assert not any(w[0] == "delete" for w in api.writes)        # NOT deleted
+    assert cache.get(f"{_ANCHOR_KEY}/kid") == "555"             # anchor intact
+
+
+# ── multiple managed playlists (The Long Glide / Touch & Go) ───────────────────
+def test_disabled_family_tears_down_its_leftover_playlist():
+    # REGRESSION (review): mood_lists was ON (created "Kid The Long Glide"); turned OFF → that
+    # playlist must be deleted, not stranded on the member account.
+    cache = _Cache({
+        "plex/playlists/combined_plan/kid": _plan("a"),
+        f"{_ANCHOR_KEY}/kid::The Long Glide": "556",
+        f"{_ANCHOR_KEY}/_index": {"kid::The Long Glide": "556"},
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"556": [{"ratingKey": "a", "playlistItemID": "p1"}]})
+    m = _mgr(cache, api)                                        # default config: mood_lists OFF
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [{"uuid": "u-kid"}], users, _TV_INV, {})
+    assert ("delete", "556", None, "KIDTOK") in api.writes      # the now-disabled family torn down
+    assert cache.get(f"{_ANCHOR_KEY}/kid::The Long Glide") is None
+
+
+
+def test_writes_one_playlist_per_enabled_family():
+    cache = _Cache({
+        "plex/playlists/combined_plan/kid": _plan("a", "b"),   # Up Next
+        "plex/playlists/glide_plan/kid": _plan("a"),           # The Long Glide
+        "plex/playlists/touchgo_plan/kid": _plan("b"),         # Touch & Go
+    })
+    api = _FakeAPI(token="OWNER")
+    cfg = {"plex": {"playlists": {"writeback": {"enabled": True}, "mood_lists": {"enabled": True}}}}
+    m = _mgr(cache, api, config=cfg)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    stats = m._writeback([_KID_USER], [], users, _TV_INV, {})
+    titles = {w[2]["title"] for w in api.writes if w[0] == "create"}
+    assert titles == {"Kid Up Next", "Kid The Long Glide", "Kid Touch & Go"}
+    assert stats["created"] == 3
+    assert cache.get(f"{_ANCHOR_KEY}/kid") is not None                     # Up Next at the LEGACY key
+    assert cache.get(f"{_ANCHOR_KEY}/kid::The Long Glide") is not None     # extra family namespaced
+
+
+def test_extra_family_not_written_when_flag_off():
+    cache = _Cache({
+        "plex/playlists/combined_plan/kid": _plan("a"),
+        "plex/playlists/glide_plan/kid": _plan("a"),           # cached but mood_lists OFF
+    })
+    api = _FakeAPI(token="OWNER")
+    m = _mgr(cache, api)                                        # default config: mood_lists absent → off
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    stats = m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert {w[2]["title"] for w in api.writes if w[0] == "create"} == {"Kid Up Next"}
+    assert stats["created"] == 1                               # only Up Next
+
+
+def test_orphan_sweep_deletes_namespaced_extra_family_anchor():
+    cache = _Cache({
+        f"{_ANCHOR_KEY}/gone::Touch & Go": "556",
+        f"{_ANCHOR_KEY}/_index": {"gone": "555", "gone::Touch & Go": "556"},
+    })
+    api = _FakeAPI(token="OWNER")
+    m = _mgr(cache, api)
+    users = _Users({}); users.tracked_users = []
+    stats = m._writeback([], [], users, {}, {})                # departed → both anchors swept
+    deleted = {w[1] for w in api.writes if w[0] == "delete"}
+    assert deleted == {"555", "556"} and stats["deleted"] == 2
 
 
 def test_orphan_deleted_when_user_gone_from_roster():

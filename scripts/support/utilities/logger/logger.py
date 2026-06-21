@@ -44,7 +44,7 @@ RUN_LOG_BACKUPS = 5                           # current + 5 previous = 6 logs re
 # (default-2.log <-> routing-2.log <-> timings-2.json are the same run). Rolled in a
 # single pass at orchestrator start by rotate_run_artifacts(). 'timings.json' replaces
 # the old unbounded 'timings.run-NNN.json' so the profiler now honours retention too.
-RUN_LOG_ARTIFACTS = ("default.log", "routing.log", "timings.json")
+RUN_LOG_ARTIFACTS = ("default.log", "routing.log", "playlists.log", "timings.json")
 
 # Set in the detached enrich daemon's environment (EnrichDaemonSupervisor.spawn). The
 # daemon is a SEPARATE process that briefly constructs the 'default' LoggerManager via

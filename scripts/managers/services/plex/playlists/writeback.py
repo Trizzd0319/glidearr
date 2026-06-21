@@ -34,13 +34,30 @@ Safety rails, all P0 (see the PR brief):
 from __future__ import annotations
 
 from scripts.managers.factories.base_manager import BaseManager
-from scripts.managers.services.plex._common import metadata_items, parse_item
+from scripts.managers.machine_learning.playlists.cert_gate import tier_level
+from scripts.managers.services.plex._common import anon_label, metadata_items, parse_item
+
+# cert_gate level → label, mirroring PlexPlaylistBuilderManager._TIER_NAMES so the de-identified
+# handle this manager logs ('T - adult 1') matches the one the builders log for the same profile.
+_TIER_NAMES = ("little_kid", "older_kid", "teen", "adult")
 
 # The three per-user plan families the builders cache (key + /{safe_user}). Each maps to one
 # managed playlist; the combined plan is the household default when movies are enabled.
 _TV_PLAN_KEY = "plex/playlists/tv_plan"
 _MOVIE_PLAN_KEY = "plex/playlists/movie_plan"
 _COMBINED_PLAN_KEY = "plex/playlists/combined_plan"
+
+# Additional opt-in per-user playlists the builders cache. Each becomes its OWN managed Plex
+# playlist (title suffix below), written only when its build flag produced a cached plan.
+_GLIDE_PLAN_KEY = "plex/playlists/glide_plan"          # The Long Glide (in-progress sagas)
+_TOUCHGO_PLAN_KEY = "plex/playlists/touchgo_plan"      # Touch & Go (low-commitment standalones)
+_FRESH_PLAN_KEY = "plex/playlists/fresh_movie_plan"    # Fresh Arrivals (genuinely-new acquisitions)
+
+# The default ALWAYS-written family — combined > tv > movie precedence, titled "Up Next".
+# Its suffix is the one that keeps the LEGACY anchor key (== safe_user), so it's a shared
+# constant: _anchor_id and every suffix default reference it, never a bare literal.
+_UP_NEXT_SUFFIX = "Up Next"
+_UP_NEXT = {"suffix": _UP_NEXT_SUFFIX, "keys": (_COMBINED_PLAN_KEY, _TV_PLAN_KEY, _MOVIE_PLAN_KEY)}
 
 _TV_INVENTORY_KEY = "plex/episodes/owned_inventory"
 _MOVIE_INVENTORY_KEY = "plex/movies/owned_inventory"
@@ -56,8 +73,6 @@ _DRIFT_SKIP_RATIO = 0.5
 # When the in-place diff would touch MORE than the whole desired list, fall back to a clean
 # recreate (create-new-then-delete-old) rather than dribbling N removes + N adds.
 _RECREATE_RATIO = 1.0
-
-_TITLE_SUFFIX = "Up Next"                              # the managed-playlist title shape
 
 
 class PlaylistWritebackManager(BaseManager):
@@ -86,6 +101,20 @@ class PlaylistWritebackManager(BaseManager):
     def _pl_cfg(self) -> dict:
         return ((self.config.get("plex", {}) if self.config else {}) or {}).get("playlists", {}) or {}
 
+    def _all_families(self) -> list:
+        """Every managed playlist family + whether it's currently ENABLED. "Up Next" is always on;
+        the mood lists + Fresh Arrivals follow their build flag. We iterate ALL of them (not just
+        the enabled ones) so that turning a family OFF tears its leftover playlist down rather than
+        orphaning it on the member account (a disabled family is driven through _handle_empty)."""
+        mood = bool((self._pl_cfg().get("mood_lists", {}) or {}).get("enabled", False))
+        fresh = bool((self._pl_cfg().get("fresh_arrivals", {}) or {}).get("enabled", False))
+        return [
+            (_UP_NEXT, True),
+            ({"suffix": "The Long Glide", "keys": (_GLIDE_PLAN_KEY,)}, mood),
+            ({"suffix": "Touch & Go", "keys": (_TOUCHGO_PLAN_KEY,)}, mood),
+            ({"suffix": "Fresh Arrivals", "keys": (_FRESH_PLAN_KEY,)}, fresh),
+        ]
+
     # ── run (I/O gather → tested core) ────────────────────────────────────────
     def run(self) -> dict:
         users_mgr = self.registry.get("manager", "PlexUsersManager") if self.registry else None
@@ -104,6 +133,10 @@ class PlaylistWritebackManager(BaseManager):
         valid_rks = self._valid_rating_keys(tv_inv, movie_inv)
         stats = {"armed": armed, "created": 0, "updated": 0, "deleted": 0,
                  "skipped": 0, "users": len(tracked), "orphans": 0}
+        # safe_user → de-identified handle, so run-log lines below never print the real profile
+        # name (the dedicated playlists.log preview keeps it). Built once from the tracked order.
+        self._anon_by_safe = {u.get("safe_user"): self._anon(u, i)
+                              for i, u in enumerate(tracked, 1) if u.get("safe_user")}
 
         for u in tracked:
             safe = u.get("safe_user")
@@ -111,44 +144,59 @@ class PlaylistWritebackManager(BaseManager):
                 stats["skipped"] += 1
                 continue
             if self._is_excluded(u, excluded):
-                self.logger.log_info(f"[Writeback] '{u.get('title')}' excluded (exclude_users) — skipped.")
+                self.logger.log_info(f"[Writeback] '{self._who(u)}' excluded (exclude_users) — skipped.")
                 stats["skipped"] += 1
                 continue
-
-            desired = self._desired_items(safe, valid_rks)
-            # An empty plan for a RESTRICTED user => do not leave an empty playlist: delete any
-            # existing managed anchor and move on (logged). For an unrestricted user an empty
-            # plan is treated the same (nothing to surface).
-            if not desired:
-                self._handle_empty(u, users_mgr, armed, stats)
-                continue
-
-            token = self._write_token(u, users_mgr)
-            if token is None:
-                self.logger.log_warning(
-                    f"[Writeback] no per-server write token for '{u.get('title')}' — skipped (counted).")
-                stats["skipped"] += 1
-                continue
-            # P0 #2: never write a non-admin's playlist with the owner token.
-            if not u.get("is_admin"):
-                owner = self.plex_api.token if self.plex_api else None
-                if owner is not None and token == owner:
-                    self.logger.log_error(
-                        f"[Writeback] refusing to write '{u.get('title')}' with the OWNER token "
-                        f"(non-admin) — skipped.")
-                    stats["skipped"] += 1
-                    continue
-
-            self._writeback_user(u, safe, desired, token, armed, stats)
+            # One managed playlist per family. An ENABLED family is written (same safety rails);
+            # a DISABLED family is torn down (delete its leftover playlist) so toggling a feature
+            # off doesn't strand a managed playlist on the member account.
+            for fam, enabled in self._all_families():
+                if enabled:
+                    self._process_family(u, safe, fam, valid_rks, users_mgr, armed, stats)
+                else:
+                    self._handle_empty(u, users_mgr, armed, stats, fam)
 
         self._cleanup_orphans(roster, tracked, excluded, users_mgr, armed, stats)
         self._banner(stats)
         return stats
 
+    def _process_family(self, u, safe, fam, valid_rks, users_mgr, armed, stats):
+        """Write ONE family's playlist for ONE user (the old per-user body, parameterized by
+        ``fam`` = ``{"suffix", "keys"}``)."""
+        desired = self._desired_items(safe, valid_rks, fam["keys"])
+        if desired is None:
+            # Too-stale-to-write (large mid-rescan drift): LEAVE the existing playlist untouched
+            # and let the next clean run rewrite it — do NOT delete it.
+            return
+        # An empty plan (e.g. a RESTRICTED user age-gated to nothing, or a family with no cached
+        # plan) => never leave an empty playlist: delete any existing managed anchor for it.
+        if not desired:
+            self._handle_empty(u, users_mgr, armed, stats, fam)
+            return
+
+        token = self._write_token(u, users_mgr)
+        if token is None:
+            self.logger.log_warning(
+                f"[Writeback] no per-server write token for '{self._who(u)}' — skipped (counted).")
+            stats["skipped"] += 1
+            return
+        # P0 #2: never write a non-admin's playlist with the owner token.
+        if not u.get("is_admin"):
+            owner = self.plex_api.token if self.plex_api else None
+            if owner is not None and token == owner:
+                self.logger.log_error(
+                    f"[Writeback] refusing to write '{self._who(u)}' with the OWNER token "
+                    f"(non-admin) — skipped.")
+                stats["skipped"] += 1
+                return
+
+        self._writeback_user(u, safe, desired, token, armed, stats, fam)
+
     # ── per-user write (find-or-create → re-resolve → diff → apply) ───────────
-    def _writeback_user(self, user, safe, desired, token, armed, stats):
-        title = self._playlist_title(user)
-        anchor = self._find_or_create_anchor(safe, title, token, armed, desired, stats)
+    def _writeback_user(self, user, safe, desired, token, armed, stats, fam=_UP_NEXT):
+        suffix = fam["suffix"]
+        title = self._playlist_title(user, suffix)
+        anchor = self._find_or_create_anchor(safe, title, token, armed, desired, stats, suffix)
         if anchor is None:
             # Not armed (no real create happened) — we've already counted a would-create and
             # logged the preview; nothing more to do this run.
@@ -167,11 +215,11 @@ class PlaylistWritebackManager(BaseManager):
         n_changes = len(plan["add"]) + len(plan["remove"]) + len(plan["move"])
         if n_changes > max(len(desired_rks), 1) * _RECREATE_RATIO:
             # Diff exceeds the whole list → cheaper + safer to recreate (new-then-old).
-            self._recreate(user, safe, title, rk, desired_rks, token, armed, stats)
+            self._recreate(user, safe, title, rk, desired_rks, token, armed, stats, suffix)
             return
 
         if not armed:
-            self.logger.log_info(
+            self._detail(
                 f"[Writeback] [disarmed] '{title}' would update "
                 f"(+{len(plan['add'])}/-{len(plan['remove'])}/~{len(plan['move'])}).")
             stats["updated"] += 1
@@ -181,24 +229,24 @@ class PlaylistWritebackManager(BaseManager):
         stats["updated"] += 1
         self._audit(user, "replace", rk, len(desired_rks))
 
-    def _find_or_create_anchor(self, safe, title, token, armed, desired, stats) -> dict | None:
+    def _find_or_create_anchor(self, safe, title, token, armed, desired, stats, suffix="Up Next") -> dict | None:
         """Resolve OUR managed playlist for this user (P0 #3). Cached ratingKey FIRST; on a
         404 fall back to a title-match and adopt ONLY when the playlist is owned by this user.
         Create one when neither resolves. Returns ``{"rating_key", "created"}`` or None when
         disarmed (the create is previewed + counted but not performed)."""
-        cached_rk = self._anchor_get(safe)
+        cached_rk = self._anchor_get(safe, suffix)
         if cached_rk is not None and self._playlist_exists(cached_rk, token):
             return {"rating_key": cached_rk, "created": False}
 
         adopted = self._adopt_by_title(title, token)
         if adopted is not None:
-            self._anchor_set(safe, adopted)
+            self._anchor_set(safe, adopted, suffix)
             return {"rating_key": adopted, "created": False}
 
         # Nothing to adopt → create.
         desired_rks = [it["rating_key"] for it in desired]
         if not armed:
-            self.logger.log_info(
+            self._detail(
                 f"[Writeback] [disarmed] '{title}' would be CREATED with {len(desired_rks)} item(s).")
             stats["created"] += 1
             return None
@@ -207,54 +255,57 @@ class PlaylistWritebackManager(BaseManager):
             self.logger.log_warning(f"[Writeback] create failed for '{title}' — skipped.")
             stats["skipped"] += 1
             return None
-        self._anchor_set(safe, rk)
+        self._anchor_set(safe, rk, suffix)
         stats["created"] += 1
         self._audit({"title": title, "safe_user": safe}, "create", rk, len(desired_rks))
         return {"rating_key": rk, "created": True}
 
-    def _recreate(self, user, safe, title, old_rk, desired_rks, token, armed, stats):
+    def _recreate(self, user, safe, title, old_rk, desired_rks, token, armed, stats, suffix="Up Next"):
         """Delete+create fallback, CREATE-NEW-THEN-DELETE-OLD so a failed create never loses
         the user's playlist (P0 #5). Only the new anchor is ever deleted on the next pass."""
         if not armed:
-            self.logger.log_info(
+            self._detail(
                 f"[Writeback] [disarmed] '{title}' would be RECREATED ({len(desired_rks)} item(s)).")
             stats["updated"] += 1
             return
         new_rk = self._create_playlist(title, desired_rks, token)
         if new_rk is None:
-            self.logger.log_warning(f"[Writeback] recreate failed for '{title}' — keeping old playlist.")
+            self.logger.log_warning(
+                f"[Writeback] recreate failed for '{self._who(user)}' ({suffix}) — keeping old playlist.")
             stats["skipped"] += 1
             return
-        self._anchor_set(safe, new_rk)            # repoint the anchor BEFORE deleting the old one
+        self._anchor_set(safe, new_rk, suffix)    # repoint the anchor BEFORE deleting the old one
         self.plex_api.delete_playlist(old_rk, token=token)
         stats["updated"] += 1
         self._audit(user, "replace", new_rk, len(desired_rks))
 
     # ── empty-plan + orphan handling ──────────────────────────────────────────
-    def _handle_empty(self, user, users_mgr, armed, stats):
-        """Empty plan (e.g. a restricted user whose owned set age-gates to nothing): never
-        write an empty playlist — delete any existing managed anchor + log (P0/brief)."""
+    def _handle_empty(self, user, users_mgr, armed, stats, fam=_UP_NEXT):
+        """Empty plan (e.g. a restricted user whose owned set age-gates to nothing, or a family
+        with no cached plan): never write an empty playlist — delete any existing managed anchor
+        for THIS family + log (P0/brief)."""
+        suffix = fam["suffix"]
         safe = user.get("safe_user")
-        cached_rk = self._anchor_get(safe)
+        cached_rk = self._anchor_get(safe, suffix)
         if cached_rk is None:
-            self.logger.log_debug(f"[Writeback] '{user.get('title')}' empty plan — nothing to write.")
+            self.logger.log_debug(f"[Writeback] '{self._who(user)}' empty '{suffix}' plan — nothing to write.")
             return
         token = self._write_token(user, users_mgr)
         if not armed:
-            self.logger.log_info(
-                f"[Writeback] [disarmed] '{user.get('title')}' empty plan would DELETE its "
-                f"managed playlist.")
+            self._detail(
+                f"[Writeback] [disarmed] '{user.get('title')}' empty '{suffix}' plan would DELETE "
+                f"its managed playlist.")
             stats["deleted"] += 1
             return
         if token is None:
             self.logger.log_warning(
-                f"[Writeback] '{user.get('title')}' empty plan but no write token — skipped (counted).")
+                f"[Writeback] '{self._who(user)}' empty plan but no write token — skipped (counted).")
             stats["skipped"] += 1
             return
         self.plex_api.delete_playlist(cached_rk, token=token)
-        self._anchor_clear(safe)
+        self._anchor_clear(safe, suffix)
         stats["deleted"] += 1
-        self.logger.log_info(f"[Writeback] '{user.get('title')}' empty plan — deleted managed playlist.")
+        self.logger.log_info(f"[Writeback] '{self._who(user)}' empty '{suffix}' plan — deleted managed playlist.")
         self._audit(user, "delete", cached_rk, 0)
 
     def _cleanup_orphans(self, roster, tracked, excluded, users_mgr, armed, stats):
@@ -268,33 +319,35 @@ class PlaylistWritebackManager(BaseManager):
         if not anchors:
             return
         live_safe = self._roster_safe_users(roster, tracked, users_mgr)
-        for safe, rk in list(anchors.items()):
+        for aid, rk in list(anchors.items()):
+            safe = aid.split("::", 1)[0]      # anchor_id is 'safe' (Up Next) or 'safe::suffix'
             if safe in live_safe:
                 continue                 # still in the household (tracked OR pin-skipped) → leave alone
             stats["orphans"] += 1
             if not armed:
                 self.logger.log_info(
-                    f"[Writeback] [disarmed] orphan playlist for '{safe}' would be DELETED.")
+                    f"[Writeback] [disarmed] orphan playlist '{aid}' would be DELETED.")
                 continue
             token = self.plex_api.token if self.plex_api else None
             self.plex_api.delete_playlist(rk, token=token)
-            self._anchor_clear(safe)
+            self._anchor_clear_by_id(aid)
             stats["deleted"] += 1
-            self.logger.log_info(f"[Writeback] deleted orphan playlist for departed user '{safe}'.")
+            self.logger.log_info(f"[Writeback] deleted orphan playlist '{aid}' (departed user '{safe}').")
             self._audit({"title": safe, "safe_user": safe}, "delete", rk, 0)
 
     # ── re-resolution (P0 #4) ─────────────────────────────────────────────────
-    def _desired_items(self, safe, valid_rks) -> list:
+    def _desired_items(self, safe, valid_rks, keys=None) -> list:
         """The user's desired playlist as ``[{"rating_key": str}]`` AFTER re-resolving the
-        cached plan against the FRESH owned inventory (P0 #4). The combined plan wins when
-        present (household default with movies on); else the TV plan; else the movie plan.
+        cached plan against the FRESH owned inventory (P0 #4). ``keys`` is the family's cache-key
+        precedence (default Up Next = combined > tv > movie); a mood/fresh family passes its own.
 
         Re-resolution: each plan item's ratingKey must still exist in the fresh inventory's
         resolved-key set (``valid_rks``) — a stale key means the item was re-scanned / removed
-        since the plan was built. Drift is counted/logged; if drift exceeds _DRIFT_SKIP_RATIO
-        the whole user is skipped with a re-run note (return ``[]`` would write an empty list,
-        so we return a sentinel-free empty here and the caller treats large drift as skip)."""
-        plan = self._load_plan(safe)
+        since the plan was built. Drift is counted/logged. Returns ``None`` when drift exceeds
+        _DRIFT_SKIP_RATIO (too stale to write → the caller LEAVES the playlist alone for a re-run);
+        ``[]`` when the plan is genuinely empty (→ the caller tears the playlist down); else the
+        kept items."""
+        plan = self._load_plan(safe, keys)
         items = (plan or {}).get("items") or []
         if not items:
             return []
@@ -307,20 +360,22 @@ class PlaylistWritebackManager(BaseManager):
                 dropped += 1
         total = len(items)
         if dropped:
+            who = (getattr(self, "_anon_by_safe", {}) or {}).get(safe, safe)
             self.logger.log_info(
-                f"[Writeback] '{safe}' plan drift: {dropped}/{total} item(s) no longer resolve "
+                f"[Writeback] '{who}' plan drift: {dropped}/{total} item(s) no longer resolve "
                 f"to a current Plex ratingKey.")
         if total and dropped / total > _DRIFT_SKIP_RATIO:
             self.logger.log_warning(
                 f"[Writeback] '{safe}' drift {dropped}/{total} exceeds "
                 f"{int(_DRIFT_SKIP_RATIO * 100)}% — skipping this user (re-run after the next scan).")
-            return []
-        return kept
+            return None        # None = too-stale-to-write → the caller LEAVES the playlist alone
+        return kept            # [] = genuinely empty → the caller tears the playlist down
 
-    def _load_plan(self, safe) -> dict | None:
-        """The cached plan to write, combined > tv > movie (combined is the cross-medium
-        household default; the standalone plans cover the single-medium installs)."""
-        for key in (_COMBINED_PLAN_KEY, _TV_PLAN_KEY, _MOVIE_PLAN_KEY):
+    def _load_plan(self, safe, keys=None) -> dict | None:
+        """The cached plan to write for a family, in ``keys`` precedence (default Up Next =
+        combined > tv > movie; combined is the cross-medium household default, the standalone
+        plans cover single-medium installs; a mood/fresh family has a single key)."""
+        for key in (keys or _UP_NEXT["keys"]):
             plan = self._cache_get(f"{key}/{safe}", None)
             if isinstance(plan, dict) and plan.get("items"):
                 return plan
@@ -428,37 +483,51 @@ class PlaylistWritebackManager(BaseManager):
         return newest
 
     # ── anchor map (P0 #3) ────────────────────────────────────────────────────
-    def _anchor_get(self, safe):
-        return self._cache_get(f"{_ANCHOR_KEY}/{safe}", None)
+    @staticmethod
+    def _anchor_id(safe, suffix=_UP_NEXT_SUFFIX) -> str:
+        """The anchor key id. "Up Next" keeps the LEGACY id (== safe_user) so existing managed
+        playlists + their cached anchors keep resolving; the extra families namespace it
+        (``safe::suffix``) so each playlist gets its own independent anchor."""
+        return safe if suffix == _UP_NEXT_SUFFIX else f"{safe}::{suffix}"
 
-    def _anchor_set(self, safe, rating_key):
+    def _anchor_get(self, safe, suffix=_UP_NEXT_SUFFIX):
+        # An anchor is always stored as str(ratingKey). The file cache returns {} (not None) for a
+        # MISSING key, so treat anything that isn't a non-empty string as "no anchor" — otherwise a
+        # phantom {} reads as an existing playlist (e.g. _handle_empty would log a bogus "would DELETE").
+        val = self._cache_get(f"{_ANCHOR_KEY}/{self._anchor_id(safe, suffix)}", None)
+        return val if (isinstance(val, str) and val) else None
+
+    def _anchor_set(self, safe, rating_key, suffix="Up Next"):
         if not self.global_cache:
             return
+        aid = self._anchor_id(safe, suffix)
         try:
-            self.global_cache.set(f"{_ANCHOR_KEY}/{safe}", str(rating_key))
-            idx = self._cache_get(f"{_ANCHOR_KEY}/_index", {}) or {}
-            idx = dict(idx)
-            idx[safe] = str(rating_key)
+            self.global_cache.set(f"{_ANCHOR_KEY}/{aid}", str(rating_key))
+            idx = dict(self._cache_get(f"{_ANCHOR_KEY}/_index", {}) or {})
+            idx[aid] = str(rating_key)
             self.global_cache.set(f"{_ANCHOR_KEY}/_index", idx)
         except Exception:
             pass
 
-    def _anchor_clear(self, safe):
+    def _anchor_clear(self, safe, suffix="Up Next"):
+        self._anchor_clear_by_id(self._anchor_id(safe, suffix))
+
+    def _anchor_clear_by_id(self, aid):
         if not self.global_cache:
             return
         try:
-            self.global_cache.set(f"{_ANCHOR_KEY}/{safe}", None)
+            self.global_cache.set(f"{_ANCHOR_KEY}/{aid}", None)
             idx = self._cache_get(f"{_ANCHOR_KEY}/_index", {}) or {}
-            if safe in idx:
+            if aid in idx:
                 idx = dict(idx)
-                idx.pop(safe, None)
+                idx.pop(aid, None)
                 self.global_cache.set(f"{_ANCHOR_KEY}/_index", idx)
         except Exception:
             pass
 
     def _all_anchors(self) -> dict:
-        """Every persisted ``safe_user → ratingKey`` anchor (for the orphan sweep) from the
-        index maintained alongside the per-user keys."""
+        """Every persisted ``anchor_id → ratingKey`` (for the orphan sweep). ``anchor_id`` is the
+        safe_user for Up Next, or ``safe::suffix`` for an extra family."""
         index = self._cache_get(f"{_ANCHOR_KEY}/_index", None)
         if isinstance(index, dict):
             return {k: v for k, v in index.items() if v is not None}
@@ -470,12 +539,12 @@ class PlaylistWritebackManager(BaseManager):
             return None
         return users_mgr.server_write_token(user)
 
-    def _playlist_title(self, user) -> str:
-        return self._title_for(user.get("title") or user.get("safe_user") or "User")
+    def _playlist_title(self, user, suffix="Up Next") -> str:
+        return self._title_for(user.get("title") or user.get("safe_user") or "User", suffix)
 
     @staticmethod
-    def _title_for(display) -> str:
-        return f"{display} {_TITLE_SUFFIX}"
+    def _title_for(display, suffix="Up Next") -> str:
+        return f"{display} {suffix}"
 
     def _excluded_users(self) -> set:
         raw = self._pl_cfg().get("exclude_users")
@@ -524,13 +593,38 @@ class PlaylistWritebackManager(BaseManager):
         else:
             self.logger.log_info(f"[AUDIT] {msg}")
 
+    def _detail(self, msg):
+        """Per-user/per-family preview detail → the DEDICATED ``support/logs/playlists.log`` (rotated
+        fresh each run), NOT the main run log — so a multi-profile × N-family dry-run doesn't flood
+        it. No-op when the logger lacks the file sink (e.g. a None logger in tests). This file is a
+        LOCAL operator drill-down, so messages here KEEP the real profile name."""
+        if self.logger and hasattr(self.logger, "log_to_file"):
+            self.logger.log_to_file("playlists", msg)
+
+    def _anon(self, u, idx):
+        """De-identified profile handle (``'{initial} - {tier} {n}'``) for the SHAREABLE run log —
+        same format the builders log, so an operator can cross-reference. Real names never reach
+        the run log; they stay in the local playlists.log preview + the audit trail."""
+        ages = self._pl_cfg().get("profile_ages", {}) or {}
+        level = tier_level(u.get("restriction_profile"),
+                           ages.get(u.get("title")) or ages.get(u.get("safe_user")))
+        tier = _TIER_NAMES[level] if 0 <= level < len(_TIER_NAMES) else "unknown"
+        return anon_label(u.get("title"), tier, idx)
+
+    def _who(self, user):
+        """The de-identified handle for ``user`` for run-log lines (looked up from the per-run map
+        built in :meth:`_writeback`; falls back to an index-less label for any off-map caller)."""
+        amap = getattr(self, "_anon_by_safe", {}) or {}
+        return amap.get(user.get("safe_user")) or anon_label(user.get("title"), "unknown", 0)
+
     def _banner(self, stats):
         """The armed/disarmed summary banner, logged EVERY run (P0 #7)."""
         state = "ARMED" if stats["armed"] else "disarmed (dry-run/disabled — no Plex writes)"
         self.logger.log_info(
             f"[Writeback] {state}: {stats['created']} create / {stats['updated']} update / "
             f"{stats['deleted']} delete / {stats['skipped']} skipped "
-            f"(over {stats['users']} user(s), {stats['orphans']} orphan(s)).")
+            f"(over {stats['users']} user(s), {stats['orphans']} orphan(s)) "
+            f"— per-playlist detail in support/logs/playlists.log.")
 
     def _cache_get(self, key, default):
         if not self.global_cache:
