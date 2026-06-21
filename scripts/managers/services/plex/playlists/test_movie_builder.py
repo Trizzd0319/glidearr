@@ -194,6 +194,20 @@ def test_config_franchise_feeds_synthetic_universe_entry():
     assert [it["tvdb"] for it in syn["items"]] == [900001, 900002]
 
 
+def test_watchlisted_franchise_feeds_synthetic_universe_entry():
+    import scripts.managers.services.plex.playlists.builder as B
+    cache = _Cache()
+    cache.set(B._UNIVERSE_SRC_KEY, {"universes": {}, "fetched": {}})
+    cache.set("plex/watchlist/union", [{"type": "show", "ids": {"tvdb": 900003}}])   # watchlisted, UNOWNED
+    cfg = {"plex": {"playlists": {"universe_timeline": {"enabled": True},
+                                  "tv_franchises": {"wlverse": {"shows": [900003, 900004]}}}}}
+    m = _mgr(cache=cache, config=cfg)
+    # own NOTHING of wlverse (only an unrelated series); the watchlist add alone pulls the family in
+    m._tv_franchise_maps([{"series_id": 1, "series_title": "Unrelated", "series_tvdb_id": 900099}])
+    syn = cache.get(B._UNIVERSE_SRC_KEY)["universes"]["tvfran:wlverse"]
+    assert syn["shows"] == [900003, 900004] and syn["timeline"] is True   # incl. the not-yet-owned siblings
+
+
 def test_builds_movie_plan_ranked_by_score():
     cache = _Cache()
     owned = [_movie(1, "Low", 2000, 20), _movie(2, "High", 2010, 90)]

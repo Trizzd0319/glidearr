@@ -158,7 +158,8 @@ def stem_franchise_clusters(series_rows, *, deny=None) -> dict:
     return out
 
 
-def tv_franchise_universes(owned_series_rows, catalog, *, cluster_same_stem=True) -> dict:
+def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
+                           cluster_same_stem=True) -> dict:
     """Synthetic ``tvfran:`` universe-source entries — the SINGLE seam that makes discovered TV
     franchises participate in playlist grouping, catch-up retention AND acquisition. Merges Layer-1
     (owned same-stem clusters, :func:`stem_franchise_clusters`) with the Layer-2 baked ``catalog``
@@ -202,7 +203,15 @@ def tv_franchise_universes(owned_series_rows, catalog, *, cluster_same_stem=True
         return {"timeline": True, "movies": [], "shows": list(ordered),
                 "items": [{"media": "show", "tvdb": tv, "rank": i} for i, tv in enumerate(ordered)]}
 
-    owned_tvdbs = set(first_index)                            # tvdbs the household owns (from the rows)
+    # The household ENGAGEMENT scope for catalog franchises: tvdbs it OWNS (from the rows) PLUS any
+    # extra engaged tvdbs the caller supplies — watchlisted shows (intent to watch), which may be
+    # UNOWNED. (``watched`` ⊆ ``owned`` for TV: the watched signal is derived from the owned episode
+    # parquet, so an owned-or-watchlisted scope already covers watched-or-owned-or-watchlisted.)
+    scope = set(first_index)
+    for x in (engaged_tvdbs or ()):
+        xi = _coerce_int(x)
+        if xi is not None:
+            scope.add(xi)
 
     out: dict = {}
     for key, members in clusters.items():
@@ -210,14 +219,15 @@ def tv_franchise_universes(owned_series_rows, catalog, *, cluster_same_stem=True
 
     # Layer-2 catalog (cross-named families the same-stem clusterer can't derive — Grey's↔Station 19,
     # Buffy↔Angel…). Each franchise is emitted in FULL (incl. its UNOWNED siblings, so acquisition can
-    # backfill them start-first) but ONLY when the household owns >=1 member — the owned-tvdb
-    # intersection self-scopes the catalog per household, so an unengaged franchise never bloats the
-    # universe source. A catalog entry overrides a same-keyed Layer-1 cluster (its curated order wins).
+    # backfill them start-first) but ONLY when the household is ENGAGED with it — owns OR has
+    # watchlisted ≥1 member — so an unengaged franchise never bloats the universe source, while a
+    # watchlist add (a not-yet-owned show) still pulls its whole family in. A catalog entry overrides
+    # a same-keyed Layer-1 cluster (its curated order wins).
     for key, entry in (catalog or {}).items():
         k = key if str(key).startswith("tvfran:") else f"tvfran:{key}"
         raw = entry.get("shows") if isinstance(entry, dict) else entry
         shows = [t for t in (_coerce_int(tv) for tv in (raw or [])) if t is not None]
-        if shows and any(s in owned_tvdbs for s in shows):
+        if shows and any(s in scope for s in shows):
             out[k] = _entry(shows)
     return out
 

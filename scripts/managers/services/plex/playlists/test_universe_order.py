@@ -364,13 +364,15 @@ def test_tv_franchise_universes_empty_when_no_family_or_clustering_off():
     assert tv_franchise_universes(_FAM, catalog={}, cluster_same_stem=False) == {}   # Layer-1 off + empty catalog
 
 
-def test_tv_franchise_universes_layer2_catalog_scoped_to_owned():
-    cat = {"buffyverse": {"shows": [101, 102]}, "tvfran:already": [201, 202]}
-    owned = [{"title": "Buffy", "tvdbId": 101}]                # own 1 of buffyverse, none of 'already'
-    out = tv_franchise_universes(owned, cat)
-    assert out["tvfran:buffyverse"]["shows"] == [101, 102]     # emitted (owns 101), incl. UNOWNED 102
-    assert out["tvfran:buffyverse"]["timeline"] is True        # bare key namespaced, timeline True
-    assert "tvfran:already" not in out                         # own none → unengaged → not emitted
+def test_tv_franchise_universes_layer2_catalog_scoped_to_owned_or_watchlisted():
+    cat = {"buffyverse": {"shows": [101, 102]}, "stargate": {"shows": [201, 202]},
+           "tvfran:cold": [301, 302]}
+    owned = [{"title": "Buffy", "tvdbId": 101}]                # own 1 of buffyverse
+    out = tv_franchise_universes(owned, cat, engaged_tvdbs={202})   # watchlisted 1 of stargate (UNOWNED)
+    assert out["tvfran:buffyverse"]["shows"] == [101, 102]     # owned member → emitted, incl. unowned 102
+    assert out["tvfran:buffyverse"]["timeline"] is True
+    assert out["tvfran:stargate"]["shows"] == [201, 202]       # watchlist intent → emitted (own none of it)
+    assert "tvfran:cold" not in out                            # neither owned nor watchlisted → excluded
 
 
 def test_tv_franchise_universes_empty_catalog_is_noop():

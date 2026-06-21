@@ -492,7 +492,8 @@ class PlexPlaylistBuilderManager(BaseManager):
                 seen_tv.add(tv)
                 rows.append({"title": ep.get("series_title") or ep.get("title") or "",
                              "tvdbId": tv, "year": ep.get("series_year") or ep.get("year")})
-            syn = tv_franchise_universes(rows, self._tv_franchise_catalog())
+            syn = tv_franchise_universes(rows, self._tv_franchise_catalog(),
+                                         engaged_tvdbs=self._watchlisted_show_tvdbs())
             cached = dict(self._cache_get(_UNIVERSE_SRC_KEY, {}) or {})
             universes = {k: v for k, v in (cached.get("universes") or {}).items()
                          if not str(k).startswith("tvfran:")}            # strip prior synthetic
@@ -507,6 +508,23 @@ class PlexPlaylistBuilderManager(BaseManager):
                                      f"by same-name clustering (feeding grouping, retention, acquisition).")
         except Exception as e:
             self.logger.log_debug(f"[UniverseOrder] synthetic franchise refresh skipped: {e}")
+
+    def _watchlisted_show_tvdbs(self) -> set:
+        """Household-watchlisted SHOW tvdbs (intent to watch) from the watchlist union — these may be
+        UNOWNED, so a watchlist add still scopes its whole franchise into the universe source (for
+        completion + retention) even before any member is in the library. ``set()`` when absent."""
+        out: set = set()
+        if not self.global_cache:
+            return out
+        try:
+            for it in (self.global_cache.get("plex/watchlist/union") or []):
+                if isinstance(it, dict) and it.get("type") == "show":
+                    tv = _to_int((it.get("ids") or {}).get("tvdb"))
+                    if tv is not None:
+                        out.add(tv)
+        except Exception:
+            pass
+        return out
 
     def _tv_franchise_catalog(self) -> dict:
         """The Layer-2 cross-named TV-franchise catalog (tvdb-keyed) the same-stem clusterer can't
