@@ -20,10 +20,16 @@ Public API:
   * per_user_affinity(history_entries, metadata_index, user_list, *, half_life_days=None, now=None) -> dict
         {username: aggregate_affinity(...)} — entries grouped by the ``user`` field;
         users with zero matching entries are omitted.
+  * build_library_index(history_entries, movie_genres_by_title, series_genres_by_title) -> dict
+        {rating_key: {"genres": [...]}} resolved from OWNED-library (Radarr/Sonarr) genres via a
+        stable title join — fills the holes the sparse per-key Tautulli fetch leaves.
+  * merge_library_first(library_index, tautulli_index) -> dict
+        library genres win; Tautulli supplies people/studios + the not-owned fallback.
 """
 from __future__ import annotations
 
 import math
+import re
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -41,6 +47,72 @@ def _entry_weight(entry: dict, half_life_days, now):
         return 1.0
     age_days = max(0.0, (now - watched).total_seconds() / 86400.0)
     return math.exp(-age_days / half_life_days)
+
+
+def _norm_title(s) -> str:
+    """Normalise a title for the STABLE (drift-proof) join: lowercase, keep only ``[a-z0-9]``.
+    So 'Bluey (2018)' → 'bluey2018' and 'The Fault in Our Stars' → 'thefaultinourstars'."""
+    return re.sub(r"[^a-z0-9]", "", str(s or "").lower())
+
+
+def _lookup_title(by_title: dict, raw) -> list | None:
+    """Title lookup with a trailing-year fallback so 'Bluey (2018)' also matches a 'Bluey'
+    entry (and vice-versa). Returns the genre list or None."""
+    if not raw:
+        return None
+    key = _norm_title(raw)
+    if key in by_title:
+        return by_title[key]
+    stripped = _norm_title(re.sub(r"\s*\(\d{4}\)\s*$", "", str(raw)))
+    if stripped != key and stripped in by_title:
+        return by_title[stripped]
+    return None
+
+
+def build_library_index(history_entries: list, movie_genres_by_title: dict,
+                        series_genres_by_title: dict) -> dict:
+    """A ``{rating_key: {"genres": [...]}}`` metadata index resolved from the OWNED-LIBRARY
+    genres (Radarr movies / Sonarr series) via a STABLE identity — the movie title, or an
+    episode's ``grandparent_title`` (series name) — rather than the churn-prone Tautulli
+    ``rating_key``. This fills the coverage holes the per-key Tautulli metadata fetch leaves:
+    a low-volume, movie-only profile whose handful of rating_keys never made the sampled index
+    would otherwise score affinity=0 and collapse to the flat household ranking. PURE.
+
+    ``*_by_title`` map a title to a genre list; keys may be raw (any case/punctuation) — they
+    are normalised here, so callers can pass straight from a Radarr/Sonarr row."""
+    mv = {_norm_title(k): v for k, v in (movie_genres_by_title or {}).items() if k}
+    sv = {_norm_title(k): v for k, v in (series_genres_by_title or {}).items() if k}
+    out: dict[str, dict] = {}
+    for e in history_entries:
+        rk = str(e.get("rating_key") or "")
+        if not rk:
+            continue
+        mt = e.get("media_type")
+        if mt == "movie":
+            genres = _lookup_title(mv, e.get("title"))
+        elif mt == "episode":
+            genres = _lookup_title(sv, e.get("grandparent_title"))
+        else:
+            genres = None
+        if genres:
+            out[rk] = {"genres": list(genres)}
+    return out
+
+
+def merge_library_first(library_index: dict, tautulli_index: dict) -> dict:
+    """Merge the library-derived index OVER the Tautulli per-key index. LIBRARY-FIRST: where the
+    library resolved genres for a rating_key, those genres WIN — one consistent Radarr/Sonarr
+    taxonomy that also matches the candidate items the scorers/genre-match compare against —
+    while Tautulli still supplies actors/directors/studios for that key and remains the sole
+    (fallback) source for watched-but-not-owned keys the library can't resolve. PURE; neither
+    input is mutated."""
+    merged = {rk: dict(v) for rk, v in (tautulli_index or {}).items()}
+    for rk, lib in (library_index or {}).items():
+        base = dict(merged.get(rk) or {})
+        if lib.get("genres"):
+            base["genres"] = list(lib["genres"])
+        merged[rk] = base
+    return merged
 
 
 def aggregate_affinity(history_entries: list, metadata_index: dict, *,

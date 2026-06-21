@@ -1,9 +1,14 @@
+import json
 import re
 from typing import Optional
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.factories.mixins.ordered_components import topo_order
+from scripts.managers.machine_learning.affinity.genre_affinity import (
+    build_library_index,
+    merge_library_first,
+)
 from scripts.managers.services.tautulli.api import TautulliAPI
 from scripts.managers.services.tautulli.devices import TautulliDevicesManager
 from scripts.managers.services.tautulli.episodes import TautulliEpisodesManager
@@ -208,6 +213,24 @@ class TautulliManager(BaseManager, ComponentManagerMixin):
         rating_keys = list({str(e.get("rating_key")) for e in all_entries if e.get("rating_key")})
         metadata_index = self.metadata.get_metadata_index_cached(rating_keys)
         self.logger.log_info(f"[Tautulli] Metadata index: {len(metadata_index)} unique items.")
+
+        # 4a. LIBRARY-FIRST enrichment. The per-key fetch above only covers WATCHED keys it could
+        #     fetch — sparse, and the cached snapshot misses newly-/rarely-watched keys until its
+        #     7-day TTL — so a low-volume, movie-only profile can score affinity=0 and collapse to
+        #     the flat household ranking. Resolve genres for every history row from the OWNED
+        #     library (Radarr movies / Sonarr series) by a STABLE title join and merge them in
+        #     (library genres win — one taxonomy that also matches the candidate items the scorers
+        #     compare against; Tautulli still supplies people/studios + the not-owned fallback).
+        #     Uses only already-cached Radarr/Sonarr data — no Tautulli API call, no api key.
+        movie_by_title, series_by_title = self._library_genre_maps()
+        if movie_by_title or series_by_title:
+            tautulli_only = len(metadata_index)
+            library_index = build_library_index(all_entries, movie_by_title, series_by_title)
+            metadata_index = merge_library_first(library_index, metadata_index)
+            self.logger.log_info(
+                f"[Tautulli] Library-first affinity: {len(library_index)} key(s) resolved from "
+                f"owned Radarr/Sonarr genres → metadata index {len(metadata_index)} items "
+                f"(Tautulli-only was {tautulli_only}).")
 
         # 5. Library list — real-time
         library_index = self.metadata.get_library_index()
@@ -436,3 +459,59 @@ class TautulliManager(BaseManager, ComponentManagerMixin):
                 "genres present in the household affinity map",
             ],
         )
+
+    # ── library-first affinity inputs ─────────────────────────────────────────
+    @staticmethod
+    def _coerce_genre_list(g):
+        """Sonarr's parquet stores ``genres`` as a JSON string (occasionally a list, or NaN).
+        Normalise to ``list[str]`` or ``None``."""
+        if isinstance(g, str):
+            try:
+                g = json.loads(g)
+            except (ValueError, TypeError):
+                return None
+        return list(g) if isinstance(g, (list, tuple)) and len(g) else None
+
+    def _library_genre_maps(self):
+        """``(movie_genres_by_title, series_genres_by_title)`` for the library-first affinity
+        enrichment — read from already-cached Radarr movies + Sonarr episode_files, so it needs
+        NO Tautulli API key. Best-effort: a missing cache / parquet / pandas just yields a smaller
+        map and the index degrades toward the Tautulli-only fetch. Titles are kept RAW here;
+        :func:`build_library_index` normalises both sides of the join."""
+        movie_by_title: dict = {}
+        series_by_title: dict = {}
+        cache = self.global_cache
+        if not cache:
+            return movie_by_title, series_by_title
+        # Radarr movies: one `.full` list per configured instance (carries title + genres).
+        insts = [k for k in (self.config.get("radarr_instances", {}) or {})
+                 if k != "default_instance"] or ["standard"]
+        for inst in insts:
+            try:
+                rows = cache.get(f"radarr.movies.{inst}.full") or []
+            except Exception:
+                continue
+            for v in (rows.values() if isinstance(rows, dict) else rows):
+                if isinstance(v, dict) and v.get("genres") and v.get("title"):
+                    movie_by_title.setdefault(v["title"], list(v["genres"]))
+        # Sonarr series: genres live in the episode_files parquet (series_title → genres). Sonarr
+        # has no global_cache `.full` key, so read the parquet directly (defensive).
+        base = getattr(getattr(cache, "key_builder", None), "base_dir", None)
+        if base is not None:
+            try:
+                import glob
+                import pandas as pd
+                for p in glob.glob(str(base / "sonarr" / "**" / "episode_files.parquet"),
+                                   recursive=True):
+                    try:
+                        df = pd.read_parquet(p, columns=["series_title", "genres"])
+                    except Exception:
+                        continue
+                    for st, g in zip(df["series_title"], df["genres"]):
+                        if st and st not in series_by_title:
+                            gl = self._coerce_genre_list(g)
+                            if gl:
+                                series_by_title[st] = gl
+            except Exception:
+                pass
+        return movie_by_title, series_by_title
