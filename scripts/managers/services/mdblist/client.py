@@ -114,14 +114,20 @@ def _list_rows(body) -> list:
 
 
 def _parse_list_item(r) -> "dict | None":
-    """One list row → ``{"tmdb", "tvdb", "media"}`` (alias-tolerant), or None if it carries no
-    usable id. ``media`` normalizes tv/series → 'show'; when absent (or when a row claims 'movie'
-    yet carries only a tvdb id) it is inferred from which id is present — a tvdb-only row is always
-    a show (we can only place it by tvdb), a tmdb-only row a movie."""
+    """One list row → ``{"tmdb", "tvdb", "media"}`` (alias-tolerant), or None if it carries no usable
+    id. mdblist rows nest the cross-ids under ``ids`` (``{"tmdb","tvdb","imdb",…}``) and put the TMDB
+    id in the top-level ``id`` field — NOT ``tmdb_id`` — so prefer ``ids`` then fall back to ``id``
+    (a prior version read only ``tmdb_id`` → tmdb was always None → every MOVIE was misfiled as a
+    show). ``media`` comes from ``mediatype``; it's only inferred from the ids when absent."""
     if not isinstance(r, dict):
         return None
-    tmdb = _int_or_none(_first(r, "tmdb_id", "tmdbid", "tmdb"))
-    tvdb = _int_or_none(_first(r, "tvdb_id", "tvdbid", "tvdb"))
+    ids = r.get("ids") if isinstance(r.get("ids"), dict) else {}
+    tmdb = _int_or_none(_first(ids, "tmdb")) if ids else None
+    if tmdb is None:
+        tmdb = _int_or_none(_first(r, "tmdb_id", "tmdbid", "tmdb", "id"))
+    tvdb = _int_or_none(_first(ids, "tvdb")) if ids else None
+    if tvdb is None:
+        tvdb = _int_or_none(_first(r, "tvdb_id", "tvdbid", "tvdb"))
     if tmdb is None and tvdb is None:
         return None
     media = _first(r, "mediatype", "media_type", "type")
@@ -129,8 +135,8 @@ def _parse_list_item(r) -> "dict | None":
     if media in ("tv", "series"):
         media = "show"
     if media not in ("movie", "show") or (tmdb is None and tvdb is not None):
-        # absent/odd media, OR a 'movie' row carrying ONLY a tvdb id → infer by id (a tvdb-only
-        # row can only be placed as a show; this avoids silently dropping it in split_list_media).
+        # absent/odd media, OR a row with no usable tmdb but a tvdb → place by the id we actually
+        # have (a tvdb-only row can only be a show; else split_list_media would silently drop it).
         media = "show" if (tvdb is not None and tmdb is None) else "movie"
     return {"tmdb": tmdb, "tvdb": tvdb, "media": media}
 

@@ -69,6 +69,17 @@ def test_list_items_movie_row_with_only_tvdb_becomes_show(monkeypatch):
     assert r["items"] == [{"tmdb": None, "tvdb": 95057, "media": "show"}]   # not dropped
 
 
+def test_list_items_reads_tmdb_from_id_and_ids(monkeypatch):
+    # REGRESSION: mdblist rows put TMDB in `id` / nested `ids`, NOT `tmdb_id` — a movie row must
+    # classify as a MOVIE (a prior bug read only tmdb_id → tmdb None → every movie misfiled a show).
+    rows = {"movies": [{"id": 603, "mediatype": "movie", "tvdb_id": 70, "ids": {"tmdb": 603, "tvdb": 70}}],
+            "shows":  [{"id": 1396, "mediatype": "show", "tvdb_id": 81189, "ids": {"tmdb": 1396, "tvdb": 81189}}]}
+    monkeypatch.setattr(client, "_http_get", _stub(200, rows))
+    r = client.list_items("k", {"id": 1})
+    assert r["items"] == [{"tmdb": 603, "tvdb": 70, "media": "movie"},
+                          {"tmdb": 1396, "tvdb": 81189, "media": "show"}]
+
+
 def test_supporter_tier_with_budget(monkeypatch):
     monkeypatch.setattr(client, "_http_get", _stub(200, {
         "username": "trizzd", "patron_status": "active_patron",
