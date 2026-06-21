@@ -2,7 +2,7 @@
 
 **Goal.** Auto-discover TV franchises (sibling/spin-off show groups) comprehensively — both **same-named** (Law & Order(+SVU/OC), NCIS, CSI, Chicago, 9-1-1, Star Trek, Stargate) and **cross-named** (Grey's Anatomy↔Station 19↔Private Practice, Buffy↔Angel, Breaking Bad↔Better Call Saul, Vampire Diaries↔Originals↔Legacies, The Boys↔Gen V) — and feed them through **one seam** to playlist grouping, catch-up retention, AND acquisition. Movies need no work (already grouped by TMDB `collection_tmdb_id`).
 
-Status: **design locked, Phase 0 in progress.**
+Status: **Phase 0 + Phase 1 landed (2026-06-21); Phases 2-3 pending.**
 
 ## Locked decisions (2026-06-21)
 - **Acquire unowned siblings:** discovered franchises participate in acquisition — engaging one show backfills the rest start-first (via the universe acquire plan + the coordinator's show-add path), bounded by `max_per_run`. Not playlist/retention-only.
@@ -24,7 +24,9 @@ Every candidate node is **filtered to an actual TV series** — keep only links 
 - catch-up retention (`saga_member_sets` — closes its curated-franchise blind spot),
 - acquisition (`unified_universe_order` → `universe_acquire_plan`).
 
-**Critical cache rule:** synthetic entries are **regenerated every run** from current owned inventory and merged into the RETURNED dict only — **never** persisted into the cached `fetched` map (else a stale owned snapshot freezes membership). Emit `items` (not just `shows`) so the unified-rank branch is used. `timeline:False` → air-date member order (correct for siblings).
+**Critical cache rule (as built — corrects the original sketch):** the three downstream consumers split — playlist grouping reads the LIVE `builder._universe_source()`, but catch-up retention, hybrid acquisition AND the Sonarr prefetch walk read the `plex/playlists/universe_source` cache key DIRECTLY. So synthetic entries are written to the CACHE (not merged into a returned dict only), regenerated every run: `builder._refresh_synthetic_universes` strips all prior `tvfran:*` keys then re-adds the fresh set, preserving the mdblist universes + their TTL `fetched` ordinals verbatim (a `__tvfran__` bookkeeping marker only). Run-order: the playlist builder writes during the Plex phase (before retention/acquisition); the Sonarr prefetch walk runs earlier, so it sees the PRIOR run's set (a one-run lag, same as it already has for mdblist — acceptable).
+
+Entries emit **`timeline: True`** (NOT False): `unified_universe_order` SKIPS non-timeline universes, so the acquisition backfill would never see a franchise's gaps with `timeline:False`. They carry `movies:[]` + a debut-ordered `shows:[tvdb…]` + `items:[{media:'show', tvdb, rank}…]` (all three are load-bearing: `shows`→`build_universe_maps` grouping/order, `items`→`saga_member_sets` + `unified_universe_order`). `tv_group_maps` precedence: a real mdblist list still wins over a curated name, but a synthetic `tvfran:` cluster YIELDS to the hand-named curated franchise, so "One Chicago"/"Law & Order" keep their label in the playlist while still feeding retention + acquisition via the cache.
 
 ## Distribution — split by media (decided)
 The two media live in DIFFERENT homes; the volume cuts opposite ways.
@@ -62,8 +64,8 @@ franchise discovery + catch-up retention together. Wire into `onboarding/schema.
 ## Phases
 | # | Phase | Effort |
 |---|---|---|
-| 0 | **Same-stem clusterer** — `_stem_norm` (separate from `_norm`; don't touch its year-strip), subtitle-stem + conservative leading-token, stoplist + DENY set, min-cluster=2 | medium |
-| 1 | **Synthetic-universe emitter + seam** — `tv_franchise_universes()` + merge in `builder._universe_source` (regenerate-every-run, never cached) | medium |
+| 0 | ✅ **Same-stem clusterer** — `_stem_norm` (separate from `_norm`; don't touch its year-strip), subtitle-stem + conservative leading-token, stoplist + DENY set, min-cluster=2 | medium |
+| 1 | ✅ **Synthetic-universe emitter + seam** — `tv_franchise_universes()` (pure, `timeline:True`, debut-ordered) + `builder._refresh_synthetic_universes` cache write (strip+regenerate every run) + `tv_group_maps` curated precedence | medium |
 | 2 | **Franchise-graph generator** — standalone CLI; build a TV-series graph from 3 edges (Wikipedia category co-membership + Wikidata P2512/P179 + Wikipedia infobox `related`/spin-off/crossover links), filter nodes to TVDB-id-bearing series (`P4835`), connected-component cluster → baked `data/tv_franchises.generated.json`; debut-date ordered; diff-reviewed, never auto-committed | large |
 | 3 | **Migrate CURATED_TV_FRANCHISES** into the tvdb-keyed catalog (closes their retention blind spot) + deconflict overlap (`arrow` already a film-universe key) | small |
 

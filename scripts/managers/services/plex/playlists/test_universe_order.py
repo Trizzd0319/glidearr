@@ -8,11 +8,14 @@ from scripts.managers.services.plex.playlists.universe_order import (
     merge_movie_orders,
     movie_order_from_children,
     movie_universe_keys,
+    saga_display_name,
     saga_member_sets,
+    saga_membership_index,
     series_order_from_children,
     split_list_media,
     stem_franchise_clusters,
     tv_franchise_maps,
+    tv_franchise_universes,
     tv_group_maps,
     tv_group_maps_from_series,
     unified_universe_order,
@@ -28,6 +31,27 @@ def test_collection_universe_key_matches_kometa_names():
     assert collection_universe_key("X-Men Universe") == "xmen"
     assert collection_universe_key("Some Random Collection") is None
     assert collection_universe_key(None) is None
+
+
+# ── saga key → human label, and id → saga reverse index (acquisition attribution) ─
+def test_saga_display_name():
+    assert saga_display_name("mcu") == "Marvel Cinematic Universe"   # reverse of the Kometa map
+    assert saga_display_name("one chicago") == "One Chicago"          # curated key, Title-Cased
+    assert saga_display_name("tvfran:ncis") == "Ncis"                 # auto-cluster prefix stripped
+    assert saga_display_name("") == "" and saga_display_name(None) == ""
+
+
+def test_saga_membership_index_reverse_lookup():
+    src = {"universes": {
+        "mcu": {"timeline": True, "items": [
+            {"media": "movie", "tmdb": 1}, {"media": "show", "tvdb": 100}]},
+        "avengers": {"timeline": True, "items": [{"media": "movie", "tmdb": 1}]},  # crossover film
+    }}
+    idx = saga_membership_index(src)
+    assert set(idx[("movie", 1)]) == {"mcu", "avengers"}    # film in two sagas
+    assert idx[("show", 100)] == ["mcu"]
+    assert ("movie", 999) not in idx                        # unlisted title → absent
+    assert saga_membership_index(None) == {} and saga_membership_index({}) == {}
 
 
 # ── movie order from a collection's ordered children ────────────────────────────
@@ -305,3 +329,59 @@ def test_stem_clusters_deny_blocks_regional_remakes():
     # an explicit deny arg also blocks a stem cluster
     sham = [{"title": "Shameless", "tvdbId": 7}, {"title": "Shameless", "tvdbId": 8}]
     assert stem_franchise_clusters(sham, deny={"shameless"}) == {}
+
+
+# ── tv_franchise_universes: the synthetic universe-source seam (Phase 1) ──────────────
+def test_tv_franchise_universes_emits_timeline_true_show_entries():
+    out = tv_franchise_universes(_FAM, catalog={})
+    lo = out["tvfran:laworder"]
+    assert lo["timeline"] is True                              # REQUIRED — unified_universe_order skips falsy
+    assert lo["movies"] == [] and lo["shows"] == [1, 2, 3]     # TV-only, input (debut) order
+    assert lo["items"] == [{"media": "show", "tvdb": 1, "rank": 0},
+                           {"media": "show", "tvdb": 2, "rank": 1},
+                           {"media": "show", "tvdb": 3, "rank": 2}]
+    assert set(out) == {"tvfran:laworder", "tvfran:ncis", "tvfran:911", "tvfran:chicago"}
+
+
+def test_tv_franchise_universes_orders_members_by_debut():
+    rows = [{"title": "Star Trek: Picard", "tvdbId": 3, "year": 2020},
+            {"title": "Star Trek: The Next Generation", "tvdbId": 1, "year": 1987},
+            {"title": "Star Trek: Voyager", "tvdbId": 2, "tvdb_first_aired": "1995-01-16"}]
+    e = tv_franchise_universes(rows, catalog={})["tvfran:startrek"]
+    assert e["shows"] == [1, 2, 3]                             # 1987 < 1995 < 2020 (debut asc)
+    assert [it["tvdb"] for it in e["items"]] == [1, 2, 3] and e["items"][0]["rank"] == 0
+
+
+def test_tv_franchise_universes_undated_members_sort_last_stable():
+    rows = [{"title": "X: B", "tvdbId": 2},                    # undated
+            {"title": "X: A", "tvdbId": 1, "year": 2000}]      # dated
+    assert tv_franchise_universes(rows, catalog={})["tvfran:x"]["shows"] == [1, 2]   # dated first
+
+
+def test_tv_franchise_universes_empty_when_no_family_or_clustering_off():
+    singles = [{"title": "Fargo", "tvdbId": 5}, {"title": "Severance", "tvdbId": 6}]
+    assert tv_franchise_universes(singles, catalog={}) == {}
+    assert tv_franchise_universes(_FAM, catalog={}, cluster_same_stem=False) == {}   # Layer-1 off + empty catalog
+
+
+def test_tv_franchise_universes_layer2_catalog_overlays():
+    cat = {"buffyverse": {"shows": [101, 102]}, "tvfran:already": [201, 202]}
+    out = tv_franchise_universes([], cat)
+    assert out["tvfran:buffyverse"]["shows"] == [101, 102]     # bare key gets namespaced
+    assert out["tvfran:already"]["shows"] == [201, 202]        # already-namespaced key kept
+    assert out["tvfran:buffyverse"]["timeline"] is True
+
+
+def test_tv_franchise_universes_entries_round_trip_through_consumers():
+    # the integration guard the seam-map flagged as missing: producer output → every consumer.
+    src = {"universes": tv_franchise_universes(_FAM, catalog={})}
+    # playlist grouping (build_universe_maps reads `shows`, stamps order because timeline True)
+    _, _, fran, time = build_universe_maps(src, set(), {1: 100, 2: 101, 3: 102})
+    assert fran == {100: "tvfran:laworder", 101: "tvfran:laworder", 102: "tvfran:laworder"}
+    assert time == {100: 0, 101: 1, 102: 2}                    # debut/input order preserved
+    # retention (saga_member_sets reads `items`)
+    assert saga_member_sets(src)["tvfran:laworder"] == {"movies": {}, "shows": {1: 0, 2: 1, 3: 2}}
+    # acquisition (unified_universe_order requires timeline truthy → franchise gaps are seen)
+    uni = unified_universe_order(src, set(), {1: 100}, include_unowned=True)["tvfran:laworder"]
+    assert [(m["media"], m["id"], m["owned"]) for m in uni] == [
+        ("show", 1, True), ("show", 2, False), ("show", 3, False)]

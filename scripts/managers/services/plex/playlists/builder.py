@@ -49,6 +49,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     movie_order_from_children,
     movie_universe_keys,
     split_list_media,
+    tv_franchise_universes,
     tv_group_maps,
     universe_lists,
 )
@@ -446,6 +447,11 @@ class PlexPlaylistBuilderManager(BaseManager):
         the SAME grouping + order. ``({}, {})`` when the feature is off → per-series fallback."""
         if not self._universe_timeline_enabled():
             return {}, {}
+        # Regenerate the owned-inventory TV-franchise (tvfran:) entries into the universe-source
+        # cache BEFORE we read it below — so the SAME synthetic franchises reach this live playlist
+        # grouping AND the cache-reading consumers that run later this run (catch-up retention +
+        # hybrid universe acquisition both read plex/playlists/universe_source directly).
+        self._refresh_synthetic_universes(owned_eps)
         seen: dict = {}
         tvdb_to_sid: dict = {}
         for ep in owned_eps or []:
@@ -461,6 +467,40 @@ class PlexPlaylistBuilderManager(BaseManager):
             self.logger.log_info(f"[UniverseOrder] {len(set(fran.values()))} TV franchise(s) → "
                                  f"{len(fran)} owned series grouped.")
         return fran, timeline
+
+    def _refresh_synthetic_universes(self, owned_eps) -> None:
+        """Merge the owned-inventory TV-franchise (``tvfran:``) entries into the cached universe
+        source, regenerated EVERY run from current inventory. Stale ``tvfran:`` keys are stripped
+        first (a removed/renamed family never lingers) and the mdblist universes + their TTL
+        metadata are preserved verbatim — the synthetic seam never pollutes the last-good cache.
+        Best-effort: a failure here never blocks playlist grouping. Reaches the live grouping below
+        AND the later cache-reading consumers (catch-up retention, hybrid universe acquisition)."""
+        if not self.global_cache:
+            return
+        try:
+            rows, seen_tv = [], set()
+            for ep in owned_eps or []:
+                tv = _to_int(ep.get("series_tvdb_id"))
+                if tv is None or tv in seen_tv:
+                    continue
+                seen_tv.add(tv)
+                rows.append({"title": ep.get("series_title") or ep.get("title") or "",
+                             "tvdbId": tv, "year": ep.get("series_year") or ep.get("year")})
+            syn = tv_franchise_universes(rows, {})
+            cached = dict(self._cache_get(_UNIVERSE_SRC_KEY, {}) or {})
+            universes = {k: v for k, v in (cached.get("universes") or {}).items()
+                         if not str(k).startswith("tvfran:")}            # strip prior synthetic
+            fetched = {k: v for k, v in (cached.get("fetched") or {}).items()
+                       if k != "__tvfran__"}                            # drop only our marker; mdblist TTL untouched
+            universes.update(syn)
+            if syn:
+                fetched["__tvfran__"] = date.today().toordinal()         # bookkeeping; not read by the mdblist TTL loop
+            self.global_cache.set(_UNIVERSE_SRC_KEY, {"universes": universes, "fetched": fetched})
+            if syn:
+                self.logger.log_info(f"[UniverseOrder] {len(syn)} owned TV franchise(s) discovered "
+                                     f"by same-name clustering (feeding grouping, retention, acquisition).")
+        except Exception as e:
+            self.logger.log_debug(f"[UniverseOrder] synthetic franchise refresh skipped: {e}")
 
     # ── config knobs ────────────────────────────────────────────────────────────
     def _pl_cfg(self) -> dict:

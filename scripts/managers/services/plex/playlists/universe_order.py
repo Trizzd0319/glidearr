@@ -157,6 +157,65 @@ def stem_franchise_clusters(series_rows, *, deny=None) -> dict:
             out.setdefault(f"tvfran:{lead}", list(members))
     return out
 
+
+def tv_franchise_universes(owned_series_rows, catalog, *, cluster_same_stem=True) -> dict:
+    """Synthetic ``tvfran:`` universe-source entries — the SINGLE seam that makes discovered TV
+    franchises participate in playlist grouping, catch-up retention AND acquisition. Merges Layer-1
+    (owned same-stem clusters, :func:`stem_franchise_clusters`) with the Layer-2 baked ``catalog``
+    (``{}`` in Phase 1 — the generated cross-named file is deferred), namespaced ``tvfran:<stem>``
+    so the keys never collide with film universes.
+
+    ``owned_series_rows`` — ``[{title|series_title, tvdbId|tvdb|series_tvdb_id, year?,
+    tvdb_first_aired?}]``. Each emitted value is shaped EXACTLY like :func:`split_list_media` output
+    so every existing consumer reads it unchanged::
+
+        {"tvfran:laworder": {"timeline": True, "movies": [],
+                             "shows": [tvdb…],                              # debut-ordered
+                             "items": [{"media": "show", "tvdb": tvdb, "rank": i}…]}}
+
+    ``timeline`` is **True**, NOT False: :func:`unified_universe_order` SKIPS non-timeline universes
+    (so the acquisition backfill would never see a franchise's gaps), and ``build_universe_maps``
+    only stamps a series order for timeline universes — both of which we want. Members are ordered by
+    debut (``tvdb_first_aired`` → ``year`` → stable input order, undated last) so the saga rank the
+    retention watchlist-prefix scoping relies on is defensible. ``shows`` and ``items`` share that
+    order. PURE — no I/O. Phase-1 ``catalog={}`` makes the Layer-2 branch a no-op."""
+    clusters = stem_franchise_clusters(owned_series_rows) if cluster_same_stem else {}
+
+    # Debut + first-seen index per tvdb (for member ordering). Undated rows → stable input order.
+    debut: dict = {}
+    first_index: dict = {}
+    for i, r in enumerate(owned_series_rows or []):
+        tv = _coerce_int(r.get("tvdbId") if "tvdbId" in r
+                         else (r.get("tvdb") if "tvdb" in r else r.get("series_tvdb_id")))
+        if tv is None:
+            continue
+        first_index.setdefault(tv, i)
+        d = r.get("tvdb_first_aired") or r.get("year")
+        if d is not None and tv not in debut:
+            debut[tv] = str(d)
+
+    def _debut_ordered(members):
+        # (undated last, debut asc, original order) — a stable, defensible debut order.
+        return sorted(members, key=lambda tv: (tv not in debut, debut.get(tv, ""), first_index.get(tv, 0)))
+
+    def _entry(ordered):
+        return {"timeline": True, "movies": [], "shows": list(ordered),
+                "items": [{"media": "show", "tvdb": tv, "rank": i} for i, tv in enumerate(ordered)]}
+
+    out: dict = {}
+    for key, members in clusters.items():
+        out[key] = _entry(_debut_ordered(members))
+
+    # Layer-2 baked catalog (Phase 1: empty → dead branch). Same entry shape; a catalog franchise
+    # extends/overrides a same-keyed Layer-1 cluster (its curated tvdb order wins).
+    for key, entry in (catalog or {}).items():
+        k = key if str(key).startswith("tvfran:") else f"tvfran:{key}"
+        raw = entry.get("shows") if isinstance(entry, dict) else entry
+        shows = [t for t in (_coerce_int(tv) for tv in (raw or [])) if t is not None]
+        if shows:
+            out[k] = _entry(shows)
+    return out
+
 # Bundled list DEFINITIONS — Kometa's own universe→list map (the IMDb/mdblist lists it builds
 # from), copied here so glidearr can fetch the SAME source ITSELF and is no longer reliant on a
 # Kometa run having created the Plex collections. This is the only STATIC piece (changes only when
@@ -383,6 +442,46 @@ def collection_universe_key(title) -> str | None:
     return UNIVERSE_COLLECTION_NAMES.get(str(title or "").strip().casefold())
 
 
+# Reverse of UNIVERSE_COLLECTION_NAMES (key -> a Title-Cased display name), built once. Used by
+# the acquisition logs to print 'Marvel Cinematic Universe' instead of the bare 'mcu' key.
+_UNIVERSE_KEY_TO_NAME = {v: k.title() for k, v in UNIVERSE_COLLECTION_NAMES.items()}
+
+
+def saga_display_name(key) -> str:
+    """A saga KEY → a human label for logs: 'mcu' -> 'Marvel Cinematic Universe' (reverse of
+    ``UNIVERSE_COLLECTION_NAMES``), 'one chicago' -> 'One Chicago', 'tvfran:ncis' -> 'Ncis' (the
+    auto-clustered TV-family prefix is stripped). An unmapped key is Title-Cased as-is. PURE."""
+    k = str(key or "").strip()
+    if not k:
+        return ""
+    if k in _UNIVERSE_KEY_TO_NAME:
+        return _UNIVERSE_KEY_TO_NAME[k]
+    if k.startswith("tvfran:"):
+        k = k.split(":", 1)[1]
+    return k.replace("_", " ").title()
+
+
+def saga_membership_index(source) -> dict:
+    """The cached universe ``source`` → ``{("movie", tmdb): [keys], ("show", tvdb): [keys]}`` — a
+    REVERSE index from a title's native id to the saga key(s) it belongs to, so an acquisition add
+    can be attributed to its saga(s). Built from :func:`saga_member_sets` (full, ownership-independent
+    membership), so a recommendation add that happens to be an MCU film is recognisable. Ids are
+    coerced to int (source ids are ints; lookups coerce too). PURE — no I/O."""
+    out: dict = {}
+    for key, sets in saga_member_sets(source).items():
+        for tmdb in (sets.get("movies") or {}):
+            try:
+                out.setdefault(("movie", int(tmdb)), []).append(key)
+            except (TypeError, ValueError):
+                continue
+        for tvdb in (sets.get("shows") or {}):
+            try:
+                out.setdefault(("show", int(tvdb)), []).append(key)
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
 def movie_universe_keys(owned_movies) -> dict:
     """``{tmdb_id: set(universe_keys)}`` from each owned movie's Radarr ``universe_name``
     (pipe-split, placeholders dropped + casefolded — the SAME cleaning the resolver groups on).
@@ -472,9 +571,19 @@ def tv_group_maps(owned_series, universe_source, tvdb_to_sid, *, curated=None):
     what :func:`...next_episode_planner.group_key_for_series` keys off. PURE."""
     c_fran, c_time = tv_franchise_maps(owned_series, curated)             # curated grouping + order
     _, _, l_fran, l_time = build_universe_maps(universe_source or {}, set(), tvdb_to_sid or {})
-    franchise = {**c_fran, **l_fran}                                      # list wins on conflict
+    # Precedence: a real mdblist universe list still wins over a curated name, but a SYNTHETIC
+    # same-name cluster (``tvfran:…``, auto-derived from owned titles) YIELDS to the hand-named
+    # curated franchise — so "One Chicago" / "Law & Order" keep their curated label + saga order in
+    # the playlist even though the same family is also discovered by clustering (which still drives
+    # acquisition + retention through the universe source). Phase 3 migrates curated into the catalog.
+    franchise = dict(c_fran)
+    for sid, key in l_fran.items():
+        if sid not in franchise or not str(key).startswith("tvfran:"):
+            franchise[sid] = key                                         # real list overrides; synthetic does not
     timeline = dict(c_time)                                               # curated saga positions…
-    for sid in l_fran:                                                    # …then the list source:
+    for sid, key in l_fran.items():                                       # …then the list source, but
+        if franchise.get(sid) != key:                                    # only where the LIST grouping won
+            continue                                                     # (curated kept this series → keep its order)
         if sid in l_time:
             timeline[sid] = l_time[sid]                                   # timeline universe → keep
         else:

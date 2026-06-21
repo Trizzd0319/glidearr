@@ -135,6 +135,44 @@ def test_tv_franchise_maps_from_curated_when_enabled():
     assert timeline == {10: 0, 11: 1}                                    # saga order
 
 
+def test_refresh_synthetic_universes_writes_tvfran_and_curated_keeps_name():
+    import scripts.managers.services.plex.playlists.builder as B
+    cache = _Cache()
+    cache.set(B._UNIVERSE_SRC_KEY, {                                     # a prior mdblist list + a STALE tvfran ghost
+        "universes": {"mcu": {"timeline": True, "movies": [1], "shows": []},
+                      "tvfran:ghost": {"timeline": True, "movies": [], "shows": [999], "items": []}},
+        "fetched": {"mcu": 5, "__tvfran__": 1}})
+    m = _mgr(cache=cache, config=_ON)
+    owned = [
+        {"series_id": 1, "series_title": "CSI: Crime Scene Investigation", "series_tvdb_id": 10},
+        {"series_id": 2, "series_title": "CSI: Miami", "series_tvdb_id": 11},   # non-curated stem → synthetic survives
+        {"series_id": 3, "series_title": "Chicago Fire", "series_tvdb_id": 20},
+        {"series_id": 4, "series_title": "Chicago P.D.", "series_tvdb_id": 21},  # curated → keeps "one chicago"
+    ]
+    fran, _ = m._tv_franchise_maps(owned)
+
+    # (1) the cache is regenerated: stale ghost stripped, mdblist universe + its TTL untouched,
+    #     BOTH discovered families written (so retention + acquisition see them too)
+    src = cache.get(B._UNIVERSE_SRC_KEY)
+    assert "tvfran:ghost" not in src["universes"]                        # stale synthetic stripped
+    assert src["universes"]["mcu"]["movies"] == [1] and src["fetched"]["mcu"] == 5
+    assert src["universes"]["tvfran:csi"]["shows"] == [10, 11]
+    assert src["universes"]["tvfran:csi"]["timeline"] is True            # so acquisition won't skip it
+    assert [it["tvdb"] for it in src["universes"]["tvfran:csi"]["items"]] == [10, 11]
+    assert src["universes"]["tvfran:chicago"]["shows"] == [20, 21]       # written even though curated names it
+
+    # (2) playlist grouping: CSI under its synthetic key, Chicago keeps the curated label
+    assert fran[1] == "tvfran:csi" and fran[2] == "tvfran:csi"
+    assert fran[3] == "one chicago" and fran[4] == "one chicago"         # curated wins over tvfran:chicago
+
+
+def test_refresh_synthetic_universes_noop_without_cache():
+    m = _mgr(config=_ON)                                                 # global_cache None
+    fran, _ = m._tv_franchise_maps([{"series_id": 1, "series_title": "CSI: Miami", "series_tvdb_id": 10},
+                                    {"series_id": 2, "series_title": "CSI: NY", "series_tvdb_id": 11}])
+    assert fran == {}                                                    # no cache → no synthetic source to group from
+
+
 def test_builds_movie_plan_ranked_by_score():
     cache = _Cache()
     owned = [_movie(1, "Low", 2000, 20), _movie(2, "High", 2010, 90)]
