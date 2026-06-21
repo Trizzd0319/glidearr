@@ -188,6 +188,140 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             )
         return stats
 
+    # ── targeted single-title acquire (hybrid universe walk) ─────────────────────
+    def _persist_deferred(self, item: dict) -> None:
+        """Append ONE item to the deferred-search backlog (same shape + cap as run()'s batch
+        write). No-op without a global_cache or in dry_run (the caller guards dry_run)."""
+        if not self.global_cache:
+            return
+        q = self.global_cache.get(self._DEFERRED_KEY)
+        q = q if isinstance(q, list) else []
+        q.append(item)
+        if len(q) > self._DEFERRED_MAX:
+            q = q[-self._DEFERRED_MAX:]
+        self.global_cache.set(self._DEFERRED_KEY, q)
+
+    def _find_movie_record(self, gw, tmdb) -> "tuple[dict | None, str | None]":
+        """The full Radarr movie record (id/hasFile/monitored) for a tmdbId, scanning EVERY
+        configured Radarr instance (cached library reads). Scanning all instances — not just
+        default+anime — closes the dedup blind spot where a saga film already owned on a 4K/other
+        instance would be re-added on default. Returns (record, instance) or (None, None)."""
+        insts = [k for k in ((self.config or {}).get("radarr_instances", {}) or {})
+                 if k != "default_instance"]
+        # default first (most movies live there), then the rest, de-duped.
+        di = gw.default_instance()
+        ordered = list(dict.fromkeys([di] + insts))
+        for inst in ordered:
+            for rec in gw.library_items(inst):
+                if isinstance(rec, dict) and str(rec.get("tmdbId")) == str(tmdb):
+                    return rec, inst
+        return None, None
+
+    def _grab_existing(self, gw, rec, inst, tmdb, band_cache) -> dict:
+        """A film already present in Radarr on ``inst``: already-owned if it has a file, else a real
+        GRAB (monitor + search) that honours ``dry_run`` and the free-space band exactly like a fresh
+        add. Shared by the routed-instance "already in library" result AND the all-instance
+        cross-mount dedup, so a film owned on ANY instance is searched in-place, never re-added on
+        default. The search is issued on ``inst`` — the mount the film actually lives on."""
+        if rec.get("hasFile"):
+            return {"action": "already-owned", "title": rec.get("title")}
+        title = rec.get("title") or str(tmdb)
+        if self.dry_run:
+            self.logger.log_info(
+                f"[acquire][universe] [dry-run] would search owned-no-file '{title}'.")
+            return {"action": "would-search", "title": title}
+        if self._acquisition_paused(gw, inst, band_cache):
+            return {"action": "paused", "title": title}
+        if not rec.get("monitored"):
+            gw.put(inst, f"movie/{rec.get('id')}", {**rec, "monitored": True})
+        free, U = self._space_band(gw, inst, band_cache)
+        if free < U:
+            # under pressure (deletions armed): leave it monitored + queue the search for when free
+            # recovers, rather than grabbing into a full disk now.
+            self._persist_deferred({
+                "service": "radarr", "instance": inst, "arr_id": rec.get("id"), "title": title,
+                "type": "movie", "profile": None,
+                "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0,
+            })
+            return {"action": "deferred", "title": title}
+        ok = self._trigger_search(gw, inst, {"type": "movie", "arr_id": rec.get("id"),
+                                             "title": title})
+        return {"action": "searched" if ok else "search-failed", "title": title}
+
+    def ensure_owned_and_grab(self, tmdb_id, *, gateways=None, band_cache=None, search=True) -> dict:
+        """Ensure ONE specific film (by tmdbId) is owned + grabbed — the entry point the hybrid
+        universe walk uses to acquire the next FILM in a saga (see
+        ``services/coordinator/universe_acquisition.md``).
+
+        EXPLICIT INTENT: unlike :meth:`run`'s recommendation adds, this BYPASSES ``min_score`` /
+        ``max_adds_per_run`` — a saga member is a deliberate target, not a scored suggestion. It
+        ALWAYS honours ``dry_run`` and the free-space band: it PAUSES (never strands) when free <
+        reserve and deletions are off, and DEFERS the search under pressure (add-monitored-now,
+        search-when-space-recovers), exactly like ``run``. Reuses the run() primitives (Resolver
+        dedup+lookup+routing, Adder, ``_trigger_search``, the deferred backlog). A coordinator may
+        pass shared ``gateways``/``band_cache`` for per-run caching.
+
+        Returns ``{"action", "title"?, "reason"?}`` where action ∈ {already-owned, already-present,
+        searched, search-failed, would-search, added, would-add, deferred, paused, add-failed,
+        skipped}."""
+        if tmdb_id is None:
+            return {"action": "skipped", "reason": "no tmdb"}
+        if gateways is None:
+            gateways = {"radarr": ArrGateway(
+                "radarr", getattr(self.radarr, "instance_manager", None), self.config, self.logger)}
+        band_cache = band_cache if band_cache is not None else {}
+        gw = gateways.get("radarr")
+        if gw is None or not gw.available:
+            return {"action": "skipped", "reason": "no radarr instance"}
+
+        resolver = Resolver(gateways, self.config, self.logger)
+        adder = Adder(gateways, self.logger, dry_run=self.dry_run, monitored=True, search=False)
+        enriched = resolver.prepare({"type": "movie", "ids": {"tmdb": int(tmdb_id)}})
+        reason = enriched.get("skip_reason")
+
+        # Cross-mount dedup FIRST. prepare() only checks the single ROUTED instance, so a saga film
+        # already owned on a DIFFERENT Radarr instance (4K/anime/other mount, separate DB) slips
+        # through as "not in library" and would be re-added on default. Scan EVERY instance by exact
+        # tmdb up front: a hit is grabbed-in-place (owned-no-file) or already-owned, never re-POSTed.
+        # The walk only calls us for titles unowned IN PLEX, so a present record is an
+        # added-but-not-imported title — grab it if it has no file, else it's truly owned.
+        rec, found_inst = self._find_movie_record(gw, int(tmdb_id))
+        if rec is not None:
+            return self._grab_existing(gw, rec, found_inst, int(tmdb_id), band_cache)
+        # prepare() said it IS in library but our all-instance scan found no record (cache race) →
+        # present, no-op (never blind-add on a stale "already in library").
+        if reason == "already in library":
+            return {"action": "already-present"}
+
+        if reason:                                       # no lookup match etc. → fail closed
+            return {"action": "skipped", "reason": reason, "title": enriched.get("title")}
+
+        # FOOTGUN GUARD: never add the wrong film on a fuzzy lookup — require the exact tmdb.
+        if str(enriched.get("ext_id")) != str(int(tmdb_id)):
+            return {"action": "skipped", "reason": "tmdb mismatch", "title": enriched.get("title")}
+
+        inst = enriched.get("instance")
+        title = enriched.get("title") or enriched.get("ext_id")
+        # No way to reclaim space (deletion not armed, free < reserve) → pause; a deferred add
+        # would strand forever.
+        if self._acquisition_paused(gw, inst, band_cache):
+            return {"action": "paused", "title": title}
+        free, U = self._space_band(gw, inst, band_cache)
+        under_pressure = free < U
+        res = adder.add(enriched, search=False if under_pressure else search)
+        action = res.get("action")
+        if under_pressure and action in ("added", "would-add"):
+            if res.get("ok") and not self.dry_run:
+                aid = (res.get("result") or {}).get("id")
+                if aid is not None:
+                    self._persist_deferred({
+                        "service": "radarr", "instance": inst, "arr_id": aid, "title": title,
+                        "type": "movie", "profile": (enriched.get("quality_profile") or {}).get("name"),
+                        "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0,
+                    })
+            return {"action": "deferred", "title": title}
+        return {"action": action, "title": title}
+
     @LoggerManager().log_function_entry
     @timeit("run")
     def run(self) -> None:
