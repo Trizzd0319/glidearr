@@ -504,8 +504,8 @@ class PlexPlaylistBuilderManager(BaseManager):
                 fetched["__tvfran__"] = date.today().toordinal()         # bookkeeping; not read by the mdblist TTL loop
             self.global_cache.set(_UNIVERSE_SRC_KEY, {"universes": universes, "fetched": fetched})
             if syn:
-                self.logger.log_info(f"[UniverseOrder] {len(syn)} owned TV franchise(s) discovered "
-                                     f"by same-name clustering (feeding grouping, retention, acquisition).")
+                self.logger.log_info(f"[UniverseOrder] {len(syn)} engaged TV franchise(s) "
+                                     f"(owned or watchlisted) feeding grouping, retention and acquisition.")
         except Exception as e:
             self.logger.log_debug(f"[UniverseOrder] synthetic franchise refresh skipped: {e}")
 

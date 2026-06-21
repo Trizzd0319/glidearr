@@ -365,6 +365,10 @@ def test_tv_franchise_universes_empty_when_no_family_or_clustering_off():
 
 
 def test_tv_franchise_universes_layer2_catalog_scoped_to_owned_or_watchlisted():
+    # The watchlist-engaged emission is load-bearing for catch-up RETENTION, not acquisition:
+    # saga_retention.compute_saga_gates prefix-scopes a hold to the watchlisted title only if the
+    # franchise is in the universe source. Acquisition stays watched-gated (universe_acquire_plan),
+    # so a watchlisted-only franchise is visible-but-not-acquired. Do NOT narrow this back to owned.
     cat = {"buffyverse": {"shows": [101, 102]}, "stargate": {"shows": [201, 202]},
            "tvfran:cold": [301, 302]}
     owned = [{"title": "Buffy", "tvdbId": 101}]                # own 1 of buffyverse
