@@ -49,6 +49,43 @@ def test_signal_absent_when_candidate_not_in_matrix():
     assert "people_affinity" not in out["matrix"]
 
 
+def _people_gc():
+    gc = _GC()
+    gc.set("people_matrix/forward", {"movie:603": _roles(1245)})
+    gc.set("people_matrix/affinity", {"1245": 5.0})
+    return gc
+
+
+def test_weighted_people_changes_total_via_renormalization():
+    # With a config (people_affinity_weight default 0.08), a candidate that CARRIES the
+    # people signal renormalizes: the cast/crew term now moves the total.
+    cand = {"type": "movie", "ids": {"tmdb": 603}, "genres": [], "year": 2000, "rating": 7.0}
+    on = AcquisitionScorer(_people_gc(), _Log(), {"acquisition": {}}).score(dict(cand))
+    off = AcquisitionScorer(_people_gc(), _Log()).score(dict(cand))   # no config → weight 0.0
+    assert on["matrix"]["people_affinity"] > 0
+    assert on["total"] != off["total"]                     # the weighted signal shifted the score
+
+
+def test_absent_people_candidate_byte_identical_across_weight():
+    # The renormalization guarantee: a candidate with NO people signal is summed into
+    # neither numerator nor denominator, so the weight value cannot change its total.
+    weighted = AcquisitionScorer(_GC(), _Log(), {"acquisition": {"people_affinity_weight": 0.2}})
+    inert = AcquisitionScorer(_GC(), _Log())
+    assert weighted.score(dict(CAND))["total"] == inert.score(dict(CAND))["total"]
+
+
+def test_explicit_zero_weight_disables_even_with_config():
+    cand = {"type": "movie", "ids": {"tmdb": 603}, "genres": [], "year": 2000, "rating": 7.0}
+    on = AcquisitionScorer(_people_gc(), _Log(), {"acquisition": {"people_affinity_weight": 0.0}}).score(dict(cand))
+    off = AcquisitionScorer(_people_gc(), _Log()).score(dict(cand))
+    assert on["total"] == off["total"]                     # weight 0.0 → byte-identical
+
+
+def test_no_config_keeps_module_default_weight_zero():
+    # Back-compat: a scorer built without a config never weights people_affinity.
+    assert AcquisitionScorer(_GC(), _Log())._weights["people_affinity"] == 0.0
+
+
 # ── co-cast source ───────────────────────────────────────────────────────────
 def _gatherer(gc, **sources):
     return CandidateGatherer(None, None, _Log(), sources, limit=20, global_cache=gc)

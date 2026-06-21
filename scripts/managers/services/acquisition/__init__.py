@@ -338,7 +338,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                                      acq.get("sources", {}), limit=int(acq.get("recommendation_limit", 20)),
                                      plex=self.plex, global_cache=self.global_cache)
         resolver = Resolver(gateways, self.config, self.logger)
-        scorer = AcquisitionScorer(self.global_cache, self.logger)
+        scorer = AcquisitionScorer(self.global_cache, self.logger, self.config)
         adder = Adder(gateways, self.logger, dry_run=self.dry_run,
                       monitored=bool(acq.get("monitored", True)),
                       search=bool(acq.get("search_on_add", False)))
@@ -367,6 +367,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 continue
             sc = scorer.score(enriched)
             enriched["score"], enriched["matrix"] = sc["total"], sc["matrix"]
+            enriched["evidence"] = sc.get("evidence", {})   # raw drivers for the why breakdown
             # Now that the score exists, re-pick the quality profile from it (the
             # matrix) — higher score → higher quality tier — instead of the default
             # first ("Any") profile. No-op if acquisition.quality_profile is pinned.
@@ -395,10 +396,12 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         )
 
         rows, added, would, failed, deferred = [], 0, 0, 0, 0
+        elevated: list[dict] = []          # acted-on titles, for the why/elevation breakdown
         new_deferred: list[dict] = []
         for e in selected:
             svc = "sonarr" if e.get("type") == "show" else "radarr"
             gw = gateways.get(svc)
+            why = scorer.reason(e.get("matrix"))   # top score drivers — explains the 4K-eligible ≥70
 
             # No way to reclaim space (deletion not consented/armed) and we're below the
             # pressure band → skip the add entirely. A deferred title would never get its
@@ -409,7 +412,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                     str(e.get("title") or e.get("ext_id"))[:34],
                     e.get("type"), e.get("score"), str(e.get("instance")),
                     (e.get("quality_profile") or {}).get("name"),
-                    self._size_str(e), "skipped (full)",
+                    self._size_str(e), "skipped (full)", why,
                 ])
                 continue
 
@@ -452,8 +455,11 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 (e.get("quality_profile") or {}).get("name"),
                 self._size_str(e),
                 action,
+                why,
             ])
             self.logger.log_debug(f"[acquire] '{e.get('title')}' matrix={e.get('matrix')}")
+            if action in ("added", "would-add", "deferred"):
+                elevated.append(e)
 
             # Dual-version companion (4k_policy=='both'): add the 2160p copy on the 4K instance
             # ON TOP of the <=1080 baseline just added. Make-before-break — gated on the baseline
@@ -478,6 +484,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                         (companion.get("quality_profile") or {}).get("name"),
                         self._size_str(companion),
                         f"{caction} [4k]",
+                        why,
                     ])
 
         # Persist the new deferrals onto the backlog (live runs only), bounding its length
@@ -497,11 +504,13 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
 
         if rows:
             self.logger.log_table(
-                ["title", "type", "score", "instance", "profile", "~size", "decision"],
+                ["title", "type", "score", "instance", "profile", "~size", "decision", "why"],
                 rows, title="Acquisition decisions",
             )
         else:
             self.logger.log_info("[Acquisition] no new candidates to add.")
+        if elevated:
+            self._log_elevation_breakdown(elevated, scorer)
         if skipped:
             self.logger.log_info("[Acquisition] skipped: "
                                  + ", ".join(f"{k}×{v}" for k, v in skipped.items()))
@@ -524,3 +533,78 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             return "?"
         suffix = "/ep" if e.get("size_unit") == "per-episode" else ""
         return f"~{size}GB{suffix}"
+
+    @staticmethod
+    def _fmt_votes(v) -> str:
+        """Humanize a vote count: 412000 -> '412K votes', 1500000 -> '1.5M votes'."""
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            return ""
+        if v >= 1_000_000:
+            return f"{v / 1_000_000:.1f}M votes"
+        if v >= 1_000:
+            return f"{round(v / 1000)}K votes"
+        return f"{int(v)} votes"
+
+    @staticmethod
+    def _fmt_feed(feed) -> str:
+        """A source feed name as a friendly phrase: 'trakt_watchlist' -> 'Trakt watchlist'."""
+        if not feed:
+            return ""
+        head, _, tail = str(feed).partition("_")
+        svc = {"trakt": "Trakt", "plex": "Plex", "mal": "MAL"}.get(head, head.title())
+        return f"{svc} {tail.replace('_', ' ')}".strip()
+
+    def _log_elevation_breakdown(self, elevated: list, scorer) -> None:
+        """Plain-language "why was this elevated" breakdown, logged under the decision table.
+
+        Names the real score drivers per title — the matched genres + their 0–1 household
+        affinity weight, the source feed/intent, community rating, vote count, release year —
+        then, once, the household cast/crew taste profile (the nameable people signal; a
+        candidate's own credits aren't available). ASCII-only so cp1252 log sinks don't choke;
+        bounded by max_adds_per_run (one short stanza per acted-on title)."""
+        self.logger.log_info("[Acquisition] elevation breakdown (why each title was added):")
+        for e in elevated:
+            ev = e.get("evidence") or {}
+            title = str(e.get("title") or e.get("ext_id"))
+            self.logger.log_info(f"  {title}  (score {e.get('score')})")
+
+            mg = ev.get("matched_genres") or []
+            if mg:
+                self.logger.log_info(
+                    "    genres: " + " + ".join(f"{g}({w:.2f})" for g, w in mg)
+                    + "   [household affinity 0-1]")
+            else:
+                self.logger.log_info("    genres: none matched household taste")
+
+            signals = []
+            feed = self._fmt_feed(ev.get("source_feed"))
+            if feed:
+                signals.append(feed)
+            if ev.get("rating10") is not None:
+                signals.append(f"rating {ev['rating10']:.1f}/10")
+            votes = self._fmt_votes(ev.get("votes")) if ev.get("votes") else ""
+            if votes:
+                signals.append(votes)
+            if ev.get("year") is not None:
+                signals.append(str(ev["year"]))
+            if signals:
+                self.logger.log_info("    signals: " + ", ".join(signals))
+
+            ppl = ev.get("people")
+            if ppl:
+                self.logger.log_info(
+                    f"    cast/crew: {ppl.get('matched')} household-favourite "
+                    f"people on this title (people-affinity {ppl.get('score')})")
+
+        # The named cast/crew context: the household taste profile the affinity is scored
+        # against. Shown once — it's household-wide, not per-title.
+        prof = scorer.taste_profile() if scorer is not None else {}
+        dirs, actors = prof.get("directors") or [], prof.get("actors") or []
+        if dirs or actors:
+            self.logger.log_info("  household taste profile (what affinity is scored against):")
+            if dirs:
+                self.logger.log_info("    top directors: " + ", ".join(dirs))
+            if actors:
+                self.logger.log_info("    top cast: " + ", ".join(actors))

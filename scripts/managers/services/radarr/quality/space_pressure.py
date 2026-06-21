@@ -336,6 +336,8 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                    adult_users: list[str] | None = None,
                    related_enabled: bool = False,
                    related_graph_cap: float = 4.0,
+                   person_weights: dict | None = None,
+                   person_affinity_cap: float = 0.0,
                    language_consumability: bool = False,
                    return_breakdown: bool = False) -> "int | tuple[int, dict]":
         """
@@ -384,6 +386,8 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 completion_threshold=0.9,
                 affinity_boost=_affinity_boost(self.config),
                 related_graph_cap=related_graph_cap,
+                person_weights=person_weights,
+                person_affinity_cap=person_affinity_cap,
                 language_consumability=language_consumability,
                 return_breakdown=return_breakdown,
             )
@@ -448,6 +452,14 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         _lc = ((self.config or {}).get("scoring", {}) or {}).get("language_consumability", {}) or {}
         language_consumability = bool(_lc.get("enabled", False)) if isinstance(_lc, dict) else bool(_lc)
 
+        # GROUP C4 — cast/crew taste overlap (config.scoring.person_affinity). Load the
+        # household person-affinity ONCE per pass; the shared resolver forces cap=0.0
+        # (byte-identical) when the term is disabled or the people-matrix has never been
+        # built, so libraries without it score exactly as before.
+        from scripts.managers.machine_learning.scoring._shared import resolve_person_affinity_inputs
+        _aff_raw = self.global_cache.get("people_matrix/affinity") if self.global_cache else None
+        person_weights, person_affinity_cap = resolve_person_affinity_inputs(self.config, _aff_raw)
+
         # Iterate plain row dicts (one to_dict("records") pass) rather than building a
         # fresh pd.Series per row via df.loc[idx] — the classic per-row anti-pattern over
         # a few-thousand-row library. build_movie_feature_row reads every field through
@@ -467,6 +479,8 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 adult_users=adult_users,
                 related_enabled=related_enabled,
                 related_graph_cap=related_graph_cap,
+                person_weights=person_weights,
+                person_affinity_cap=person_affinity_cap,
                 language_consumability=language_consumability,
                 return_breakdown=with_breakdown,
             )

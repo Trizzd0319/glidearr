@@ -62,7 +62,9 @@ class _FakeGatherer:
 
 class _FakeScorer:
     def __init__(self, *a, **k): pass
-    def score(self, enriched): return {"total": 87, "matrix": {}}
+    def score(self, enriched): return {"total": 87, "matrix": {}, "evidence": {}}
+    def reason(self, matrix, **k): return ""
+    def taste_profile(self, k=5): return {"genres": [], "directors": [], "actors": []}
 
 
 class _RecAdder:

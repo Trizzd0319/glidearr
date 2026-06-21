@@ -83,6 +83,7 @@ _DOC_LEAVES = [
     ("size_anomaly.enabled", "true", "Report files wildly out of size profile for their graded quality (e.g. a 45 GB '720p')"),
     ("size_anomaly.remediate", "false", "ACT on size anomalies: rescan mis-graded + re-grab bloated at profile target (DESTRUCTIVE; needs a valid backup)"),
     ("size_anomaly.over_ratio", "3.0", "Flag oversized at >= this multiple of the expected size for the quality"),
+    ("acquisition.people_affinity_weight", "0.08", "Weighted share of cast/crew (people) overlap in the ADD score — elevates candidates sharing cast/crew with your watched titles. Renormalizes on present signals (no-overlap candidates unaffected); 0 disables (byte-identical)"),
     ("acquisition.next_episode.mode", "recommended", "Next-episode prefetch tuning: recommended | customize | off (set =off to keep it disabled headlessly)"),
     ("acquisition.universe.enabled", "false", "Hybrid universe acquisition: once the household watches part of a saga (MCU, Star Trek, Arrowverse, One Chicago…), grab its remaining films (Radarr) + shows (Sonarr) in timeline order — START-first. Default off; honours dry_run + free-space band. Needs plex.playlists.universe_timeline on"),
     ("acquisition.universe.max_per_run", "5", "Per-run cap on universe backfill grabs (bypasses acquisition.max_adds_per_run / min_score — explicit intent, own budget)"),

@@ -244,6 +244,33 @@ def person_affinity_score(
     return round(min(cap, (sum(top3) / len(top3)) * cap), 3)
 
 
+def resolve_person_affinity_inputs(config, affinity_raw) -> "tuple[dict, float]":
+    """Owned-scorer Group-C4 inputs ``(person_weights, cap)`` from config + the cached
+    household person-affinity (``people_matrix/affinity``, ``{str(person_id): weight}``).
+
+    The single gate for BOTH the movie (space_pressure) and show (episode_files) upgrade
+    paths so they can't drift. ``cap`` is forced to 0.0 — making C4 byte-identical — when
+    the term is config-disabled (``scoring.person_affinity.enabled``) OR the people-matrix
+    affinity is empty, so a library that never built the matrix is wholly unaffected.
+    Default cap 8.0 (mirrors the Group-C2 ratios + the C4 integration test) when enabled
+    and weights exist."""
+    weights: dict[int, float] = {}
+    for k, v in (affinity_raw or {}).items():
+        try:
+            weights[int(k)] = float(v)
+        except (TypeError, ValueError):
+            continue
+    pa = ((config or {}).get("scoring", {}) or {}).get("person_affinity", {}) or {}
+    enabled = bool(pa.get("enabled", True)) if isinstance(pa, dict) else bool(pa)
+    try:
+        cap = float(pa.get("cap", 8.0)) if isinstance(pa, dict) else 8.0
+    except (TypeError, ValueError):
+        cap = 8.0
+    if not enabled or not weights or cap <= 0:
+        return weights, 0.0
+    return weights, cap
+
+
 def user_rating_score(
     user_rating: float | None,
     *,

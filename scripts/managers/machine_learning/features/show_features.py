@@ -154,6 +154,8 @@ def score_show_features(
     adult_users: list | None = None,
     watched_tvdb_ids=None,
     related_graph_cap: float = 4.0,
+    person_weights: dict | None = None,
+    person_affinity_cap: float = 0.0,
     ur_slope: float = 1.5,
     ur_pos_cap: float = 8.0,
     ur_neg_cap: float = -3.0,
@@ -163,7 +165,9 @@ def score_show_features(
 ):
     """Reconstruct the exact ``score_show`` call from a ShowFeatureRow + the shared
     library context. Byte-identical to the marshalling previously inline in
-    episode_files._build_show_score_map."""
+    episode_files._build_show_score_map. ``person_weights``/``person_affinity_cap`` feed
+    Group-C4 (cast/crew taste overlap); cap DEFAULT 0.0 → C4 is byte-identical until the
+    caller opts in (episode_files gates it on config + a built people-matrix)."""
     show = {
         "genres": list(fr.genres),
         "network": fr.network,
@@ -195,6 +199,8 @@ def score_show_features(
         latest_air_date=fr.latest_air_date,
         related_tvdb_ids=related,
         watched_tvdb_ids=watched_tvdb_ids,
+        person_weights=person_weights,
+        person_affinity_cap=person_affinity_cap,
         # File-aware G1 is OPT-IN (oracle-mover): only pass the per-episode consumable
         # fraction when the caller enables it; otherwise None → score_show falls back to
         # the legacy household-language penalty → byte-identical.

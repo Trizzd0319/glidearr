@@ -826,6 +826,14 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # English dub, Demon Slayer's English subs).
         _lc = ((self.config or {}).get("scoring", {}) or {}).get("language_consumability", {}) or {}
         language_consumability = bool(_lc.get("enabled", False)) if isinstance(_lc, dict) else bool(_lc)
+
+        # GROUP C4 — cast/crew taste overlap (config.scoring.person_affinity), the TV twin
+        # of the movie path. Same shared resolver, so cap=0.0 (byte-identical) whenever the
+        # term is disabled or the people-matrix affinity is empty. Loaded once per pass.
+        from scripts.managers.machine_learning.scoring._shared import resolve_person_affinity_inputs
+        _aff_raw = self.global_cache.get("people_matrix/affinity") if self.global_cache else None
+        person_weights, person_affinity_cap = resolve_person_affinity_inputs(self.config, _aff_raw)
+
         watched_tvdb_ids: set[int] = set()
         if related_enabled and "is_watched" in df.columns:
             for _wsid, _wrows in df.groupby("series_id", sort=False):
@@ -895,6 +903,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     adult_users=adult_users,
                     watched_tvdb_ids=watched_tvdb_ids,
                     related_graph_cap=related_graph_cap,
+                    person_weights=person_weights,
+                    person_affinity_cap=person_affinity_cap,
                     language_consumability=language_consumability,
                     return_breakdown=with_breakdown,
                     **ur_kwargs,

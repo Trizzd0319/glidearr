@@ -217,6 +217,12 @@ def empty_config() -> dict:
                 "slope": 1.5, "pos_cap": 8.0, "neg_cap": -3.0, "conf_divisor": 8.0,
             },
             "related_graph": {"enabled": True, "cap": 4.0},
+            # person_affinity: Group-C4 owned-media cast/crew taste overlap (id-keyed, so it's
+            # immune to name-spelling drift). Reads the household person-affinity from the
+            # people_matrix; raises the UPGRADE score for a movie/series whose cast/crew the
+            # household favours. cap = max points (mirrors C2's ratios). enabled toggles the
+            # term; it stays inert (byte-identical) until the people_matrix has been built.
+            "person_affinity": {"enabled": True, "cap": 8.0},
         },
         # JIT next-episode quality: per_episode_tiers (default ON) lets each upcoming episode earn
         # its OWN best-that-fits tier, so one series can mix tiers (e.g. one 2160p next to four
@@ -353,6 +359,11 @@ def empty_config() -> dict:
             "recommendation_limit": 20,
             "quality_profile": "",
             "min_score": 0,
+            # Weighted share of cast/crew (people) overlap in the ADD score: how strongly a
+            # candidate sharing cast/crew with the household's watched titles is elevated. The
+            # score renormalizes on the PRESENT signals, so a candidate with no people overlap
+            # is unaffected; only co-cast candidates re-rank. 0.0 disables (byte-identical).
+            "people_affinity_weight": 0.08,
             # Next-episode (stay-ahead) prefetch tuning — RECOMMENDED ON. Each sub-key
             # is opt-OUT: write {} or {"enabled": False} to disable just that feature.
             # Keep these values IN SYNC with the DEFAULT_* constants in

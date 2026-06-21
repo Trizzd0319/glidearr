@@ -104,12 +104,16 @@ def score_movie_features(
     completion_threshold: float = 0.9,
     affinity_boost: float = 1.0,
     related_graph_cap: float = 4.0,
+    person_weights: dict | None = None,
+    person_affinity_cap: float = 0.0,
     language_consumability: bool = False,
     return_breakdown: bool = False,
 ):
     """Reconstruct the exact ``score_movie`` call from a MovieFeatureRow + the shared
     library context. Byte-identical to the marshalling previously inline in
-    space_pressure._score_row."""
+    space_pressure._score_row. ``person_weights``/``person_affinity_cap`` feed Group-C4
+    (cast/crew taste overlap); cap DEFAULT 0.0 → C4 contributes 0.0 → byte-identical until
+    a caller opts in (space_pressure gates it on config + a built people-matrix)."""
     movie = {
         "tmdbId": fr.tmdb_id,
         "genres": list(fr.genres),
@@ -154,5 +158,7 @@ def score_movie_features(
         affinity_boost=affinity_boost,
         related_tmdb_ids=related,
         related_graph_cap=related_graph_cap,
+        person_weights=person_weights,
+        person_affinity_cap=person_affinity_cap,
         return_breakdown=return_breakdown,
     )
