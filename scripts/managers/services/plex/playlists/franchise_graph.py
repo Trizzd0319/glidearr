@@ -59,6 +59,49 @@ def connected_components(edges) -> list[set]:
     return list(comps.values())
 
 
+def franchise_star_edges(groups, *, min_members: int = 2, max_members=None, deny_types=None):
+    """Membership ``groups`` → connector ("star") edges + the member nodes that survive the filters.
+
+    ``groups`` — ``{group_id: {"members": [(tvdb, title, date)…], "types": set[str]}}`` — the
+    Wikidata 'part of the series' (``P179``) shape, where the members of one group share a franchise
+    node. A group is DROPPED when it has fewer than ``min_members`` distinct tvdb members, MORE than
+    ``max_members`` (the programming-SLOT over-capture — a Christmas-calendar / telenovela-time-slot
+    node bundles dozens of UNRELATED shows), or its ``types`` intersect ``deny_types`` (lower-cased
+    non-franchise type labels, e.g. 'program block', 'wikimedia list article'). Survivors are
+    star-connected — the first member ↔ each other member — so a P179 franchise becomes ONE connected
+    component once these edges union with the spin-off (``P2512``) edges. Returns ``(edges, nodes)``
+    with ``nodes`` = ``{tvdb: {"title", "date"}}`` (first non-null date wins). PURE."""
+    deny = {str(d).lower() for d in (deny_types or ())}
+    edges: list = []
+    nodes: dict = {}
+    for slot in (groups or {}).values():
+        if not isinstance(slot, dict):
+            continue
+        seen: set = set()
+        uniq: list = []
+        for m in (slot.get("members") or []):
+            tv = m[0] if m else None
+            if isinstance(tv, int) and not isinstance(tv, bool) and tv not in seen:
+                seen.add(tv)
+                uniq.append(m)
+        if len(uniq) < min_members:
+            continue
+        if max_members is not None and len(uniq) > max_members:   # programming-slot over-capture
+            continue
+        if deny and {str(t).lower() for t in (slot.get("types") or ())} & deny:
+            continue
+        for tv, title, date in uniq:
+            cur = nodes.get(tv)
+            if cur is None:
+                nodes[tv] = {"title": title, "date": date}
+            elif cur.get("date") is None and date:
+                cur["date"] = date
+        anchor = uniq[0][0]
+        for m in uniq[1:]:
+            edges.append((anchor, m[0]))
+    return edges, nodes
+
+
 def build_franchises(edges, nodes, *, min_members: int = 2, deny=None) -> dict:
     """Spin-off ``edges`` + ``nodes`` metadata → ``{franchise_key: {"titles": [...], "shows":
     [tvdb...]}}``.

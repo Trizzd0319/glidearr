@@ -2,7 +2,7 @@
 
 **Goal.** Auto-discover TV franchises (sibling/spin-off show groups) comprehensively — both **same-named** (Law & Order(+SVU/OC), NCIS, CSI, Chicago, 9-1-1, Star Trek, Stargate) and **cross-named** (Grey's Anatomy↔Station 19↔Private Practice, Buffy↔Angel, Breaking Bad↔Better Call Saul, Vampire Diaries↔Originals↔Legacies, The Boys↔Gen V) — and feed them through **one seam** to playlist grouping, catch-up retention, AND acquisition. Movies need no work (already grouped by TMDB `collection_tmdb_id`).
 
-Status: **Phases 0-3 landed (2026-06-21). Follow-ups: the generator's other two edges (Wikipedia category + infobox) and a fuller baked catalog.**
+Status: **Phases 0-3 landed (2026-06-21); generator now unions Wikidata P2512 + P179 (154→191 franchises). Follow-ups: the design's other two edges (Wikipedia category co-membership + infobox related/spin-off links) and a fuller baked catalog.**
 
 ## Locked decisions (2026-06-21)
 - **Acquire unowned siblings:** discovered franchises participate in acquisition — engaging one show backfills the rest start-first (via the universe acquire plan + the coordinator's show-add path), bounded by `max_per_run`. Not playlist/retention-only.

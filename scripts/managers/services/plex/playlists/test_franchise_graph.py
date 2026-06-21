@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from scripts.managers.services.plex.playlists.franchise_graph import (
-    build_franchises, connected_components, normalize_key,
+    build_franchises, connected_components, franchise_star_edges, normalize_key,
 )
 
 
@@ -60,3 +60,36 @@ def test_build_franchises_deny_suppresses():
 def test_normalize_key():
     assert normalize_key("Grey's Anatomy") == "greysanatomy"
     assert normalize_key("Star Trek: The Next Generation") == "startrekthenextgeneration"
+
+
+# ── franchise_star_edges: the P179 'part of the series' grouping + over-capture guards ──────
+def test_star_edges_connects_members_and_collects_nodes():
+    groups = {"Q1": {"members": [(1, "A", "2000"), (2, "B", "2002"), (3, "C", None)], "types": {"media franchise"}}}
+    edges, nodes = franchise_star_edges(groups)
+    assert sorted(edges) == [(1, 2), (1, 3)]                    # star: anchor(1) ↔ each other member
+    assert nodes == {1: {"title": "A", "date": "2000"}, 2: {"title": "B", "date": "2002"},
+                     3: {"title": "C", "date": None}}
+
+
+def test_star_edges_drops_singletons_and_dedups_members():
+    groups = {"Q1": {"members": [(1, "A", None), (1, "A", None)], "types": set()}}   # one real member
+    assert franchise_star_edges(groups) == ([], {})
+
+
+def test_star_edges_size_cap_drops_programming_slots():
+    big = {"Q1": {"members": [(i, f"Show {i}", None) for i in range(1, 12)], "types": {"television series"}}}
+    assert franchise_star_edges(big, max_members=8) == ([], {})  # 11-member 'Christmas calendar' slot dropped
+    assert franchise_star_edges(big, max_members=None) != ([], {})  # no cap → kept
+
+
+def test_star_edges_bad_type_exclude():
+    groups = {"Q1": {"members": [(1, "X", None), (2, "Y", None)], "types": {"program block"}}}
+    assert franchise_star_edges(groups, deny_types={"program block", "wikimedia list article"}) == ([], {})
+
+
+def test_star_edges_unions_into_build_franchises():
+    # a P179 franchise (no spin-off edge) becomes a real franchise once star-connected
+    groups = {"Q1": {"members": [(10, "Pilot", "1990"), (11, "Sequel", "1995")], "types": {"media franchise"}}}
+    e, n = franchise_star_edges(groups)
+    cat = build_franchises(e, n)
+    assert cat["pilot"]["shows"] == [10, 11]
