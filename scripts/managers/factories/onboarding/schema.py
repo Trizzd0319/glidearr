@@ -299,6 +299,12 @@ def empty_config() -> dict:
                  #     own, seed its playlist from the household's engagement with age-appropriate
                  #     content (a parent co-viewing kid shows) instead of a flat household order.
                  #     OFF by default → byte-identical.
+                 #   universe_timeline: order a universe/franchise block (MCU, Star Wars, …) by its
+                 #     in-universe TIMELINE instead of release date. Membership + order are fetched
+                 #     from the SAME IMDb/mdblist lists Kometa uses (needs mdblist.apikey), cached
+                 #     ttl_days and auto-updating as new films release — Kometa NOT required. Add or
+                 #     re-point a universe via universe_lists: {key: {imdb|mdblist|id, timeline}}.
+                 #     OFF by default → release-date order, byte-identical.
                  "playlists": {
                      "writeback": {"enabled": False},
                      "cold_start_kids_prior": False,
@@ -315,6 +321,23 @@ def empty_config() -> dict:
                      "profile_ages": {},
                      "recency_boost": {"enabled": False, "window_days": 30},
                      "fresh_arrivals": {"enabled": False, "acquired_window_days": 45},
+                     "universe_timeline": {"enabled": False, "ttl_days": 7},
+                     "universe_lists": {},
+                     # resume_boost: lift an IN-PROGRESS saga (≥1 watched + more queued —
+                     #   MCU/X-Men/Freddy collection, or a TV show) in the blended Up Next so you
+                     #   continue what you started. order: recency (default → the saga you watched
+                     #   most recently) | progress (the one you're deepest into). weight ∈ [0,1]
+                     #   (default 0.35 = moderate): a TUNABLE bonus — the in-progress saga wins ties
+                     #   and affinity gaps up to the weight, but a clearly-higher-affinity standalone
+                     #   still overtakes (casual-night exploration). 0 = affinity-first; ~1 ≈
+                     #   saga-almost-always-first. OFF by default → byte-identical.
+                     "resume_boost": {"enabled": False, "order": "recency", "weight": 0.35},
+                     # mood_lists: build two extra per-user playlists from the same pool — "The
+                     #   Long Glide" (in-progress sagas/franchises/shows, resume-ordered) and
+                     #   "Touch & Go" (low-commitment standalones + not-started, by affinity) — so
+                     #   you pick the row that matches tonight's mood instead of one blended list.
+                     #   Cached + dry-run previewed (write-back is separate). OFF → not built.
+                     "mood_lists": {"enabled": False},
                      "home_collections": {"enabled": False, "promote_home": True, "promote_shared": False},
                  }},
         "mdblist": {"apikey": ""},   # opt-in: aggregated ratings + lists. apikey -> keyring.
@@ -339,6 +362,45 @@ def empty_config() -> dict:
                 "recency_gate":  {"enabled": True, "cold_days": 90},
                 "budget_ramp":   {"enabled": True, "low_mult": 0.5, "high_mult": 1.5},
             },
+            # Hybrid UNIVERSE acquisition (Phase-3 coordinator, OFF by default). Once the household
+            # WATCHES part of a saga (MCU, Star Trek, Star Wars, Arrowverse, One Chicago…), acquire
+            # its remaining films (Radarr) + shows (Sonarr) in in-universe TIMELINE order, START-first
+            # (watch Clone Wars → pull Episodes I-III ahead of more Clone Wars). Membership + order come
+            # from plex.playlists.universe_timeline (the same cached mdblist universe lists). Universe
+            # grabs are explicit intent: they BYPASS max_adds_per_run / min_score and use their own
+            # max_per_run cap — but ALWAYS honour dry_run, the free-space band, and the acquisition
+            # pause (never strands adds when free<reserve and deletions are off). See
+            # services/coordinator/universe_acquisition.md.
+            "universe": {
+                "enabled": False,        # master gate for hybrid film+TV universe acquisition
+                "max_per_run": 5,        # own per-run cap on universe backfill grabs
+                "cold_start": False,     # extend only sagas with ≥1 watched member. true (cold-start
+                                         # unwatched sagas) is COORDINATOR-PENDING — inert until Phase 7.
+                "movies": True,          # acquire unowned FILM members via Radarr
+                "tv": True,              # acquire unowned SHOW members via Sonarr
+            },
+        },
+        # Catch-up (trailing-viewer) RETENTION — the deletion twin of acquisition.universe. For each
+        # saga the set of viewers who can BLOCK deletion is DERIVED FROM DATA every run (NO hardcoded
+        # users): a viewer who WATCHED (≥completion_threshold, or started within engagement_grace_days)
+        # OR WATCHLISTED any saga member. A held title is never deleted while a still-climbing engaged
+        # viewer hasn't reached it; at the free-space floor it is DOWNGRADED (shrunk), not deleted. As a
+        # hold nears release (dormancy lapse / watchlist intent expiry) its final expiry_boost_days lift
+        # it to the top of that viewer's playlists + a "Leaving Soon" collection. OFF by default →
+        # byte-identical. See services/coordinator/catchup_retention.md.
+        "saga_retention": {
+            "enabled": False,                  # master gate; off → no holds, legacy deletion unchanged
+            "dormancy_window_days": 90,        # drop a viewer from a saga's gate after N days no saga activity
+            "completion_threshold": 0.8,       # a ≥80% play = "meaningful watch" = engaged
+            "engagement_grace_days": 7,        # a STARTED but sub-threshold play still counts for N days
+                                               #   (a kid/work/life interruption gets a week to finish)
+            "watchlist_hold_policy": "windowed",  # until_start | windowed | indefinite
+            "expiry_boost_days": 30,           # final N days before release → top of playlists + Leaving Soon
+            "downgrade_at_floor": True,        # at free<free_space_limit, held titles downgrade not delete
+            "leaving_soon_collection": True,   # surface the expiring set as a promoted "Leaving Soon" collection
+            "leaving_soon_title": "⏳ Leaving Soon",
+            "exclude_users": [],               # subtract these user ids/safe-keys (e.g. a kiosk); NOT a source
+            "quorum": {"enabled": False, "fraction": 1.0},  # optional escape valve (active gating supersedes)
         },
         "trakt_writeback": {"enabled": False, "collection": True, "history": True},
         "mal_writeback": {"enabled": False},
