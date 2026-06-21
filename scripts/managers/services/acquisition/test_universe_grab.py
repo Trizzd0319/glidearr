@@ -50,7 +50,15 @@ def _mgr(config=None, *, dry_run=False, cache=None):
     m.dry_run = dry_run
     m.global_cache = cache
     m.radarr = None
+    m.sonarr = None
     return m
+
+
+def _sgw(library=None, im=None, available=True):
+    """A Sonarr-flavoured fake gateway (series records, SeriesSearch) for the show twin."""
+    g = _GW(im=im, library=library, available=available)
+    g.service = "sonarr"
+    return g
 
 
 def _patch(monkeypatch, prepare_result, add_result=None):
@@ -192,3 +200,68 @@ def test_deferred_under_pressure_when_deletions_armed(monkeypatch):
     assert adds and adds[0][1] is False                       # search OFF under pressure
     q = cache.get(_DEFERRED_KEY)
     assert q and q[0]["arr_id"] == 999 and q[0]["service"] == "radarr"
+
+
+# ── show (Sonarr) twin: ensure_show_owned_and_grab ──────────────────────────────
+_TWO_SONARR = {"sonarr_instances": {"default_instance": "standard", "standard": {}, "uhd": {}}}
+
+
+def test_show_not_in_library_added_with_search(monkeypatch):
+    adds = _patch(monkeypatch, {"skip_reason": None, "ext_id": 55, "instance": "standard",
+                                "title": "Show", "type": "show"})
+    out = _mgr(cache=_Cache()).ensure_show_owned_and_grab(55, gateways={"sonarr": _sgw()})
+    assert out["action"] == "added" and adds and adds[0][1] is True
+
+
+def test_show_already_owned_when_episodes_present(monkeypatch):
+    _patch(monkeypatch, {"skip_reason": "already in library"})
+    gw = _sgw(library=[{"tvdbId": 55, "statistics": {"episodeFileCount": 12}, "id": 5, "title": "Show"}])
+    out = _mgr().ensure_show_owned_and_grab(55, gateways={"sonarr": gw})
+    assert out["action"] == "already-owned" and not gw.commands       # has episodes → owned
+
+
+def test_show_in_library_no_episodes_searches(monkeypatch):
+    _patch(monkeypatch, {"skip_reason": "already in library"})
+    gw = _sgw(library=[{"tvdbId": 55, "statistics": {"episodeFileCount": 0},
+                        "monitored": True, "id": 5, "title": "Show"}])
+    out = _mgr().ensure_show_owned_and_grab(55, gateways={"sonarr": gw})
+    assert out["action"] == "searched"
+    assert gw.commands and gw.commands[0][1] == {"name": "SeriesSearch", "seriesId": 5}
+
+
+def test_show_tvdb_mismatch_fails_closed(monkeypatch):
+    _patch(monkeypatch, {"skip_reason": None, "ext_id": 999, "instance": "standard",
+                         "title": "Wrong", "type": "show"})
+    out = _mgr().ensure_show_owned_and_grab(55, gateways={"sonarr": _sgw()})
+    assert out["action"] == "skipped" and out["reason"] == "tvdb mismatch"
+
+
+def test_show_dedups_series_owned_on_other_instance(monkeypatch):
+    # series owned (has episodes) on the 4K Sonarr instance → already-owned, never re-added on default.
+    adds = _patch(monkeypatch, {"skip_reason": None, "ext_id": 55, "instance": "standard",
+                                "title": "Show", "type": "show"})
+    gw = _MultiGW({"standard": [],
+                   "uhd": [{"tvdbId": 55, "statistics": {"episodeFileCount": 3}, "id": 7, "title": "Show"}]})
+    gw.service = "sonarr"
+    out = _mgr(_TWO_SONARR, cache=_Cache()).ensure_show_owned_and_grab(55, gateways={"sonarr": gw})
+    assert out["action"] == "already-owned" and not adds
+
+
+def test_show_paused_when_full_and_deletions_off(monkeypatch):
+    _patch(monkeypatch, {"skip_reason": None, "ext_id": 55, "instance": "standard",
+                         "title": "Show", "type": "show"})
+    gw = _sgw(im=_IM(free=100, total=8000))
+    out = _mgr({"free_space_limit": 2000}, cache=_Cache()).ensure_show_owned_and_grab(55, gateways={"sonarr": gw})
+    assert out["action"] == "paused"
+
+
+def test_show_defers_under_pressure_when_deletions_armed(monkeypatch):
+    adds = _patch(monkeypatch, {"skip_reason": None, "ext_id": 55, "instance": "standard",
+                                "title": "Show", "type": "show"})
+    cache = _Cache()
+    gw = _sgw(im=_IM(free=100, total=8000))
+    out = _mgr({"free_space_limit": 2000, "deletions_consent": True}, cache=cache).ensure_show_owned_and_grab(
+        55, gateways={"sonarr": gw})
+    assert out["action"] == "deferred" and adds and adds[0][1] is False
+    q = cache.get(_DEFERRED_KEY)
+    assert q and q[0]["service"] == "sonarr" and q[0]["type"] == "show"

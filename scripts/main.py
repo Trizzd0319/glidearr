@@ -247,6 +247,25 @@ class Main(BaseManager, ComponentManagerMixin):
         )
         self.registry.set_flag("saga_retention_producer_initialized")
 
+        # Hybrid universe acquisition coordinator (opt-in). Backfills unowned saga members (films via
+        # Radarr, shows via Sonarr) once the household has watched part of a saga. No-op unless
+        # acquisition.universe.enabled AND plex.playlists.universe_timeline.enabled; routes every grab
+        # through the AcquisitionManager primitives (dry_run + free-space band honoured). Constructed
+        # AFTER AcquisitionManager so the registry lookup resolves at run-time.
+        from scripts.managers.services.coordinator import HybridUniverseAcquisitionManager
+        self.hybrid_universe_acquisition = HybridUniverseAcquisitionManager(
+            logger=self.logger,
+            config=self.config,
+            global_cache=self.global_cache,
+            validator=self.validator,
+            registry=self.registry,
+            dry_run=self.dry_run,
+            sonarr=self.sonarr,
+            radarr=self.radarr,
+            tautulli=self.tautulli,
+        )
+        self.registry.set_flag("hybrid_universe_acquisition_initialized")
+
     def validate(self):
         """The single validation GATE — run after config is loaded/generated and
         BEFORE any manager runs. Validates, in order:
@@ -512,6 +531,16 @@ class Main(BaseManager, ComponentManagerMixin):
         except Exception as e:
             summary.add_error(f"SpaceCoordinator: {e}")
             self.logger.log_error(f"[Main] space coordinator run failed: {e}")
+
+        # Hybrid universe acquisition — backfill unowned saga members from the now-warm universe
+        # source + frontier. After the space coordinator (so its decisions are stamped) and before
+        # the plan summary. No-op + dry-run-safe unless its two flags are on.
+        try:
+            if getattr(self, "hybrid_universe_acquisition", None) is not None:
+                self.hybrid_universe_acquisition.run()
+        except Exception as e:
+            summary.add_error(f"UniverseAcquire: {e}")
+            self.logger.log_error(f"[Main] hybrid universe acquisition failed: {e}")
 
         # Roll up the decision ledger (planned_action / watchability_score stamped
         # into the Parquet caches) into one readable "what I'd do" summary — the

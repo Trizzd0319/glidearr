@@ -2,7 +2,7 @@
 
 - **File** — `scripts/managers/services/coordinator/universe_acquisition.py` *(planned — see Status)*
 - **One-liner** — When the household watches *any* part of a shared universe (MCU, Star Trek, Star Wars, Arrowverse, One Chicago…), Glidearr acquires the **rest of that saga in in-universe timeline order** — films via Radarr, shows via Sonarr — filling from the **start** of the saga first, weaving movies and episodes onto one axis.
-- **Status** — 🚧 **In progress.** The pure data + planning layers are landed and tested; the I/O coordinator + Radarr grab path + the TV per-group walk are pending. See [Status](#status).
+- **Status** — ✅ **Coordinator landed (Phase 7).** The pure data/planning layers, the Radarr + Sonarr grab paths (`ensure_owned_and_grab` / `ensure_show_owned_and_grab`), and the `HybridUniverseAcquisitionManager` (frontier sourcing → plan → crossover-dedup → cap → grab, dry-run-safe, two-flag-gated) are landed + tested and wired into `main.py` after the space coordinator. `cold_start` + the unreleased pre-filter remain inert refinements. See [Status](#status).
 
 > **Design north star (operator's words):** *"Prioritize accuracy of acquisition over efficiency of coding, but make sure there are no footgun obstacles in the way."* Every write goes through an existing, dry-run-safe, space-aware primitive. The walk never POSTs directly, never bypasses the free-space band, and never strands an add.
 
@@ -155,7 +155,7 @@ Each step is independently shippable and tested; later steps are gated default-o
 | **4 — Radarr grab** ✅ | `AcquisitionManager.ensure_owned_and_grab(tmdb)` | `acquisition/__init__.py` | `test_universe_grab.py` — dedup / present-no-file / not-present / dry-run / exact-match-fail-closed / pause / defer (9 tests) | medium |
 | **5 — Sonarr accessor** ✅ | `universe_order.tv_group_maps_from_series` + `episode_files._universe_group_maps(instance)` (series cache + cached source, gated by `acquisition.universe.enabled`) | `test_universe_group_maps.py` + `test_universe_order.py` | low |
 | **6 — TV per-group walk** ✅ | `_plan_group_walk` + group-boundary budget/cap in `_compute_next_episodes` | `episode_files.py` | `test_universe_walk.py` — byte-identical-off / shared-budget frontier-first / unstarted-member injection / off-doesn't-prefetch-unstarted (4 tests) | **high** |
-| **7 — coordinator** | `HybridUniverseAcquisitionManager` + `main.py` wiring | `coordinator/universe_acquisition.py`, `main.py` | run() dry-run preview, household-watched gate, cap, space-pause, double-grab dedup | medium |
+| **7 — coordinator** ✅ | `HybridUniverseAcquisitionManager` + `ensure_show_owned_and_grab` + `main.py` wiring | `coordinator/hybrid_universe_acquisition.py`, `acquisition/__init__.py`, `main.py` | DONE: run() dry-run preview, two-flag gate, household-watched frontier (tmdb_completions + Sonarr is_watched), (media,id) crossover dedup, max_per_run cap, space-pause via the grab primitives; 34 tests | medium |
 | **8 — playlist interleave** *(optional/later)* | unified rank into the combined Up Next block | `combined_builder.py` | spoiler-safety preserved | medium |
 
 **Process discipline (the "accuracy over efficiency" mandate):**

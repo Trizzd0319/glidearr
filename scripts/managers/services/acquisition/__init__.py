@@ -322,6 +322,104 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             return {"action": "deferred", "title": title}
         return {"action": action, "title": title}
 
+    # ── show (Sonarr) twin of the movie grab — the hybrid universe walk's TV add-by-tvdb ──────
+    def _find_series_record(self, gw, tvdb) -> "tuple[dict | None, str | None]":
+        """The full Sonarr series record for a tvdbId, scanning every configured Sonarr instance
+        (cached library reads). Closes the same dedup blind spot as :meth:`_find_movie_record` so a
+        saga show already on another instance is never re-added. Returns (record, instance) or
+        (None, None). Shows are keyed by ``tvdbId`` (NOT tmdbId — that's the movie identity)."""
+        insts = [k for k in ((self.config or {}).get("sonarr_instances", {}) or {})
+                 if k != "default_instance"]
+        di = gw.default_instance()
+        ordered = list(dict.fromkeys([di] + insts))
+        for inst in ordered:
+            for rec in gw.library_items(inst):
+                if isinstance(rec, dict) and str(rec.get("tvdbId")) == str(tvdb):
+                    return rec, inst
+        return None, None
+
+    def _grab_existing_show(self, gw, rec, inst, tvdb, band_cache) -> dict:
+        """A series already present in Sonarr on ``inst``: already-owned if it has any downloaded
+        episode, else a real GRAB (monitor + SeriesSearch) honouring ``dry_run`` + the free-space
+        band, exactly like :meth:`_grab_existing` for movies. NOTE: a series record has NO ``hasFile``
+        — ownership is ``statistics.episodeFileCount > 0``."""
+        if (rec.get("statistics") or {}).get("episodeFileCount", 0) > 0:
+            return {"action": "already-owned", "title": rec.get("title")}
+        title = rec.get("title") or str(tvdb)
+        if self.dry_run:
+            self.logger.log_info(
+                f"[acquire][universe] [dry-run] would search owned-no-file show '{title}'.")
+            return {"action": "would-search", "title": title}
+        if self._acquisition_paused(gw, inst, band_cache):
+            return {"action": "paused", "title": title}
+        if not rec.get("monitored"):
+            gw.put(inst, f"series/{rec.get('id')}", {**rec, "monitored": True})
+        free, U = self._space_band(gw, inst, band_cache)
+        if free < U:
+            self._persist_deferred({
+                "service": "sonarr", "instance": inst, "arr_id": rec.get("id"), "title": title,
+                "type": "show", "profile": None,
+                "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0,
+            })
+            return {"action": "deferred", "title": title}
+        ok = self._trigger_search(gw, inst, {"type": "show", "arr_id": rec.get("id"),
+                                             "title": title})
+        return {"action": "searched" if ok else "search-failed", "title": title}
+
+    def ensure_show_owned_and_grab(self, tvdb_id, *, gateways=None, band_cache=None, search=True) -> dict:
+        """Ensure ONE specific series (by tvdbId) is owned + grabbed — the SHOW twin of
+        :meth:`ensure_owned_and_grab`, used by the hybrid universe walk to acquire the next SHOW in a
+        saga. Same contract: bypasses min_score/max_adds, honours dry_run + the free-space band on the
+        Sonarr mount (the ONLY place a TV add can hit a full Sonarr disk — the next-episode walk only
+        prefetches already-owned series). Reuses Resolver/Adder show routing. Returns the same action
+        shape as the movie path."""
+        if tvdb_id is None:
+            return {"action": "skipped", "reason": "no tvdb"}
+        if gateways is None:
+            gateways = {"sonarr": ArrGateway(
+                "sonarr", getattr(self.sonarr, "instance_manager", None), self.config, self.logger)}
+        band_cache = band_cache if band_cache is not None else {}
+        gw = gateways.get("sonarr")
+        if gw is None or not gw.available:
+            return {"action": "skipped", "reason": "no sonarr instance"}
+
+        resolver = Resolver(gateways, self.config, self.logger)
+        adder = Adder(gateways, self.logger, dry_run=self.dry_run, monitored=True, search=False)
+        enriched = resolver.prepare({"type": "show", "ids": {"tvdb": int(tvdb_id)}})
+        reason = enriched.get("skip_reason")
+
+        rec, found_inst = self._find_series_record(gw, int(tvdb_id))
+        if rec is not None:
+            return self._grab_existing_show(gw, rec, found_inst, int(tvdb_id), band_cache)
+        if reason == "already in library":
+            return {"action": "already-present"}
+        if reason:
+            return {"action": "skipped", "reason": reason, "title": enriched.get("title")}
+
+        # FOOTGUN GUARD: never add the wrong series on a fuzzy lookup — require the exact tvdb.
+        if str(enriched.get("ext_id")) != str(int(tvdb_id)):
+            return {"action": "skipped", "reason": "tvdb mismatch", "title": enriched.get("title")}
+
+        inst = enriched.get("instance")
+        title = enriched.get("title") or enriched.get("ext_id")
+        if self._acquisition_paused(gw, inst, band_cache):
+            return {"action": "paused", "title": title}
+        free, U = self._space_band(gw, inst, band_cache)
+        under_pressure = free < U
+        res = adder.add(enriched, search=False if under_pressure else search)
+        action = res.get("action")
+        if under_pressure and action in ("added", "would-add"):
+            if res.get("ok") and not self.dry_run:
+                aid = (res.get("result") or {}).get("id")
+                if aid is not None:
+                    self._persist_deferred({
+                        "service": "sonarr", "instance": inst, "arr_id": aid, "title": title,
+                        "type": "show", "profile": (enriched.get("quality_profile") or {}).get("name"),
+                        "queued_at": datetime.now(timezone.utc).isoformat(), "attempts": 0,
+                    })
+            return {"action": "deferred", "title": title}
+        return {"action": action, "title": title}
+
     @LoggerManager().log_function_entry
     @timeit("run")
     def run(self) -> None:
