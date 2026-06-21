@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 from scripts.managers.services.plex.playlists.combined_builder import (
+    _GLIDE_PLAN_KEY,
     _PLAN_KEY,
+    _TOUCHGO_PLAN_KEY,
     CombinedPlaylistBuilderManager,
 )
 
 
 class _Log:
-    def __init__(self): self.infos = []; self.warns = []; self.grids = []
+    def __init__(self): self.infos = []; self.warns = []; self.grids = []; self.files = {}
     def log_info(self, m): self.infos.append(m)
     def log_warning(self, m): self.warns.append(m)
     def log_error(self, m): pass
     def log_grid(self, headers, rows, title="", cap=16): self.grids.append((title, headers, rows))
+    def log_to_file(self, category, message, *, reset=False):
+        self.files.setdefault(category, []).append(message)
 
 
 class _Cache:
@@ -59,6 +63,68 @@ def test_combined_plan_merges_tv_and_movies_with_kind_and_why():
     assert {it["rating_key"] for it in items} == {"e", "m"}      # BOTH mediums in one plan
     _, headers, _rows = m.logger.grids[0]
     assert "Kind" in headers and "Why" in headers and "Title" in headers
+
+
+def test_preview_de_identifies_run_log_but_keeps_name_in_playlists_log():
+    # Privacy: the run log (grid title + [ComboPlaylists] line) must carry the de-identified
+    # handle, while the LOCAL playlists.log mirror keeps the real name for validation.
+    cache = _Cache()
+    owned_eps = [_ep(1, 1, 1, "100:1:1", "Pilot")]
+    owned_movies = [_movie(603, "The Matrix", 1999, score=70)]
+    tv_inv = {"100:1:1": {"rating_key": "e", "series_title": "Show", "title": "Pilot"}}
+    mv_inv = {"603": {"rating_key": "m", "title": "The Matrix", "year": 1999}}
+    m = _mgr(cache, {"plex": {"playlists": {"profile_ages": {"Rob": "adult"}}}})
+    m._build_for_users(_TRACKED, owned_eps, owned_movies, tv_inv, mv_inv,
+                       {1: 80.0}, {1: ["Action"]}, {}, {"rob": set()},
+                       {"rob": set()}, {"rob": set()}, {"rob": {}})
+    grid_title = m.logger.grids[0][0]
+    combo_line = " ".join(m.logger.infos)
+    assert "'Rob'" not in grid_title and "'R - " in grid_title       # grid → de-identified
+    assert "'Rob'" not in combo_line and "R - " in combo_line         # candidate line → de-identified
+    assert any("'Rob'" in ln for ln in m.logger.files.get("playlists", []))   # file → real name
+
+
+def test_mood_lists_split_in_progress_from_standalones():
+    # The Long Glide = in-progress show (series 1, an ep watched); Touch & Go = standalone movie.
+    cache = _Cache()
+    owned_eps = [_ep(1, 1, 1, "100:1:1", "Pilot"), _ep(1, 1, 2, "100:1:2", "Ep2")]
+    owned_movies = [_movie(603, "The Matrix", 1999, score=70)]
+    tv_inv = {"100:1:1": {"rating_key": "e1", "series_title": "Show", "title": "Pilot"},
+              "100:1:2": {"rating_key": "e2", "series_title": "Show", "title": "Ep2"}}
+    mv_inv = {"603": {"rating_key": "m", "title": "The Matrix", "year": 1999}}
+    m = _mgr(cache, {"plex": {"playlists": {"mood_lists": {"enabled": True}}}})
+    m._build_for_users(_TRACKED, owned_eps, owned_movies, tv_inv, mv_inv,
+                       {1: 80.0}, {1: ["Action"]}, {}, {"rob": set()},
+                       {"rob": {"e1"}}, {"rob": set()}, {"rob": {}})   # e1 watched → series 1 started
+    glide = {it["rating_key"] for it in cache.get(f"{_GLIDE_PLAN_KEY}/rob")["items"]}
+    touchgo = {it["rating_key"] for it in cache.get(f"{_TOUCHGO_PLAN_KEY}/rob")["items"]}
+    assert glide == {"e2"}                                  # in-progress show's next ep
+    assert touchgo == {"m"}                                 # the standalone movie
+
+
+def test_up_next_resume_boost_lifts_in_progress_tv_show():
+    # REGRESSION (review): with resume_boost on, the blended Up Next must lift an in-progress SHOW
+    # too (series_recency must reach the up_next build, not only the mood lists).
+    cache = _Cache()
+    owned_eps = [_ep(1, 1, 1, "100:1:1", "Pilot"), _ep(1, 1, 2, "100:1:2", "Ep2")]
+    owned_movies = [_movie(603, "Hi Movie", 1999, score=99)]        # high-affinity standalone
+    tv_inv = {"100:1:1": {"rating_key": "e1", "series_title": "Show", "title": "Pilot"},
+              "100:1:2": {"rating_key": "e2", "series_title": "Show", "title": "Ep2"}}
+    mv_inv = {"603": {"rating_key": "m", "title": "Hi Movie", "year": 1999}}
+    _mgr(cache)._build_for_users(_TRACKED, owned_eps, owned_movies, tv_inv, mv_inv,
+                                 {1: 30.0}, {1: ["Action"]}, {}, {"rob": set()},
+                                 {"rob": {"e1"}}, {"rob": set()}, {"rob": {}},
+                                 resume_boost=True)                  # e1 watched → series 1 in-progress
+    assert cache.get(f"{_PLAN_KEY}/rob")["items"][0]["rating_key"] == "e2"   # show leads the standalone
+
+
+def test_mood_lists_off_by_default_not_built():
+    cache = _Cache()
+    owned_movies = [_movie(603, "The Matrix", 1999, score=70)]
+    mv_inv = {"603": {"rating_key": "m", "title": "The Matrix", "year": 1999}}
+    _mgr(cache)._build_for_users(_TRACKED, [], owned_movies, {}, mv_inv, {}, {}, {},
+                                 {"rob": set()}, {"rob": set()}, {"rob": set()}, {"rob": {}})
+    assert cache.get(f"{_GLIDE_PLAN_KEY}/rob") is None and cache.get(f"{_TOUCHGO_PLAN_KEY}/rob") is None
 
 
 def test_no_inventory_short_circuits():

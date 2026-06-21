@@ -29,6 +29,7 @@ from scripts.managers.services.plex.playlists.movie_resolver import (
     build_fresh_movie_plan,
     build_movie_plan,
     watched_movie_keys,
+    watched_movie_recency,
 )
 
 _INVENTORY_KEY = "plex/movies/owned_inventory"
@@ -51,8 +52,15 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                            for u in tracked}
         affinity_by_user = {u["safe_user"]: self._user_affinity(u.get("tautulli_username"))
                             for u in tracked}
+        resume_on, resume_order, resume_weight = self._resume_cfg()
+        recency_by_user = ({u["safe_user"]: self._watched_movie_recency_for(u.get("tautulli_user_id"))
+                            for u in tracked} if resume_on else {})
         return self._build_for_users(tracked, owned, inventory, watched_by_user, affinity_by_user,
-                                     csm_ages=self._movie_csm_ages())
+                                     csm_ages=self._movie_csm_ages(),
+                                     universe_order=self._movie_universe_order(inventory, owned),
+                                     universe_membership=self._movie_universe_membership(owned),
+                                     resume_boost=resume_on, resume_order=resume_order,
+                                     resume_weight=resume_weight, recency_by_user=recency_by_user)
 
     def _movie_csm_ages(self) -> dict:
         """{tmdb_id(int): Common Sense age(int)} from the MDBList movie age cache — the
@@ -84,10 +92,14 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
             return 45
 
     def _build_for_users(self, tracked, owned, inventory, watched_by_user, affinity_by_user,
-                         csm_ages=None) -> dict:
+                         csm_ages=None, universe_order=None, universe_membership=None,
+                         resume_boost=False, resume_order="recency", resume_weight=0.0,
+                         recency_by_user=None) -> dict:
         """Per user: age-gate by cert + personalize each movie's score by genre affinity
         (no JIT), build+cache the plan, log a preview. Returns run stats. ``csm_ages`` maps
-        ``tmdb_id → Common Sense age`` and is the cert-gate fallback for uncertified movies."""
+        ``tmdb_id → Common Sense age`` and is the cert-gate fallback for uncertified movies.
+        ``universe_order`` (``{tmdb: pos}``) saga-orders universe blocks (empty → release date);
+        ``universe_membership`` (``{tmdb: set(keys)}``) groups them straight from the lists."""
         csm_ages = csm_ages or {}
         if not inventory:
             self.logger.log_warning("[MoviePlaylists] no plex/movies/owned_inventory — "
@@ -143,13 +155,19 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                                                        self._genre_match_opts())
 
             plan, stats = build_movie_plan(user_owned, inventory, watched, movie_scores,
-                                           family="up_next", max_items=self._max_items())
+                                           family="up_next", max_items=self._max_items(),
+                                           universe_order=universe_order,
+                                           universe_membership=universe_membership,
+                                           resume_boost=resume_boost, resume_order=resume_order,
+                                           resume_weight=resume_weight,
+                                           watch_recency=(recency_by_user or {}).get(u["safe_user"], {}))
             if self.global_cache:
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))
             protected.update(t for i in plan.items
                              if (t := rk_to_tmdb.get(str(i.rating_key))) is not None)
             reasons = self._movie_reasons(user_owned, inventory, user_aff)
-            self._log_preview(u, plan, stats, display, reasons, label="movie")
+            who = anon_label(u.get("title"), tier_name, idx)
+            self._log_preview(u, plan, stats, display, reasons, label="movie", anon=who)
 
             # Fresh Arrivals (opt-in): a SECOND per-user plan, filtered to genuinely-new
             # acquisitions (churn-immune movie.added) within the window, ranked by the same
@@ -163,7 +181,7 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                 protected.update(t for i in fplan.items
                                  if (t := rk_to_tmdb.get(str(i.rating_key))) is not None)
                 self._log_preview(u, fplan, fstats, display, reasons, label="movie",
-                                  family_label="Fresh Arrivals")
+                                  family_label="Fresh Arrivals", anon=who)
             built += 1
         self._publish_protected_movie_tmdbs(_PROTECTED_KEY, protected)
         self.logger.log_info(f"[MoviePlaylists] built {built} per-user movie plan(s) (dry-run — no Plex writes).")
@@ -270,6 +288,36 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
             return watched_movie_keys(hm.get_all_history_cached(user_id))
         except Exception:
             return set()
+
+    def _watched_movie_recency_for(self, user_id) -> dict:
+        """{identity: latest unix watch ts} for this user — the resume boost's recency key. {} on
+        any miss. History is the same 24h-cached fetch _watched_movies_for uses (cache hit)."""
+        if user_id is None or not self.registry:
+            return {}
+        hm = self.registry.get("manager", "TautulliWatchHistoryManager")
+        if hm is None:
+            taut = self.registry.get("manager", "TautulliManager")
+            hm = getattr(taut, "watch_history", None) if taut else None
+        if not hm or not hasattr(hm, "get_all_history_cached"):
+            return {}
+        try:
+            return watched_movie_recency(hm.get_all_history_cached(user_id))
+        except Exception:
+            return {}
+
+    def _resume_cfg(self):
+        """(enabled, order, weight) from plex.playlists.resume_boost — lift an in-progress saga.
+        order ∈ {recency (default), progress}; weight ∈ [0,1] (default 0.35 = moderate: saga wins
+        ties + gaps up to the weight, a clearly-higher-affinity standalone overtakes). OFF →
+        byte-identical."""
+        rc = self._pl_cfg().get("resume_boost", {}) or {}
+        order = str(rc.get("order", "recency")).strip().lower()
+        try:
+            weight = min(1.0, max(0.0, float(rc.get("weight", 0.35))))
+        except (TypeError, ValueError):
+            weight = 0.35
+        return (bool(rc.get("enabled", False)),
+                (order if order in ("recency", "progress") else "recency"), weight)
 
     def _load_owned_movies(self) -> list:
         """Owned (has_file) Radarr movies from every movie_files.parquet, deduped by tmdb.

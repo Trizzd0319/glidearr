@@ -18,8 +18,10 @@ rather than raising; the tested core is ``_build_for_users`` (pure given its inp
 from __future__ import annotations
 
 import math
+from datetime import date
 
 from scripts.managers.factories.base_manager import BaseManager
+from scripts.managers.services.mdblist import client as mdblist_client
 from scripts.managers.machine_learning.playlists.cert_gate import (
     cert_allowed,
     is_restricted,
@@ -32,16 +34,39 @@ from scripts.managers.machine_learning.playlists.per_user import (
     priority_score,
 )
 from scripts.managers.machine_learning.playlists.rationale import explain_reason
-from scripts.managers.services.plex._common import anon_label
+from scripts.managers.services.plex._common import anon_label, metadata_items
 from scripts.managers.services.plex.playlists.readiness import diagnose_tv_readiness
 from scripts.managers.services.plex.playlists.tv_resolver import (
     build_tv_plan,
     watched_episode_keys,
+    watched_episode_recency,
+)
+from scripts.managers.services.plex.playlists.universe_order import (
+    build_universe_maps,
+    collection_universe_key,
+    is_stale,
+    merge_movie_orders,
+    movie_order_from_children,
+    movie_universe_keys,
+    split_list_media,
+    tv_group_maps,
+    universe_lists,
 )
 
 _INVENTORY_KEY = "plex/episodes/owned_inventory"
 _STATS_KEY = "plex/episodes/resolution_stats"
 _PLAN_KEY = "plex/playlists/tv_plan"          # + /{safe_user}
+_UNIVERSE_SRC_KEY = "plex/playlists/universe_source"   # fetched universe lists (cache VOLUME)
+_UNIVERSE_TTL_DAYS = 7                                  # re-fetch a universe list at most weekly
+
+
+def _to_int(v):
+    """Int-or-None — module-level so the BASE builder's universe helpers don't depend on the
+    movie-subclass ``_coerce_int`` (the TV builder is a base instance)."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _finite_float(value, default: float) -> float:
@@ -81,16 +106,19 @@ class PlexPlaylistBuilderManager(BaseManager):
                            for u in tracked}
         affinity_by_user = {u["safe_user"]: self._user_affinity(u.get("tautulli_username"))
                             for u in tracked}
+        franchise_by_series, series_timeline = self._tv_franchise_maps(owned_eps)
         return self._build_for_users(
             tracked, owned_eps, inventory, resolution_stats, series_scores,
             watched_by_user, series_genres=series_genres, affinity_by_user=affinity_by_user,
             series_certs=series_certs, series_csm_ages=self._series_csm_ages(),
-            daemon_enabled=self._daemon_enabled(), daemon_running=self._daemon_running())
+            daemon_enabled=self._daemon_enabled(), daemon_running=self._daemon_running(),
+            franchise_by_series=franchise_by_series, series_timeline=series_timeline)
 
     def _build_for_users(self, tracked, owned_eps, inventory, resolution_stats,
                          series_scores, watched_by_user, *, series_genres=None,
                          affinity_by_user=None, series_certs=None, series_csm_ages=None,
-                         daemon_enabled, daemon_running) -> dict:
+                         daemon_enabled, daemon_running,
+                         franchise_by_series=None, series_timeline=None) -> dict:
         """The orchestration core: diagnose readiness, then per user AGE-GATE (parental
         controls) + PERSONALIZE the series watchability by their genre affinity (tilt),
         build+cache the plan, and log a preview. Returns run stats. ``series_csm_ages``
@@ -176,11 +204,13 @@ class PlexPlaylistBuilderManager(BaseManager):
                 self._genre_match_opts())
             plan, stats = build_tv_plan(
                 user_owned, inventory, watched, user_scores, family="up_next",
-                episode_cap=self._episode_cap(), max_items=self._max_items())
+                episode_cap=self._episode_cap(), max_items=self._max_items(),
+                franchise_by_series=franchise_by_series, series_timeline=series_timeline)
             if self.global_cache:
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))
             reasons = self._tv_reasons(user_owned, inventory, series_genres, user_aff, user_jit)
-            self._log_preview(u, plan, stats, display, reasons, label="episode")
+            self._log_preview(u, plan, stats, display, reasons, label="episode",
+                              anon=anon_label(u.get("title"), tier_name, idx))
             built += 1
         self.logger.log_info(f"[Playlists] built {built} per-user TV plan(s) (dry-run — no Plex writes).")
         return {"users": len(tracked), "built": built, "can_build": True}
@@ -198,7 +228,8 @@ class PlexPlaylistBuilderManager(BaseManager):
         }
 
     def _log_preview(self, user, plan, stats, display: dict, reasons=None, *,
-                     kinds=None, label: str = "episode", family_label: str = "Up Next"):
+                     kinds=None, label: str = "episode", family_label: str = "Up Next",
+                     anon: str | None = None):
         """Preview grid: ``# | Title | [Kind] | Rank | Why``.
 
         ``Rank`` = the per-user priority_score the block is ordered on (affinity > JIT >
@@ -218,7 +249,10 @@ class PlexPlaylistBuilderManager(BaseManager):
             if show_kind:
                 row.append(kinds.get(rk, "?"))
             rows.append(row + [score, why])
-        header = (f"[dry-run] '{title}' {family_label} - {len(plan.items)} {label}(s), "
+        # The SHAREABLE run log gets the de-identified handle (anon, e.g. 'T - adult 1'); the real
+        # name only ever reaches the local playlists.log mirror below.
+        who = anon or title
+        header = (f"[dry-run] '{who}' {family_label} - {len(plan.items)} {label}(s), "
                   f"{stats.get('unresolved', 0)} unmatched")
         cols = ["#", "Title"] + (["Kind"] if show_kind else []) + ["Rank", "Why"]
         grid = getattr(self.logger, "log_grid", None)
@@ -226,6 +260,17 @@ class PlexPlaylistBuilderManager(BaseManager):
             grid(cols, rows, title=header, cap=44)
         else:
             self.logger.log_info(f"[Playlists] {header}")
+        # Mirror the full preview into the dedicated, per-run support/logs/playlists.log so the
+        # complete per-profile contents stay inspectable without bloating the main run log. This
+        # file is a LOCAL operator drill-down (not shared), so it KEEPS the real profile name to
+        # stay easy to validate by household member.
+        to_file = getattr(self.logger, "log_to_file", None)
+        if callable(to_file) and rows:
+            file_header = (f"[dry-run] '{title}' {family_label} - {len(plan.items)} {label}(s), "
+                           f"{stats.get('unresolved', 0)} unmatched")
+            to_file("playlists", file_header)
+            for r in rows:
+                to_file("playlists", "  " + " | ".join(str(c) for c in r))
 
     @staticmethod
     def _per_user_series_scores(series_scores, series_genres, user_aff, user_jit, hh_max, weights,
@@ -280,6 +325,142 @@ class PlexPlaylistBuilderManager(BaseManager):
             out[str(rk)] = (f"{v.get('series_title', '')}{se}".strip()
                             or v.get("title", "") or str(rk))
         return out
+
+    # ── universe / franchise timeline ordering (plex.playlists.universe_timeline.*) ──
+    # Hybrid source: (1) fetch the SAME IMDb/mdblist universe lists Kometa uses, ourselves, via
+    # mdblist → membership + saga order, cached with a TTL (auto-updates as new films release, no
+    # Kometa + no container rebuild); (2) the operator's Kometa universe Plex COLLECTIONS, if any
+    # (respects custom curation); (3) the bundled curated TV-franchise map. The list source is
+    # primary; the others fill gaps. All inert when the feature flag is off → byte-identical.
+    def _universe_timeline_enabled(self) -> bool:
+        """plex.playlists.universe_timeline.enabled — default OFF. When off, the maps below are
+        empty and the resolvers fall back to release/air date → byte-identical to today."""
+        return bool((self._pl_cfg().get("universe_timeline", {}) or {}).get("enabled", False))
+
+    def _mdblist_key(self) -> str:
+        return ((self.config.get("mdblist", {}) if self.config else {}) or {}).get("apikey", "") or ""
+
+    def _cfg_universe_lists(self) -> dict:
+        return self._pl_cfg().get("universe_lists", {}) or {}
+
+    def _universe_ttl_days(self) -> int:
+        try:
+            return int((self._pl_cfg().get("universe_timeline", {}) or {}).get("ttl_days", _UNIVERSE_TTL_DAYS))
+        except (TypeError, ValueError):
+            return _UNIVERSE_TTL_DAYS
+
+    def _universe_source(self) -> dict:
+        """The cached universe contents — ``{"universes": {key: {timeline, movies, shows}}}`` —
+        fetched from the mdblist universe lists. Refreshes any STALE/never-fetched universe (TTL),
+        keeping the LAST-GOOD entry on a fetch failure (a transient mdblist outage never wipes a
+        working list). Returns ``{}`` when the feature is off. With no API key it serves whatever
+        was last cached (so the feature survives a key being removed)."""
+        if not self._universe_timeline_enabled():
+            return {}
+        cached = dict(self._cache_get(_UNIVERSE_SRC_KEY, {}) or {})
+        universes = dict(cached.get("universes") or {})
+        fetched = dict(cached.get("fetched") or {})
+        key = self._mdblist_key()
+        if key:
+            now = date.today().toordinal()
+            ttl = self._universe_ttl_days()
+            refreshed = 0
+            for uk, defn in universe_lists(self._cfg_universe_lists()).items():
+                if not isinstance(defn, dict):     # a config typo (bare string) can't abort the run
+                    continue
+                if not is_stale(fetched.get(uk), now, ttl):
+                    continue
+                res = mdblist_client.list_items(key, defn)
+                if res.get("ok") and res.get("items"):
+                    universes[uk] = split_list_media(res["items"], bool(defn.get("timeline", True)))
+                    fetched[uk] = now
+                    refreshed += 1
+                # else: leave the prior entry untouched (LAST-GOOD)
+            if refreshed and self.global_cache:
+                self.global_cache.set(_UNIVERSE_SRC_KEY, {"universes": universes, "fetched": fetched})
+                self.logger.log_info(f"[UniverseOrder] refreshed {refreshed} universe list(s) from mdblist "
+                                     f"({len(universes)} cached).")
+        return {"universes": universes}
+
+    def _movie_universe_order(self, movie_inventory, owned_movies=None) -> dict:
+        """``{tmdb_id: position}`` saga order — MERGED from the mdblist universe lists (primary,
+        self-updating) + the operator's Kometa universe Plex collections (if present). ``{}`` when
+        the feature is off → callers degrade to release date."""
+        if not self._universe_timeline_enabled():
+            return {}
+        owned_tmdbs = {t for m in (owned_movies or []) if (t := _to_int(m.get("tmdb_id"))) is not None}
+        _, list_order, _, _ = build_universe_maps(self._universe_source(), owned_tmdbs, {})
+        return {**self._plex_collection_order(movie_inventory, owned_movies), **list_order}  # list wins
+
+    def _movie_universe_membership(self, owned_movies=None) -> dict:
+        """``{tmdb_id: set(universe_keys)}`` GROUPING from the fetched universe lists — forms a
+        universe block with NO Kometa ``universe_name`` tag required. ``{}`` when the feature is off."""
+        if not self._universe_timeline_enabled():
+            return {}
+        owned_tmdbs = {t for m in (owned_movies or []) if (t := _to_int(m.get("tmdb_id"))) is not None}
+        membership, _, _, _ = build_universe_maps(self._universe_source(), owned_tmdbs, {})
+        return membership
+
+    def _plex_collection_order(self, movie_inventory, owned_movies=None) -> dict:
+        """``{tmdb_id: position}`` from the operator's Kometa UNIVERSE Plex collections (read IN
+        COLLECTION ORDER), gated to movies whose ``universe_name`` matches the collection's universe
+        (anti-contamination). ``{}`` with no Plex API / no movie inventory. Secondary to the list
+        source — present only to honour a custom Plex curation a Kometa user may have."""
+        if not self.plex_api or not movie_inventory:
+            return {}
+        rk_to_tmdb = self._inventory_rk_to_tmdb(movie_inventory)
+        keys_by_tmdb = movie_universe_keys(owned_movies)
+        try:
+            cols = metadata_items(self.plex_api.get_collections())
+        except Exception:
+            return {}
+        orders, matched = [], 0
+        for d in cols:
+            rk = d.get("ratingKey")
+            key = collection_universe_key(d.get("title")) if rk is not None else None
+            if key is None:
+                continue
+            try:
+                # get_collections is library-wide: TV-library universe collections (e.g. Arrowverse)
+                # also match, but their SHOW ratingKeys aren't in rk_to_tmdb so they drop to {}.
+                kids = metadata_items(self.plex_api.get_collection_children(rk))
+            except Exception:
+                continue
+            child_rks = [str(c.get("ratingKey")) for c in kids if c.get("ratingKey") is not None]
+            allowed = {t for t, ks in keys_by_tmdb.items() if key in ks}
+            order = movie_order_from_children(child_rks, rk_to_tmdb, allowed_tmdbs=allowed)
+            if order:
+                orders.append(order)
+                matched += 1
+        merged = merge_movie_orders(orders)
+        if merged:
+            self.logger.log_info(f"[UniverseOrder] {matched} Plex universe collection(s) → "
+                                 f"{len(merged)} owned movie(s).")
+        return merged
+
+    def _tv_franchise_maps(self, owned_eps):
+        """``({series_id: franchise}, {series_id: timeline_index})`` for owned series — the canonical
+        merge of the bundled curated TV franchises (One Chicago, Law & Order, …) + the fetched
+        universe lists (tvdb→series_id; e.g. Arrowverse / Star Trek TV), delegated to
+        ``universe_order.tv_group_maps`` so the playlist builder and the acquisition prefetch read
+        the SAME grouping + order. ``({}, {})`` when the feature is off → per-series fallback."""
+        if not self._universe_timeline_enabled():
+            return {}, {}
+        seen: dict = {}
+        tvdb_to_sid: dict = {}
+        for ep in owned_eps or []:
+            sid = ep.get("series_id")
+            if sid is None:
+                continue
+            seen.setdefault(sid, ep.get("series_title") or ep.get("title") or "")
+            tv = _to_int(ep.get("series_tvdb_id"))
+            if tv is not None:
+                tvdb_to_sid.setdefault(tv, sid)
+        fran, timeline = tv_group_maps(list(seen.items()), self._universe_source(), tvdb_to_sid)
+        if fran:
+            self.logger.log_info(f"[UniverseOrder] {len(set(fran.values()))} TV franchise(s) → "
+                                 f"{len(fran)} owned series grouped.")
+        return fran, timeline
 
     # ── config knobs ────────────────────────────────────────────────────────────
     def _pl_cfg(self) -> dict:
@@ -613,6 +794,23 @@ class PlexPlaylistBuilderManager(BaseManager):
             return watched_episode_keys(hm.get_all_history_cached(user_id))
         except Exception:
             return set()
+
+    def _watched_episode_recency_for(self, user_id) -> dict:
+        """{episode-identity: latest unix watch ts} for this user — tv_inputs aggregates it per
+        series into series_recency (The Long Glide's TV recency key). {} on any miss; the same
+        24h-cached history fetch _watched_for uses (cache hit)."""
+        if user_id is None or not self.registry:
+            return {}
+        hm = self.registry.get("manager", "TautulliWatchHistoryManager")
+        if hm is None:
+            taut = self.registry.get("manager", "TautulliManager")
+            hm = getattr(taut, "watch_history", None) if taut else None
+        if not hm or not hasattr(hm, "get_all_history_cached"):
+            return {}
+        try:
+            return watched_episode_recency(hm.get_all_history_cached(user_id))
+        except Exception:
+            return {}
 
     def _daemon_enabled(self) -> bool:
         d = ((self.config.get("daemons", {}) if self.config else {}) or {}).get("enrich", {}) or {}
