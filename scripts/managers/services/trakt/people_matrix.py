@@ -33,6 +33,7 @@ from scripts.managers.factories.daemons.daemon_paths import (
     MOVIE_BUCKETS,
     PEOPLE_AFFINITY_PATH,
     PEOPLE_MATRIX_PATH,
+    PEOPLE_NAMES_PATH,
     SHOW_BUCKETS,
 )
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
@@ -52,6 +53,7 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
         self.ttl     = int(kwargs.get("ttl", self.DEFAULT_TTL))
         self.matrix_path   = Path(kwargs.get("matrix_path", PEOPLE_MATRIX_PATH))
         self.affinity_path = Path(kwargs.get("affinity_path", PEOPLE_AFFINITY_PATH))
+        self.names_path    = Path(kwargs.get("names_path", PEOPLE_NAMES_PATH))
         self._movie_cache = None
         self._show_cache  = None
 
@@ -111,12 +113,13 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
         """Read the people buckets, build the person↔media graph, cache the forward
         map, and log coverage. ``media_people`` may be injected (tests); otherwise it
         is assembled from the daemon buckets. Best-effort + never raises into the run."""
-        from scripts.managers.machine_learning.people_matrix import build_index, serialize_forward
+        from scripts.managers.machine_learning.people_matrix import (
+            build_index, serialize_forward, serialize_names)
         from scripts.managers.machine_learning.affinity.genre_affinity import aggregate_person_affinity
         try:
             if media_people is None:
                 media_people = dict(self._iter_media_people())
-            person_index, fwd = build_index(media_people)
+            person_index, fwd, names = build_index(media_people)
 
             total       = len(media_people)
             with_people = sum(1 for roles in fwd.values() if any(roles.values()))
@@ -126,6 +129,17 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
                     self.global_cache.set("people_matrix/forward", serialize_forward(fwd))
                 except Exception:
                     pass
+
+            # Additive id→name lookup (infra). Persisted alongside the forward map so a
+            # person id can be resolved to a label later; NOT read by the scorers (which
+            # are id-keyed) or surfaced in any log. Fully isolated — a names-persistence
+            # failure must NEVER abort the forward/affinity build it rides along with.
+            try:
+                self._save_names(names)
+                if self.global_cache:
+                    self.global_cache.set("people_matrix/names", serialize_names(names))
+            except Exception:
+                pass
 
             # Household person-affinity (volatile — cached SEPARATELY from the forward
             # map). Derived from the SAME watched-set the C3 scorer uses (Trakt history
@@ -147,7 +161,8 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
                 f"person-ids ({pct:.0f}% of enriched), {len(person_index):,} distinct people; "
                 f"household affinity over {len(watched_keys):,} watched -> {len(person_weights):,} people.")
             stats = {"titles": total, "with_people": with_people,
-                     "persons": len(person_index), "weighted_people": len(person_weights)}
+                     "persons": len(person_index), "weighted_people": len(person_weights),
+                     "named_people": len(names)}
             if self.global_cache:
                 try:
                     self.global_cache.set("people_matrix/run_stats", stats)
@@ -201,6 +216,12 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
         keys are stringified for JSON and coerced back on read by the consumers."""
         self._write_gz(self.affinity_path, {str(k): v for k, v in person_weights.items()})
 
+    def _save_names(self, names: dict) -> None:
+        """Atomic gz write of the id→name lookup ({person_id: name}); int keys stringified
+        for JSON. Infra artifact — written even in dry_run (a derived read-cache)."""
+        from scripts.managers.machine_learning.people_matrix import serialize_names
+        self._write_gz(self.names_path, serialize_names(names))
+
     def _write_gz(self, path: Path, payload) -> None:
         """Atomic gz write (temp + os.replace) so a hard kill never leaves a partial."""
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -242,7 +263,30 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
         return invert_forward(fwd), fwd
 
     def _read_forward_gz(self) -> dict | None:
-        path = self.matrix_path
+        return self._read_gz(self.matrix_path)
+
+    def load_names(self) -> dict:
+        """Return the ``{tmdb_person_id: name}`` id→name lookup from cache (global_cache
+        first, then the gz on disk), or ``{}`` when never built / stale / unreadable. Infra
+        for any future consumer that wants to resolve a person id to a label."""
+        from scripts.managers.machine_learning.people_matrix import deserialize_names
+        raw = None
+        if self.global_cache:
+            try:
+                raw = self.global_cache.get("people_matrix/names")
+            except Exception:
+                raw = None
+        if raw is None:
+            raw = self._read_gz(self.names_path)
+        if not raw:
+            return {}
+        try:
+            return deserialize_names(raw)
+        except Exception as e:
+            self.logger.log_debug(f"[PeopleMatrix] names parse error: {e}")
+            return {}
+
+    def _read_gz(self, path: Path) -> dict | None:
         try:
             st = path.stat()
         except OSError:

@@ -46,12 +46,13 @@ def _ordered_unique_ids(members) -> list[int]:
     return out
 
 
-def route_people(credits: dict, *, cast_limit: int = 10) -> dict[str, list[int]]:
-    """Daemon credits ``{cast:[{name,id,order}], crew:[{name,id,job,department}]}`` →
-    ``{role: [tmdb_person_id]}`` for every role in :data:`ROLES`. Crew classification
-    is byte-for-byte the same branch logic as ``flatten_trakt_people`` (Director /
-    producer / writer / composer); cast is capped at ``cast_limit`` after sorting by
-    billing ``order`` (same as the display columns)."""
+def _route_members(credits: dict, *, cast_limit: int = 10) -> dict[str, list[dict]]:
+    """Classify daemon credits ``{cast:[{name,id,order}], crew:[{name,id,job,department}]}``
+    into role buckets of MEMBER dicts (names + ids intact). The SHARED step behind both
+    :func:`route_people` (which keeps ids) and :func:`route_people_names` (which keeps
+    names), so the crew-classification branch logic exists ONCE and the two never drift.
+    Crew branches mirror ``flatten_trakt_people``; cast is capped at ``cast_limit`` after
+    sorting by billing ``order`` (same as the display columns)."""
     credits = credits or {}
     cast = credits.get("cast") or []
     crew = credits.get("crew") or []
@@ -69,13 +70,31 @@ def route_people(credits: dict, *, cast_limit: int = 10) -> dict[str, list[int]]
             writers.append(m)
         elif job == "Original Music Composer":
             composers.append(m)
-    return {
-        "cast":      _ordered_unique_ids(cast_sorted),
-        "directors": _ordered_unique_ids(directors),
-        "writers":   _ordered_unique_ids(writers),
-        "composers": _ordered_unique_ids(composers),
-        "producers": _ordered_unique_ids(producers),
-    }
+    return {"cast": cast_sorted, "directors": directors,
+            "writers": writers, "composers": composers, "producers": producers}
+
+
+def route_people(credits: dict, *, cast_limit: int = 10) -> dict[str, list[int]]:
+    """Daemon credits → ``{role: [tmdb_person_id]}`` for every role in :data:`ROLES`
+    (ids only — the minimal forward-map payload). Crew classification + the cast cap come
+    from :func:`_route_members`."""
+    return {role: _ordered_unique_ids(members)
+            for role, members in _route_members(credits, cast_limit=cast_limit).items()}
+
+
+def route_people_names(credits: dict, *, cast_limit: int = 10) -> dict[int, str]:
+    """The ``{tmdb_person_id: name}`` pairs for exactly the members :func:`route_people`
+    admits to the graph (same cast cap + crew classification), captured BEFORE the id-only
+    routing drops the name. The persisted union of these (see :func:`build_index`) is the
+    id→name lookup the forward map can't carry — INFRASTRUCTURE for resolving a person id
+    to a label; it is NOT consumed by any scorer (which is purely id-keyed) or logger."""
+    out: dict[int, str] = {}
+    for members in _route_members(credits, cast_limit=cast_limit).values():
+        for m in members:
+            pid, name = m.get("id"), m.get("name")
+            if isinstance(pid, int) and not isinstance(pid, bool) and name:
+                out.setdefault(pid, str(name))
+    return out
 
 
 def invert_forward(media_people_fwd: dict) -> dict:
@@ -98,15 +117,21 @@ def build_index(media_people: dict, *, cast_limit: int = 10):
     tvdb_id (show); the ``(medium, ext_id)`` tuple namespaces the two id-spaces so a
     movie tmdb 603 and a show tvdb 603 never collide.
 
-    Returns ``(person_index, media_people_fwd)``:
+    Returns ``(person_index, media_people_fwd, names)``:
       * ``person_index``     — ``{tmdb_person_id: set[(medium, ext_id)]}`` inverted index
       * ``media_people_fwd`` — ``{(medium, ext_id): {role: [tmdb_person_id]}}`` forward map
+      * ``names``            — ``{tmdb_person_id: name}`` flat id→name lookup (infra only;
+        the union of every title's :func:`route_people_names`; not read by the scorers)
     """
     media_people_fwd = {
         key: route_people(credits, cast_limit=cast_limit)
         for key, credits in media_people.items()
     }
-    return invert_forward(media_people_fwd), media_people_fwd
+    names: dict[int, str] = {}
+    for credits in media_people.values():
+        for pid, name in route_people_names(credits, cast_limit=cast_limit).items():
+            names.setdefault(pid, name)
+    return invert_forward(media_people_fwd), media_people_fwd, names
 
 
 def serialize_forward(media_people_fwd: dict) -> dict:
@@ -123,6 +148,24 @@ def deserialize_forward(d: dict) -> dict:
     for k, roles in (d or {}).items():
         medium, ext = k.split(":", 1)
         out[(medium, int(ext))] = {r: [int(p) for p in (v or [])] for r, v in (roles or {}).items()}
+    return out
+
+
+def serialize_names(names: dict) -> dict:
+    """``{person_id: name}`` → JSON-safe ``{str(person_id): name}``. Pure — the service
+    manager gzips the result; :func:`deserialize_names` inverts it."""
+    return {str(pid): name for pid, name in (names or {}).items()}
+
+
+def deserialize_names(d: dict) -> dict:
+    """Inverse of :func:`serialize_names` — JSON dict → ``{int(person_id): name}``,
+    dropping any key that won't coerce to int."""
+    out: dict[int, str] = {}
+    for k, name in (d or {}).items():
+        try:
+            out[int(k)] = name
+        except (TypeError, ValueError):
+            continue
     return out
 
 

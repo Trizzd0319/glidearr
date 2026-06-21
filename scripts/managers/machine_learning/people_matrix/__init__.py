@@ -13,14 +13,17 @@ from scripts.managers.machine_learning.people_matrix.build import (
     build_index,
     co_occurring,
     deserialize_forward,
+    deserialize_names,
     films_with_all,
     invert_forward,
     route_people,
+    route_people_names,
     serialize_forward,
+    serialize_names,
 )
 
 __all__ = [
     "PERSON_ROLE_WEIGHTS", "ROLES", "build_index", "co_occurring",
-    "deserialize_forward", "films_with_all", "invert_forward", "route_people",
-    "serialize_forward",
+    "deserialize_forward", "deserialize_names", "films_with_all", "invert_forward",
+    "route_people", "route_people_names", "serialize_forward", "serialize_names",
 ]

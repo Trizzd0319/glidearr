@@ -22,6 +22,7 @@ def _mgr(tmp_path):
     m.config = None
     m.matrix_path = tmp_path / "people_matrix.json.gz"
     m.affinity_path = tmp_path / "people_affinity.json.gz"
+    m.names_path = tmp_path / "people_names.json.gz"
     m._movie_cache = m._show_cache = None
     return m
 
@@ -36,12 +37,14 @@ def test_build_caches_and_load_roundtrips(tmp_path):
              ("movie", 271110): _cast(3223),
              ("show", 100): _cast(999)}
     stats = m.build(media_people=media)
-    assert stats == {"titles": 3, "with_people": 3, "persons": 3, "weighted_people": 0}
-    assert m.matrix_path.exists()
+    assert stats == {"titles": 3, "with_people": 3, "persons": 3,
+                     "weighted_people": 0, "named_people": 3}
+    assert m.matrix_path.exists() and m.names_path.exists()
 
     pidx, fwd = m.load_index()                       # from global_cache
     assert pidx[3223] == {("movie", 24428), ("movie", 271110)}
     assert fwd[("show", 100)]["cast"] == [999]
+    assert m.load_names() == {1245: "p1245", 3223: "p3223", 999: "p999"}  # id→name infra
 
     m.global_cache.d.clear()                          # force the gz fallback
     pidx2, _ = m.load_index()
@@ -51,7 +54,7 @@ def test_build_caches_and_load_roundtrips(tmp_path):
 def test_build_empty_is_safe(tmp_path):
     m = _mgr(tmp_path)
     assert m.build(media_people={}) == {"titles": 0, "with_people": 0, "persons": 0,
-                                        "weighted_people": 0}
+                                        "weighted_people": 0, "named_people": 0}
     assert m.load_index() == (None, None)
 
 

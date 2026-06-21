@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from scripts.managers.machine_learning.people_matrix.build import (
-    build_index, co_occurring, films_with_all, route_people,
+    build_index, co_occurring, deserialize_names, films_with_all, route_people,
+    route_people_names, serialize_names,
 )
 
 # tmdb person ids
@@ -24,7 +25,7 @@ LIBRARY = {
 
 
 def test_inverted_index_and_forward_map():
-    pidx, fwd = build_index(LIBRARY)
+    pidx, fwd, _ = build_index(LIBRARY)
     assert pidx[SCARJO] == {("movie", 24428)}
     assert pidx[RDJ] == {("movie", 24428), ("movie", 271110)}
     assert pidx[EVANS] == {("movie", 24428), ("movie", 1771), ("movie", 271110)}
@@ -32,7 +33,7 @@ def test_inverted_index_and_forward_map():
 
 
 def test_co_occurring_ranks_by_match_count():
-    pidx, _ = build_index(LIBRARY)
+    pidx, _, _ = build_index(LIBRARY)
     co = co_occurring(pidx, {SCARJO, RDJ})
     assert co[("movie", 24428)] == 2      # both appear
     assert co[("movie", 271110)] == 1     # only RDJ
@@ -40,7 +41,7 @@ def test_co_occurring_ranks_by_match_count():
 
 
 def test_films_with_all_is_strict_AND():
-    pidx, _ = build_index(LIBRARY)
+    pidx, _, _ = build_index(LIBRARY)
     # "films with ScarJo AND RDJ" → only Avengers has both
     assert films_with_all(pidx, {SCARJO, RDJ}) == {("movie", 24428)}
     # RDJ AND Evans → Avengers + Civil War
@@ -50,14 +51,14 @@ def test_films_with_all_is_strict_AND():
 
 
 def test_empty_input_is_empty():
-    assert build_index({}) == ({}, {})
+    assert build_index({}) == ({}, {}, {})
     assert co_occurring({}, {SCARJO}) == {}
     assert films_with_all({}, set()) == set()
 
 
 def test_movie_show_id_spaces_do_not_collide():
     lib = {("movie", 100): _cast(SCARJO), ("show", 100): _cast(RDJ)}
-    pidx, _ = build_index(lib)
+    pidx, _, _ = build_index(lib)
     assert pidx[SCARJO] == {("movie", 100)}
     assert pidx[RDJ] == {("show", 100)}
 
@@ -90,3 +91,34 @@ def test_cast_limit_and_order():
     ids = route_people(credits, cast_limit=3)["cast"]
     assert len(ids) == 3
     assert ids == [111, 110, 109]   # lowest order first (billing), capped at 3
+
+
+# ── id→name infra (additive; not read by the scorers) ────────────────────────────────
+def test_route_people_names_captures_cast_and_crew():
+    credits = {"cast": [{"name": "ScarJo", "id": SCARJO, "order": 0},
+                        {"name": "RDJ", "id": RDJ, "order": 1}],
+               "crew": [{"name": "Dir", "id": 1, "job": "Director", "department": "Directing"},
+                        {"name": "NoId", "id": None, "job": "Writer", "department": "Writing"}]}
+    names = route_people_names(credits)
+    assert names == {SCARJO: "ScarJo", RDJ: "RDJ", 1: "Dir"}     # null-id member dropped
+
+
+def test_route_people_names_respects_cast_limit_and_drops_bool_ids():
+    credits = {"cast": [{"name": str(i), "id": 100 + i, "order": i} for i in range(12)]
+                       + [{"name": "boolid", "id": True, "order": 99}],
+               "crew": []}
+    names = route_people_names(credits, cast_limit=3)
+    assert set(names) == {100, 101, 102}                          # capped to billing top-3, bool dropped
+
+
+def test_build_index_aggregates_flat_names_union():
+    lib = {("movie", 24428): _cast(SCARJO, RDJ), ("movie", 1771): _cast(EVANS)}
+    _, _, names = build_index(lib)
+    assert names == {SCARJO: f"p{SCARJO}", RDJ: f"p{RDJ}", EVANS: f"p{EVANS}"}
+
+
+def test_serialize_names_round_trips_int_keys():
+    names = {SCARJO: "ScarJo", RDJ: "RDJ"}
+    assert serialize_names(names) == {str(SCARJO): "ScarJo", str(RDJ): "RDJ"}
+    assert deserialize_names(serialize_names(names)) == names     # int keys preserved
+    assert deserialize_names({"bad": "x", "7": "ok"}) == {7: "ok"}  # unparseable key dropped

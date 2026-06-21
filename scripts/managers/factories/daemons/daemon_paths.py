@@ -76,6 +76,7 @@ SHOW_BUCKETS: dict[str, Path] = {
 # watched-set change.
 PEOPLE_MATRIX_PATH:   Path = CACHE_TRAKT / "people_matrix.json.gz"      # forward map {(medium,ext_id):{role:[pid]}}
 PEOPLE_AFFINITY_PATH: Path = CACHE_TRAKT / "people_affinity.json.gz"    # household {tmdb_person_id: weight}
+PEOPLE_NAMES_PATH:    Path = CACHE_TRAKT / "people_names.json.gz"       # {tmdb_person_id: name}; infra id→name lookup, not read by the scorers
 
 # Default per-movie scope. translations is ON by default for the globally-shared
 # deployment — it caches localized title/tagline/overview text for non-English
