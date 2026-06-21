@@ -11,9 +11,25 @@
   "titles": ["Doctor Who", "Torchwood", "The Sarah Jane Adventures", "Class"],
   "shows": [76107, 79511, 79708, 309893]
  },
+ "fbi": {
+  "titles": ["FBI", "FBI: Most Wanted"],
+  "shows": [350071, 364088]
+ },
  "greysanatomy": {
   "titles": ["Grey's Anatomy", "Private Practice", "Station 19"],
   "shows": [73762, 80542, 341852]
+ },
+ "law & order": {
+  "titles": ["Law & Order", "Law & Order: Special Victims Unit", "Law & Order: Criminal Intent", "Law & Order: LA", "Law & Order: Organized Crime"],
+  "shows": [72368, 75692, 71489, 168161, 383397]
+ },
+ "ncis": {
+  "titles": ["NCIS", "NCIS: Los Angeles", "NCIS: New Orleans", "NCIS: Sydney", "NCIS: Origins", "NCIS: Tony & Ziva"],
+  "shows": [72108, 95441, 278125, 416493, 444350, 446847]
+ },
+ "one chicago": {
+  "titles": ["Chicago Fire", "Chicago P.D.", "Chicago Med", "Chicago Justice"],
+  "shows": [258541, 269641, 295640, 311896]
  },
  "stargate": {
   "titles": ["Stargate SG-1", "Stargate Atlantis", "Stargate Universe"],

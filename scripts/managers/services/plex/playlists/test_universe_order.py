@@ -383,6 +383,24 @@ def test_tv_franchise_universes_empty_catalog_is_noop():
     assert tv_franchise_universes([{"title": "Solo Show", "tvdbId": 5}], {}) == {}
 
 
+def test_tv_franchise_universes_catalog_supersedes_layer1_cluster():
+    # own Chicago Fire + P.D. → Layer-1 would auto-cluster them as tvfran:chicago; the catalog's
+    # FULL "one chicago" (incl. unowned Med/Justice) must SUPERSEDE that owned-only cluster.
+    owned = [{"title": "Chicago Fire", "tvdbId": 20}, {"title": "Chicago P.D.", "tvdbId": 21}]
+    cat = {"one chicago": {"shows": [20, 21, 22, 23]}}                  # 22/23 unowned siblings
+    out = tv_franchise_universes(owned, cat)
+    assert out["tvfran:one chicago"]["shows"] == [20, 21, 22, 23]       # full membership, catalog wins
+    assert "tvfran:chicago" not in out                                  # owned-only auto-cluster dropped
+
+
+def test_tv_franchise_universes_film_universe_deny_drops_catalog_and_cluster():
+    # a TV family a film universe already groups (deny_tvdbs) is never re-emitted as tvfran:.
+    owned = [{"title": "Arrow", "tvdbId": 50}, {"title": "Arrow: Spinoff", "tvdbId": 51}]   # would stem-cluster
+    cat = {"arrow": {"shows": [50, 51, 52]}}
+    out = tv_franchise_universes(owned, cat, deny_tvdbs={50})           # 50 is in the Arrowverse film list
+    assert out == {}                                                    # catalog AND the stem-cluster suppressed
+
+
 def test_tv_franchise_universes_entries_round_trip_through_consumers():
     # the integration guard the seam-map flagged as missing: producer output → every consumer.
     src = {"universes": tv_franchise_universes(_FAM, catalog={})}

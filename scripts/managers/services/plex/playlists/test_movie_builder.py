@@ -208,6 +208,35 @@ def test_watchlisted_franchise_feeds_synthetic_universe_entry():
     assert syn["shows"] == [900003, 900004] and syn["timeline"] is True   # incl. the not-yet-owned siblings
 
 
+def test_film_universe_deny_prevents_double_grouping():
+    import scripts.managers.services.plex.playlists.builder as B
+    cache = _Cache()
+    # an mdblist FILM universe already groups show 900010 (e.g. Arrowverse)
+    cache.set(B._UNIVERSE_SRC_KEY, {"universes": {"arrow": {"timeline": True, "movies": [],
+                                    "shows": [900010], "items": []}}, "fetched": {"arrow": 5}})
+    cfg = {"plex": {"playlists": {"universe_timeline": {"enabled": True},
+                                  "tv_franchises": {"arrowtv": {"shows": [900010, 900011]}}}}}
+    m = _mgr(cache=cache, config=cfg)
+    m._tv_franchise_maps([{"series_id": 1, "series_title": "Arrow", "series_tvdb_id": 900010}])
+    u = cache.get(B._UNIVERSE_SRC_KEY)["universes"]
+    assert "arrow" in u                                                  # film universe preserved
+    assert "tvfran:arrowtv" not in u                                     # catalog dup denied (film universe covers it)
+
+
+def test_baked_floor_one_chicago_supersedes_stem_cluster():
+    import scripts.managers.services.plex.playlists.builder as B
+    cache = _Cache()
+    cache.set(B._UNIVERSE_SRC_KEY, {"universes": {}, "fetched": {}})
+    m = _mgr(cache=cache, config=_ON)
+    # own 2 Chicago shows (real baked-floor tvdbs) → the floor's full "one chicago" supersedes the
+    # owned-only stem cluster, so retention/acquisition see all 4 members (incl. unowned Med/Justice)
+    m._tv_franchise_maps([{"series_id": 1, "series_title": "Chicago Fire", "series_tvdb_id": 258541},
+                          {"series_id": 2, "series_title": "Chicago P.D.", "series_tvdb_id": 269641}])
+    u = cache.get(B._UNIVERSE_SRC_KEY)["universes"]
+    assert "tvfran:one chicago" in u and "tvfran:chicago" not in u
+    assert u["tvfran:one chicago"]["shows"] == [258541, 269641, 295640, 311896]   # full floor membership
+
+
 def test_builds_movie_plan_ranked_by_score():
     cache = _Cache()
     owned = [_movie(1, "Low", 2000, 20), _movie(2, "High", 2010, 90)]

@@ -492,11 +492,15 @@ class PlexPlaylistBuilderManager(BaseManager):
                 seen_tv.add(tv)
                 rows.append({"title": ep.get("series_title") or ep.get("title") or "",
                              "tvdbId": tv, "year": ep.get("series_year") or ep.get("year")})
-            syn = tv_franchise_universes(rows, self._tv_franchise_catalog(),
-                                         engaged_tvdbs=self._watchlisted_show_tvdbs())
             cached = dict(self._cache_get(_UNIVERSE_SRC_KEY, {}) or {})
             universes = {k: v for k, v in (cached.get("universes") or {}).items()
                          if not str(k).startswith("tvfran:")}            # strip prior synthetic
+            # Film-universe show tvdbs — a TV franchise that a film universe (Arrowverse, Star Trek…)
+            # already groups must NOT be re-emitted as a tvfran: entry (no double-grouping).
+            deny = {ti for v in universes.values() for tv in (v.get("shows") or [])
+                    if (ti := _to_int(tv)) is not None}
+            syn = tv_franchise_universes(rows, self._tv_franchise_catalog(),
+                                         engaged_tvdbs=self._watchlisted_show_tvdbs(), deny_tvdbs=deny)
             fetched = {k: v for k, v in (cached.get("fetched") or {}).items()
                        if k != "__tvfran__"}                            # drop only our marker; mdblist TTL untouched
             universes.update(syn)

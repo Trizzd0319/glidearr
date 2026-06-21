@@ -159,12 +159,14 @@ def stem_franchise_clusters(series_rows, *, deny=None) -> dict:
 
 
 def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
-                           cluster_same_stem=True) -> dict:
+                           deny_tvdbs=None, cluster_same_stem=True) -> dict:
     """Synthetic ``tvfran:`` universe-source entries — the SINGLE seam that makes discovered TV
-    franchises participate in playlist grouping, catch-up retention AND acquisition. Merges Layer-1
-    (owned same-stem clusters, :func:`stem_franchise_clusters`) with the Layer-2 baked ``catalog``
-    (``{}`` in Phase 1 — the generated cross-named file is deferred), namespaced ``tvfran:<stem>``
-    so the keys never collide with film universes.
+    franchises participate in playlist grouping, catch-up retention AND acquisition. Merges Layer-2
+    (the baked/generated tvdb-keyed ``catalog`` — cross-named families + the migrated curated
+    same-name ones) with Layer-1 (owned same-stem clusters, :func:`stem_franchise_clusters`),
+    namespaced ``tvfran:<key>``. Deconflicted: a catalog franchise's full membership SUPERSEDES the
+    owned-only Layer-1 cluster of the same family, and a family a film universe (``deny_tvdbs`` —
+    Arrowverse, Star Trek…) already groups is dropped — so no family is ever grouped under two keys.
 
     ``owned_series_rows`` — ``[{title|series_title, tvdbId|tvdb|series_tvdb_id, year?,
     tvdb_first_aired?}]``. Each emitted value is shaped EXACTLY like :func:`split_list_media` output
@@ -179,7 +181,8 @@ def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
     only stamps a series order for timeline universes — both of which we want. Members are ordered by
     debut (``tvdb_first_aired`` → ``year`` → stable input order, undated last) so the saga rank the
     retention watchlist-prefix scoping relies on is defensible. ``shows`` and ``items`` share that
-    order. PURE — no I/O. Phase-1 ``catalog={}`` makes the Layer-2 branch a no-op."""
+    order. ``deny_tvdbs`` = tvdbs a film universe already groups. PURE — no I/O; ``catalog={}`` makes
+    the Layer-2 branch a no-op (Layer-1 clustering still runs)."""
     clusters = stem_franchise_clusters(owned_series_rows) if cluster_same_stem else {}
 
     # Debut + first-seen index per tvdb (for member ordering). Undated rows → stable input order.
@@ -212,23 +215,37 @@ def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
         xi = _coerce_int(x)
         if xi is not None:
             scope.add(xi)
+    deny = {di for di in (_coerce_int(x) for x in (deny_tvdbs or ())) if di is not None}
 
     out: dict = {}
-    for key, members in clusters.items():
-        out[key] = _entry(_debut_ordered(members))
+    catalog_shows: set = set()                                # tvdbs a catalog franchise already claims
 
-    # Layer-2 catalog (cross-named families the same-stem clusterer can't derive — Grey's↔Station 19,
-    # Buffy↔Angel…). Each franchise is emitted in FULL (incl. its UNOWNED siblings, so acquisition can
-    # backfill them start-first) but ONLY when the household is ENGAGED with it — owns OR has
-    # watchlisted ≥1 member — so an unengaged franchise never bloats the universe source, while a
-    # watchlist add (a not-yet-owned show) still pulls its whole family in. A catalog entry overrides
-    # a same-keyed Layer-1 cluster (its curated order wins).
+    # Layer-2 catalog FIRST (canonical, full membership). Cross-named families the same-stem clusterer
+    # can't derive (Grey's↔Station 19, Buffy↔Angel) AND the migrated curated same-name families (One
+    # Chicago, Law & Order, NCIS) — now tvdb-keyed so they reach retention + acquisition, not just the
+    # playlist. Emitted in FULL (incl. UNOWNED siblings, so acquisition backfills them start-first) but
+    # ONLY when the household is ENGAGED — owns OR has watchlisted ≥1 member — and NOT when a film
+    # universe (``deny_tvdbs`` — Arrowverse, Star Trek…) already groups the family (no double-grouping).
     for key, entry in (catalog or {}).items():
         k = key if str(key).startswith("tvfran:") else f"tvfran:{key}"
         raw = entry.get("shows") if isinstance(entry, dict) else entry
         shows = [t for t in (_coerce_int(tv) for tv in (raw or [])) if t is not None]
-        if shows and any(s in scope for s in shows):
-            out[k] = _entry(shows)
+        if not shows or not any(s in scope for s in shows):
+            continue
+        if deny and any(s in deny for s in shows):           # film universe already covers it
+            continue
+        if any(s in catalog_shows for s in shows):           # another catalog franchise already claims a
+            continue                                         # member → first-wins (floor before generated)
+        out[k] = _entry(shows)
+        catalog_shows.update(shows)
+
+    # Layer-1 owned-stem clusters — SKIP any whose members a catalog franchise already covers (the
+    # catalog's full membership SUPERSEDES the owned-only auto-cluster, so a family is never grouped
+    # under two keys) or that a film universe covers.
+    for key, members in clusters.items():
+        if any(m in catalog_shows for m in members) or (deny and any(m in deny for m in members)):
+            continue
+        out[key] = _entry(_debut_ordered(members))
     return out
 
 # Bundled list DEFINITIONS — Kometa's own universe→list map (the IMDb/mdblist lists it builds
