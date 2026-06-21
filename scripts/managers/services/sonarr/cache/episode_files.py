@@ -48,11 +48,15 @@ from scripts.managers.machine_learning.acquisition.next_episode_planner import (
     DEFAULT_RECENCY_GATE,
     build_runtime_lookup,
     episode_cap,
+    group_key_for_series,
+    group_members,
     is_cold_series,
     last_watched_per_series,
+    order_groups_by_recency,
     order_series_by_recency,
     series_budget_multiplier,
 )
+from scripts.managers.services.plex.playlists.universe_order import tv_group_maps_from_series
 from scripts.managers.machine_learning.acquisition.pilot_stepping import (
     choose_pilot_profile,
     next_pilot_profile,
@@ -96,6 +100,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     GRACE_HOURS       = 3        # keep a watched file available this long before deletion
     RECENT_AIR_DAYS   = 30       # never delete an episode that aired within this many days
     PREFETCH_HOURS    = 3.0      # target runtime budget of upcoming episodes to pre-acquire per series
+    # Cache key the Plex playlist builder writes the fetched mdblist universe lists under; the
+    # per-group prefetch walk reads the SAME source so acquisition + playlists agree on grouping.
+    _UNIVERSE_SRC_KEY = "plex/playlists/universe_source"
     MIN_FREE_SPACE_GB = 50.0     # last-resort acquire/upgrade floor only (free_space_limit unset AND
                                    # total drive unreadable); normally space_targets uses 25%-of-total
     JIT_MAX_EPISODES  = 3         # max episodes to JIT-upgrade per series per run (prevents upgrading
@@ -1666,6 +1673,90 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     # ── Lifecycle helpers ────────────────────────────────────────────────────────
 
+    def _universe_group_maps(self, instance):
+        """``({series_id: group_token}, {series_id: timeline_index})`` for the per-group prefetch
+        walk — the SAME grouping + order the Plex playlist builder uses
+        (``universe_order.tv_group_maps``), sourced Sonarr-side from the series cache (id / title /
+        tvdbId) + the cached universe source. Returns ``({}, {})`` — i.e. every series becomes its
+        own singleton group and the walk reduces BYTE-IDENTICALLY to the legacy per-series
+        behaviour — when ``acquisition.enabled`` OR ``acquisition.universe.enabled`` is off, or the
+        series cache / source is unavailable. (The mdblist source may be empty without a key; the
+        curated TV franchises — One Chicago, Law & Order, Doctor Who — still group from the bundled
+        map.)
+
+        ``acquisition.universe`` is a CHILD of ``acquisition``: disabling the parent disables the
+        whole acquisition subtree, including this universe reordering/injection — it never runs
+        behind a master switch the operator believes is off."""
+        acq = ((self.config or {}).get("acquisition", {}) or {})
+        uni = (acq.get("universe", {}) or {})
+        if not (acq.get("enabled") and uni.get("enabled")):
+            return {}, {}
+        series_cache = getattr(self.sonarr_cache, "series", None)
+        if series_cache is None:
+            return {}, {}
+        try:
+            rows = [s for s in series_cache.iter_all_series(instance) if isinstance(s, dict)]
+        except Exception as e:
+            self.logger.log_warning(f"[UniverseAcquire] series list unavailable for '{instance}': {e}")
+            return {}, {}
+        source = self.global_cache.get(self._UNIVERSE_SRC_KEY) if self.global_cache else None
+        fran, timeline = tv_group_maps_from_series(rows, source or {})
+        if fran:
+            self.logger.log_info(
+                f"[UniverseAcquire] {len(set(fran.values()))} saga group(s) → {len(fran)} owned "
+                f"series for the per-group prefetch walk ({len(timeline)} timeline-ordered).")
+        return fran, timeline
+
+    def _plan_group_walk(self, last_by_series, group_of, group_timeline, instance):
+        """Order the prefetch walk by GROUP. Returns a list of resume-row DICTS, each tagged with
+        ``_group`` (its saga key). Groups run in recency order; within a group, members in saga
+        order (``timeline_index``, else stable). For an ENGAGED group (≥1 already-watched member)
+        the UNSTARTED owned in-Sonarr members are appended as synthetic resume rows (S1E0 → the
+        walk begins at S1E1), so the saga's NEXT show prefetches once the current is exhausted
+        ("finish Loki → Daredevil"). No cold-start: a saga nobody has watched is never injected.
+
+        With ``group_of`` empty (feature off) every series is its own singleton group and the order
+        equals ``last_by_series`` — so the downstream walk reduces BYTE-IDENTICALLY to the legacy
+        per-series behaviour."""
+        rows = [dict(r) for _, r in last_by_series.iterrows()]
+        if not group_of:
+            for r in rows:
+                r["_group"] = f"series:{int(r['series_id'])}"
+            return rows
+
+        def _key(sid):
+            return group_key_for_series(sid, group_of, group_timeline)[0]
+
+        started = {int(r["series_id"]) for r in rows}
+        engaged = {_key(s) for s in started}
+        resume_by_sid = {int(r["series_id"]): r for r in rows}
+        # Titles for the synthetic unstarted rows — from the series cache (id → title).
+        titles: dict = {}
+        series_cache = getattr(self.sonarr_cache, "series", None)
+        if series_cache is not None:
+            try:
+                titles = {int(s["id"]): s.get("title", "")
+                          for s in series_cache.iter_all_series(instance)
+                          if isinstance(s, dict) and s.get("id") is not None}
+            except Exception:
+                titles = {}
+        extra_sids = [sid for sid in group_of if sid not in started and _key(sid) in engaged]
+        all_sids = list(dict.fromkeys(list(started) + extra_sids))
+        groups = group_members(all_sids, group_of, group_timeline)
+        order = order_groups_by_recency(last_by_series, {sid: _key(sid) for sid in all_sids})
+        walk: list = []
+        for key in order:
+            for sid in groups.get(key, {}).get("members", []):
+                r = resume_by_sid.get(sid)
+                if r is None:                              # unstarted member → synthetic resume @ S1E0
+                    r = {"series_id": sid, "series_title": titles.get(sid, ""),
+                         "season_number": 1, "episode_number": 0,
+                         "watchability_percentile": None, "last_watched_at": None,
+                         "keep_policy": None, "certification": None}
+                r["_group"] = key
+                walk.append(r)
+        return walk
+
     @timeit("_compute_next_episodes")
     def _compute_next_episodes(
         self,
@@ -1738,6 +1829,14 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if _cold_days is not None:
             last_by_series = order_series_by_recency(last_by_series)
 
+        # Group-aware ordering (acquisition.universe.enabled). The walk-plan lists resume rows by
+        # SAGA group (members in saga order, + unstarted members of engaged sagas), so a universe/
+        # franchise shares ONE budget walked frontier-first. Feature off → group_of empty → every
+        # series is its own singleton group → the plan == last_by_series → byte-identical walk.
+        group_of, group_timeline = self._universe_group_maps(instance)
+        _walk_plan = self._plan_group_walk(last_by_series, group_of, group_timeline, instance)
+        _prev_group = None
+
         # Pre-cast the search columns once so the inner mask avoids both
         # repeated computation AND the FutureWarning about fillna downcasting.
         # These are safe to cache because df is not structurally mutated
@@ -1772,7 +1871,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # thread merges results. Per-series cache logs are suppressed in bulk mode.
         # No force_refresh on this path; if ever added, delete keys serially on the
         # main thread BEFORE fan-out (save_json is non-atomic for the SAME key).
-        series_ids = list(dict.fromkeys(int(r["series_id"]) for _, r in last_by_series.iterrows()))
+        series_ids = list(dict.fromkeys(int(r["series_id"]) for r in _walk_plan))
         PROGRESS_BAR_THRESHOLD = 10
         use_tqdm = len(series_ids) > PROGRESS_BAR_THRESHOLD
         if use_tqdm and season_ep_cache is not None:
@@ -1783,13 +1882,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 desc="Episode cache",
             )
 
-        for _cne_i, (_, row) in enumerate(last_by_series.iterrows(), start=1):
+        for _cne_i, row in enumerate(_walk_plan, start=1):
             sid          = int(row["series_id"])
             series_title = str(row.get("series_title") or "")
             # Who this next-up is queued FOR — recent household watcher(s), most-recent first
             # (same attribution the JIT grab grid shows). Display-only; never affects the walk.
             _for_cell = ", ".join((_jit_watchers.get(str(sid)) or [])[:2]) or "-"
-            _total_series = len(last_by_series)
+            _total_series = len(_walk_plan)
             if not use_tqdm:
                 self.logger.log_info(
                     f"[⏱️] compute_next_episodes [{_cne_i}/{_total_series}] — "
@@ -1835,20 +1934,31 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             # since they're small files and the whole season fits in the budget.
             SHORT_EPISODE_S     = 600.0  # 10 minutes in seconds
             MAX_EP_PER_SERIES   = 6      # cap for normal-length episodes
-            MAX_TIME_PER_SERIES = 25.0   # wall-clock seconds before bailing out
+            MAX_TIME_PER_SERIES = 25.0   # wall-clock seconds before bailing out (per member)
             _series_start = time.time()
-            _ep_cap = episode_cap(
-                series_runtime_s, short_episode_s=SHORT_EPISODE_S, max_ep=MAX_EP_PER_SERIES,
-                graduated=_graduated_cap,
-            )
-            # Per-series runtime budget (opt-in percentile ramp; multiplier is exactly
-            # 1.0 when unconfigured, so series_budget == budget_seconds → byte-identical).
-            series_budget = budget_seconds * series_budget_multiplier(
-                row.get("watchability_percentile"), _budget_ramp
-            )
-            accumulated_s = 0.0
-            cur_season, cur_ep = last_season, last_ep
-            ep_count = 0
+            # Group boundary — detected HERE (after the cold-skip `continue` above) so a cold
+            # frontier member doesn't consume the saga's lead and strand the next member with an
+            # unset budget. The first NON-skipped member of a saga is its frontier.
+            _group_lead = row.get("_group") != _prev_group
+            _prev_group = row.get("_group")
+            # GROUP-level budget + cap + accumulators: computed/reset ONLY on a saga's frontier
+            # member (`_group_lead`) and SHARED across the rest of its members, so a universe/
+            # franchise prefetches one budget walked frontier-first (finish the current show's
+            # next-up, then the next show). A singleton group (feature off) is its own frontier
+            # every iteration → this reduces EXACTLY to the legacy per-series budget/cap/reset.
+            if _group_lead:
+                _ep_cap = episode_cap(
+                    series_runtime_s, short_episode_s=SHORT_EPISODE_S, max_ep=MAX_EP_PER_SERIES,
+                    graduated=_graduated_cap,
+                )
+                # Runtime budget (opt-in percentile ramp; multiplier is exactly 1.0 when
+                # unconfigured, so series_budget == budget_seconds → byte-identical).
+                series_budget = budget_seconds * series_budget_multiplier(
+                    row.get("watchability_percentile"), _budget_ramp
+                )
+                accumulated_s = 0.0
+                ep_count = 0
+            cur_season, cur_ep = last_season, last_ep   # per-member resume point
             # Use shared cache if provided; otherwise a per-series local dict.
             # series_ep_cache keys by series_id → {season: [ep_objs]}
             # Fetch ALL episodes for this series in one call upfront so the

@@ -16,11 +16,59 @@ from scripts.managers.machine_learning.acquisition.next_episode_planner import (
     DEFAULT_RECENCY_GATE,
     build_runtime_lookup,
     episode_cap,
+    group_key_for_series,
+    group_members,
     is_cold_series,
     last_watched_per_series,
+    order_groups_by_recency,
     order_series_by_recency,
     series_budget_multiplier,
 )
+
+
+# ── group resolution (franchise / universe aware prefetch) ──────────────────────
+def test_group_key_for_series_timeline_vs_airdate_vs_singleton():
+    fran = {10: "one chicago", 11: "one chicago", 20: "mcu", 21: "mcu", 30: "rel", 31: "rel"}
+    timeline = {10: 0, 11: 1, 20: 0, 21: 1}     # one chicago (curated) + mcu have timeline; 'rel' not
+    assert group_key_for_series(10, fran, timeline) == ("one chicago", "timeline")  # curated saga order
+    assert group_key_for_series(20, fran, timeline) == ("mcu", "timeline")
+    assert group_key_for_series(30, fran, timeline) == ("rel", "airdate")   # grouped, no timeline
+    assert group_key_for_series(99, fran, timeline) == ("series:99", "series")  # ungrouped → singleton
+
+
+def test_group_key_empty_maps_make_every_series_a_singleton():
+    # Feature OFF (empty maps) → each series is its own group → group walk == per-series walk.
+    assert group_key_for_series(5, {}, {}) == ("series:5", "series")
+    assert group_key_for_series(5, None, None) == ("series:5", "series")
+
+
+def test_group_members_orders_timeline_by_index_airdate_by_id():
+    fran = {11: "one chicago", 10: "one chicago", 21: "mcu", 20: "mcu", 22: "mcu", 41: "rel", 40: "rel"}
+    timeline = {10: 0, 11: 1, 20: 0, 21: 1, 22: 2}   # one chicago + mcu timeline; 'rel' has none
+    groups = group_members([22, 11, 20, 10, 21, 41, 40], fran, timeline)
+    assert groups["mcu"]["members"] == [20, 21, 22] and groups["mcu"]["kind"] == "timeline"
+    assert groups["one chicago"]["members"] == [10, 11] and groups["one chicago"]["kind"] == "timeline"
+    assert groups["rel"]["members"] == [40, 41] and groups["rel"]["kind"] == "airdate"  # by series_id
+
+
+def test_group_members_mixed_group_is_order_independent_timeline():
+    # A mixed group (member 5 has a timeline_index, 6 doesn't) must resolve to the SAME kind +
+    # member order regardless of iteration order — a group is timeline if ANY member is indexed.
+    fran = {5: "fast", 6: "fast"}
+    timeline = {5: 0}
+    g_fwd = group_members([5, 6], fran, timeline)["fast"]
+    g_rev = group_members([6, 5], fran, timeline)["fast"]
+    assert g_fwd["kind"] == "timeline" == g_rev["kind"]
+    assert g_fwd["members"] == [5, 6] == g_rev["members"]   # indexed (5) first, non-indexed (6) last
+
+
+def test_order_groups_by_recency_most_recent_member_first():
+    last = pd.DataFrame([
+        {"series_id": 10, "last_watched_at": "2026-06-01T00:00:00Z"},   # one chicago (older)
+        {"series_id": 20, "last_watched_at": "2026-06-19T00:00:00Z"},   # mcu (newer)
+    ])
+    group_of = {10: "one chicago", 20: "mcu"}
+    assert order_groups_by_recency(last, group_of) == ["mcu", "one chicago"]
 
 
 # ── last_watched_per_series ─────────────────────────────────────────────────────

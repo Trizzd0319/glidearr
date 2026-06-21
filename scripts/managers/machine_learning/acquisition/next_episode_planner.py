@@ -142,6 +142,80 @@ def is_cold_series(last_watched_at, now, *, cold_days, has_upcoming) -> bool:
     return (now - dt).days > cold_days
 
 
+def group_key_for_series(series_id, franchise_by_series, series_timeline):
+    """``(group_key, kind)`` for one owned series. The prefetch walk groups its forward walk by
+    this key so a franchise/universe is acquired as ONE run (finish a saga's current show → its
+    next show; or interleave sibling shows by air date) instead of per-series in isolation.
+
+    Rule — order by ``timeline_index`` WHENEVER it is available, else air date:
+    - ``kind == "timeline"`` — the series has a ``series_timeline`` position (a curated saga order
+      like One Chicago, OR a timeline-flagged universe like MCU); the group is walked in that saga
+      order (show-by-show).
+    - ``kind == "airdate"`` — grouped (a ``franchise_by_series`` token) but NO timeline_index (a
+      release-ordered collection); members are visited in series_id order. NOTE the walk is
+      member-SEQUENTIAL (frontier-first): it walks each member's own episode sequence to budget
+      exhaustion before the next member — it does NOT interleave episodes across shows by air date.
+    - ``kind == "series"`` — UNGROUPED; its own singleton group, so when the maps are empty
+      (feature off) the group walk reduces EXACTLY to the legacy per-series walk.
+
+    This mirrors the playlist builder's contract (``universe_order.tv_group_maps``), so the two
+    layers agree on grouping and order."""
+    token = (franchise_by_series or {}).get(series_id)
+    if token is None:
+        return (f"series:{series_id}", "series")
+    kind = "timeline" if series_id in (series_timeline or {}) else "airdate"
+    return (str(token), kind)
+
+
+def group_members(series_ids, franchise_by_series, series_timeline):
+    """Bucket owned ``series_ids`` into groups: ``{group_key: {"kind", "members": [sid...]}}``.
+
+    ``members`` are ORDERED so the walk knows the saga sequence: a ``timeline`` group by
+    ``series_timeline`` position (then series_id as a stable tie-break); an ``airdate`` or
+    singleton group by series_id. This sets the member VISIT order only — the walk is
+    member-SEQUENTIAL (frontier-first), so there is NO per-episode cross-show interleave. PURE."""
+    timeline = series_timeline or {}
+    groups: dict = {}
+    for sid in series_ids:
+        key, kind = group_key_for_series(sid, franchise_by_series, timeline)
+        g = groups.setdefault(key, {"kind": kind, "members": []})
+        g["members"].append(sid)
+        # A group is timeline-ordered if ANY member carries a timeline_index — decided over ALL
+        # members, NOT the first one seen, so a MIXED group (some indexed, some not) is
+        # order-independent. Members without an index sort last (inf) under the timeline sort.
+        if kind == "timeline":
+            g["kind"] = "timeline"
+    for g in groups.values():
+        if g["kind"] == "timeline":
+            g["members"].sort(key=lambda s: (timeline.get(s, float("inf")), s))
+        else:
+            g["members"].sort()
+    return groups
+
+
+def order_groups_by_recency(last_by_series, group_of):
+    """Order GROUP keys most-recently-watched-first (so the hottest group prefetches before the
+    walk's wall-clock/budget runs out), mirroring :func:`order_series_by_recency` at the group
+    level. ``group_of`` maps series_id → group_key. A group's recency = its most-recent member
+    watch. Returns a list of group keys; groups with no parseable watch sort last. PURE."""
+    if last_by_series is None or last_by_series.empty or "series_id" not in last_by_series.columns:
+        return []
+    lw = (pd.to_datetime(last_by_series["last_watched_at"], utc=True, errors="coerce")
+          if "last_watched_at" in last_by_series.columns else None)
+    best: dict = {}
+    for pos, idx in enumerate(last_by_series.index):
+        sid = last_by_series.at[idx, "series_id"]
+        key = group_of.get(sid, f"series:{sid}")
+        ts = lw.iloc[pos] if lw is not None else pd.NaT
+        cur = best.get(key)
+        if cur is None or (pd.notna(ts) and (pd.isna(cur) or ts > cur)):
+            best[key] = ts
+    # NaT (never/garbled) sorts last; newest first otherwise.
+    return [k for k, _ in sorted(
+        best.items(),
+        key=lambda kv: (pd.isna(kv[1]), -(kv[1].value if pd.notna(kv[1]) else 0)))]
+
+
 def series_budget_multiplier(percentile, ramp) -> float:
     """Multiplier on a series' prefetch runtime budget from its watchability_percentile.
 
