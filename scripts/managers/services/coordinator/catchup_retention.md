@@ -2,7 +2,7 @@
 
 **Goal.** When one household viewer is **behind** on a saga another has finished, never delete the content the trailing viewer still needs to reach. At the critical free-space floor, **downgrade** (shrink) the held portions instead of deleting them. The set of viewers who can block a saga's deletion is **derived from data every run — never hardcoded** — so it self-configures for any **Household** (the shipped product, every deployment).
 
-Status: **Phases 0-1 built + tested** (config knobs + the pure `saga_retention.py` brain — no engine wiring yet, default-OFF). Deletion is destructive + currently ARMED (`deletions_consent=true`, `free_space_limit=2050`); only `dry_run` guards it. Build + verify the remaining (engine-touching) phases entirely under dry-run.
+Status: **Phases 0-2 built + tested** (config knobs + the pure `saga_retention.py` brain + the `SagaRetentionProducerManager` that writes `lifecycle/saga_gates` — read-only + a cache write, no deletes yet, default-OFF). Deletion is destructive + currently ARMED (`deletions_consent=true`, `free_space_limit=2050`); only `dry_run` guards it. Build + verify the remaining (delete-guard) phases entirely under dry-run.
 
 ---
 
@@ -54,7 +54,7 @@ This is the retention twin of acquisition's frontier: acquisition fills *forward
 |---|---|---|---|
 | 0 | ✅ **Config knobs** (`saga_retention` block, default OFF → byte-identical) | `onboarding/schema.py` + `env_map.py` + `config.json` | small |
 | 1 | ✅ **Pure brain** `saga_retention.py` — `compute_saga_gates(...)` + `saga_member_sets()` beside `unified_universe_order` (19 tests) | `machine_learning/lifecycle/saga_retention.py` + test; `plex/playlists/universe_order.py` | large |
-| 2 | **Per-user producer + the new movie watched-set** — bucket raw history by `user_id`, join watchlist via `identity_map`, write `lifecycle/saga_gates` | NEW producer near `tautulli/__init__.py:288` or coordinator pre-pass | large |
+| 2 | ✅ **Per-user producer + the new movie watched-set** — `SagaRetentionProducerManager` buckets raw `tautulli/history/all` by `user_id` (watched≥thr vs started-in-grace, title→id via owned inventory), joins per-user watchlist via `tracked_users`/`identity_map`, calls the brain, writes `lifecycle/saga_gates`; runs after `plex.run_reconcile()`, before the space coordinator; fail-open; 9 tests | `coordinator/saga_retention_producer.py` + `main.py` | large |
 | 3 | **Movie hold (Radarr)** — `is_saga_held` column + `continue` guard in `build_movie_delete_candidates` AND coordinator `build_delete_candidates`; leave downgrade untouched | `radarr/cache/movie_files.py`, `space/delete_planner.py:88`, `radarr/quality/space_pressure.py` | medium |
 | 4 | **Coordinator shield** (2nd line) — extend `_shield_protected_picks` to drop saga-held ids | `coordinator/space_coordinator.py:355-393` | small |
 | 5 | **Episode hold (Sonarr)** — OR `saga_held` into `all_household_watched` (move all 3 readers together: grace :2370, delete :3045, guards :88); keep memberless household hold as coexisting fallback | `sonarr/cache/episode_files.py`, `classification/guards.py:83`, `lifecycle/grace_policy.py:85` | medium |

@@ -228,6 +228,25 @@ class Main(BaseManager, ComponentManagerMixin):
         )
         self.registry.set_flag("space_coordinator_initialized")
 
+        # Catch-up retention PRODUCER (opt-in). Writes the de-identified lifecycle/saga_gates the
+        # deletion guards consume; read-only, no-op unless saga_retention.enabled. Runs in run()
+        # after the Plex reconcile pass (identity + per-user watchlist warm) and before the space
+        # coordinator that consumes it.
+        from scripts.managers.services.coordinator import SagaRetentionProducerManager
+        self.saga_retention_producer = SagaRetentionProducerManager(
+            logger=self.logger,
+            config=self.config,
+            global_cache=self.global_cache,
+            validator=self.validator,
+            registry=self.registry,
+            dry_run=self.dry_run,
+            sonarr=self.sonarr,
+            radarr=self.radarr,
+            plex=self.plex,
+            tautulli=self.tautulli,
+        )
+        self.registry.set_flag("saga_retention_producer_initialized")
+
     def validate(self):
         """The single validation GATE — run after config is loaded/generated and
         BEFORE any manager runs. Validates, in order:
@@ -470,6 +489,16 @@ class Main(BaseManager, ComponentManagerMixin):
         except Exception as e:
             summary.add_error(f"Plex reconcile: {e}")
             self.logger.log_error(f"[Main] Plex reconcile run failed: {e}")
+
+        # Catch-up retention producer — writes lifecycle/saga_gates from the now-warm watch
+        # history + per-user watchlist + universe source, BEFORE the space coordinator consumes
+        # it. Read-only + a cache write; no-op unless saga_retention.enabled.
+        try:
+            if getattr(self, "saga_retention_producer", None) is not None:
+                self.saga_retention_producer.run()
+        except Exception as e:
+            summary.add_error(f"SagaRetention: {e}")
+            self.logger.log_error(f"[Main] Saga retention producer failed: {e}")
 
         # ── Phase 2.5: cross-service space coordinator (opt-in; gated) ─────
         # Runs AFTER both services have scored + downgraded, but BEFORE the plan
