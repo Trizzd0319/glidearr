@@ -17,7 +17,9 @@ rather than raising; the tested core is ``_build_for_users`` (pure given its inp
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 from datetime import date
 
 from scripts.managers.factories.base_manager import BaseManager
@@ -59,6 +61,10 @@ _STATS_KEY = "plex/episodes/resolution_stats"
 _PLAN_KEY = "plex/playlists/tv_plan"          # + /{safe_user}
 _UNIVERSE_SRC_KEY = "plex/playlists/universe_source"   # fetched universe lists (cache VOLUME)
 _UNIVERSE_TTL_DAYS = 7                                  # re-fetch a universe list at most weekly
+# Layer-2 cross-named TV-franchise catalog files (co-located with this package), in load order:
+# the hand-vetted baked floor, then the generated catalog (overlays the floor). The
+# `plex.playlists.tv_franchises` config key overlays both. See coordinator/tv_franchise_discovery.md.
+_TV_FRANCHISE_FILES = ("tv_franchises.json", "tv_franchises.generated.json")
 
 
 def _to_int(v):
@@ -486,7 +492,7 @@ class PlexPlaylistBuilderManager(BaseManager):
                 seen_tv.add(tv)
                 rows.append({"title": ep.get("series_title") or ep.get("title") or "",
                              "tvdbId": tv, "year": ep.get("series_year") or ep.get("year")})
-            syn = tv_franchise_universes(rows, {})
+            syn = tv_franchise_universes(rows, self._tv_franchise_catalog())
             cached = dict(self._cache_get(_UNIVERSE_SRC_KEY, {}) or {})
             universes = {k: v for k, v in (cached.get("universes") or {}).items()
                          if not str(k).startswith("tvfran:")}            # strip prior synthetic
@@ -501,6 +507,31 @@ class PlexPlaylistBuilderManager(BaseManager):
                                      f"by same-name clustering (feeding grouping, retention, acquisition).")
         except Exception as e:
             self.logger.log_debug(f"[UniverseOrder] synthetic franchise refresh skipped: {e}")
+
+    def _tv_franchise_catalog(self) -> dict:
+        """The Layer-2 cross-named TV-franchise catalog (tvdb-keyed) the same-stem clusterer can't
+        derive — Grey's↔Station 19↔Private Practice, Buffy↔Angel, … — merged from the baked floor,
+        the generated catalog (if present) and the ``plex.playlists.tv_franchises`` config overlay
+        (each later source overlays the earlier). ``{}`` when none exist. Shape is
+        ``{franchise_key: {"shows": [tvdb…], "titles": [...]}}``, fed to :func:`tv_franchise_universes`
+        alongside the owned-inventory clusters. Recomputed per call (the files are tiny + a manager
+        is a long-lived singleton, so a stale memo would freeze a regenerated catalog)."""
+        catalog: dict = {}
+        pkg_dir = os.path.dirname(os.path.abspath(__file__))
+        for fname in _TV_FRANCHISE_FILES:
+            try:
+                with open(os.path.join(pkg_dir, fname), encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    catalog.update(data)                       # generated overlays the baked floor
+            except FileNotFoundError:
+                continue
+            except Exception as e:
+                self.logger.log_debug(f"[UniverseOrder] tv-franchise catalog read skipped ({fname}): {e}")
+        overlay = self._pl_cfg().get("tv_franchises", {})
+        if isinstance(overlay, dict) and overlay:
+            catalog.update(overlay)                            # config overlay wins (no rebuild)
+        return catalog
 
     # ── config knobs ────────────────────────────────────────────────────────────
     def _pl_cfg(self) -> dict:

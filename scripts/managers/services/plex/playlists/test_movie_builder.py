@@ -173,6 +173,27 @@ def test_refresh_synthetic_universes_noop_without_cache():
     assert fran == {}                                                    # no cache → no synthetic source to group from
 
 
+def test_tv_franchise_catalog_includes_config_overlay():
+    # the plex.playlists.tv_franchises overlay is merged (and overrides any baked/generated file)
+    m = _mgr(config={"plex": {"playlists": {"tv_franchises": {"testverse": {"shows": [900001, 900002]}}}}})
+    assert m._tv_franchise_catalog()["testverse"] == {"shows": [900001, 900002]}
+
+
+def test_config_franchise_feeds_synthetic_universe_entry():
+    import scripts.managers.services.plex.playlists.builder as B
+    cache = _Cache()
+    cache.set(B._UNIVERSE_SRC_KEY, {"universes": {}, "fetched": {}})
+    cfg = {"plex": {"playlists": {"universe_timeline": {"enabled": True},
+                                  # a cross-named catalog franchise (fake tvdbs → isolated from real data)
+                                  "tv_franchises": {"testverse": {"shows": [900001, 900002]}}}}}
+    m = _mgr(cache=cache, config=cfg)
+    # own only 900001; 900002 is the unowned sibling the catalog still lists for acquisition backfill
+    m._tv_franchise_maps([{"series_id": 1, "series_title": "Owned One", "series_tvdb_id": 900001}])
+    syn = cache.get(B._UNIVERSE_SRC_KEY)["universes"]["tvfran:testverse"]
+    assert syn["shows"] == [900001, 900002] and syn["timeline"] is True
+    assert [it["tvdb"] for it in syn["items"]] == [900001, 900002]
+
+
 def test_builds_movie_plan_ranked_by_score():
     cache = _Cache()
     owned = [_movie(1, "Low", 2000, 20), _movie(2, "High", 2010, 90)]

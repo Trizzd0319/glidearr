@@ -202,17 +202,22 @@ def tv_franchise_universes(owned_series_rows, catalog, *, cluster_same_stem=True
         return {"timeline": True, "movies": [], "shows": list(ordered),
                 "items": [{"media": "show", "tvdb": tv, "rank": i} for i, tv in enumerate(ordered)]}
 
+    owned_tvdbs = set(first_index)                            # tvdbs the household owns (from the rows)
+
     out: dict = {}
     for key, members in clusters.items():
         out[key] = _entry(_debut_ordered(members))
 
-    # Layer-2 baked catalog (Phase 1: empty → dead branch). Same entry shape; a catalog franchise
-    # extends/overrides a same-keyed Layer-1 cluster (its curated tvdb order wins).
+    # Layer-2 catalog (cross-named families the same-stem clusterer can't derive — Grey's↔Station 19,
+    # Buffy↔Angel…). Each franchise is emitted in FULL (incl. its UNOWNED siblings, so acquisition can
+    # backfill them start-first) but ONLY when the household owns >=1 member — the owned-tvdb
+    # intersection self-scopes the catalog per household, so an unengaged franchise never bloats the
+    # universe source. A catalog entry overrides a same-keyed Layer-1 cluster (its curated order wins).
     for key, entry in (catalog or {}).items():
         k = key if str(key).startswith("tvfran:") else f"tvfran:{key}"
         raw = entry.get("shows") if isinstance(entry, dict) else entry
         shows = [t for t in (_coerce_int(tv) for tv in (raw or [])) if t is not None]
-        if shows:
+        if shows and any(s in owned_tvdbs for s in shows):
             out[k] = _entry(shows)
     return out
 

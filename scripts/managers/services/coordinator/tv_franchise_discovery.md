@@ -2,7 +2,7 @@
 
 **Goal.** Auto-discover TV franchises (sibling/spin-off show groups) comprehensively — both **same-named** (Law & Order(+SVU/OC), NCIS, CSI, Chicago, 9-1-1, Star Trek, Stargate) and **cross-named** (Grey's Anatomy↔Station 19↔Private Practice, Buffy↔Angel, Breaking Bad↔Better Call Saul, Vampire Diaries↔Originals↔Legacies, The Boys↔Gen V) — and feed them through **one seam** to playlist grouping, catch-up retention, AND acquisition. Movies need no work (already grouped by TMDB `collection_tmdb_id`).
 
-Status: **Phase 0 + Phase 1 landed (2026-06-21); Phases 2-3 pending.**
+Status: **Phase 0 + Phase 1 + Phase 2 (Wikidata edge + loader + floor) landed (2026-06-21); Phase 3 pending.**
 
 ## Locked decisions (2026-06-21)
 - **Acquire unowned siblings:** discovered franchises participate in acquisition — engaging one show backfills the rest start-first (via the universe acquire plan + the coordinator's show-add path), bounded by `max_per_run`. Not playlist/retention-only.
@@ -66,7 +66,7 @@ franchise discovery + catch-up retention together. Wire into `onboarding/schema.
 |---|---|---|
 | 0 | ✅ **Same-stem clusterer** — `_stem_norm` (separate from `_norm`; don't touch its year-strip), subtitle-stem + conservative leading-token, stoplist + DENY set, min-cluster=2 | medium |
 | 1 | ✅ **Synthetic-universe emitter + seam** — `tv_franchise_universes()` (pure, `timeline:True`, debut-ordered) + `builder._refresh_synthetic_universes` cache write (strip+regenerate every run) + `tv_group_maps` curated precedence | medium |
-| 2 | **Franchise-graph generator** — standalone CLI; build a TV-series graph from 3 edges (Wikipedia category co-membership + Wikidata P2512/P179 + Wikipedia infobox `related`/spin-off/crossover links), filter nodes to TVDB-id-bearing series (`P4835`), connected-component cluster → baked `data/tv_franchises.generated.json`; debut-date ordered; diff-reviewed, never auto-committed | large |
+| 2 | ✅ **Franchise-graph generator + loader** — `support/tools/generate_tv_franchises.py` builds the graph from **Wikidata `P2512` spin-off edges** between TVDB-id-bearing (`P4835`) series → `franchise_graph.build_franchises` connected components → `tv_franchises.generated.json` (debut-ordered, JSON, **gitignored — diff-review before shipping**). `builder._tv_franchise_catalog` loads the baked floor (`tv_franchises.json`, 8 vetted cross-named families) + the generated catalog + the `plex.playlists.tv_franchises` config overlay, fed to `tv_franchise_universes` (owned-scoped: a franchise emits only when ≥1 member is owned, but with its UNOWNED siblings for backfill). **FOLLOW-UP:** the other two edges — Wikipedia `Category:<X> television series` co-membership + infobox `related`/spin-off/crossover links — aren't unioned yet (P2512 alone gave 154 franchises / 400 series; the other edges catch franchises P2512 misses, e.g. P179-only or Wikipedia-only). Also: the generator's member ORDER relies on `P571`; an unbound date sorts a member last (e.g. it ordered Angel before Buffy) — the baked floor hand-corrects this, the generated set is a review item | large |
 | 3 | **Migrate CURATED_TV_FRANCHISES** into the tvdb-keyed catalog (closes their retention blind spot) + deconflict overlap (`arrow` already a film-universe key) | small |
 
 ## Risks / guards

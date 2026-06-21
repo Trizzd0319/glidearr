@@ -56,3 +56,9 @@ Thumbs.db
 # Vendored third-party Kometa overlay asset bundles (PNGs/yml dumped under the
 # cache factory dir) — not source; keep out of commits.
 scripts/managers/factories/cache/kometa-*/
+
+# Generated TV-franchise catalog (Wikidata spin-off graph). DIFF-REVIEW before shipping:
+# the raw generator output carries noise (loosely-linked cartoons, regional reality versions)
+# the design says to prune in review — never auto-commit. Regenerate with
+# `python -m scripts.support.tools.generate_tv_franchises`; force-add a vetted copy when ready.
+scripts/managers/services/plex/playlists/tv_franchises.generated.json

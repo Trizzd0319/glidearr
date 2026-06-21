@@ -364,12 +364,17 @@ def test_tv_franchise_universes_empty_when_no_family_or_clustering_off():
     assert tv_franchise_universes(_FAM, catalog={}, cluster_same_stem=False) == {}   # Layer-1 off + empty catalog
 
 
-def test_tv_franchise_universes_layer2_catalog_overlays():
+def test_tv_franchise_universes_layer2_catalog_scoped_to_owned():
     cat = {"buffyverse": {"shows": [101, 102]}, "tvfran:already": [201, 202]}
-    out = tv_franchise_universes([], cat)
-    assert out["tvfran:buffyverse"]["shows"] == [101, 102]     # bare key gets namespaced
-    assert out["tvfran:already"]["shows"] == [201, 202]        # already-namespaced key kept
-    assert out["tvfran:buffyverse"]["timeline"] is True
+    owned = [{"title": "Buffy", "tvdbId": 101}]                # own 1 of buffyverse, none of 'already'
+    out = tv_franchise_universes(owned, cat)
+    assert out["tvfran:buffyverse"]["shows"] == [101, 102]     # emitted (owns 101), incl. UNOWNED 102
+    assert out["tvfran:buffyverse"]["timeline"] is True        # bare key namespaced, timeline True
+    assert "tvfran:already" not in out                         # own none → unengaged → not emitted
+
+
+def test_tv_franchise_universes_empty_catalog_is_noop():
+    assert tv_franchise_universes([{"title": "Solo Show", "tvdbId": 5}], {}) == {}
 
 
 def test_tv_franchise_universes_entries_round_trip_through_consumers():

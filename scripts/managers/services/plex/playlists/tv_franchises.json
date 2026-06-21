@@ -1,0 +1,34 @@
+{
+ "breakingbad": {
+  "titles": ["Breaking Bad", "Better Call Saul"],
+  "shows": [81189, 273181]
+ },
+ "buffyverse": {
+  "titles": ["Buffy the Vampire Slayer", "Angel"],
+  "shows": [70327, 71035]
+ },
+ "doctorwho": {
+  "titles": ["Doctor Who", "Torchwood", "The Sarah Jane Adventures", "Class"],
+  "shows": [76107, 79511, 79708, 309893]
+ },
+ "greysanatomy": {
+  "titles": ["Grey's Anatomy", "Private Practice", "Station 19"],
+  "shows": [73762, 80542, 341852]
+ },
+ "stargate": {
+  "titles": ["Stargate SG-1", "Stargate Atlantis", "Stargate Universe"],
+  "shows": [72449, 70851, 83237]
+ },
+ "theboys": {
+  "titles": ["The Boys", "Gen V"],
+  "shows": [355567, 417909]
+ },
+ "vampirediaries": {
+  "titles": ["The Vampire Diaries", "The Originals", "Legacies"],
+  "shows": [95491, 266883, 349309]
+ },
+ "walkingdead": {
+  "titles": ["The Walking Dead", "Fear the Walking Dead"],
+  "shows": [153021, 290853]
+ }
+}
