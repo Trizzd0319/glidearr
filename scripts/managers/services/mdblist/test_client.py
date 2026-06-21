@@ -14,6 +14,61 @@ def test_no_apikey_is_skip():
     assert r["ok"] is False and r["error"] == "no apikey"
 
 
+# ── list_items ────────────────────────────────────────────────────────────────
+def test_list_items_no_apikey_or_ref():
+    assert client.list_items("", {"imdb": "ls1"})["ok"] is False
+    assert client.list_items("k", {})["ok"] is False
+
+
+def test_list_items_parses_split_movies_shows_in_order(monkeypatch):
+    monkeypatch.setattr(client, "_http_get", _stub(200, {
+        "movies": [{"tmdb_id": 1726, "mediatype": "movie"},      # Iron Man
+                   {"tmdb_id": 1724}],                            # no mediatype → inferred movie
+        "shows": [{"tvdb_id": 280619, "mediatype": "show"}],     # Agent Carter
+    }))
+    r = client.list_items("k", {"imdb": "ls539646485"})
+    assert r["ok"] is True
+    assert r["items"] == [{"tmdb": 1726, "tvdb": None, "media": "movie"},
+                          {"tmdb": 1724, "tvdb": None, "media": "movie"},
+                          {"tmdb": None, "tvdb": 280619, "media": "show"}]
+
+
+def test_list_items_bare_list_and_alias_tolerant(monkeypatch):
+    monkeypatch.setattr(client, "_http_get", _stub(200, [
+        {"tmdb": 603, "type": "movie"}, {"tvdbid": 78901, "media_type": "tv"}, {"junk": 1}]))
+    r = client.list_items("k", {"mdblist": "k0meta/external/15110"})
+    assert r["items"] == [{"tmdb": 603, "tvdb": None, "media": "movie"},
+                          {"tmdb": None, "tvdb": 78901, "media": "show"}]   # junk row dropped
+
+
+def test_list_items_http_error_degrades(monkeypatch):
+    monkeypatch.setattr(client, "_http_get", _stub(404, None))
+    r = client.list_items("k", {"id": 15110})
+    assert r["ok"] is False and r["items"] == []
+
+
+def test_list_items_malformed_body_soft_degrades_not_raises(monkeypatch):
+    # REGRESSION (review HIGH): a shape-drifted body where movies/shows is a non-iterable scalar
+    # must NOT raise (caller relies on never-raises to keep its last-good cache).
+    for bad in ({"movies": 5}, {"shows": 3.5}, {"movies": True}, 42, "nope"):
+        monkeypatch.setattr(client, "_http_get", _stub(200, bad))
+        r = client.list_items("k", {"imdb": "ls1"})
+        assert r["ok"] is True and r["items"] == []        # degrades to empty, no exception
+
+
+def test_list_items_non_dict_ref_does_not_raise():
+    # REGRESSION (review MEDIUM): an operator config typo ({"mcu": "ls539646485"}) makes ref a
+    # bare string → must return ok=False, not AttributeError.
+    assert client.list_items("k", "ls539646485")["ok"] is False
+    assert client.list_items("k", ["x"])["ok"] is False
+
+
+def test_list_items_movie_row_with_only_tvdb_becomes_show(monkeypatch):
+    monkeypatch.setattr(client, "_http_get", _stub(200, [{"tvdb_id": 95057, "mediatype": "movie"}]))
+    r = client.list_items("k", {"imdb": "ls1"})
+    assert r["items"] == [{"tmdb": None, "tvdb": 95057, "media": "show"}]   # not dropped
+
+
 def test_supporter_tier_with_budget(monkeypatch):
     monkeypatch.setattr(client, "_http_get", _stub(200, {
         "username": "trizzd", "patron_status": "active_patron",

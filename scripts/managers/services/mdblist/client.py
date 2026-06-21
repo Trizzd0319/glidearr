@@ -17,6 +17,14 @@ USER_PATH = "/user"
 MOVIE_PATH = "/tmdb/movie"   # GET /tmdb/movie/{tmdbId} → ratings incl. Common Sense age
 SHOW_PATH = "/tmdb/show"     # GET /tmdb/show/{tmdbId}  → same shape for TV series
 
+# List endpoints — return a list's items in its RANK (== defined/saga) order. Like the paths
+# above, these are module constants so they're trivial to adjust once a live key confirms the
+# exact route + response shape; the parser is alias-tolerant and the call NEVER raises, so a
+# route/shape drift soft-degrades to ``{"ok": False, "items": []}`` (caller falls back to dates).
+IMDB_LIST_PATH = "/lists/imdb/{ident}/items"     # mdblist proxy for an IMDb list (ls…)
+LIST_BY_ID_PATH = "/lists/{ident}/items"          # numeric mdblist list id
+LIST_BY_SLUG_PATH = "/lists/{user}/{slug}/items"  # user list, e.g. k0meta/external/15110
+
 
 def _ratings(apikey: str, media_path: str, media_id, *, base_url: str, timeout: float) -> dict:
     """Shared MDBList media lookup → Common Sense / cert fields (never raises). The only
@@ -57,6 +65,74 @@ def show_ratings(apikey: str, tmdb_id, *, base_url: str = BASE_URL, timeout: flo
     The TV age cache must be kept SEPARATE from the movie cache: show and movie tmdbIds share
     the same integer space, so a show id 82728 and a movie id 82728 are different titles."""
     return _ratings(apikey, SHOW_PATH, tmdb_id, base_url=base_url, timeout=timeout)
+
+
+def list_items(apikey: str, ref: dict, *, base_url: str = BASE_URL,
+               timeout: float = 20.0, limit: int = 2000) -> dict:
+    """Fetch a universe list's items IN LIST ORDER (rank.asc = the list's defined saga order).
+
+    ``ref`` selects the list: ``{"imdb": "ls539646485"}`` | ``{"mdblist": "k0meta/external/15110"}``
+    | ``{"id": 15110}``. Returns (never raises):
+        {"ok": bool, "items": [{"tmdb": int|None, "tvdb": int|None, "media": "movie"|"show"|None}],
+         "error": str|None}
+    Items keep the list's order. Alias-tolerant parse; any non-200/parse failure → ok=False, [] so
+    the caller degrades to release/air-date ordering."""
+    if not apikey or not isinstance(ref, dict) or not ref:
+        return {"ok": False, "items": [], "error": "missing/invalid apikey/ref"}
+    if ref.get("imdb"):
+        path = IMDB_LIST_PATH.format(ident=ref["imdb"])
+    elif ref.get("id") is not None:
+        path = LIST_BY_ID_PATH.format(ident=ref["id"])
+    elif ref.get("mdblist"):
+        parts = str(ref["mdblist"]).strip("/").split("/", 1)
+        path = LIST_BY_SLUG_PATH.format(user=parts[0], slug=parts[1] if len(parts) > 1 else "")
+    else:
+        return {"ok": False, "items": [], "error": "unrecognized ref"}
+    # The fetch AND the body parse are both inside the guard — a shape-drift in the body (e.g.
+    # ``{"movies": 5}``) must soft-degrade to ok=False, not raise, so _universe_source keeps LAST-GOOD.
+    try:
+        status, _headers, body = _http_get(f"{base_url.rstrip('/')}{path}",
+                                           {"apikey": apikey, "limit": limit}, timeout)
+        if status != 200:
+            return {"ok": False, "items": [], "error": f"HTTP {status}"}
+        items = [it for raw in _list_rows(body) if (it := _parse_list_item(raw)) is not None]
+    except Exception as e:                        # noqa: BLE001 — never raise to callers
+        return {"ok": False, "items": [], "error": str(e)[:80]}
+    return {"ok": True, "items": items, "error": None}
+
+
+def _list_rows(body) -> list:
+    """mdblist returns either a bare item list OR ``{"movies": [...], "shows": [...]}`` — flatten
+    movies-then-shows, preserving each section's order. A non-list ``movies``/``shows`` (shape
+    drift) coerces to [] rather than blowing up ``list()``; anything else → []."""
+    if isinstance(body, list):
+        return body
+    if isinstance(body, dict):
+        mv, sh = body.get("movies"), body.get("shows")
+        return (mv if isinstance(mv, list) else []) + (sh if isinstance(sh, list) else [])
+    return []
+
+
+def _parse_list_item(r) -> "dict | None":
+    """One list row → ``{"tmdb", "tvdb", "media"}`` (alias-tolerant), or None if it carries no
+    usable id. ``media`` normalizes tv/series → 'show'; when absent (or when a row claims 'movie'
+    yet carries only a tvdb id) it is inferred from which id is present — a tvdb-only row is always
+    a show (we can only place it by tvdb), a tmdb-only row a movie."""
+    if not isinstance(r, dict):
+        return None
+    tmdb = _int_or_none(_first(r, "tmdb_id", "tmdbid", "tmdb"))
+    tvdb = _int_or_none(_first(r, "tvdb_id", "tvdbid", "tvdb"))
+    if tmdb is None and tvdb is None:
+        return None
+    media = _first(r, "mediatype", "media_type", "type")
+    media = str(media).strip().lower() if media else None
+    if media in ("tv", "series"):
+        media = "show"
+    if media not in ("movie", "show") or (tmdb is None and tvdb is not None):
+        # absent/odd media, OR a 'movie' row carrying ONLY a tvdb id → infer by id (a tvdb-only
+        # row can only be placed as a show; this avoids silently dropping it in split_list_media).
+        media = "show" if (tvdb is not None and tmdb is None) else "movie"
+    return {"tmdb": tmdb, "tvdb": tvdb, "media": media}
 
 
 def validate_key(apikey: str, *, base_url: str = BASE_URL, timeout: float = 10.0) -> dict:
