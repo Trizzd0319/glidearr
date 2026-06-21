@@ -20,7 +20,10 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from scripts.managers.machine_learning.playlists.models import PlaylistInput
+from scripts.managers.machine_learning.playlists.models import (
+    PLACEHOLDER_AFFINITY,
+    PlaylistInput,
+)
 from scripts.managers.machine_learning.playlists.ordering import order_items
 
 
@@ -41,13 +44,15 @@ def _coll_key(v):
     a missing value as float ``NaN`` (``to_numeric(errors='coerce')``), and ``NaN`` is
     TRUTHY in Python — so without this guard every collection-less movie would fuse under
     the literal key ``'nan'`` into one giant bogus group. NaN/empty → None; a whole-number
-    float id → an int string (``500.0`` → ``'500'``) so the key is stable."""
+    float id → an int string (``500.0`` → ``'500'``) so the key is stable. Placeholder
+    labels (the junk bare ``"universe"`` plus ``"none"``/``"standalone"``/``"unknown"``/etc.)
+    are ALSO dropped → None: they are not real identities and must never fuse a group."""
     if v is None or (isinstance(v, float) and v != v):        # None or NaN
         return None
     if isinstance(v, float) and v.is_integer():
         return str(int(v))
     s = str(v).strip()
-    return s if s and s.lower() != "nan" else None
+    return s if s and s.lower() not in PLACEHOLDER_AFFINITY else None
 
 
 def _release_date(mv: dict):
@@ -118,17 +123,64 @@ def watched_movie_keys(history: list, *, min_pct: float = 85.0) -> set:
     return out
 
 
-def movie_inputs(owned_movies: list, owned_inventory: dict, watched, movie_scores: dict):
+def watched_movie_recency(history: list, *, min_pct: float = 85.0) -> dict:
+    """``{identity: latest unix watch ts}`` for finished MOVIES — the SAME mixed identities as
+    :func:`watched_movie_keys` (ratingKey + ``(title, year)``), valued by Tautulli's ``date``.
+    Feeds the resume boost's recency key (which in-progress saga the user watched most recently);
+    the ``(title, year)`` identity survives ratingKey churn just like the watched set does."""
+    out: dict = {}
+    for row in history or []:
+        if not isinstance(row, dict) or str(row.get("media_type", "")).lower() != "movie":
+            continue
+        try:
+            pct = float(row.get("percent_complete") or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        if pct < min_pct:
+            continue
+        try:
+            ts = int(row.get("date") or 0)
+        except (TypeError, ValueError):
+            ts = 0
+        rk = row.get("rating_key")
+        if rk is not None:
+            out[str(rk)] = max(out.get(str(rk), 0), ts)
+        t, y = _norm(row.get("title")), _coerce_int(row.get("year"))
+        if t and y is not None:
+            out[(t, y)] = max(out.get((t, y), 0), ts)
+    return out
+
+
+def movie_inputs(owned_movies: list, owned_inventory: dict, watched, movie_scores: dict,
+                 *, universe_order: dict | None = None, universe_membership: dict | None = None,
+                 watch_recency: dict | None = None):
     """Resolve owned movies (keyed by tmdb) to Plex ratingKeys + build grouped/timed
     ``PlaylistInput``s — the candidates WITHOUT ordering. Shared by :func:`build_movie_plan`
     and the combined cross-medium plan. Returns ``(list[PlaylistInput], stats)``.
 
     ``watched`` is the mixed identity set from :func:`watched_movie_keys` (ratingKeys +
     ``(title, year)`` tuples); a movie is watched if EITHER hits. ``movie_scores`` is keyed
-    by tmdb (the per-user ranking score the builder computed)."""
+    by tmdb (the per-user ranking score the builder computed).
+
+    ``universe_order`` (``{tmdb_id: position}``, default None) stamps each movie's
+    ``timeline_index`` with its position in its universe's in-universe timeline — sourced
+    from a Kometa universe collection's order. The brain reads ``timeline_index`` as a
+    saga order that OVERRIDES release-date ordering WITHIN the universe group. Empty (the
+    flag-off default) → byte-identical. NOTE: within a group, indexed members sort AHEAD of
+    un-indexed ones (which tail the block in release-date order) — so a brand-new film not
+    YET in the list lands at the END of its saga block until the next list refresh, rather
+    than interleaving by date.
+
+    ``universe_membership`` (``{tmdb_id: set(universe_keys)}``, default None) adds universe
+    GROUPING tokens sourced from a fetched list (mdblist), UNIONED with the Radarr
+    ``universe_name`` tag — so a universe block can form with NO Kometa tag at all, yet a
+    tagged install still groups identically (the two sources are complementary)."""
     watched = set(watched or ())
     inv = owned_inventory or {}
     scores = movie_scores or {}
+    uorder = universe_order or {}
+    umembers = universe_membership or {}
+    wrec = watch_recency or {}
     stats = {"owned": len(owned_movies or []), "resolved": 0, "unresolved": 0}
 
     inputs: list = []
@@ -142,19 +194,36 @@ def movie_inputs(owned_movies: list, owned_inventory: dict, watched, movie_score
         stats["resolved"] += 1
         title, year = _norm(mv.get("title")), _coerce_int(mv.get("year"))
         is_watched = (rk in watched) or (bool(title) and year is not None and (title, year) in watched)
+        last_watched = None
+        if is_watched and wrec:
+            last_watched = wrec.get(rk)
+            if last_watched is None and title and year is not None:
+                last_watched = wrec.get((title, year))
         franchise = _coll_key(mv.get("collection_tmdb_id")) or _coll_key(mv.get("collection_name"))
-        uni = _coll_key(mv.get("universe_name"))
+        # ``universe_name`` carries the operator's Radarr universe labels ("mcu", "mcu|xmen", …)
+        # — the saga binder that fuses a whole universe (e.g. all MCU films, across their separate
+        # TMDB collections) into one contiguous playlist block. SPLIT the pipe-join so a film in
+        # {mcu, xmen} carries BOTH tokens and bridges the pure-mcu and pure-xmen components
+        # (connected-components grouping needs the separate tokens — the brain never splits '|').
+        # ``_coll_key`` drops the junk bare "universe" placeholder (and ""/"nan"/…), so only REAL
+        # universe labels fuse a group.
+        tag_universes = {t for raw in str(mv.get("universe_name") or "").split("|")
+                         if (t := _coll_key(raw)) is not None}
+        universes = tuple(sorted({u.lower() for u in tag_universes}
+                                 | {u.lower() for u in (umembers.get(tmdb) or ())}))
         inputs.append(PlaylistInput(
             rating_key=rk, medium="movie",
             title=(mv.get("title") or (match.get("title") or "")),
             score=scores.get(tmdb),
             watched=is_watched,
             franchise=franchise,
-            universes=((uni.lower(),) if uni else ()),
+            universes=universes,
+            timeline_index=uorder.get(tmdb),
             release_date=_release_date(mv),
             year=year,
             added_at=_iso_or_none(mv.get("added_at")),
             cert=mv.get("certification"),
+            last_watched=last_watched,
         ))
 
     stats["movies"] = len(inputs)
@@ -162,11 +231,21 @@ def movie_inputs(owned_movies: list, owned_inventory: dict, watched, movie_score
 
 
 def build_movie_plan(owned_movies: list, owned_inventory: dict, watched, movie_scores: dict,
-                     *, family: str = "up_next", max_items: int = 100):
+                     *, family: str = "up_next", max_items: int = 100,
+                     universe_order: dict | None = None, universe_membership: dict | None = None,
+                     watch_recency: dict | None = None,
+                     resume_boost: bool = False, resume_order: str = "recency",
+                     resume_weight: float = 0.0):
     """Build movie candidates (:func:`movie_inputs`) then hand them to the brain to order.
-    Returns ``(PlaylistPlan, stats)``."""
-    inputs, stats = movie_inputs(owned_movies, owned_inventory, watched, movie_scores)
-    plan = order_items(inputs, family=family, max_items=max_items)
+    Returns ``(PlaylistPlan, stats)``. ``resume_boost`` lifts an in-progress movie saga (see
+    :func:`order_items`); ``watch_recency`` stamps ``last_watched`` for its recency key."""
+    inputs, stats = movie_inputs(owned_movies, owned_inventory, watched, movie_scores,
+                                 universe_order=universe_order,
+                                 universe_membership=universe_membership,
+                                 watch_recency=watch_recency)
+    plan = order_items(inputs, family=family, max_items=max_items,
+                       resume_boost=resume_boost, resume_order=resume_order,
+                       resume_weight=resume_weight)
     stats["in_plan"] = len(plan.items)
     return plan, stats
 

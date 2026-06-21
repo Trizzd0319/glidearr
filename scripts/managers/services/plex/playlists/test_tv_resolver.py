@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from scripts.managers.services.plex.playlists.tv_resolver import (
     build_tv_plan,
+    tv_inputs,
     watched_episode_keys,
+    watched_episode_recency,
 )
 
 
@@ -65,7 +67,8 @@ def test_resolves_owned_episode_to_ratingkey():
     inv = {"100:1:1": {"rating_key": "5001", "title": "Pilot"}}
     plan, stats = build_tv_plan(owned, inv, set(), {1: 80})
     assert [i.rating_key for i in plan.items] == ["5001"]
-    assert stats == {"owned": 1, "unresolved": 0, "resolved": 1, "series": 1, "in_plan": 1}
+    assert stats == {"owned": 1, "unresolved": 0, "resolved": 1, "series": 1, "in_plan": 1,
+                     "started_series": set(), "series_recency": {}}
 
 
 def test_unresolved_episode_dropped_and_counted():
@@ -98,6 +101,66 @@ def test_series_ordered_by_watchability():
     plan, _ = build_tv_plan(owned, inv, set(), {1: 30, 2: 90})
     assert [i.rating_key for i in plan.items] == ["b", "a"]
     assert plan.items[0].group_kind == "series"   # TV degrades to per-series grouping
+
+
+# ── TV franchise grouping (Kometa universe collection → sibling-show binding) ───
+def test_franchise_binds_sibling_series_and_timeline_orders_them():
+    # Chicago Fire (sid 1) + P.D. (sid 2) + Med (sid 3) bound into ONE "one chicago" franchise;
+    # series_timeline pins the saga order (Fire→P.D.→Med) over air date AND watchability.
+    owned = [_owned(1, 1, 1, "f1"), _owned(2, 1, 1, "p1"), _owned(3, 1, 1, "m1")]
+    inv = {"f1": {"rating_key": "fire"}, "p1": {"rating_key": "pd"}, "m1": {"rating_key": "med"}}
+    fbs = {1: "one chicago", 2: "one chicago", 3: "one chicago"}
+    plan, _ = build_tv_plan(owned, inv, set(), {1: 30, 2: 90, 3: 60},   # P.D. scores highest
+                            franchise_by_series=fbs, series_timeline={1: 0, 2: 1, 3: 2})
+    assert [i.rating_key for i in plan.items] == ["fire", "pd", "med"]  # saga order, not by score
+    assert all(i.group_kind == "franchise" and i.group_key == "one chicago" for i in plan.items)
+
+
+def test_franchise_without_timeline_orders_series_by_air_date():
+    # franchise binds them; with no series_timeline the series tracks interleave by lead air date.
+    fire = _owned(1, 1, 1, "f1"); fire["air_date_utc"] = "2012-01-01"
+    pd = _owned(2, 1, 1, "p1");   pd["air_date_utc"] = "2014-01-01"
+    owned = [pd, fire]                                                  # input order shuffled
+    inv = {"f1": {"rating_key": "fire"}, "p1": {"rating_key": "pd"}}
+    plan, _ = build_tv_plan(owned, inv, set(), {1: 30, 2: 90},          # P.D. scores higher
+                            franchise_by_series={1: "one chicago", 2: "one chicago"})
+    assert [i.rating_key for i in plan.items] == ["fire", "pd"]         # earlier air date leads
+    assert all(i.group_kind == "franchise" for i in plan.items)
+
+
+def test_no_franchise_map_is_unchanged_per_series_grouping():
+    # backward-compat: without the map, sibling series stay separate, watchability-ranked.
+    owned = [_owned(1, 1, 1, "a1"), _owned(2, 1, 1, "b1")]
+    inv = {"a1": {"rating_key": "a"}, "b1": {"rating_key": "b"}}
+    plan, _ = build_tv_plan(owned, inv, set(), {1: 30, 2: 90})
+    assert [i.rating_key for i in plan.items] == ["b", "a"]             # per-series, by score
+    assert all(i.group_kind == "series" for i in plan.items)
+
+
+def test_started_series_tracks_in_progress_shows():
+    # a series with ≥1 watched episode is "started" (drives The Long Glide); others aren't.
+    owned = [_owned(1, 1, 1, "k1"), _owned(1, 1, 2, "k2"), _owned(2, 1, 1, "k3")]
+    inv = {"k1": {"rating_key": "a"}, "k2": {"rating_key": "b"}, "k3": {"rating_key": "c"}}
+    _, stats = build_tv_plan(owned, inv, {"a"}, {1: 80, 2: 80})   # watched 'a' (series 1)
+    assert stats["started_series"] == {1}
+
+
+def test_watched_episode_recency_latest_per_identity():
+    h = [{"media_type": "episode", "rating_key": "5", "grandparent_title": "Show", "title": "Pilot",
+          "parent_media_index": 1, "media_index": 1, "percent_complete": 95, "date": 100},
+         {"media_type": "episode", "rating_key": "5", "grandparent_title": "Show", "title": "Pilot",
+          "parent_media_index": 1, "media_index": 1, "percent_complete": 95, "date": 300}]
+    rec = watched_episode_recency(h)
+    assert rec["5"] == 300 and rec[("show", 1, 1)] == 300 and rec[("show", "pilot")] == 300
+
+
+def test_series_recency_aggregates_latest_ts_and_count():
+    owned = [_owned(1, 1, 1, "k1"), _owned(1, 1, 2, "k2"), _owned(2, 1, 1, "k3")]
+    inv = {"k1": {"rating_key": "a"}, "k2": {"rating_key": "b"}, "k3": {"rating_key": "c"}}
+    _, stats = tv_inputs(owned, inv, {"a", "b"}, {1: 80, 2: 80},     # 2 eps of series 1 watched
+                         watch_recency={"a": 100, "b": 500})
+    assert stats["series_recency"] == {1: (500, 2)}                  # latest ts 500, depth 2
+    assert stats["started_series"] == {1}
 
 
 def test_empty_inputs_safe():

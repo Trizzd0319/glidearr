@@ -125,7 +125,10 @@ def _watched_by_group(groups, watched: list[PlaylistInput]):
 def order_items(items: list[PlaylistInput], *, family: str = "up_next",
                 max_items: int | None = None, normalize_per_medium: bool = False,
                 include_specials: bool = False, recency_boost: bool = False,
-                window_days: int = 30, now: date | None = None) -> PlaylistPlan:
+                window_days: int = 30, now: date | None = None,
+                resume_boost: bool = False, resume_order: str = "recency",
+                resume_weight: float = 0.0,
+                progress_filter: str | None = None, series_recency=None) -> PlaylistPlan:
     """Order candidate items into a spoiler-safe, group-contiguous, watchability-ranked
     :class:`PlaylistPlan`. See module docstring for the pipeline.
 
@@ -135,7 +138,37 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
     the added_at / air-date blend). It is a GROUP-rank tiebreak that sits ABOVE
     watchability for qualifying groups — never an item-level sort, so group contiguity
     and spoiler order are untouched. ``now`` overrides "today" (clamps future dates;
-    testability)."""
+    testability).
+
+    ``resume_boost`` (default OFF → byte-identical) lifts an IN-PROGRESS saga (a group with
+    ≥1 watched member AND unwatched members queued — MCU/X-Men/Freddy collection/series alike)
+    above not-started groups and standalones, so you continue what you started. Among the
+    in-progress sagas the PRIMARY key is ``resume_order``: ``"recency"`` (default) → the saga
+    you watched MOST RECENTLY first (max ``last_watched`` over its watched members); ``"progress"``
+    → the saga you're DEEPEST into first (most watched members). Either way watchability+affinity
+    breaks the primary's ties. A standalone (e.g. a high-affinity one-off) is never in-progress,
+    so it stays in the lower tier — finishing a saga beats a fresh one-off. Mutually exclusive
+    with ``recency_boost`` (recency_boost wins if both set).
+
+    ``resume_weight`` (0..1) makes the resume boost a TUNABLE bonus instead of a hard tier in the
+    BLENDED list (no ``progress_filter``): each group's watchability is min-max normalized to
+    [0,1] across the plan and an in-progress saga gets ``+resume_weight`` — so it wins ties and
+    gaps up to the weight, but a standalone whose normalized affinity is more than ``resume_weight``
+    higher still leads (your casual-night exploration). 0 = pure affinity (in-progress only breaks
+    ties); ~1 ≈ the old hard tier (saga almost always first). In a filtered mood list
+    (``progress_filter="in"`` = The Long Glide) everything is in-progress, so the weight is moot and
+    ``resume_order`` (recency/progress) is the PRIMARY order there.
+
+    ``progress_filter`` splits the candidate pool into the two mood lists from ONE plan:
+    ``"in"`` keeps ONLY in-progress sagas/franchises/series ("The Long Glide"); ``"out"`` keeps
+    ONLY the rest — standalones + not-started groups ("Touch & Go", the low-commitment one-offs).
+    ``None`` (default) keeps everything (the blended "Up Next"). A group is in-progress when it has
+    a watched member sharing its affinity (movies) OR a member whose ``series_id`` is in
+    ``series_recency`` (TV — whose watched episodes are pre-filtered out upstream).
+
+    ``series_recency`` (``{series_id: (last_watch_ts, watched_count)}``) supplies the TV side of the
+    resume keys (recency + depth) that watched episodes can't, since they're filtered out before
+    here — so an in-progress SHOW ranks in The Long Glide like an in-progress movie saga."""
     items = list(items)
     considered = len(items)
 
@@ -149,6 +182,41 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
                             dropped_watched=dropped_watched, truncated=0, coverage={})
 
     groups = group_items(live)
+
+    # IN-PROGRESS detection (shared by the resume boost + the progress filter): a group is
+    # in-progress if it has a watched member sharing its affinity (movies carry their watched
+    # entries through) OR a member whose series_id is in started_series (TV drops watched eps
+    # upstream, so the builder passes the started-series set explicitly).
+    resume: dict[int, tuple] = {}
+    in_progress: dict[int, bool] = {}
+    if resume_boost or progress_filter:
+        srec = series_recency or {}
+        wfor = _watched_by_group(groups, [it for it in items if it.watched])
+        for g in groups:
+            # watched MOVIE members only — TV's watched eps are pre-filtered upstream and its
+            # signal comes from series_recency, so excluding episodes here keeps depth from
+            # double-counting were a watched episode ever to reach the candidate pool.
+            w = [m for m in wfor[id(g)] if m.medium != "episode"]
+            # DISTINCT in-progress series in the group — a series contributes ONE (ts, count),
+            # not one per queued episode (a series group holds many next-unwatched members).
+            tv = [srec[sid] for sid in {m.series_id for m in g.members if m.series_id in srec}]
+            ip = bool(w) or bool(tv)
+            in_progress[id(g)] = ip
+            # recency = latest watch across watched movies + the group's in-progress shows;
+            # depth = watched movies + watched episodes — so TV and movie sagas rank on one axis.
+            last = max([m.last_watched or 0 for m in w] + [t[0] for t in tv], default=0)
+            depth = len(w) + sum(t[1] for t in tv)
+            resume[id(g)] = (1 if ip else 0, last, depth)
+
+    # progress filter — slice the pool into the two mood lists (The Long Glide / Touch & Go).
+    if progress_filter == "in":
+        groups = [g for g in groups if in_progress.get(id(g))]
+    elif progress_filter == "out":
+        groups = [g for g in groups if not in_progress.get(id(g))]
+    if not groups:
+        return PlaylistPlan(family=family, items=(), considered=considered,
+                            dropped_watched=dropped_watched, truncated=0, coverage={})
+
     coverage = coverage_stats(groups)
     score_of = _score_resolver(live, normalize_per_medium)
 
@@ -173,6 +241,15 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
         top = max(scores) if scores else _NEG_INF
         rendered.append((g, members, top))
 
+    # min-max normalize the group watchability scores to [0,1] so resume_weight is a meaningful,
+    # scale-independent bonus whether scores are raw (movie-only) or percentile (combined).
+    _tops = [t for _, _, t in rendered if t != _NEG_INF]
+    _lo = min(_tops) if _tops else 0.0
+    _rng = (max(_tops) - _lo) if len(_tops) >= 2 else 0.0
+
+    def _norm(t):
+        return ((t - _lo) / _rng) if (_rng and t != _NEG_INF) else 0.0
+
     # rank groups: watchability DESC, then size DESC, then earliest lead date,
     # then lead title, then group key — fully deterministic. When the recency boost
     # is on, a qualifying (caught-up + fresh) group sorts ABOVE everything else first
@@ -181,22 +258,38 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
         g, members, top = entry
         lead = members[0]
         base = (-top, -len(members), chrono_value(lead), lead.title.casefold(), g.key)
-        if not recency_boost:
-            return base
-        return (0 if boosted[id(g)] else 1,) + base
+        if recency_boost:
+            return (0 if boosted[id(g)] else 1,) + base
+        if progress_filter == "in":
+            # The Long Glide (pure resume list): recency/progress is the PRIMARY order.
+            _, last, depth = resume[id(g)]
+            order_key = (-last, -depth) if resume_order == "recency" else (-depth, -last)
+            return order_key + base
+        if resume_boost:
+            # blended Up Next: in-progress saga gets a TUNABLE watchability bonus, then the
+            # recency/progress tiebreak among comparable groups, then the deterministic keys.
+            in_prog, last, depth = resume[id(g)]
+            order_key = (-last, -depth) if resume_order == "recency" else (-depth, -last)
+            eff = _norm(top) + (resume_weight if in_prog else 0.0)
+            return (-eff,) + order_key + base
+        return base
 
     rendered.sort(key=_rank)
 
-    # flatten in ranked order, carrying group identity + rank score per item
+    blocks = [members for _, members, _ in rendered]
+    kept, truncated = apply_size_cap(blocks, max_items)
+    kept_ids = {id(it) for it in kept}      # cap may SKIP an oversized group, so kept is
+                                            # NOT necessarily a prefix — align by identity
+
+    # flatten in ranked order, carrying group identity + rank score per item, keeping
+    # only the items the cap retained (each kept group stays whole; idx/n stay the
+    # member's position within its FULL group, so the "k/n" rationale is honest)
     flat: list[tuple[PlaylistInput, object, float, int, int]] = []
     for g, members, top in rendered:
         n = len(members)
         for idx, m in enumerate(members):
-            flat.append((m, g, top, idx, n))
-
-    blocks = [members for _, members, _ in rendered]
-    kept, truncated = apply_size_cap(blocks, max_items)
-    flat = flat[:len(kept)]                 # kept is a prefix of the flattened blocks
+            if id(m) in kept_ids:
+                flat.append((m, g, top, idx, n))
 
     plans = []
     for ordinal, (m, g, top, idx, n) in enumerate(flat):

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 from scripts.managers.machine_learning.playlists.models import (
     FRANCHISE,
+    PLACEHOLDER_AFFINITY,
     SERIES,
     STANDALONE,
     UNIVERSE,
@@ -57,24 +58,32 @@ class _DSU:
 
 
 def _affinity_keys(it: PlaylistInput):
-    """Every equivalence token this item carries. Sharing ANY one binds two items."""
+    """Every equivalence token this item carries. Sharing ANY one binds two items.
+    Placeholder labels (e.g. the literal "universe" leaking from enrichment) are
+    dropped here so junk can never fuse unrelated items — the brain-level safety net
+    that protects EVERY resolver path, not just the movie one."""
     for u in it.universes:
         u = (u or "").strip().lower()
-        if u:
+        if u and u not in PLACEHOLDER_AFFINITY:
             yield f"u:{u}"
     if it.franchise:
-        yield f"f:{str(it.franchise).strip().lower()}"
+        f = str(it.franchise).strip().lower()
+        if f and f not in PLACEHOLDER_AFFINITY:
+            yield f"f:{f}"
     if it.series_id is not None:
         yield f"s:{it.series_id}"
 
 
 def _label(members: list[PlaylistInput]) -> tuple[str, str]:
     """Name a component by the BROADEST affinity present (deterministic tie-break:
-    most-common label, then lexicographically smallest)."""
-    univ = Counter(u.strip().lower() for m in members for u in m.universes if (u or "").strip())
+    most-common label, then lexicographically smallest). Placeholder labels are
+    excluded so a real group is never NAMED by junk a stray member carried."""
+    univ = Counter(lbl for m in members for u in m.universes
+                   if (lbl := (u or "").strip().lower()) and lbl not in PLACEHOLDER_AFFINITY)
     if univ:
         return UNIVERSE, _top(univ)
-    fran = Counter(str(m.franchise).strip().lower() for m in members if m.franchise)
+    fran = Counter(lbl for m in members if m.franchise
+                   and (lbl := str(m.franchise).strip().lower()) not in PLACEHOLDER_AFFINITY)
     if fran:
         return FRANCHISE, _top(fran)
     series = {m.series_id for m in members if m.series_id is not None}

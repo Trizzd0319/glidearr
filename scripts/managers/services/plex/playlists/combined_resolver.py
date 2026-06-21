@@ -14,12 +14,21 @@ from __future__ import annotations
 from scripts.managers.machine_learning.playlists.ordering import order_items
 
 
-def build_combined_plan(input_lists, *, family: str = "up_next", max_items: int = 100):
+def build_combined_plan(input_lists, *, family: str = "up_next", max_items: int = 100,
+                        resume_boost: bool = False, resume_order: str = "recency",
+                        resume_weight: float = 0.0,
+                        progress_filter: str | None = None, series_recency=None):
     """Order the merged candidates from one or more mediums into a single cross-medium plan.
     ``input_lists`` is an iterable of ``PlaylistInput`` lists (e.g. ``[tv_items, movie_items]``).
-    Returns ``(PlaylistPlan, stats)``."""
+    Returns ``(PlaylistPlan, stats)``. ``resume_boost`` lifts an in-progress saga.
+    ``progress_filter`` ("in"/"out") slices the pool into the mood lists (The Long Glide / Touch &
+    Go); ``series_recency`` (``{series_id: (last_ts, count)}``) carries in-progress shows' recency +
+    depth (their watched episodes are pre-filtered), so TV resumes alongside movie sagas."""
     merged = [it for lst in input_lists for it in (lst or [])]
-    plan = order_items(merged, family=family, max_items=max_items, normalize_per_medium=True)
+    plan = order_items(merged, family=family, max_items=max_items, normalize_per_medium=True,
+                       resume_boost=resume_boost, resume_order=resume_order,
+                       resume_weight=resume_weight,
+                       progress_filter=progress_filter, series_recency=series_recency)
     by_medium: dict = {}
     for it in merged:
         by_medium[it.medium] = by_medium.get(it.medium, 0) + 1

@@ -24,6 +24,20 @@ STANDALONE = "standalone"
 # Precedence for naming a mixed component (lower = broader = wins the label).
 _KIND_RANK = {UNIVERSE: 0, FRANCHISE: 1, SERIES: 2, STANDALONE: 3}
 
+# Affinity labels that are PLACEHOLDERS, not real franchise/universe identities, and
+# must NEVER fuse unrelated items into one group. The chief offender is the literal
+# "universe": Radarr enrichment writes ``universe_name = "universe"`` for any movie
+# tagged bare ``keep-universe`` with no specific franchise (see
+# classification/keep_policy.py) — a meaningful keep-policy bucket there, but junk as a
+# grouping token (it once fused ~220 unrelated movies into one mega-group, starving the
+# playlist cap). Real labels like "mcu"/"star" pass through; only the placeholders are
+# dropped. Compared case-folded after strip; exact-match only, so a real collection like
+# "The Universe Collection" (≠ "universe") is unaffected.
+PLACEHOLDER_AFFINITY = frozenset({
+    "", "universe", "franchise", "series", "standalone",
+    "none", "null", "nan", "nat", "unknown",
+})
+
 
 @dataclass(frozen=True)
 class PlaylistInput:
@@ -60,6 +74,9 @@ class PlaylistInput:
     # ── safety / display ──────────────────────────────────────────────────────
     cert: str | None = None               # content rating (kids cert-gating, later PR)
     is_special: bool = False              # season 0 / special → group tail
+    last_watched: int | None = None       # unix ts the USER last watched THIS item (Tautulli
+    #                                       'date'); set only on watched items, feeds the
+    #                                       resume boost's recency key (which saga to continue)
 
 
 @dataclass(frozen=True)

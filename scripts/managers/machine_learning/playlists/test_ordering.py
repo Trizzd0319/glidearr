@@ -81,6 +81,111 @@ def test_cap_truncates_within_a_single_oversized_top_group():
     assert len(kept) == 3 and trunc == 2
 
 
+def test_cap_skips_oversized_block_and_keeps_filling():
+    # An oversized group in the MIDDLE of the ranking is stepped over (not stopped at), so
+    # smaller lower-ranked groups still fill the budget — a huge group can't starve the rest.
+    a, c, d = mv("a"), mv("c"), mv("d")
+    big = [mv(f"b{i}") for i in range(5)]
+    kept, trunc = apply_size_cap([[a], big, [c], [d]], 3)
+    assert [it.rating_key for it in kept] == ["a", "c", "d"]    # big(5) skipped; a,c,d kept
+    assert trunc == 5
+
+
+def test_oversized_midrank_group_is_skipped_not_stopped():
+    # hi(95)[1] ranks first; the 5-member universe group(90) ranks 2nd but overflows the
+    # remaining budget — the cap must SKIP it and keep filling from lo1(80)/lo2(70), not
+    # stop dead at one item. (Regression: a ~200-member junk group once starved the plan to 4.)
+    big = [mv(f"g{i}", 90, universes=("mcu",), release_date=f"20{10+i:02d}-01-01")
+           for i in range(5)]
+    plan = order_items([mv("hi", 95), *big, mv("lo1", 80), mv("lo2", 70)], max_items=3)
+    assert _rks(plan) == ["hi", "lo1", "lo2"]                   # big group skipped over
+    assert plan.truncated == 5
+
+
+# ── resume boost: a TUNABLE bonus (saga vs higher-affinity standalone) ──────────
+def test_resume_weight_tunes_saga_vs_standalone():
+    # mid-MCU (next film 60) vs Passengers(95, much higher) + a near(65) standalone; 'low' just
+    # spreads the score normalization so the weight is meaningful.
+    items = [mv("seen1", 70, universes=("mcu",), watched=True, last_watched=100, release_date="2012-01-01"),
+             mv("mcu_next", 60, universes=("mcu",), release_date="2021-01-01"),
+             mv("passengers", 95), mv("near", 65), mv("low", 10)]
+    assert _rks(order_items(items))[0] == "passengers"                     # OFF: pure affinity
+    w0 = _rks(order_items(items, resume_boost=True, resume_weight=0.0))
+    assert w0[0] == "passengers"                                          # weight 0 → affinity-first
+    mod = _rks(order_items(items, resume_boost=True, resume_weight=0.35))
+    assert mod[0] == "passengers"                                        # big gap → standalone still wins
+    assert mod.index("mcu_next") < mod.index("near")                     # but saga overtakes the close one
+    assert _rks(order_items(items, resume_boost=True, resume_weight=1.0))[0] == "mcu_next"   # strong → saga first
+
+
+def test_resume_order_recency_picks_most_recently_watched_saga():
+    items = [mv("a_seen", 60, universes=("mcu",), watched=True, last_watched=400),
+             mv("a_next", 50, universes=("mcu",), release_date="2020-01-01"),
+             mv("b_seen", 60, universes=("xmen",), watched=True, last_watched=900),  # watched later
+             mv("b_next", 50, universes=("xmen",), release_date="2020-01-01")]
+    plan = order_items(items, resume_boost=True, resume_order="recency")
+    assert _rks(plan) == ["b_next", "a_next"]                             # xmen watched most recently
+
+
+def test_resume_order_progress_picks_deepest_saga():
+    items = [mv("a1", 60, universes=("mcu",), watched=True, last_watched=400),
+             mv("a2", 60, universes=("mcu",), watched=True, last_watched=410),       # depth 2
+             mv("a_next", 50, universes=("mcu",), release_date="2020-01-01"),
+             mv("b1", 60, universes=("xmen",), watched=True, last_watched=900),       # depth 1, newer
+             mv("b_next", 50, universes=("xmen",), release_date="2020-01-01")]
+    plan = order_items(items, resume_boost=True, resume_order="progress")
+    assert _rks(plan) == ["a_next", "b_next"]                             # mcu is deeper (2 > 1)
+
+
+def test_progress_filter_in_keeps_only_in_progress_sagas():
+    # The Long Glide: only sagas you've STARTED (a watched member) survive.
+    items = [mv("seen1", 70, universes=("mcu",), watched=True, last_watched=100),
+             mv("mcu_next", 50, universes=("mcu",)),
+             mv("xmen_new", 80, universes=("xmen",)),       # owned but not started
+             mv("passengers", 90)]                          # standalone
+    assert _rks(order_items(items, progress_filter="in")) == ["mcu_next"]
+
+
+def test_progress_filter_out_keeps_standalones_and_not_started():
+    # Touch & Go: the low-commitment pool — standalones + not-started, by affinity.
+    items = [mv("seen1", 70, universes=("mcu",), watched=True, last_watched=100),
+             mv("mcu_next", 50, universes=("mcu",)),
+             mv("xmen_new", 80, universes=("xmen",)),
+             mv("passengers", 90)]
+    assert _rks(order_items(items, progress_filter="out")) == ["passengers", "xmen_new"]
+
+
+def test_progress_filter_in_uses_series_recency_for_tv():
+    # TV watched eps are pre-filtered upstream, so series_recency flags in-progress shows.
+    items = [ep("e1", 1, 1, score=50, sid=7), ep("e2", 1, 2, score=50, sid=8)]
+    assert _rks(order_items(items, progress_filter="in",
+                            series_recency={7: (1000, 3)})) == ["e1"]   # only series 7 (in-progress)
+
+
+def test_resume_recency_ranks_tv_show_by_series_recency():
+    # an in-progress show whose last watch is more recent sorts ahead of a less-recent one.
+    items = [ep("a1", 2, 1, score=50, sid=1), ep("b1", 2, 1, score=50, sid=2)]
+    plan = order_items(items, resume_boost=True, resume_order="recency",
+                       series_recency={1: (200, 1), 2: (900, 1)})   # series 2 watched later
+    assert _rks(plan) == ["b1", "a1"]
+
+
+def test_resume_progress_depth_not_inflated_by_queued_tv_episodes():
+    # REGRESSION (review): a series' watched depth must count ONCE, not once per queued episode.
+    # series 1: 5 watched, 3 queued eps; series 2: 10 watched, 1 queued. Series 2 is genuinely deeper.
+    items = [ep("a1", 1, 1, score=50, sid=1), ep("a2", 1, 2, score=50, sid=1),
+             ep("a3", 1, 3, score=50, sid=1), ep("b1", 1, 1, score=50, sid=2)]
+    plan = order_items(items, resume_boost=True, resume_order="progress",
+                       series_recency={1: (100, 5), 2: (100, 10)})   # same ts → depth decides
+    assert _rks(plan)[0] == "b1"                                      # depth 10 > 5, NOT 5×3=15
+
+
+def test_resume_boost_off_is_byte_identical():
+    items = [mv("seen1", 70, universes=("mcu",), watched=True, last_watched=100),
+             mv("next", 50, universes=("mcu",)), mv("solo", 90)]
+    assert _rks(order_items(items)) == _rks(order_items(items, resume_boost=False))
+
+
 # ── spoiler safety holds across the full pipeline, for any input order ──────────
 def test_spoiler_safe_property_over_permutations():
     eps = [ep("e1", 1, 1, score=50), ep("e2", 1, 2, score=50, watched=True),
