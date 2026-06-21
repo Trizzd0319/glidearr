@@ -39,6 +39,7 @@ passes plain dicts/lists here; everything below is deterministic + unit-testable
 from __future__ import annotations
 
 import re
+import unicodedata
 
 from scripts.managers.services.plex.playlists.movie_resolver import _coerce_int, _coll_key
 
@@ -80,6 +81,82 @@ CURATED_TV_FRANCHISES: dict[str, list[str]] = {
     "doctor who": ["Doctor Who"],   # classic + revival usually one Sonarr series each; both match
 }
 
+# ── Layer 1: same-name TV-franchise clustering (runtime, owned inventory) ─────────────
+# Auto-groups SAME-named sibling shows from the owned Sonarr titles alone (no baked list, no
+# network) — the cross-named families (Grey's↔Station 19) come from the generated catalog (Layer 2).
+# Two signals: (a) a shared SUBTITLE STEM — "X" / "X: Sub" (Law & Order, NCIS, CSI, 9-1-1, Star Trek);
+# (b) a distinctive shared LEADING TOKEN for the no-subtitle class (Chicago Fire/Med/P.D.). Kept
+# SEPARATE from ``_norm`` (whose year-strip semantics are locked by tests). PURE.
+_SUBTITLE_DELIMS = re.compile(r"\s*[:–—]\s+|\s+-\s+")   # "X: Sub" (no space before colon) | " – " | " — " | " - " (hyphen needs BOTH spaces so 'Spider-Man'/'9-1-1' survive)
+_LEAD_STOPWORDS = {"the", "a", "an", "american", "new", "young", "untitled", "los", "la"}
+# Same leading token / stem but DIFFERENT franchise → never merge (regional remakes etc.). Covers
+# both the stem form ('theoffice') and the leading-token form ('office') so either title shape is safe.
+_FRANCHISE_DENY: set = {"theoffice", "office", "shameless", "skins", "thebridge", "beinghuman"}
+
+
+def _stem_norm(s) -> str:
+    """The SUBTITLE STEM key: accent-folded, lowercased head BEFORE the first subtitle delimiter,
+    stripped to ``[a-z0-9]`` — so 'Law & Order: SVU'→'laworder', '9-1-1: Lone Star'→'911',
+    "NCIS: Hawai'i"→'ncis'. A bare 'Chicago Fire' (no delimiter) →'chicagofire' (see _lead_token)."""
+    s = unicodedata.normalize("NFKD", str(s or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    head = _SUBTITLE_DELIMS.split(s, 1)[0]
+    return re.sub(r"[^a-z0-9]", "", head)
+
+
+def _lead_token(s) -> "str | None":
+    """The first distinctive word (skips a stop-word lead, needs ≥3 chars) — the franchise marker for
+    the no-subtitle sibling class: 'Chicago Fire'/'Chicago Med'→'chicago'. None if nothing distinctive."""
+    s = unicodedata.normalize("NFKD", str(s or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    for w in re.findall(r"[a-z0-9]+", s):
+        if len(w) >= 3 and w not in _LEAD_STOPWORDS:
+            return w
+    return None
+
+
+def stem_franchise_clusters(series_rows, *, deny=None) -> dict:
+    """Owned Sonarr series → ``{franchise_key: [tvdb…]}`` for SAME-named families of ≥2 owned members.
+    ``series_rows`` is ``[{title, tvdbId|tvdb, id?}]``. A series joins a cluster by shared subtitle
+    STEM first; the remaining singletons then cluster by shared distinctive LEADING TOKEN (the Chicago
+    case). De-duped by tvdb; clusters of one are dropped; DENY keys never form a cluster. PURE — no
+    I/O, deterministic (members in input order). The cross-named catalog (Layer 2) overlays this."""
+    denyset = set(_FRANCHISE_DENY) | set(deny or ())
+    rows = []
+    for r in (series_rows or []):
+        tv = _coerce_int(r.get("tvdbId") if "tvdbId" in r else r.get("tvdb"))
+        title = r.get("title") or r.get("series_title")
+        if tv is not None and title:
+            rows.append((title, tv))
+
+    by_stem: dict = {}
+    for title, tv in rows:
+        key = _stem_norm(title)
+        if key and key not in denyset:
+            by_stem.setdefault(key, [])
+            if tv not in by_stem[key]:
+                by_stem[key].append(tv)
+    clustered = {tv for members in by_stem.values() if len(members) >= 2 for tv in members}
+
+    by_lead: dict = {}
+    for title, tv in rows:
+        if tv in clustered:                       # already in a subtitle-stem cluster
+            continue
+        lead = _lead_token(title)
+        if lead and lead not in denyset:
+            by_lead.setdefault(lead, [])
+            if tv not in by_lead[lead]:
+                by_lead[lead].append(tv)
+
+    out: dict = {}
+    for key, members in by_stem.items():
+        if len(members) >= 2:
+            out[f"tvfran:{key}"] = list(members)
+    for lead, members in by_lead.items():
+        if len(members) >= 2:
+            out.setdefault(f"tvfran:{lead}", list(members))
+    return out
+
 # Bundled list DEFINITIONS — Kometa's own universe→list map (the IMDb/mdblist lists it builds
 # from), copied here so glidearr can fetch the SAME source ITSELF and is no longer reliant on a
 # Kometa run having created the Plex collections. This is the only STATIC piece (changes only when
@@ -88,22 +165,26 @@ CURATED_TV_FRANCHISES: dict[str, list[str]] = {
 # flip to False for a list that's merely release-ordered (→ grouping only, dates order it). Extend
 # or override per install via ``plex.playlists.universe_lists`` in config.json (no image rebuild).
 UNIVERSE_LISTS: dict[str, dict] = {
-    "mcu":      {"imdb": "ls539646485", "timeline": True},
-    "star":     {"imdb": "ls501373412", "timeline": True},
-    "trek":     {"imdb": "ls547463722", "timeline": True},
-    "xmen":     {"imdb": "ls567618635", "timeline": True},
-    "dcu":      {"imdb": "ls524274984", "timeline": True},
-    "arrow":    {"imdb": "ls566667558", "timeline": True},
-    "avp":      {"imdb": "ls543971628", "timeline": True},
-    "conjuring": {"imdb": "ls068768438", "timeline": True},
-    "fast":     {"imdb": "ls4102351575", "timeline": True},
-    "dca":      {"mdblist": "johnfawkes/dca", "timeline": True},
-    "marvel":   {"mdblist": "k0meta/external/15110", "timeline": True},
-    "middle":   {"mdblist": "k0meta/external/46550", "timeline": True},
-    "mummy":    {"mdblist": "k0meta/external/9249", "timeline": True},
-    "rocky":    {"mdblist": "k0meta/external/9248", "timeline": True},
-    "askew":    {"mdblist": "k0meta/external/15362", "timeline": True},
-    "wizard":   {"mdblist": "k0meta/external/23683", "timeline": True},
+    # Public mdblist lists (numeric id or user/slug), fetched IN LIST ORDER and content-verified
+    # against the live API. The prior IMDb-list refs (ls…) 404 — mdblist exposes no IMDb-list
+    # endpoint — and the Kometa ``external/<n>`` numbers resolved to unrelated lists (anime, art
+    # films), so every ref here was re-sourced. Override/extend per install via
+    # ``plex.playlists.universe_lists`` in config.json (no image rebuild).
+    "mcu":       {"id": 117444, "timeline": True},                 # MCU (timeline order)
+    "star":      {"id": 119979, "timeline": True},                 # Star Wars: the Skywalker Saga
+    "trek":      {"id": 102138, "timeline": True},                 # Star Trek (chronological)
+    "xmen":      {"id": 92827,  "timeline": True},                 # X-Men universe
+    "dcu":       {"id": 49433,  "timeline": True},                 # DC Extended Universe
+    "arrow":     {"id": 140366, "timeline": True},                 # Arrowverse (TV)
+    "avp":       {"id": 101434, "timeline": True},                 # Alien vs Predator
+    "conjuring": {"id": 68164,  "timeline": True},                 # The Conjuring universe
+    "fast":      {"id": 76743,  "timeline": True},                 # Fast & Furious
+    "dca":       {"mdblist": "johnfawkes/dca", "timeline": True},  # DC Animated
+    "middle":    {"id": 120168, "timeline": True},                 # Middle-earth (LOTR + Hobbit)
+    "mummy":     {"id": 16827,  "timeline": True},                 # The Mummy / Scorpion King
+    "rocky":     {"id": 49530,  "timeline": True},                 # Rocky & Creed
+    "askew":     {"id": 80700,  "timeline": True},                 # View Askewniverse
+    "wizard":    {"id": 159768, "timeline": True},                 # Wizarding World
 }
 
 

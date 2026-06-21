@@ -11,6 +11,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     saga_member_sets,
     series_order_from_children,
     split_list_media,
+    stem_franchise_clusters,
     tv_franchise_maps,
     tv_group_maps,
     tv_group_maps_from_series,
@@ -125,7 +126,7 @@ def test_tv_group_maps_list_wins_over_curated():
 # ── hybrid: bundled definitions + mdblist list source → maps ────────────────────
 def test_universe_lists_merges_config_overrides():
     base = universe_lists()
-    assert base["mcu"] == {"imdb": "ls539646485", "timeline": True}
+    assert base["mcu"] == {"id": 117444, "timeline": True}
     over = universe_lists({"mcu": {"mdblist": "me/mine", "timeline": False},
                            "newverse": {"imdb": "ls999", "timeline": True}})
     assert over["mcu"] == {"mdblist": "me/mine", "timeline": False}   # override wins
@@ -265,3 +266,42 @@ def test_saga_member_sets_from_legacy_lists_movies_then_shows():
 def test_saga_member_sets_empty_universe_skipped():
     assert saga_member_sets({"universes": {"empty": {"movies": [], "shows": []}}}) == {}
     assert saga_member_sets({}) == {}
+
+
+# ── Layer-1 same-name TV-franchise clustering (runtime, owned inventory) ─────────────
+_FAM = [
+    {"title": "Law & Order", "tvdbId": 1},
+    {"title": "Law & Order: Special Victims Unit", "tvdbId": 2},
+    {"title": "Law & Order: Organized Crime", "tvdbId": 3},
+    {"title": "NCIS", "tvdbId": 10},
+    {"title": "NCIS: Hawai'i", "tvdbId": 11},                 # accent + apostrophe fold
+    {"title": "Chicago Fire", "tvdbId": 20},                  # no subtitle → leading-token class
+    {"title": "Chicago Med", "tvdbId": 21},
+    {"title": "Chicago P.D.", "tvdbId": 22},
+    {"title": "9-1-1", "tvdbId": 30},                         # hyphen-digit, no space delimiter
+    {"title": "9-1-1: Lone Star", "tvdbId": 31},
+    {"title": "Breaking Bad", "tvdbId": 40},                  # standalone → no cluster (catalog's job)
+]
+
+
+def test_stem_clusters_subtitle_and_leading_token():
+    out = stem_franchise_clusters(_FAM)
+    assert out["tvfran:laworder"] == [1, 2, 3]
+    assert out["tvfran:ncis"] == [10, 11]
+    assert out["tvfran:911"] == [30, 31]
+    assert out["tvfran:chicago"] == [20, 21, 22]             # leading-token cluster (stems all differ)
+    assert "tvfran:breakingbad" not in out and "tvfran:breaking" not in out   # standalone dropped
+
+
+def test_stem_clusters_dedup_and_singletons():
+    rows = [{"title": "Fargo", "tvdbId": 5}, {"title": "Fargo", "tvdbId": 5},   # dup tvdb
+            {"title": "Severance", "tvdbId": 6}]
+    assert stem_franchise_clusters(rows) == {}                # one real series each → no cluster
+
+
+def test_stem_clusters_deny_blocks_regional_remakes():
+    rows = [{"title": "The Office (US)", "tvdbId": 7}, {"title": "The Office (UK)", "tvdbId": 8}]
+    assert stem_franchise_clusters(rows) == {}               # 'office'/'theoffice' in the DENY set
+    # an explicit deny arg also blocks a stem cluster
+    sham = [{"title": "Shameless", "tvdbId": 7}, {"title": "Shameless", "tvdbId": 8}]
+    assert stem_franchise_clusters(sham, deny={"shameless"}) == {}

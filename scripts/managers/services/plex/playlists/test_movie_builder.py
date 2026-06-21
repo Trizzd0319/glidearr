@@ -105,7 +105,7 @@ def test_universe_membership_and_order_from_mdblist_list(monkeypatch):
     monkeypatch.setattr(B.mdblist_client, "list_items", lambda key, defn:
         {"ok": True, "items": [{"tmdb": 200, "tvdb": None, "media": "movie"},
                                {"tmdb": 100, "tvdb": None, "media": "movie"}]}
-        if defn.get("imdb") == "ls539646485" else {"ok": True, "items": []})
+        if defn.get("id") == 117444 else {"ok": True, "items": []})
     m = _mgr(cache=_Cache(), config=_on_with_list_and_key())
     owned = [{"tmdb_id": 100}, {"tmdb_id": 200}, {"tmdb_id": 300}]      # 300 not in any list
     assert m._movie_universe_membership(owned) == {200: {"mcu"}, 100: {"mcu"}}   # grouping, no Kometa tag
