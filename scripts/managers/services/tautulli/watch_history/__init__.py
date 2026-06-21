@@ -3,7 +3,12 @@ from scripts.managers.machine_learning.affinity.group_completion import (
     group_movie_completions,
 )
 
-_HISTORY_TTL = 86_400  # 24 hours
+# Refreshed hourly (down from 24 h): with things watched frequently, the resume/recency/JIT
+# signals the playlists ride on need to reflect what was JUST watched. A full re-fetch is cheap
+# (one paginated call of ~hundreds of rows) and — unlike a date-delta — also picks up in-progress
+# %-complete updates to already-seen watches. Kept positive (not per-run) because ~6 consumers
+# call get_all_history_cached per run; the TTL must exceed a run's duration so they share one fetch.
+_HISTORY_TTL = 3_600  # 1 hour
 
 # Data-minimization (PII): the raw Tautulli history record carries household
 # PII that is NEVER consumed downstream from this "tautulli/history/all" cache

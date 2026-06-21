@@ -55,11 +55,12 @@ class TautulliMetadataManager(BaseManager):
         return metadata
 
     def get_metadata_index_cached(self, rating_keys: list) -> dict:
-        """Return metadata index, cached for 7 days.
+        """Return the metadata index: a 7-day-cached FULL build, topped up INCREMENTALLY each run
+        with any requested rating_key not already present (so newly-watched items resolve the same
+        run instead of waiting up to a week for the TTL rebuild).
 
-        Auto-invalidates the cache when it pre-dates the tmdb_id field so that
-        the first run after a schema change rebuilds immediately rather than
-        waiting for the 7-day TTL to expire.
+        Auto-invalidates the cache when it pre-dates the tmdb_id field so that the first run after a
+        schema change rebuilds immediately rather than waiting for the 7-day TTL to expire.
         """
         if not self.global_cache:
             return self.build_metadata_index(rating_keys)
@@ -74,15 +75,55 @@ class TautulliMetadataManager(BaseManager):
                 )
                 self.global_cache.delete("tautulli/metadata/index")
 
-        return self.global_cache.get_or_generate_cache(
+        rebuilt = {"flag": False}
+
+        def _gen():
+            rebuilt["flag"] = True
+            return self.build_metadata_index(rating_keys)
+
+        index = self.global_cache.get_or_generate_cache(
             key="tautulli/metadata/index",
-            generator_function=lambda: self.build_metadata_index(rating_keys),
+            generator_function=_gen,
             expiration_time=_METADATA_TTL,
             # Resolves rating_key → tmdb_id for the watched-set. Must refresh on
             # TTL or newly-watched items never resolve to a tmdbId and silently
             # drop out of the household watched-set.
             regenerate_on_expiry=True,
         )
+        if not isinstance(index, dict):
+            return index
+        # A full (re)build already tried every key in one pass — reset the negative cache so a key
+        # that has since reappeared in Plex gets re-tried (and so it can't grow unbounded).
+        if rebuilt["flag"]:
+            self.global_cache.delete("tautulli/metadata/unresolved")
+
+        # Incremental top-up. Within the 7-day TTL the cached index is frozen, so a rating_key
+        # first watched AFTER the last full build is absent until the rebuild — its item silently
+        # drops from the affinity/watched-set for up to a week (exactly the staleness that left
+        # low-volume profiles under-personalised). Fetch metadata for ONLY the requested keys
+        # missing from the index and merge them in, so newly-watched items resolve THIS run.
+        #
+        # Negative cache: most history ratingKeys never resolve via the per-key API — Plex re-scans
+        # churn the ratingKey, so the OLD key Tautulli logged is gone (these are the keys the
+        # library-first title join already covers). Remember keys that came back empty and skip
+        # them on future runs, else we'd re-hit the API for hundreds of dead keys EVERY run. Only
+        # record them when the fetch produced ≥1 success (proof the API/key is live), so a keyless
+        # or down run can't poison the skip-list.
+        unresolved = set(self.global_cache.get("tautulli/metadata/unresolved") or [])
+        missing = [rk for rk in (rating_keys or [])
+                   if str(rk) not in index and str(rk) not in unresolved]
+        if missing:
+            fresh = self.build_metadata_index(missing)
+            if fresh:
+                index = {**index, **fresh}
+                self.global_cache.set("tautulli/metadata/index", index)
+                dead = {str(rk) for rk in missing if str(rk) not in fresh}
+                if dead:
+                    self.global_cache.set("tautulli/metadata/unresolved", sorted(unresolved | dead))
+                self.logger.log_info(
+                    f"[TautulliMeta] Incremental fetch: +{len(fresh)} resolved, {len(dead)} "
+                    f"unresolvable (cached, skipped next run) → metadata index {len(index)} items.")
+        return index
 
     def get_library_index(self) -> dict:
         """Real-time library list from Tautulli."""
