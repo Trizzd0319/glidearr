@@ -95,6 +95,8 @@ def test_ratings_keeps_nonzero_normalized_to_int():
 
 # ── collections (membership_by_tmdb; smart filter captured opaque) ─────────────
 class _CollectionsAPI:
+    def get_sections(self, fallback=None):                       # collections are read PER SECTION
+        return {"MediaContainer": {"Directory": [{"key": "1", "type": "movie"}]}}
     def get_collections(self, section_id=None, fallback=None):
         return {"MediaContainer": {"Metadata": [
             {"ratingKey": "c1", "title": "Marvel", "smart": True, "childCount": "2",

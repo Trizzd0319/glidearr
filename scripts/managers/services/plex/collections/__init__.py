@@ -33,9 +33,8 @@ class PlexCollectionsManager(BaseManager):
 
     def run(self) -> dict:
         meta = self.registry.get("manager", "PlexMetadataManager") if self.registry else None
-        resp = self.plex_api.get_collections()
         index, membership = {}, {}
-        for d in metadata_items(resp):
+        for d in self._all_collections():
             rk = d.get("ratingKey")
             if rk is None:
                 continue
@@ -61,6 +60,28 @@ class PlexCollectionsManager(BaseManager):
         self.logger.log_info(f"[PlexCollections] {len(index)} collection(s), "
                              f"{len(membership)} tmdb member(s).")
         return {"collections": len(index)}
+
+    def _all_collections(self) -> list:
+        """Every Plex collection across ALL library sections, as a flat list of metadata dicts.
+        Collections are PER-SECTION on PMS — the global ``/library/collections`` endpoint returns
+        nothing on modern servers — so iterate ``get_sections()`` and read each section's collections
+        (mirrors ``PlexPlaylistBuilderManager._all_collections``). ``[]`` with no Plex API / on error."""
+        if not self.plex_api:
+            return []
+        try:
+            secs = metadata_items(self.plex_api.get_sections())
+        except Exception:
+            return []
+        out: list = []
+        for s in secs:
+            sid = s.get("key")
+            if sid is None:
+                continue
+            try:
+                out.extend(metadata_items(self.plex_api.get_collections(section_id=sid)))
+            except Exception:
+                continue
+        return out
 
     def _members(self, rating_key, meta) -> list:
         resp = self.plex_api.get_collection_children(rating_key)
