@@ -51,7 +51,9 @@ class Adder:
         inst = enriched.get("instance")
 
         if self.dry_run:
-            self.logger.log_info(
+            # Per-line at DEBUG only — the caller summarises every add in a decision log_table
+            # (Acquisition decisions / Universe acquisition), so this would just duplicate it at INFO.
+            self.logger.log_debug(
                 f"[acquire] dry_run — would add '{title}' to {inst} "
                 f"(profile={enriched['quality_profile'].get('name')}, "
                 f"monitored={self.monitored}, search={eff_search})"
