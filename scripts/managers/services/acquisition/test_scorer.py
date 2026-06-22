@@ -51,6 +51,16 @@ def test_empty_or_invalid_returns_blank():
     assert _S.reason({}) == "" and _S.reason(None) == ""
 
 
+def test_evidence_renders_named_genres_instead_of_genre_score():
+    m = {"genre_affinity": 71, "source": 100, "recency": 88}   # source 25 > genre 24.85 > recency 13.2
+    ev = {"matched_genres": [("sci-fi", 0.95), ("action", 0.70), ("drama", 0.40), ("comedy", 0.10)]}
+    # genre driver becomes the actual genre NAMES (Title-Cased, top-3 by weight), not "genre 71".
+    assert _S.reason(m, evidence=ev) == "watchlist, Sci-Fi + Action + Drama, recent 88"
+    # back-compat: no/empty evidence → the original bare score label.
+    assert _S.reason(m) == "watchlist, genre 71, recent 88"
+    assert _S.reason(m, evidence={"matched_genres": []}) == "watchlist, genre 71, recent 88"
+
+
 # ── evidence capture (the named "why" drivers) ────────────────────────────────────────
 # score() returns a third `evidence` sibling key with the raw, nameable drivers; `total`
 # and `matrix` stay byte-identical (so reason()/the existing tests are untouched).

@@ -213,15 +213,21 @@ class AcquisitionScorer:
             den += weight
         return round(num / den) if den else 0
 
-    def reason(self, matrix: dict, *, top: int = 3) -> str:
+    def reason(self, matrix: dict, *, top: int = 3, evidence: "dict | None" = None) -> str:
         """A short, human "why this scored what it did" — the top components by CONTRIBUTION
         (``weight × value``, not raw value), so a high score (e.g. the ≥ ``4k_dual_min_score`` that
-        earns the 4K copy) is explainable at a glance: e.g. ``"genre 78, watchlist, recent 92"``.
+        earns the 4K copy) is explainable at a glance: e.g. ``"Sci-Fi + Action, watchlist, recent 92"``.
         Reads this instance's (config-gated) weights, so ``cast`` only appears once the
         people_affinity weight is non-zero. ``""`` for an empty matrix (universe-saga grabs
-        bypass scoring → no signals)."""
+        bypass scoring → no signals).
+
+        ``evidence`` (the ``score()`` sibling): when given, the genre_affinity driver is rendered
+        as the ACTUAL matched genre names (``"Sci-Fi + Action"``, the household-favourite genres
+        this title hit, top-3 by weight) instead of the bare ``"genre 71"`` score — so the table
+        names the genres. Omitted/empty evidence falls back to the score label (back-compat)."""
         if not isinstance(matrix, dict) or not matrix:
             return ""
+        matched = (evidence or {}).get("matched_genres") or []
         contrib = [(w * float(matrix[k]), k, matrix[k]) for k, w in self._weights.items()
                    if w > 0 and matrix.get(k) is not None]
         contrib.sort(key=lambda t: t[0], reverse=True)
@@ -229,6 +235,8 @@ class AcquisitionScorer:
         for _c, key, val in contrib[:top]:
             if key == "source":
                 parts.append(_SOURCE_LABEL.get(int(val), f"source {int(val)}"))
+            elif key == "genre_affinity" and matched:
+                parts.append(" + ".join(str(g).title() for g, _w in matched[:3]))
             else:
                 parts.append(f"{_COMPONENT_LABEL.get(key, key)} {int(round(float(val)))}")
         return ", ".join(parts)
