@@ -892,6 +892,49 @@
    }
   ]
  },
+ "middle": {
+  "display": "Middle-earth",
+  "sources": [
+   {
+    "title": "in-universe chronological (curated; not on chronolists)",
+    "link": ""
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "movie",
+    "tmdb": 49051,
+    "title": "The Hobbit: An Unexpected Journey"
+   },
+   {
+    "media": "movie",
+    "tmdb": 57158,
+    "title": "The Hobbit: The Desolation of Smaug"
+   },
+   {
+    "media": "movie",
+    "tmdb": 122917,
+    "title": "The Hobbit: The Battle of the Five Armies"
+   },
+   {
+    "media": "movie",
+    "tmdb": 120,
+    "title": "The Lord of the Rings: The Fellowship of the Ring"
+   },
+   {
+    "media": "movie",
+    "tmdb": 121,
+    "title": "The Lord of the Rings: The Two Towers"
+   },
+   {
+    "media": "movie",
+    "tmdb": 122,
+    "title": "The Lord of the Rings: The Return of the King"
+   }
+  ],
+  "slug": null
+ },
  "one chicago": {
   "display": "Chicago",
   "slug": "chicago",

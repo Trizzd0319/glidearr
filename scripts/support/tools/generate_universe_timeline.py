@@ -87,6 +87,16 @@ _CURATED: dict[str, dict] = {
         {"media": "movie", "tmdb": 480530,  "title": "Creed II"},       # 2018
         {"media": "movie", "tmdb": 677179,  "title": "Creed III"},      # 2023
     ]},
+    "middle": {"display": "Middle-earth",
+               "sources": [{"title": "in-universe chronological (curated; not on chronolists)", "link": ""}],
+               "version": 1, "items": [
+        {"media": "movie", "tmdb": 49051,   "title": "The Hobbit: An Unexpected Journey"},          # 2012
+        {"media": "movie", "tmdb": 57158,   "title": "The Hobbit: The Desolation of Smaug"},        # 2013
+        {"media": "movie", "tmdb": 122917,  "title": "The Hobbit: The Battle of the Five Armies"},  # 2014
+        {"media": "movie", "tmdb": 120,     "title": "The Lord of the Rings: The Fellowship of the Ring"},  # 2001
+        {"media": "movie", "tmdb": 121,     "title": "The Lord of the Rings: The Two Towers"},       # 2002
+        {"media": "movie", "tmdb": 122,     "title": "The Lord of the Rings: The Return of the King"},      # 2003
+    ]},
 }
 
 
@@ -167,7 +177,7 @@ def generate(only: "set[str] | None" = None, *, sleep: float = 1.0) -> dict:
         if only and key not in only:
             continue
         out.setdefault(key, {**entry, "slug": None})             # never override a fetched universe
-        print(f"  {key:14s} {len(entry['items']):3d} films + {0:3d} shows  [curated: release order]")
+        print(f"  {key:14s} {len(entry['items']):3d} films + {0:3d} shows  [curated]")
     return out
 
 
