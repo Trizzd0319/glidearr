@@ -124,6 +124,21 @@ def deletions_enabled(config) -> bool:
         return False
 
 
+def deletions_disabled_reason(config) -> str:
+    """The SPECIFIC reason :func:`deletions_enabled` is closed, for accurate logging — ``""`` when
+    deletions ARE enabled. Replaces the old hardcoded "free_space_limit is not set" message, which
+    misreported a missing-CONSENT gate as a missing floor (consent is checked first, so an install
+    WITH a free_space_limit but no consent was wrongly told the floor was unset)."""
+    if not deletions_consented(config):
+        return "no operator consent (deletions_consented not set)"
+    try:
+        if float(_cfg_get(config, "free_space_limit", 0) or 0) <= 0:
+            return "free_space_limit is not set"
+    except (TypeError, ValueError):
+        return "free_space_limit is invalid"
+    return ""
+
+
 def coordinator_owns_deletion(config) -> bool:
     """True when the cross-service space coordinator owns ALL deletion, so the
     per-service legacy delete paths (Radarr space-pressure delete, movie_files

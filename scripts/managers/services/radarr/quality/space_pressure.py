@@ -67,7 +67,7 @@ from scripts.support.utilities.watch_likelihood import (
 )
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
 from scripts.support.utilities.space_targets import (
-    coordinator_owns_deletion, deletions_enabled, space_targets,
+    coordinator_owns_deletion, deletions_disabled_reason, deletions_enabled, space_targets,
 )
 
 
@@ -715,7 +715,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             # HARD SAFETY GATE: no operator-set free_space_limit → no deletions,
             # anywhere. main.py emits the loud end-of-run banner.
             self.logger.log_warning(
-                "[SpacePressure] deletions DISABLED — free_space_limit is not set; "
+                f"[SpacePressure] deletions DISABLED — {deletions_disabled_reason(self.config)}; "
                 "skipping the movie delete pass."
             )
             return stats
@@ -998,7 +998,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             # Belt-and-braces: the coordinator can't run without a floor, but never
             # delete through this APPLY primitive either when the gate is closed.
             self.logger.log_warning(
-                "[SpacePressure] deletions DISABLED — free_space_limit is not set; "
+                f"[SpacePressure] deletions DISABLED — {deletions_disabled_reason(self.config)}; "
                 f"refusing coordinator delete of {len(picks)} movie pick(s)."
             )
             return stats

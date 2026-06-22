@@ -92,7 +92,7 @@ from scripts.support.utilities.watch_likelihood import (
 )
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
 from scripts.support.utilities.space_targets import (
-    coordinator_owns_deletion, deletions_enabled, space_targets,
+    coordinator_owns_deletion, deletions_disabled_reason, deletions_enabled, space_targets,
 )
 
 
@@ -1085,7 +1085,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             # Belt-and-braces: the coordinator can't run without a floor, but never
             # delete through this APPLY primitive either when the gate is closed.
             self.logger.log_warning(
-                "[EpisodeFiles] deletions DISABLED — free_space_limit is not set; "
+                f"[EpisodeFiles] deletions DISABLED — {deletions_disabled_reason(self.config)}; "
                 f"refusing coordinator delete of {len(want)} episode file(s)."
             )
             return stats
@@ -2925,7 +2925,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             # deletions. Grace MARKING is unaffected; rows stay marked for when a floor
             # is configured. main.py emits the loud end-of-run banner.
             self.logger.log_warning(
-                "[EpisodeFiles] deletions DISABLED — free_space_limit is not set; "
+                f"[EpisodeFiles] deletions DISABLED — {deletions_disabled_reason(self.config)}; "
                 f"leaving {int(marked_mask.sum())} marked row(s) untouched."
             )
             return df, stats
@@ -3243,7 +3243,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             # HARD SAFETY GATE: no operator-set free_space_limit → no deletions.
             # Grace MARKING is unaffected; only this destructive pass skips.
             self.logger.log_warning(
-                "[EpisodeFiles] deletions DISABLED — free_space_limit is not set; "
+                f"[EpisodeFiles] deletions DISABLED — {deletions_disabled_reason(self.config)}; "
                 "skipping the grace-marked episode delete pass."
             )
             return {"checked": 0, "deleted": 0, "failed": 0, "purged": 0,

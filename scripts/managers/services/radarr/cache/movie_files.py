@@ -45,7 +45,7 @@ from scripts.managers.machine_learning.lifecycle.grace_policy import (
 )
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
-from scripts.support.utilities.space_targets import deletions_enabled
+from scripts.support.utilities.space_targets import deletions_disabled_reason, deletions_enabled
 
 
 class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
@@ -995,7 +995,7 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
             # HARD SAFETY GATE: no operator-set free_space_limit → no deletions.
             # Grace MARKING is unaffected; only this destructive pass skips.
             self.logger.log_warning(
-                "[MovieFiles] deletions DISABLED — free_space_limit is not set; "
+                f"[MovieFiles] deletions DISABLED — {deletions_disabled_reason(self.config)}; "
                 "skipping the grace-marked movie delete pass."
             )
             return stats

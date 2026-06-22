@@ -11,10 +11,23 @@ import pytest
 from scripts.managers.machine_learning.space.space_targets import (
     PRESSURE_FALLBACK_FRACTION,
     PRESSURE_FALLBACK_GB,
+    _CONSENT_ENV_VARS,
     deletions_consented,
+    deletions_disabled_reason,
     deletions_enabled,
     space_targets,
 )
+
+
+def test_deletions_disabled_reason_is_accurate(monkeypatch):
+    for v in _CONSENT_ENV_VARS:                                       # config-driven, ignore any ambient env
+        monkeypatch.delenv(v, raising=False)
+    # consent is checked first: a configured floor but NO consent reports the consent gate, not the floor
+    assert "consent" in deletions_disabled_reason({"free_space_limit": 1500})
+    # consent but no floor → the floor reason
+    assert deletions_disabled_reason({"deletions_consent": True}) == "free_space_limit is not set"
+    # both set → enabled, no reason
+    assert deletions_disabled_reason({"deletions_consent": True, "free_space_limit": 1500}) == ""
 
 
 def test_configured_limit_drives_band():
