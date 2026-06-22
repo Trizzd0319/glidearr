@@ -292,10 +292,43 @@ def test_flag_off_reproduces_legacy_floor_first():
     assert stats["searched"] == 1
 
 
-# ── DEFAULT: within-run floor-first climb ─────────────────────────────────────────
+# ── DEFAULT: interactive search (one manual search per stub) ──────────────────────
+def test_interactive_default_spawns_interactive_worker():
+    """By default (no pilot_interactive key → enabled), the main loop resolves S01E01 and hands it to
+    the BACKGROUND interactive worker with the ascending ladder + per-series meta; it does NO profile
+    flips itself (the worker owns the grab). The worker is stubbed to capture its arguments."""
+    df = _stub_df()
+    api = _FakeApi(series_qp=99)
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = api
+    m.sonarr_cache = None
+    m.global_cache = None
+    m.config = {"free_space_limit": 100}          # no pilot_interactive key → default ON
+    m.dry_run = False                              # LIVE so the worker is actually spawned
+    m._resolve_instance = lambda inst: inst
+    m.load = lambda inst: df
+    m.save = lambda inst, d: None
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_episode_id = lambda *a, **k: 999
+
+    spawned: dict = {}
+    m._spawn_pilot_interactive_worker = lambda inst, items, ladder, meta, idx, floor, cd: spawned.update(
+        instance=inst, items=list(items), ladder=list(ladder), meta=dict(meta)
+    )
+
+    stats = m.run_pilot_search("inst")
+
+    assert spawned["items"] == [(1, 999)]                       # (sid, s01e01 id) handed to worker
+    assert [res for _pid, res in spawned["ladder"]] == [720, 1080, 2160]
+    assert spawned["meta"][1]["title"] == "S"                   # title threaded for label + ledger
+    assert api.puts == []                                       # main thread flips NO profiles
+    assert stats["searched"] == 1
+
+
 def test_climb_default_collects_items_and_spawns_worker():
-    """By default (no pilot_floor_climb key → enabled), the main loop resolves S01E01 and hands it
-    to the BACKGROUND climb worker with the ascending floor→widest ladder; it does NO profile flips
+    """With interactive search OFF, the default falls back to the BACKGROUND climb worker: the main
+    loop resolves S01E01 and hands it the ascending floor→widest ladder, doing NO profile flips
     itself (the worker owns those). The worker is stubbed to capture its arguments."""
     df = _stub_df()
     api = _FakeApi(series_qp=99)
@@ -304,7 +337,7 @@ def test_climb_default_collects_items_and_spawns_worker():
     m.sonarr_api = api
     m.sonarr_cache = None
     m.global_cache = None
-    m.config = {"free_space_limit": 100}          # no pilot_floor_climb key → default ON
+    m.config = {"free_space_limit": 100, "pilot_interactive": {"enabled": False}}  # climb fallback
     m.dry_run = False                              # LIVE so the worker is actually spawned
     m._resolve_instance = lambda inst: inst
     m.load = lambda inst: df

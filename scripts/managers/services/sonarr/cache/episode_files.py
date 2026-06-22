@@ -58,10 +58,13 @@ from scripts.managers.machine_learning.acquisition.next_episode_planner import (
 )
 from scripts.managers.services.plex.playlists.universe_order import tv_group_maps_from_series
 from scripts.managers.machine_learning.acquisition.pilot_stepping import (
+    choose_lowest_available_tier,
     choose_pilot_profile,
+    indexer_fingerprint,
     next_pilot_profile,
     next_pilot_profile_descend,
     pilot_backoff_interval,
+    pilot_recheck_due,
     pilot_search_due,
     profile_max_resolution,
     rank_pilot_profiles,
@@ -3860,6 +3863,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         stats = {
             "checked": 0, "searched": 0, "stepped_down": 0,
             "at_floor": 0, "skipped_recent": 0, "skipped_space": 0, "failed": 0,
+            "skipped_unacquirable": 0,
         }
 
         df = self.load(instance)
@@ -3957,6 +3961,28 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # is exactly `interval`, byte-identical.
         _pilot_backoff = ((self.config or {}).get("pilot_backoff") or {})
         changed  = False
+
+        # Interactive-search model (default ON when climbing): ONE manual search per stub reveals
+        # all availability — grab the lowest available resolution, or flag UNACQUIRABLE when the
+        # indexers return nothing at any resolution. An UNACQUIRABLE stub stays dead until a NEW
+        # indexer is added OR recheck_days has elapsed (read here; the gate is in the loop below).
+        _pi = ((self.config or {}).get("pilot_interactive") or {})
+        interactive = pilot_climb and (bool(_pi.get("enabled", True)) if isinstance(_pi, dict) else bool(_pi))
+        try:
+            recheck_cooldown = timedelta(days=float(_pi.get("recheck_days", 7) or 7))
+        except (TypeError, ValueError):
+            recheck_cooldown = timedelta(days=7)
+        try:
+            pilot_floor_res = max(0, int(_pi.get("floor_res", 0) or 0))
+        except (TypeError, ValueError):
+            pilot_floor_res = 0
+        current_indexers: list = []
+        _unacq_ledger: dict = {}
+        if interactive:
+            current_indexers = indexer_fingerprint(
+                self.sonarr_api._make_request(instance, "indexer", fallback=[]) or [])
+            _unacq_ledger = (self.global_cache.get(self._pilot_unacq_key(instance))
+                             if self.global_cache else None) or {}
 
         # Measured MiB/min per quality for the dry-run space estimate (JIT
         # fallback table covers qualities with no samples). Computed once.
@@ -4085,6 +4111,16 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 continue
             sid = int(sid)
 
+            # ── UNACQUIRABLE gate: a stub the interactive search proved has NO release at any
+            #    resolution stays dead until a NEW indexer appears OR the re-check cooldown elapses
+            #    (the only two ways an empty search can newly succeed). Supersedes the 24 h interval. ──
+            if interactive:
+                _e = _unacq_ledger.get(str(sid))
+                if _e and not pilot_recheck_due(_e.get("flagged_at"), _e.get("indexers"),
+                                                now_utc, current_indexers, cooldown=recheck_cooldown):
+                    stats["skipped_unacquirable"] += 1
+                    continue
+
             # ── Interval guard (with optional attempts-based backoff) ─────────
             _att_raw = df.at[idx, "pilot_search_attempts"]
             _eff_interval = pilot_backoff_interval(
@@ -4122,10 +4158,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     series_fallback.append((idx, sid, title))
                 if self.dry_run:
                     _what = "S01E01" if ep_id else "SeriesSearch (S01E01 id n/a)"
+                    _how = ("interactive-search" if interactive else "climb") + (
+                        " (grab lowest available resolution, or flag UNACQUIRABLE)")
                     _log(
-                        f"  [dry_run] PilotSearch would climb '{title}' {_what} floor-first "
-                        f"(≤{_climb_ladder[0][1]}p → ≤{_climb_ladder[-1][1]}p), grabbing at the "
-                        f"lowest available tier | why: stub pilot, no file"
+                        f"  [dry_run] PilotSearch would {_how} '{title}' {_what} "
+                        f"(≤{_climb_ladder[0][1]}p → ≤{_climb_ladder[-1][1]}p) "
+                        f"| why: stub pilot, no file"
                     )
                 continue
 
@@ -4349,29 +4387,44 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                             f"run (re-probe next run; never whole-series searched)"
                         )
                 if climb_items:
-                    self._spawn_pilot_climb_worker(instance, climb_items, _climb_ladder)
+                    if interactive:
+                        # One manual search per stub: grab the lowest available resolution, or flag
+                        # UNACQUIRABLE. Pass title/tvdb so the worker labels logs + the ledger.
+                        _meta = {sid: {"title": (series_by_id.get(sid) or {}).get("title"),
+                                       "tvdb": (series_by_id.get(sid) or {}).get("tvdbId")}
+                                 for sid, _ in climb_items}
+                        self._spawn_pilot_interactive_worker(
+                            instance, climb_items, _climb_ladder, _meta,
+                            current_indexers, pilot_floor_res, recheck_cooldown)
+                    else:
+                        self._spawn_pilot_climb_worker(instance, climb_items, _climb_ladder)
                 stats["searched"] = len(climb_items)
             if changed and not self.dry_run:
                 self.save(instance, df)
             _prefix = "[dry_run] " if self.dry_run else ""
+            _mode = "interactive search" if interactive else "floor-first climb"
             self.logger.log_table(
                 ["Outcome", "Count"],
                 [
-                    ["climb searched",     stats["searched"]],
-                    ["id unresolved",      _unresolved],
-                    ["skipped recent",     stats["skipped_recent"]],
-                    ["failed",             stats["failed"]],
+                    ["searched",            stats["searched"]],
+                    ["id unresolved",       _unresolved],
+                    ["skipped recent",      stats["skipped_recent"]],
+                    ["skipped unacquirable", stats["skipped_unacquirable"]],
+                    ["failed",              stats["failed"]],
                 ],
-                title=f"[PilotSearch] {_prefix}'{instance}' floor-first climb "
+                title=f"[PilotSearch] {_prefix}'{instance}' {_mode} "
                       f"(≤{_climb_ladder[0][1]}p → ≤{_climb_ladder[-1][1]}p)",
-                caption="Within-run floor-first pilot climb: each pilot is searched UP the resolution "
-                        "ladder and grabbed at the LOWEST tier with a release, then left there for the "
-                        "watch-based upgrade path. Stubs whose S01E01 id can't be resolved are deferred "
-                        "(never whole-series searched).",
+                caption="Pilot search: each pilot is grabbed at the LOWEST resolution actually "
+                        "available, then left there for the watch-based upgrade path. With interactive "
+                        "search ON, one manual search per stub reveals all availability — stubs with NO "
+                        "release at any resolution are flagged UNACQUIRABLE and skipped until a new "
+                        "indexer is added or the re-check cooldown elapses. Stubs whose S01E01 id can't "
+                        "be resolved are deferred (never whole-series searched).",
                 descriptions=[
-                    "pilots handed to the background climb worker (grab at lowest available tier)",
+                    "pilots handed to the background search worker (grab at lowest available tier)",
                     "stubs whose S01E01 id stayed unresolved (cache + live miss) → deferred to next run",
                     f"stubs skipped: searched within last {PILOT_SEARCH_INTERVAL_H}h",
+                    "stubs skipped: flagged UNACQUIRABLE (no releases) — re-checks on new-indexer or cooldown",
                     "search or profile-set calls that errored",
                 ],
             )
@@ -4651,6 +4704,137 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                         fut.result()
                     except Exception as e:  # _process_pilot shouldn't raise, but stay defensive
                         self.logger.log_warning(f"[PilotSearch] climb task crashed: {e}")
+
+    @staticmethod
+    def _pilot_unacq_key(instance: str) -> str:
+        """global_cache key for the per-instance UNACQUIRABLE ledger (the background interactive
+        worker writes it; run_pilot_search reads it to gate re-searches)."""
+        return f"sonarr/pilot/unacquirable/{instance}"
+
+    def _spawn_pilot_interactive_worker(self, instance: str, items: list, ladder: list,
+                                        meta: dict, current_indexers: list, floor_res: int,
+                                        recheck_cooldown) -> None:
+        """Spawn the interactive-search pilot worker on a NON-daemon background thread (mirrors
+        :meth:`_spawn_pilot_climb_worker`): it never blocks the pipeline, but the interpreter waits
+        for it on exit so every grab/flag lands. One manual search per stub — far lighter than the
+        tier-by-tier climb it replaces."""
+        import threading
+        items  = [(int(s), int(e)) for s, e in items if s is not None and e is not None]
+        ladder = [(int(p), int(r)) for p, r in ladder if p is not None]
+        if not items or not ladder:
+            return
+        threading.Thread(
+            target=self._pilot_interactive_worker,
+            args=(instance, items, ladder, meta, list(current_indexers), int(floor_res),
+                  recheck_cooldown),
+            name="pilot-interactive-search", daemon=False,
+        ).start()
+        self.logger.log_info(
+            f"[PilotSearch] Interactive search started for {len(items)} pilot(s) across up to "
+            f"{min(self.JIT_SEARCH_MAX_WORKERS, len(items))} parallel worker(s) — one manual search "
+            f"each: grab the lowest available resolution, or flag UNACQUIRABLE if nothing is found."
+        )
+
+    def _pilot_interactive_worker(self, instance: str, items: list, ladder: list, meta: dict,
+                                  current_indexers: list, floor_res: int, recheck_cooldown) -> None:
+        """Per stub pilot: ONE Sonarr interactive search (``GET /release?episodeId=``) returns every
+        candidate release with its resolution, so a single call shows BOTH whether anything exists
+        and every resolution that does. The search is used ONLY for availability discovery — set the
+        series to the LOWEST tier that has results (jumping straight past tiers with none — "no SD,
+        no 720, but 1080 → search 1080"; seed low, the watch-based upgrade path raises it later) and
+        fire an ``EpisodeSearch`` so SONARR'S OWN quality + custom-format scoring picks the actual
+        release. We never pick a release ourselves. When the search comes back EMPTY the stub has no
+        release at any resolution → recorded UNACQUIRABLE in the ledger, which stays dead until a new
+        indexer is added or ``recheck_cooldown`` elapses. Replaces the blind climb: one interactive
+        search + one EpisodeSearch at the resolved tier.
+
+        Concurrency mirrors :meth:`_pilot_climb_worker`; outcomes are collected under a lock and the
+        ledger is MERGED once at the end so flags for stubs outside this run are preserved."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading as _threading
+        lock     = _threading.Lock()
+        flagged: dict = {}     # sid → ledger entry (UNACQUIRABLE this run)
+        searched: set = set()  # sid had results + a search was fired → clear any prior flag
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+
+        def _label(sid):
+            m = meta.get(sid) or {}
+            title = (m.get("title") or "").strip()
+            return (f"sonarr/{instance} '{title}' (tvdb-{m.get('tvdb')})"
+                    if title else f"sonarr/{instance} series {sid}")
+
+        def _one(sid, ep_id):
+            label = _label(sid)
+            try:
+                releases = self.sonarr_api._make_request(
+                    instance, f"release?episodeId={ep_id}", fallback=[]) or []
+                pick = choose_lowest_available_tier(releases, ladder, floor_res=floor_res)
+                if pick is None:
+                    m = meta.get(sid) or {}
+                    with lock:
+                        flagged[sid] = {"flagged_at": now_iso, "indexers": list(current_indexers),
+                                        "title": m.get("title"), "tvdb": m.get("tvdb")}
+                    self.logger.log_info(
+                        f"  🚫 Pilot UNACQUIRABLE: {label} — no S01E01 release at ANY resolution "
+                        f"across {len(current_indexers)} indexer(s); blocked until an indexer is "
+                        f"added or the re-check cooldown elapses")
+                    return
+                res, pid = pick
+                # Set the series to the lowest tier with results, then fire an EpisodeSearch — Sonarr's
+                # own quality + custom-format scoring then selects the actual release at that tier. We do
+                # NOT pick a release ourselves; the interactive search is only used to find which
+                # resolution has results (and to jump straight past tiers that have none).
+                if not self._pilot_set_profile(instance, sid, pid):
+                    self.logger.log_warning(
+                        f"  ⚠️ Pilot: {label} profile flip to tier ≤{res}p failed — skipping search")
+                    return
+                cmd = self.sonarr_api._make_request(
+                    instance, "command", method="POST",
+                    payload={"name": "EpisodeSearch", "episodeIds": [ep_id]})
+                if cmd is None:
+                    self.logger.log_warning(f"  ⚠️ Pilot EpisodeSearch POST failed for {label} at ≤{res}p")
+                    return
+                with lock:
+                    searched.add(sid)
+                self.logger.log_info(
+                    f"  🔎 Pilot search: {label} at ≤{res}p (profile {pid}) — lowest resolution with "
+                    f"results; Sonarr's quality + custom-format scoring grabs the best release there")
+            except Exception as e:
+                self.logger.log_warning(f"[PilotSearch] interactive search failed for {label}: {e}")
+
+        if len(items) <= 1:
+            for sid, ep_id in items:
+                _one(sid, ep_id)
+        else:
+            with ThreadPoolExecutor(
+                max_workers=min(self.JIT_SEARCH_MAX_WORKERS, len(items)),
+                thread_name_prefix="pilot-interactive",
+            ) as ex:
+                futures = [ex.submit(_one, sid, ep_id) for sid, ep_id in items]
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        self.logger.log_warning(f"[PilotSearch] interactive task crashed: {e}")
+
+        # Merge outcomes into the UNACQUIRABLE ledger (preserve entries for stubs not in this run):
+        # drop the ones that had results (search fired), (re)flag the ones that came up empty.
+        if self.global_cache is not None and (flagged or searched):
+            try:
+                key = self._pilot_unacq_key(instance)
+                ledger = dict(self.global_cache.get(key) or {})
+                for sid in searched:
+                    ledger.pop(str(sid), None)
+                for sid, entry in flagged.items():
+                    ledger[str(sid)] = entry
+                self.global_cache.set(key, ledger)
+            except Exception as e:
+                self.logger.log_debug(f"[PilotSearch] unacquirable ledger update skipped: {e}")
+        if flagged or searched:
+            self.logger.log_info(
+                f"[PilotSearch] interactive pass: {len(searched)} searched at the lowest available "
+                f"tier (Sonarr CF picks the release), {len(flagged)} flagged UNACQUIRABLE "
+                f"(no releases at any resolution).")
 
     def _get_total_space_gb(self, instance: str) -> float:
         """
