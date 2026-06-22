@@ -432,6 +432,28 @@ class PlexPlaylistBuilderManager(BaseManager):
         membership, _, _, _ = build_universe_maps(self._universe_source(), owned_tmdbs, {})
         return membership
 
+    def _all_collections(self) -> list:
+        """Every Plex collection across ALL library sections, as a flat list of metadata dicts.
+        Collections are PER-SECTION on PMS — the global ``/library/collections`` endpoint returns
+        nothing on modern servers — so iterate ``get_sections()`` and read each section's collections.
+        ``[]`` with no Plex API / on error."""
+        if not self.plex_api:
+            return []
+        try:
+            secs = metadata_items(self.plex_api.get_sections())
+        except Exception:
+            return []
+        out: list = []
+        for s in secs:
+            sid = s.get("key")
+            if sid is None:
+                continue
+            try:
+                out.extend(metadata_items(self.plex_api.get_collections(section_id=sid)))
+            except Exception:
+                continue
+        return out
+
     def _plex_collection_order(self, movie_inventory, owned_movies=None) -> dict:
         """``{tmdb_id: position}`` from the operator's Kometa UNIVERSE Plex collections (read IN
         COLLECTION ORDER). A child film earns a saga index only if it belongs to THIS universe — proven
@@ -444,10 +466,7 @@ class PlexPlaylistBuilderManager(BaseManager):
         rk_to_tmdb = self._inventory_rk_to_tmdb(movie_inventory)
         keys_by_tmdb = movie_universe_keys(owned_movies)           # Radarr universe_name tags (may be empty)
         members = saga_member_sets(self._universe_source())        # tag-free list/bake membership
-        try:
-            cols = metadata_items(self.plex_api.get_collections())
-        except Exception:
-            return {}
+        cols = self._all_collections()
         det = detect_kometa([d.get("title") for d in cols])
         if det["detected"]:
             self.logger.log_info(f"[UniverseOrder] Kometa Defaults detected "
@@ -505,10 +524,7 @@ class PlexPlaylistBuilderManager(BaseManager):
         source — present only to honour a custom Plex curation a Kometa user may have."""
         if not self.plex_api or not tvdb_to_sid:
             return {}, {}
-        try:
-            cols = metadata_items(self.plex_api.get_collections())
-        except Exception:
-            return {}, {}
+        cols = self._all_collections()
         fran_all, time_all, matched = {}, {}, 0
         for d in cols:
             rk = d.get("ratingKey")

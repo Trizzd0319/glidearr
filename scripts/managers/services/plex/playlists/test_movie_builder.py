@@ -61,7 +61,11 @@ def _items(cache, su):
 
 class _FakePlexAPI:
     """Minimal Plex API stub: one universe collection ('Marvel Cinematic Universe') whose
-    children come back IN COLLECTION ORDER (Captain Marvel before Iron Man = saga order)."""
+    children come back IN COLLECTION ORDER (Captain Marvel before Iron Man = saga order).
+    Collections are read PER SECTION, so get_sections() yields one section."""
+    def get_sections(self):
+        return {"MediaContainer": {"Metadata": [{"key": "1", "title": "Movies", "type": "movie"}]}}
+
     def get_collections(self, section_id=None):
         return {"MediaContainer": {"Metadata": [
             {"ratingKey": "c1", "title": "Marvel Cinematic Universe"},
@@ -95,6 +99,8 @@ def test_movie_universe_order_skips_movie_not_tagged_for_that_universe():
     # 'foreign' is a child of the MCU collection but its Radarr universe_name is only 'xmen' →
     # it must NOT inherit an MCU saga index (would mis-order it inside its xmen group).
     class _API:
+        def get_sections(self):
+            return {"MediaContainer": {"Metadata": [{"key": "1", "title": "Movies", "type": "movie"}]}}
         def get_collections(self, section_id=None):
             return {"MediaContainer": {"Metadata": [
                 {"ratingKey": "c1", "title": "Marvel Cinematic Universe"}]}}
@@ -123,6 +129,8 @@ def test_plex_collection_order_excludes_film_not_in_universe_list(monkeypatch):
     # 'foreign' (200) sits in the MCU Plex collection but is NOT in the mcu canonical list → it must
     # not inherit an MCU index (anti-contamination preserved, now via list membership not the tag).
     class _API:
+        def get_sections(self):
+            return {"MediaContainer": {"Metadata": [{"key": "1", "title": "Movies", "type": "movie"}]}}
         def get_collections(self, section_id=None):
             return {"MediaContainer": {"Metadata": [
                 {"ratingKey": "c1", "title": "Marvel Cinematic Universe"}]}}
@@ -151,7 +159,10 @@ def test_tvdb_from_guids_parses_modern_legacy_and_misses():
 class _FakeTVPlexAPI:
     """One universe SHOW collection ('Marvel Cinematic Universe') whose children come back IN
     COLLECTION ORDER (Loki before WandaVision) carrying tvdb Guids; one unowned show + a non-universe
-    collection that must be ignored."""
+    collection that must be ignored. Collections are read PER SECTION → one section."""
+    def get_sections(self):
+        return {"MediaContainer": {"Metadata": [{"key": "2", "title": "TV Shows", "type": "show"}]}}
+
     def get_collections(self, section_id=None):
         return {"MediaContainer": {"Metadata": [
             {"ratingKey": "u1", "title": "Marvel Cinematic Universe"},

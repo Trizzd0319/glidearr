@@ -264,10 +264,14 @@ class PlexAPI:
                              params={"includeGuids": 1}, fallback=fallback)
 
     def get_collections(self, section_id=None, fallback=None):
-        """GET /library/collections — manual + smart collections (optionally one section)."""
-        params = {"sectionId": section_id} if section_id is not None else None
-        return self._request("GET", f"{self.base_url}/library/collections",
-                             params=params, fallback=fallback)
+        """Collections in a library section — ``GET /library/sections/{id}/collections``. Collections
+        are PER-SECTION on PMS; the global ``/library/collections`` endpoint returns nothing on modern
+        servers, so pass a ``section_id`` (the builders iterate sections). Without one it falls back to
+        the global endpoint for back-compat (usually empty)."""
+        if section_id is not None:
+            return self._request("GET", f"{self.base_url}/library/sections/{section_id}/collections",
+                                 fallback=fallback)
+        return self._request("GET", f"{self.base_url}/library/collections", fallback=fallback)
 
     def get_collection_children(self, rating_key, fallback=None, *, include_guids=False):
         """GET /library/collections/{rk}/children — member items of a collection. ``include_guids=True``
