@@ -202,8 +202,13 @@ def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
         # (undated last, debut asc, original order) — a stable, defensible debut order.
         return sorted(members, key=lambda tv: (tv not in debut, debut.get(tv, ""), first_index.get(tv, 0)))
 
-    def _entry(ordered):
-        return {"timeline": True, "movies": [], "shows": list(ordered),
+    def _entry(ordered, tier=0):
+        # ``tier`` is the acquisition-priority class (0 curated/known, 1 owned-stem-derived, 2
+        # auto-generated/unvetted). It ONLY orders which gaps the acquisition fills first — grouping,
+        # retention and the preview see every engaged saga regardless, so an unvetted franchise still
+        # "provides the info" when someone watches into it; it just yields its grab slots to the
+        # curated families (Grey's, One Chicago, …) first.
+        return {"timeline": True, "tier": tier, "movies": [], "shows": list(ordered),
                 "items": [{"media": "show", "tvdb": tv, "rank": i} for i, tv in enumerate(ordered)]}
 
     # The household ENGAGEMENT scope for catalog franchises: tvdbs it OWNS (from the rows) PLUS any
@@ -236,7 +241,7 @@ def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
             continue
         if any(s in catalog_shows for s in shows):           # another catalog franchise already claims a
             continue                                         # member → first-wins (floor before generated)
-        out[k] = _entry(shows)
+        out[k] = _entry(shows, tier=int(entry.get("tier", 0)) if isinstance(entry, dict) else 0)
         catalog_shows.update(shows)
 
     # Layer-1 owned-stem clusters — SKIP any whose members a catalog franchise already covers (the
@@ -245,7 +250,7 @@ def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
     for key, members in clusters.items():
         if any(m in catalog_shows for m in members) or (deny and any(m in deny for m in members)):
             continue
-        out[key] = _entry(_debut_ordered(members))
+        out[key] = _entry(_debut_ordered(members), tier=1)     # owned-stem derived: below curated, above generated
     return out
 
 # Bundled list DEFINITIONS — Kometa's own universe→list map (the IMDb/mdblist lists it builds

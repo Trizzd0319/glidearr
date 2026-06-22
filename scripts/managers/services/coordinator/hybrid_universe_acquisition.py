@@ -28,23 +28,28 @@ from scripts.managers.services.plex.playlists.universe_order import (
 from scripts.support.utilities.decorators.timing import timeit
 
 
-def _flatten_dedup_cap(plan, *, cap):
+def _flatten_dedup_cap(plan, *, cap, tiers=None):
     """``{key: [{media,id,rank}…]}`` → ``(selected, dropped, flat)``. Flatten to ONE globally-ordered
-    list of UNIQUE ``(media, id)`` — ordered by ``(rank, universe-key)`` so it's start-first and
-    deterministic — then cap. A crossover member (a film in two universes) is deduped by the
-    ``(media, id)`` TUPLE BEFORE the cap, so it never double-spends a slot or double-POSTs. PURE."""
+    list of UNIQUE ``(media, id)`` — ordered by ``(tier, rank, universe-key)`` so CURATED/known sagas
+    fill their gaps before auto-generated ones, start-first within each, deterministic on the key —
+    then cap. ``tiers`` = ``{key: priority}`` (0 curated/known, 1 owned-stem-derived, 2 auto-generated;
+    a key missing → 0). A crossover member (a film in two universes) is deduped by the ``(media, id)``
+    TUPLE BEFORE the cap — keeping its lowest-tier (highest-priority) universe — so it never
+    double-spends a slot or double-POSTs. PURE."""
+    tiers = tiers or {}
     items = []
     for key, members in (plan or {}).items():
+        tier = int(tiers.get(key, 0) or 0)
         for m in (members or []):
-            items.append((m.get("rank", 0), str(key), m.get("media"), m.get("id")))
-    items.sort(key=lambda t: (t[0], t[1]))
+            items.append((tier, m.get("rank", 0), str(key), m.get("media"), m.get("id")))
+    items.sort(key=lambda t: (t[0], t[1], t[2]))
     flat, seen = [], set()
-    for rank, key, media, mid in items:
+    for tier, rank, key, media, mid in items:
         ident = (media, mid)
         if mid is None or ident in seen:
             continue
         seen.add(ident)
-        flat.append({"media": media, "id": mid, "rank": rank, "universe": key})
+        flat.append({"media": media, "id": mid, "rank": rank, "universe": key, "tier": tier})
     if cap and cap > 0:
         return flat[:cap], flat[cap:], flat
     return flat, [], flat
@@ -185,7 +190,9 @@ class HybridUniverseAcquisitionManager(BaseManager, ComponentManagerMixin):
         unified = unified_universe_order(source, owned_m, tvdb_to_sid, include_unowned=True)
         plan = universe_acquire_plan(unified, watched_movies, watched_shows)
         cap = int(uni.get("max_per_run", 5) or 0)
-        selected, dropped, flat = _flatten_dedup_cap(plan, cap=cap)
+        tiers = {k: (v.get("tier", 0) if isinstance(v, dict) else 0)
+                 for k, v in (source.get("universes") or {}).items()}      # curated < derived < generated
+        selected, dropped, flat = _flatten_dedup_cap(plan, cap=cap, tiers=tiers)
         if not flat:
             return self._noop("no engaged saga gaps")
         if dropped:

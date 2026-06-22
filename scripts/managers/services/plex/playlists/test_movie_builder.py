@@ -186,9 +186,10 @@ def test_refresh_synthetic_universes_noop_without_cache():
 
 
 def test_tv_franchise_catalog_includes_config_overlay():
-    # the plex.playlists.tv_franchises overlay is merged (and overrides any baked/generated file)
+    # the plex.playlists.tv_franchises overlay is merged (and overrides any baked/generated file), and
+    # an operator-added family is stamped tier 0 (curated — config is trusted, so it acquires first).
     m = _mgr(config={"plex": {"playlists": {"tv_franchises": {"testverse": {"shows": [900001, 900002]}}}}})
-    assert m._tv_franchise_catalog()["testverse"] == {"shows": [900001, 900002]}
+    assert m._tv_franchise_catalog()["testverse"] == {"shows": [900001, 900002], "tier": 0}
 
 
 def test_config_franchise_feeds_synthetic_universe_entry():

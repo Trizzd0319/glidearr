@@ -70,6 +70,18 @@ def test_flatten_caps_and_keeps_the_dropped_tail():
     assert [m["id"] for m in sel] == [0, 1] and len(drop) == 3
 
 
+def test_flatten_fills_curated_tier_before_generated():
+    # a generated saga's rank-0 gap yields to curated sagas' gaps (even higher-rank ones), so known
+    # families (Grey's, the bake) fill first; the unvetted one is deferred, not dropped from the plan.
+    plan = {"tvfran:courage": [{"media": "show", "id": 9, "rank": 0}],     # generated
+            "tvfran:greys":   [{"media": "show", "id": 1, "rank": 5}],     # curated floor
+            "mcu":            [{"media": "movie", "id": 7, "rank": 3}]}    # curated (tier defaults to 0)
+    tiers = {"tvfran:courage": 2, "tvfran:greys": 0}                       # mcu absent → 0
+    sel, drop, _ = hua._flatten_dedup_cap(plan, cap=2, tiers=tiers)
+    assert [(m["media"], m["id"]) for m in sel] == [("movie", 7), ("show", 1)]   # both curated, start-first
+    assert [(m["media"], m["id"]) for m in drop] == [("show", 9)]               # generated deferred last
+
+
 # ── wired run() ─────────────────────────────────────────────────────────────────────
 def test_run_backfills_engaged_saga(monkeypatch):
     monkeypatch.setattr(hua, "ArrGateway", lambda *a, **k: object())

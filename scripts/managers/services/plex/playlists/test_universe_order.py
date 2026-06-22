@@ -353,6 +353,23 @@ def test_tv_franchise_universes_emits_timeline_true_show_entries():
     assert set(out) == {"tvfran:laworder", "tvfran:ncis", "tvfran:911", "tvfran:chicago"}
 
 
+def test_tv_franchise_universes_catalog_tier_from_provenance():
+    # acquisition priority: a curated-floor catalog entry → tier 0 (known), an auto-generated one →
+    # tier 2 (unvetted), so known families fill their gaps before generated ones in _flatten_dedup_cap.
+    rows = [{"title": "Grey's Anatomy", "tvdbId": 1, "year": 2005},
+            {"title": "Courage", "tvdbId": 9, "year": 1999}]
+    catalog = {"greysanatomy":  {"shows": [1, 2], "tier": 0},     # curated floor
+               "couragenoise":  {"shows": [9, 8], "tier": 2}}     # auto-generated
+    out = tv_franchise_universes(rows, catalog)
+    assert out["tvfran:greysanatomy"]["tier"] == 0                # known → high priority
+    assert out["tvfran:couragenoise"]["tier"] == 2                # generated → deprioritized (still emitted)
+
+
+def test_tv_franchise_universes_stem_clusters_are_tier_1():
+    out = tv_franchise_universes(_FAM, catalog={})                # all Layer-1 owned-stem clusters
+    assert out and all(v["tier"] == 1 for v in out.values())      # derived: below curated, above generated
+
+
 def test_tv_franchise_universes_orders_members_by_debut():
     rows = [{"title": "Star Trek: Picard", "tvdbId": 3, "year": 2020},
             {"title": "Star Trek: The Next Generation", "tvdbId": 1, "year": 1987},

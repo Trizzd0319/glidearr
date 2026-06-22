@@ -595,16 +595,25 @@ class PlexPlaylistBuilderManager(BaseManager):
         derive — Grey's↔Station 19↔Private Practice, Buffy↔Angel, … — merged from the baked floor,
         the generated catalog (if present) and the ``plex.playlists.tv_franchises`` config overlay
         (each later source overlays the earlier). ``{}`` when none exist. Shape is
-        ``{franchise_key: {"shows": [tvdb…], "titles": [...]}}``, fed to :func:`tv_franchise_universes`
-        alongside the owned-inventory clusters. Recomputed per call (the files are tiny + a manager
-        is a long-lived singleton, so a stale memo would freeze a regenerated catalog)."""
+        ``{franchise_key: {"shows": [tvdb…], "titles": [...], "tier": int}}``, fed to
+        :func:`tv_franchise_universes` alongside the owned-inventory clusters.
+
+        Each entry carries a ``tier`` for ACQUISITION priority, by KEY provenance (not by which file's
+        data won the merge): a key present in the hand-curated floor OR the config overlay is tier 0
+        (known/trusted — Grey's, One Chicago, …); a key only in the auto-generated Wikidata catalog is
+        tier 2 (unvetted). So a curated family stays prioritized even when the generated catalog also
+        lists it. Recomputed per call (the files are tiny + a manager is a long-lived singleton, so a
+        stale memo would freeze a regenerated catalog)."""
         catalog: dict = {}
+        curated_keys: set = set()
         pkg_dir = os.path.dirname(os.path.abspath(__file__))
         for fname in _TV_FRANCHISE_FILES:
             try:
                 with open(os.path.join(pkg_dir, fname), encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, dict):
+                    if "generated" not in fname:               # the baked floor is hand-curated/trusted
+                        curated_keys.update(data.keys())
                     catalog.update(data)                       # generated overlays the baked floor
             except FileNotFoundError:
                 continue
@@ -613,6 +622,10 @@ class PlexPlaylistBuilderManager(BaseManager):
         overlay = self._pl_cfg().get("tv_franchises", {})
         if isinstance(overlay, dict) and overlay:
             catalog.update(overlay)                            # config overlay wins (no rebuild)
+            curated_keys.update(overlay.keys())                # operator-added → trusted
+        for k, v in catalog.items():                           # stamp acquisition tier by key provenance
+            if isinstance(v, dict):
+                v["tier"] = 0 if k in curated_keys else 2
         return catalog
 
     def _universe_timeline_catalog(self) -> dict:
