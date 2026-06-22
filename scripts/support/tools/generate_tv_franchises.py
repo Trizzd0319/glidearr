@@ -1,26 +1,30 @@
 """
 generate_tv_franchises.py — standalone generator for the TV-franchise catalog.
 ================================================================================
-Builds the Layer-2 cross-named franchise catalog from **Wikidata**, unioning two edges between
-TheTVDB-id-bearing (``P4835``) television series: spin-off (``P2512``) and 'part of the series'
-(``P179`` — so a franchise modelled as shared membership, not a direct spin-off, is still caught).
-Connected components = franchises; members are debut-ordered by inception date (``P571``). Output
-is JSON (PR-reviewable — binary would hide a bad edit) at the catalog path the playlist builder
-loads. The ``P179`` edge has a programming-SLOT over-capture (Christmas-calendar / telenovela
-time-slot nodes); it is guarded by a size cap + a bad-type exclude (see ``franchise_star_edges``).
+Builds the Layer-2 cross-named franchise catalog by UNIONING four edges between TheTVDB-id-bearing
+(``P4835``) television series, from two sources:
+  * **Wikidata** — spin-off (``P2512``) and 'part of the series' (``P179`` — so a franchise modelled as
+    shared membership, not a direct spin-off, is still caught).
+  * **Wikipedia** — co-membership of a ``Category:<X> television series`` subcategory of
+    ``Category:Television series by franchise``, and the article infobox ``related`` / ``spin_offs``
+    links (the strongest CROSS-NAMED signal — Grey's→Station 19, Buffy→Angel — that Wikidata misses).
+Every candidate is still filtered to an actual TVDB-id series before it counts. Connected components =
+franchises; members are debut-ordered by inception date (``P571``). Output is JSON (PR-reviewable —
+binary would hide a bad edit). The ``P179`` edge has a programming-SLOT over-capture (Christmas-calendar
+/ telenovela time-slot nodes); it is guarded by a size cap + a bad-type exclude (see ``franchise_star_edges``).
 
-  python -m scripts.support.tools.generate_tv_franchises [--out PATH] [--min-members N] [--dry-run]
+  python -m scripts.support.tools.generate_tv_franchises [--out PATH] [--min-members N] [--no-wiki] [--no-infobox] [--dry-run]
 
-DIFF-REVIEW the output before committing. Wikidata is openly editable, so a vandalised or
-spurious spin-off edge would inject a bogus franchise; the JSON diff is the guard — this tool
-NEVER auto-commits. The pure graph logic lives in
-``services/plex/playlists/franchise_graph``; this module only does the network fetch + write.
+DIFF-REVIEW the output before committing. Wikidata + Wikipedia are openly editable, so a vandalised or
+spurious edge would inject a bogus franchise; the JSON diff is the guard — this tool NEVER auto-commits.
+The pure graph logic lives in ``services/plex/playlists/franchise_graph``; this module only fetches + writes.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -37,6 +41,10 @@ _WIKI_API = "https://en.wikipedia.org/w/api.php"
 # pages the franchise's shows. Catches cross-named families the Wikidata P2512/P179 edges miss (the
 # member pages are still filtered to actual TVDB-id series before they count — same guard as the others).
 _FRANCHISE_ROOT_CAT = "Category:Television series by franchise"
+# Infobox-television ``related``/``spin_offs`` field → the linked sibling articles. The field value runs
+# to the next ``| param`` or the closing ``}}``; ``_WIKILINK`` pulls the page title before any ``|`` display.
+_INFOBOX_RELATED = re.compile(r"\|\s*(?:related|spin[\s_]?offs?)\s*=\s*(.*?)(?=\n\s*\||\n\s*\}\})", re.S | re.I)
+_WIKILINK = re.compile(r"\[\[\s*([^\]|#<\n]+?)\s*(?:\||\]\])")
 _UA = "glidearr-tv-franchise-gen/1.0 (offline catalog build; contact via project repo)"
 
 # P179 ('part of the series') over-capture guards. The P4835 filter already drops episode/season
@@ -219,34 +227,125 @@ def _resolve_qids_to_tvdb(qids, *, batch: int = 180) -> dict:
     return out
 
 
-def fetch_wikipedia_categories():
-    """Wikipedia ``Category:Television series by franchise`` → ``(edges, nodes)``. Each subcategory is a
-    franchise; its member articles are resolved to TVDB-id series and star-connected (so they union
-    with the Wikidata graph and catch cross-named families P2512/P179 miss)."""
+def _franchise_category_members() -> dict:
+    """``{category_title: [(page_title, qid)…]}`` for every subcategory of the franchise root with ≥2
+    member articles — the shared seed for BOTH the category edge and the infobox edge (fetched once)."""
     subcats = [m["title"] for m in _wiki_members(_FRANCHISE_ROOT_CAT, "subcat")]
-    cat_qids: dict = {}
-    all_qids: set = set()
+    out: dict = {}
     skipped = 0
     for cat in subcats:
         try:
-            qids = [m["qid"] for m in _wiki_members(cat, "page", with_qid=True) if m.get("qid")]
+            ms = [(m["title"], m["qid"]) for m in _wiki_members(cat, "page", with_qid=True) if m.get("qid")]
         except urllib.error.URLError as e:                      # a persistent rate-limit/parse on one
             skipped += 1                                        # category never aborts the whole sweep
             print(f"  wiki category skipped ({cat}): {e}", file=sys.stderr)
             continue
-        if len(qids) >= 2:                                       # a 1-member category can't be a franchise
-            cat_qids[cat] = qids
-            all_qids.update(qids)
+        if len(ms) >= 2:                                         # a 1-member category can't be a franchise
+            out[cat] = ms
         time.sleep(0.3)                                          # be polite to the API
     if skipped:
         print(f"  ({skipped} of {len(subcats)} categories skipped on fetch error)", file=sys.stderr)
-    resolved = _resolve_qids_to_tvdb(sorted(all_qids))
+    return out
+
+
+def fetch_wikipedia_categories(members: dict, resolved: dict):
+    """Category edge: each franchise subcategory's TVDB-resolved members star-connected (so they union
+    with the Wikidata graph and catch cross-named families P2512/P179 miss). ``resolved`` is the shared
+    QID→(tvdb,label,date) map."""
     groups: dict = {}
-    for cat, qids in cat_qids.items():
-        members = [resolved[q] for q in qids if q in resolved]   # TVDB-bearing series only
-        if len(members) >= 2:
-            groups[cat] = {"members": members, "types": set()}
+    for cat, ms in members.items():
+        mem = [resolved[q] for (_, q) in ms if q in resolved]    # TVDB-bearing series only
+        if len(mem) >= 2:
+            groups[cat] = {"members": mem, "types": set()}
     return franchise_star_edges(groups, min_members=2)
+
+
+def _chunks(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def _batch_wikitext(titles) -> dict:
+    """``{article_title: wikitext}`` for up to 50 titles per MediaWiki request."""
+    out: dict = {}
+    for chunk in _chunks(list(titles), 50):
+        d = _wiki_api({"action": "query", "prop": "revisions", "rvprop": "content", "rvslots": "main",
+                       "titles": "|".join(chunk), "formatversion": 2})
+        for p in (d.get("query") or {}).get("pages", []):
+            revs = p.get("revisions") or []
+            content = (((revs[0].get("slots") or {}).get("main") or {}).get("content")) if revs else None
+            if content:
+                out[p.get("title")] = content
+        time.sleep(0.3)
+    return out
+
+
+def _parse_infobox_related(text: str):
+    """Linked article titles from an ``{{Infobox television}}`` ``related`` / ``spin_offs`` field — the
+    page titles (before any ``|`` display text), in order, de-duped.
+
+    >>> _parse_infobox_related("{{Infobox television\\n| related = [[Private Practice (TV series)|"
+    ...   "Private Practice]], [[Station 19]]\\n| genre = Drama\\n}}")
+    ['Private Practice (TV series)', 'Station 19']
+    """
+    seen: list = []
+    for m in _INFOBOX_RELATED.finditer(text or ""):
+        for lk in _WIKILINK.findall(m.group(1)):
+            t = lk.strip()
+            if t and t not in seen:
+                seen.append(t)
+    return seen
+
+
+def _resolve_titles_to_qid(titles) -> dict:
+    """``{input_title: QID}`` via batched pageprops (50/req), following the normalize + redirect maps so
+    a related-link title resolves even when it redirects to the canonical article."""
+    out: dict = {}
+    for chunk in _chunks(list(titles), 50):
+        d = _wiki_api({"action": "query", "prop": "pageprops", "ppprop": "wikibase_item",
+                       "titles": "|".join(chunk), "redirects": 1, "formatversion": 2})
+        q = d.get("query") or {}
+        final = {p.get("title"): (p.get("pageprops") or {}).get("wikibase_item")
+                 for p in q.get("pages", []) if (p.get("pageprops") or {}).get("wikibase_item")}
+        nmap = {n["from"]: n["to"] for n in q.get("normalized", [])}
+        rmap = {r["from"]: r["to"] for r in q.get("redirects", [])}
+        for t in chunk:
+            cur = nmap.get(t, t)
+            cur = rmap.get(cur, cur)
+            if cur in final:
+                out[t] = final[cur]
+        time.sleep(0.3)
+    return out
+
+
+def fetch_infobox_related(members: dict, resolved: dict):
+    """Infobox edge: from each seed series' Wikipedia ``related`` / ``spin_offs`` links → franchise
+    edges (Grey's→Station 19, Buffy→Angel). Seed = the franchise-category members; the shared
+    ``resolved`` map (their QID→tvdb) is EXTENDED with the related titles' ids. Catches sibling links
+    the categories + Wikidata miss."""
+    seed: dict = {}                                              # page_title -> qid
+    for ms in members.values():
+        for (title, qid) in ms:
+            seed.setdefault(title, qid)
+    pairs: list = []                                            # (src_title, related_title)
+    rel_titles: set = set()
+    for title, text in _batch_wikitext(sorted(seed)).items():
+        for lk in _parse_infobox_related(text):
+            pairs.append((title, lk))
+            rel_titles.add(lk)
+    rel_qid = _resolve_titles_to_qid(sorted(rel_titles))        # related title -> qid
+    have = set(resolved)
+    new_qids = sorted({q for q in rel_qid.values() if q and q not in have})
+    res = {**resolved, **(_resolve_qids_to_tvdb(new_qids) if new_qids else {})}
+    edges, nodes = [], {}
+    for src_title, rel_title in pairs:
+        sr = res.get(seed.get(src_title))
+        rr = res.get(rel_qid.get(rel_title))
+        if sr and rr and sr[0] != rr[0]:
+            edges.append((sr[0], rr[0]))
+            for tv, label, date in (sr, rr):
+                nodes.setdefault(tv, {"title": label, "date": date})
+    return edges, nodes
 
 
 def _merge_nodes(dst: dict, src: dict) -> None:
@@ -263,39 +362,50 @@ def _merge_nodes(dst: dict, src: dict) -> None:
                 cur["date"] = meta["date"]
 
 
-def generate(*, min_members: int = 2, deny=None, wiki: bool = True):
+def generate(*, min_members: int = 2, deny=None, wiki: bool = True, infobox: bool = True):
     """Fetch the franchise graph — Wikidata spin-off (P2512) ∪ part-of-the-series (P179) ∪ (when
-    ``wiki``) the Wikipedia ``Television series by franchise`` category tree — and build the catalog.
-    Returns ``(catalog, edges, nodes)``."""
+    ``wiki``) the Wikipedia franchise-category tree ∪ (when ``infobox``) the article infobox
+    ``related``/``spin_offs`` links — and build the catalog. The Wikipedia category members are fetched
+    ONCE and their QIDs resolved ONCE, shared by both Wikipedia edges. Returns ``(catalog, edges, nodes)``."""
     e_spin, n_spin = fetch_p2512()
     e_part, n_part = fetch_p179()
     edges = e_spin + e_part
     nodes = dict(n_part)
     _merge_nodes(nodes, n_spin)
-    if wiki:
-        e_wiki, n_wiki = fetch_wikipedia_categories()
-        edges += e_wiki
-        _merge_nodes(nodes, n_wiki)
+    if wiki or infobox:
+        members = _franchise_category_members()
+        resolved = _resolve_qids_to_tvdb(sorted({q for ms in members.values() for (_, q) in ms}))
+        if wiki:
+            e_wiki, n_wiki = fetch_wikipedia_categories(members, resolved)
+            edges += e_wiki
+            _merge_nodes(nodes, n_wiki)
+        if infobox:
+            e_ib, n_ib = fetch_infobox_related(members, resolved)
+            edges += e_ib
+            _merge_nodes(nodes, n_ib)
     return build_franchises(edges, nodes, min_members=min_members, deny=deny), edges, nodes
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description="Generate the TV-franchise catalog from Wikidata (P2512 + P179) + Wikipedia categories.")
+        description="Generate the TV-franchise catalog from Wikidata (P2512 + P179) + Wikipedia "
+                    "categories + infobox related/spin-off links.")
     ap.add_argument("--out", default=None, help="output JSON path (default: the package catalog file)")
     ap.add_argument("--min-members", type=int, default=2, help="minimum series per franchise")
     ap.add_argument("--no-wiki", action="store_true", help="skip the Wikipedia franchise-category edge")
+    ap.add_argument("--no-infobox", action="store_true", help="skip the Wikipedia infobox related/spin-off edge")
     ap.add_argument("--dry-run", action="store_true", help="print stats only, do not write")
     args = ap.parse_args(argv)
 
     try:
-        catalog, edges, nodes = generate(min_members=args.min_members, wiki=not args.no_wiki)
+        catalog, edges, nodes = generate(min_members=args.min_members,
+                                         wiki=not args.no_wiki, infobox=not args.no_infobox)
     except Exception as e:                                       # network / parse — fail loud, write nothing
         print(f"generation failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
     members = sum(len(v["shows"]) for v in catalog.values())
-    src = "P2512 + P179" + ("" if args.no_wiki else " + Wikipedia categories")
+    src = "P2512 + P179" + ("" if args.no_wiki else " + wiki-cats") + ("" if args.no_infobox else " + infobox")
     print(f"{len(edges)} edges ({src}), {len(nodes)} tvdb series "
           f"-> {len(catalog)} franchises ({members} member series)")
     biggest = sorted(catalog.items(), key=lambda kv: -len(kv[1]["shows"]))[:8]
