@@ -58,6 +58,48 @@ def test_breakdown_handles_no_genre_overlap_and_no_people():
     assert "cast/crew:" not in text                          # people block omitted
 
 
+def test_breakdown_names_profile_reason_and_saga():
+    m = _mgr()
+    elevated = [{
+        "title": "Doctor Strange in the Multiverse of Madness", "score": 78,
+        "type": "movie", "instance": "standard", "is_anime": False,
+        "quality_profile": {"name": "English - UHD Bluray + WEB"},
+        "profile_reason": "score 78 picks up to the 2160p tier",
+        "saga_names": ["Marvel Cinematic Universe"],
+        "evidence": {"matched_genres": [], "source_feed": "trakt_watchlist",
+                     "rating10": None, "votes": None, "year": 2022},
+    }]
+    m._log_elevation_breakdown(elevated, _Scorer())
+    text = "\n".join(m.logger.lines)
+
+    assert "saga: part of Marvel Cinematic Universe" in text
+    assert ("profile: English - UHD Bluray + WEB  (score 78 picks up to the 2160p tier) "
+            "-> standard") in text
+    assert "[anime route]" not in text                       # non-anime title
+    text.encode("cp1252")                                    # ASCII-safe
+
+
+def test_breakdown_flags_anime_route_and_omits_absent_profile_saga():
+    m = _mgr()
+    elevated = [
+        {"title": "Ao no Hako", "score": 40, "type": "show", "instance": "standard",
+         "route_category": "anime", "quality_profile": {"name": "[Anime] Remux-1080p"},
+         "profile_reason": "score 40 picks up to the 1080p tier",
+         "evidence": {"matched_genres": [], "source_feed": "mal_plantowatch",
+                      "rating10": None, "votes": None, "year": 2024}},
+        {"title": "Bare Title Only", "score": 22,
+         "evidence": {"matched_genres": [], "source_feed": "trakt_watchlist",
+                      "rating10": None, "votes": None, "year": 2010}},
+    ]
+    m._log_elevation_breakdown(elevated, _Scorer())
+    text = "\n".join(m.logger.lines)
+
+    assert "[anime route]" in text                           # route_category=anime flagged
+    assert "Bare Title Only  (score 22)" in text
+    # the second title carries no profile/saga keys → those lines are simply omitted (no crash)
+    assert text.count("profile:") == 1 and "saga:" not in text
+
+
 def test_votes_and_feed_humanizers():
     assert AcquisitionManager._fmt_votes(412000) == "412K votes"
     assert AcquisitionManager._fmt_votes(1_500_000) == "1.5M votes"

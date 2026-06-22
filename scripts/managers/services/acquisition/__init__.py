@@ -21,6 +21,10 @@ from scripts.managers.services.acquisition.candidates import CandidateGatherer
 from scripts.managers.services.acquisition.gateway import ArrGateway
 from scripts.managers.services.acquisition.resolver import Resolver
 from scripts.managers.services.acquisition.scorer import AcquisitionScorer
+from scripts.managers.services.plex.playlists.universe_order import (
+    saga_display_name,
+    saga_membership_index,
+)
 from scripts.support.utilities.decorators.timing import timeit
 from datetime import datetime, timezone
 
@@ -493,25 +497,43 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             self.global_cache.get("tautulli/platforms") if self.global_cache else None,
         )
 
+        # Saga attribution: a recommendation add that happens to be a member of an engaged
+        # saga (an MCU film, a One Chicago show) is tagged with its saga so the decision table
+        # and breakdown say WHICH universe it belongs to. Built once from the cached universe
+        # source; empty (and the 'saga' column omitted) when the universe feature is unbuilt.
+        saga_idx = saga_membership_index(
+            self.global_cache.get("plex/playlists/universe_source") if self.global_cache else None)
+        has_saga = bool(saga_idx)
+
         rows, added, would, failed, deferred = [], 0, 0, 0, 0
         elevated: list[dict] = []          # acted-on titles, for the why/elevation breakdown
         new_deferred: list[dict] = []
         for e in selected:
             svc = "sonarr" if e.get("type") == "show" else "radarr"
             gw = gateways.get(svc)
-            why = scorer.reason(e.get("matrix"))   # top score drivers — explains the 4K-eligible ≥70
+            # Top score drivers, with the genre component rendered as the actual matched genre
+            # names (from evidence) rather than a bare "genre 71" score.
+            why = scorer.reason(e.get("matrix"), evidence=e.get("evidence"))
+            # Which saga(s) this title belongs to — full names in the table and the breakdown.
+            # Stamped on `e` so the elevation breakdown can reuse it.
+            saga_names = [saga_display_name(k) for k in self._saga_keys_for(e, saga_idx)]
+            saga_cell = " / ".join(saga_names) if saga_names else "-"
+            e["saga_names"] = saga_names
 
             # No way to reclaim space (deletion not consented/armed) and we're below the
             # pressure band → skip the add entirely. A deferred title would never get its
             # space freed, so pause new acquisition instead of stranding it in *arr.
             if self._acquisition_paused(gw, e.get("instance"), band_cache):
                 skipped["space_full_no_deletion"] = skipped.get("space_full_no_deletion", 0) + 1
-                rows.append([
+                row = [
                     str(e.get("title") or e.get("ext_id"))[:34],
                     e.get("type"), e.get("score"), str(e.get("instance")),
                     (e.get("quality_profile") or {}).get("name"),
                     self._size_str(e), "skipped (full)", why,
-                ])
+                ]
+                if has_saga:
+                    row.insert(2, saga_cell)
+                rows.append(row)
                 continue
 
             under_pressure = False
@@ -545,7 +567,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 would += action == "would-add"
             failed += action == "add-failed"
 
-            rows.append([
+            row = [
                 str(e.get("title") or e.get("ext_id"))[:34],
                 e.get("type"),
                 e.get("score"),
@@ -554,7 +576,10 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 self._size_str(e),
                 action,
                 why,
-            ])
+            ]
+            if has_saga:
+                row.insert(2, saga_cell)
+            rows.append(row)
             self.logger.log_debug(f"[acquire] '{e.get('title')}' matrix={e.get('matrix')}")
             if action in ("added", "would-add", "deferred"):
                 elevated.append(e)
@@ -575,7 +600,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                     added += caction == "added"
                     would += caction == "would-add"
                     failed += caction == "add-failed"
-                    rows.append([
+                    crow = [
                         str(companion.get("title") or companion.get("ext_id"))[:34],
                         "movie", companion.get("score"),
                         f"{companion.get('instance')} [4k]",
@@ -583,7 +608,10 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                         self._size_str(companion),
                         f"{caction} [4k]",
                         why,
-                    ])
+                    ]
+                    if has_saga:
+                        crow.insert(2, saga_cell)
+                    rows.append(crow)
 
         # Persist the new deferrals onto the backlog (live runs only), bounding its length
         # so chronic pressure can't grow it without limit (keep the newest).
@@ -601,9 +629,13 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             )
 
         if rows:
+            headers = ["title", "type", "score", "instance", "profile", "~size", "decision", "why"]
+            if has_saga:
+                headers.insert(2, "saga")
             self.logger.log_table(
-                ["title", "type", "score", "instance", "profile", "~size", "decision", "why"],
-                rows, title="Acquisition decisions",
+                headers, rows, title="Acquisition decisions",
+                caption="Why each candidate was added: score, routed instance/profile, est. size, "
+                        "and the saga it belongs to (if any). Profile reasoning below.",
             )
         else:
             self.logger.log_info("[Acquisition] no new candidates to add.")
@@ -623,6 +655,19 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 self.global_cache.set("acquisition/run_stats", stats)
             except Exception:
                 pass
+
+    @staticmethod
+    def _saga_keys_for(e: dict, saga_idx: dict) -> list:
+        """The saga key(s) this candidate belongs to, via the reverse membership index keyed by
+        (media, native-id). Movies key by tmdbId, shows by tvdbId — exactly the ext_id the resolver
+        resolved. Empty when the title is in no saga (or the index is empty)."""
+        if not saga_idx:
+            return []
+        try:
+            eid = int(e.get("ext_id"))
+        except (TypeError, ValueError):
+            return []
+        return saga_idx.get((e.get("type"), eid), [])
 
     @staticmethod
     def _size_str(e: dict) -> str:
@@ -667,6 +712,22 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             ev = e.get("evidence") or {}
             title = str(e.get("title") or e.get("ext_id"))
             self.logger.log_info(f"  {title}  (score {e.get('score')})")
+
+            # Which saga drove/justifies the add (recommendation adds that are also saga members).
+            sagas = e.get("saga_names") or []
+            if sagas:
+                self.logger.log_info(f"    saga: part of {', '.join(sagas)}")
+
+            # WHY this quality profile was chosen (score->tier / pinned / HD baseline / 4K copy)
+            # and where it routed (instance + anime route, which decides anime profiles/folders).
+            qp = e.get("quality_profile") or {}
+            preason = e.get("profile_reason")
+            if qp.get("name") or preason:
+                anime = " [anime route]" if (e.get("route_category") == "anime"
+                                             or e.get("is_anime")) else ""
+                where = f" -> {e.get('instance')}" if e.get("instance") else ""
+                tail = f"  ({preason})" if preason else ""
+                self.logger.log_info(f"    profile: {qp.get('name')}{tail}{where}{anime}")
 
             mg = ev.get("matched_genres") or []
             if mg:

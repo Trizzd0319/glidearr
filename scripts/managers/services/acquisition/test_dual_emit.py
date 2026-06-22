@@ -131,6 +131,38 @@ def _cfg(policy="both", *, min_score=0):
     }
 
 
+class _CapLogger(_Logger):
+    def __init__(self):
+        self.tables = []
+        self.infos = []
+    def log_info(self, m="", *a, **k): self.infos.append(str(m))
+    def log_table(self, headers, rows, **k): self.tables.append((headers, rows))
+
+
+class _DictCache:
+    def __init__(self, d): self.d = dict(d)
+    def get(self, k, default=None): return self.d.get(k, default)
+    def set(self, k, v): self.d[k] = v
+
+
+def test_decision_table_attributes_saga_and_profile(monkeypatch):
+    """A recommendation add that is ALSO a saga member gets a 'saga' column (short key) in the
+    decision table and a friendly-name + profile-reasoning stanza in the elevation breakdown."""
+    _patch(monkeypatch)
+    src = {"universes": {"mcu": {"timeline": True, "items": [{"media": "movie", "tmdb": 862}]}}}
+    m = _mgr(_cfg("highest_only"))
+    m.logger = _CapLogger()
+    m.global_cache = _DictCache({"plex/playlists/universe_source": src})
+    m.run()
+
+    headers, rows = m.logger.tables[-1]
+    assert "saga" in headers
+    assert rows[0][headers.index("saga")] == "Marvel Cinematic Universe"   # full name in the table
+    text = "\n".join(m.logger.infos)
+    assert "saga: part of Marvel Cinematic Universe" in text       # friendly name in the breakdown
+    assert "profile: UHD-std  (score 87 picks up to the 2160p tier) -> standard" in text
+
+
 def test_both_emits_baseline_then_4k(monkeypatch):
     _patch(monkeypatch)
     _mgr(_cfg("both")).run()
