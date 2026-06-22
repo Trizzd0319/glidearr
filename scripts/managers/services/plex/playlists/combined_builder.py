@@ -56,7 +56,8 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
         tv_watched = {u["safe_user"]: self._watched_for(u.get("tautulli_user_id")) for u in tracked}
         movie_watched = {u["safe_user"]: self._watched_movies_for(u.get("tautulli_user_id")) for u in tracked}
         affinity = {u["safe_user"]: self._user_affinity(u.get("tautulli_username")) for u in tracked}
-        franchise_by_series, series_timeline = self._tv_franchise_maps(owned_eps)
+        # combined playlist: bake leads (prefer_plex=False) so movies + shows interleave on its unified rank.
+        franchise_by_series, series_timeline = self._tv_franchise_maps(owned_eps, prefer_plex=False)
         resume_on, resume_order, resume_weight = self._resume_cfg()
         # The Long Glide always orders by recency, so its watch-recency data is needed whenever
         # mood_lists is on too — not only when the blended-list resume_boost flag is set.

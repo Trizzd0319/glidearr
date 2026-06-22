@@ -4,9 +4,11 @@ from __future__ import annotations
 from scripts.managers.services.plex.playlists.universe_order import (
     apply_universe_timeline,
     build_universe_maps,
+    collection_group_key,
     collection_universe_key,
     detect_kometa,
     franchise_tier,
+    franchise_title_index,
     is_stale,
     merge_movie_orders,
     movie_order_from_children,
@@ -35,6 +37,25 @@ def test_collection_universe_key_matches_kometa_names():
     assert collection_universe_key("X-Men Universe") == "xmen"
     assert collection_universe_key("Some Random Collection") is None
     assert collection_universe_key(None) is None
+
+
+# ── recognise universe + franchise collections (incl. custom-named) ─────────────
+def test_collection_universe_key_strips_trailing_parenthetical():
+    assert collection_universe_key("Arrowverse (Watch Order)") == "arrow"   # custom-named → still arrow
+    assert collection_universe_key("Marvel Cinematic Universe") == "mcu"     # plain still works
+    assert collection_universe_key("Some Random Collection") is None
+
+
+def test_collection_group_key_matches_franchise_collections():
+    idx = franchise_title_index({"ncis": {"shows": [1]}, "walkingdead": {"display": "The Walking Dead"}})
+    assert collection_group_key("Marvel Cinematic Universe", idx) == "mcu"   # universe wins first
+    assert collection_group_key("Arrowverse (Watch Order)", idx) == "arrow"  # suffix-stripped universe
+    assert collection_group_key("One Chicago", idx) == "one chicago"         # curated franchise
+    assert collection_group_key("NCIS", idx) == "ncis"                       # catalog key
+    assert collection_group_key("The Walking Dead", idx) == "walkingdead"    # catalog display name
+    assert collection_group_key("Streaming Collections", idx) is None        # separator → ignored
+    assert collection_group_key("Totally Unknown Show", idx) is None
+    assert collection_group_key("One Chicago", None) is None                 # no index → only universes
 
 
 # ── Kometa Defaults detection from collection titles ────────────────────────────

@@ -564,10 +564,22 @@ def _norm(s) -> str:
     return _YEAR_SUFFIX.sub("", str(s or "").strip()).casefold()
 
 
+_PAREN_SUFFIX = re.compile(r"\s*\([^)]*\)\s*$")     # 'Arrowverse (Watch Order)', 'Father Brown (2013)'
+
+
+def _collection_norm(title) -> str:
+    """A Plex collection title → a bare comparison token: a trailing parenthetical (``(Watch Order)``,
+    ``(2013)``) stripped, then casefolded to alphanumerics only ('One Chicago' → 'onechicago')."""
+    base = _PAREN_SUFFIX.sub("", str(title or "")).strip()
+    return "".join(c for c in base.lower() if c.isalnum())
+
+
 def collection_universe_key(title) -> str | None:
-    """A Plex collection title → its universe key (``"mcu"`` …) or None if it isn't a known
-    universe collection. Comparison is exact (after strip+casefold) against the registry."""
-    return UNIVERSE_COLLECTION_NAMES.get(str(title or "").strip().casefold())
+    """A Plex collection title → its universe key (``"mcu"`` …) or None if it isn't a known universe
+    collection. A trailing parenthetical (e.g. ``(Watch Order)``) is stripped first, then matched
+    exactly (strip+casefold) against the registry — so a custom ``Arrowverse (Watch Order)`` resolves."""
+    base = _PAREN_SUFFIX.sub("", str(title or "")).strip()
+    return UNIVERSE_COLLECTION_NAMES.get(base.casefold())
 
 
 # Kometa Defaults emit canonical "<Word> Collections" SEPARATOR collections (one per default set);
@@ -598,6 +610,33 @@ def detect_kometa(titles) -> dict:
         if k is not None:
             uni.add(k)
     return {"detected": len(seen_sep) >= 2, "separators": sorted(seen_sep), "universe_keys": sorted(uni)}
+
+
+def franchise_title_index(catalog=None, curated=None) -> dict:
+    """``{normalized franchise name → key}`` for matching a Plex FRANCHISE collection title to a known
+    glidearr group. Built from the curated TV-franchise map keys + the franchise/universe catalog keys
+    (and their ``display`` names). First definition wins on a normalized clash. PURE."""
+    idx: dict = {}
+    for k in (curated if curated is not None else CURATED_TV_FRANCHISES):
+        idx.setdefault(_collection_norm(k), k)
+    for k, v in (catalog or {}).items():
+        idx.setdefault(_collection_norm(k), k)
+        disp = v.get("display") if isinstance(v, dict) else None
+        if disp:
+            idx.setdefault(_collection_norm(disp), k)
+    return idx
+
+
+def collection_group_key(title, franchise_index=None) -> str | None:
+    """A Plex collection title → its glidearr group key (universe OR franchise), or None if unknown.
+    A UNIVERSE collection matches the whitelist (trailing parenthetical stripped, so a custom
+    ``Arrowverse (Watch Order)`` resolves to ``arrow``); a FRANCHISE collection matches by normalized
+    name against ``franchise_index`` ({normalized name → key}), so ``One Chicago`` → ``one chicago``
+    and ``NCIS`` → ``ncis``. ``None`` for an unrecognised / separator / streaming collection. PURE."""
+    uk = collection_universe_key(title)
+    if uk is not None:
+        return uk
+    return franchise_index.get(_collection_norm(title)) if franchise_index else None
 
 
 # Reverse of UNIVERSE_COLLECTION_NAMES (key -> a Title-Cased display name), built once. Used by

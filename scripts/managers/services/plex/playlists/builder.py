@@ -44,10 +44,13 @@ from scripts.managers.services.plex.playlists.tv_resolver import (
     watched_episode_recency,
 )
 from scripts.managers.services.plex.playlists.universe_order import (
+    CURATED_TV_FRANCHISES,
     apply_universe_timeline,
     build_universe_maps,
+    collection_group_key,
     collection_universe_key,
     detect_kometa,
+    franchise_title_index,
     franchise_tier,
     is_stale,
     merge_movie_orders,
@@ -123,7 +126,8 @@ class PlexPlaylistBuilderManager(BaseManager):
                            for u in tracked}
         affinity_by_user = {u["safe_user"]: self._user_affinity(u.get("tautulli_username"))
                             for u in tracked}
-        franchise_by_series, series_timeline = self._tv_franchise_maps(owned_eps)
+        # TV-only playlist: let a Kometa user's custom SHOW-collection order lead (prefer_plex).
+        franchise_by_series, series_timeline = self._tv_franchise_maps(owned_eps, prefer_plex=True)
         return self._build_for_users(
             tracked, owned_eps, inventory, resolution_stats, series_scores,
             watched_by_user, series_genres=series_genres, affinity_by_user=affinity_by_user,
@@ -531,11 +535,16 @@ class PlexPlaylistBuilderManager(BaseManager):
         source — present only to honour a custom Plex curation a Kometa user may have."""
         if not self.plex_api or not tvdb_to_sid:
             return {}, {}
+        # Recognise both UNIVERSE collections (Arrowverse, MCU…) and FRANCHISE collections (One Chicago,
+        # NCIS, Doctor Who…) by matching the title to a known glidearr group key — with a trailing
+        # parenthetical stripped, so a custom "Arrowverse (Watch Order)" still resolves to 'arrow'.
+        fidx = franchise_title_index({**self._tv_franchise_catalog(), **self._universe_timeline_catalog()},
+                                     CURATED_TV_FRANCHISES)
         cols = self._all_collections()
         fran_all, time_all, matched = {}, {}, 0
         for d in cols:
             rk = d.get("ratingKey")
-            key = collection_universe_key(d.get("title")) if rk is not None else None
+            key = collection_group_key(d.get("title"), fidx) if rk is not None else None
             if key is None:
                 continue
             try:
@@ -561,16 +570,20 @@ class PlexPlaylistBuilderManager(BaseManager):
                 time_all.update(tmap)
                 matched += 1
         if fran_all:
-            self.logger.log_info(f"[UniverseOrder] {matched} Plex universe SHOW collection(s) → "
+            self.logger.log_info(f"[UniverseOrder] {matched} Plex universe/franchise SHOW collection(s) → "
                                  f"{len(fran_all)} owned series.")
         return fran_all, time_all
 
-    def _tv_franchise_maps(self, owned_eps):
+    def _tv_franchise_maps(self, owned_eps, *, prefer_plex=False):
         """``({series_id: franchise}, {series_id: timeline_index})`` for owned series — the canonical
         merge of the bundled curated TV franchises (One Chicago, Law & Order, …) + the fetched
         universe lists (tvdb→series_id; e.g. Arrowverse / Star Trek TV), delegated to
         ``universe_order.tv_group_maps`` so the playlist builder and the acquisition prefetch read
-        the SAME grouping + order. ``({}, {})`` when the feature is off → per-series fallback."""
+        the SAME grouping + order. ``({}, {})`` when the feature is off → per-series fallback.
+
+        ``prefer_plex`` picks the winner on overlap (mirrors the movie path): the TV-only playlist passes
+        ``True`` so a Kometa user's custom SHOW-collection order LEADS; the COMBINED playlist keeps the
+        default ``False`` so the bake leads (its unified movie+show rank drives the interleave)."""
         if not self._universe_timeline_enabled():
             return {}, {}
         # Regenerate the owned-inventory TV-franchise (tvfran:) entries into the universe-source
@@ -589,17 +602,18 @@ class PlexPlaylistBuilderManager(BaseManager):
             if tv is not None:
                 tvdb_to_sid.setdefault(tv, sid)
         fran, timeline = tv_group_maps(list(seen.items()), self._universe_source(), tvdb_to_sid)
-        # Secondary: honour a Kometa user's custom SHOW-collection order, but ONLY for owned series the
-        # curated/list source didn't already group — the bake/list wins where it has an opinion (mirrors
-        # the movie path's "list wins"), and a series it deliberately air-date-ordered keeps that. Plex's
-        # custom collection order becomes timeline_index for the remaining (gap) series.
+        # Honour a Kometa user's custom SHOW-collection order. prefer_plex=True → it OVERRIDES the
+        # curated/list order for any series in a Plex collection (custom curation wins). prefer_plex=False
+        # → gap-fill only: add series the curated/list source didn't already group, so the bake leads.
         plex_fran, plex_time = self._plex_tv_collection_order(tvdb_to_sid)
         for sid, fkey in plex_fran.items():
-            if sid in fran:
+            if sid in fran and not prefer_plex:
                 continue
             fran[sid] = fkey
             if sid in plex_time:
                 timeline[sid] = plex_time[sid]
+            elif prefer_plex:
+                timeline.pop(sid, None)
         if fran:
             self.logger.log_info(f"[UniverseOrder] {len(set(fran.values()))} TV franchise(s) → "
                                  f"{len(fran)} owned series grouped.")

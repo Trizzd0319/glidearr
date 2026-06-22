@@ -200,6 +200,38 @@ def test_plex_tv_collection_order_orders_owned_series_by_collection():
     # unowned show consumed no position (dense over owned survivors)
 
 
+class _FakeTVFranchiseAPI:
+    """A FRANCHISE show collection ('One Chicago') + a custom-named universe collection
+    ('Arrowverse (Watch Order)') — neither matches the bare universe whitelist."""
+    def get_sections(self):
+        return {"MediaContainer": {"Metadata": [{"key": "2", "title": "TV Shows", "type": "show"}]}}
+
+    def get_collections(self, section_id=None):
+        return {"MediaContainer": {"Metadata": [
+            {"ratingKey": "oc", "title": "One Chicago"},
+            {"ratingKey": "aw", "title": "Arrowverse (Watch Order)"}]}}
+
+    def get_collection_children(self, rk, include_guids=False):
+        if rk == "oc":
+            return {"MediaContainer": {"Metadata": [
+                {"ratingKey": "fire", "Guid": [{"id": "tvdb://500001"}]},
+                {"ratingKey": "pd",   "Guid": [{"id": "tvdb://500002"}]}]}}
+        if rk == "aw":
+            return {"MediaContainer": {"Metadata": [{"ratingKey": "flash", "Guid": [{"id": "tvdb://279121"}]}]}}
+        return {"MediaContainer": {"Metadata": []}}
+
+
+def test_plex_tv_collection_order_recognises_franchise_and_custom_named(monkeypatch):
+    m = _mgr()
+    m.plex_api = _FakeTVFranchiseAPI()
+    monkeypatch.setattr(m, "_tv_franchise_catalog", lambda: {})              # franchise index = curated map only
+    monkeypatch.setattr(m, "_universe_timeline_catalog", lambda: {})
+    tvdb_to_sid = {500001: 1, 500002: 2, 279121: 3}                          # owns Fire, P.D., The Flash
+    fran, timeline = m._plex_tv_collection_order(tvdb_to_sid)
+    assert fran == {1: "one chicago", 2: "one chicago", 3: "arrow"}          # franchise + suffix-stripped universe
+    assert timeline == {1: 0, 2: 1, 3: 0}                                   # collection order, per group
+
+
 def test_plex_tv_collection_order_empty_without_api_or_series():
     assert MoviePlaylistBuilderManager._plex_tv_collection_order(_mgr(), {1: 2}) == ({}, {})  # no plex_api
     m = _mgr(); m.plex_api = _FakeTVPlexAPI()
