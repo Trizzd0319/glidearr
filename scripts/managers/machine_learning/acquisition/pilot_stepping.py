@@ -46,6 +46,23 @@ Public API:
         'target' | 'step_down' | 'at_floor'. Targets the best-that-fits-space ceiling
         (``start_rank``), and descends ONE rung per empty run (availability divert), never above
         the ceiling and never out of the search (a pilot is never abandoned).
+
+INTERACTIVE-SEARCH pilot model (supersedes the blind climb when enabled): ONE manual search
+(GET /release?episodeId=) returns every candidate release with its resolution, so a single call
+reveals (a) whether ANYTHING is available at all and (b) every resolution that IS — no tier-by-tier
+probing. The pure slices for that model:
+  * available_release_resolutions(releases) -> [int]
+        distinct resolutions present, ascending. EMPTY => nothing available anywhere (UNACQUIRABLE).
+  * choose_lowest_available_tier(releases, ladder, *, floor_res=0)
+        the LOWEST available resolution >= floor_res mapped to the lowest ladder tier that covers
+        it -> (resolution, profile_id) | None. Does NO release-level selection — it only decides
+        which resolution to search at; Sonarr's own quality + custom-format scoring picks the
+        actual release once the service sets that profile and fires an EpisodeSearch.
+  * indexer_fingerprint(indexers) -> [int]
+        sorted ids of the interactive-search-enabled indexers (the set whose GROWTH re-opens an
+        UNACQUIRABLE pilot).
+  * pilot_recheck_due(flagged_at, flagged_indexers, now, current_indexers, *, cooldown) -> bool
+        an UNACQUIRABLE pilot stays dead until a NEW indexer appears OR ``cooldown`` has elapsed.
 """
 from __future__ import annotations
 
@@ -204,3 +221,66 @@ def next_pilot_profile_descend(*, start_rank, current_pid, current_rank, last_pi
             return ranked[0]["id"], "at_floor"
         return ranked[min(new_rank, start_rank)]["id"], "step_down"
     return ranked[start_rank]["id"], "target"
+
+
+# ── interactive-search model (one manual search reveals all availability) ──────────────
+def available_release_resolutions(releases) -> list:
+    """Distinct resolutions present in an *arr interactive-search release list, ascending. Reads
+    ``quality.quality.resolution`` off each release; ignores entries with no positive resolution.
+    The interactive search (GET /release?episodeId=) returns EVERY candidate the indexers found, so
+    an EMPTY result here means genuinely nothing is available at any resolution -> UNACQUIRABLE."""
+    res = set()
+    for r in (releases or []):
+        v = (((r or {}).get("quality") or {}).get("quality") or {}).get("resolution")
+        if isinstance(v, (int, float)) and int(v) > 0:
+            res.add(int(v))
+    return sorted(res)
+
+
+def choose_lowest_available_tier(releases, ladder, *, floor_res: int = 0):
+    """The pilot's grab TIER from interactive-search results: the LOWEST available resolution
+    >= ``floor_res`` — the "no SD, no 720, but 1080 -> search 1080" jump. ``ladder`` is
+    ``[(profile_id, max_resolution)]`` ascending; the chosen resolution maps to the lowest tier
+    whose max_resolution covers it (the widest tier if none does). Returns ``(resolution,
+    profile_id)`` or ``None`` when nothing is available (-> UNACQUIRABLE).
+
+    Deliberately does NO release-level selection (no seeders/size/rejected ranking): it ONLY decides
+    which resolution has results. The service then sets that profile and fires an EpisodeSearch so
+    Sonarr's own quality + custom-format scoring picks the actual release. Pure: stdlib only."""
+    avail = [r for r in available_release_resolutions(releases) if r >= floor_res]
+    if not avail:
+        return None
+    res = avail[0]
+    pid = next((p for p, r in ladder if r >= res), (ladder[-1][0] if ladder else None))
+    return res, pid
+
+
+def indexer_fingerprint(indexers) -> list:
+    """Sorted ids of the indexers that feed interactive search — the set whose GROWTH means a
+    previously-empty pilot is worth re-checking. An indexer with ``enableInteractiveSearch`` false
+    can't surface results, so it is excluded; a missing flag is treated as enabled (Sonarr default).
+    Entries without an id are dropped."""
+    out = set()
+    for ix in (indexers or []):
+        if not isinstance(ix, dict) or ix.get("id") is None:
+            continue
+        if ix.get("enableInteractiveSearch", True) is False:
+            continue
+        out.add(int(ix["id"]))
+    return sorted(out)
+
+
+def pilot_recheck_due(flagged_at, flagged_indexers, now, current_indexers, *, cooldown) -> bool:
+    """Whether an UNACQUIRABLE pilot is due for a re-check. It stays DEAD until EITHER a NEW indexer
+    has appeared (``current_indexers`` carries an id not in ``flagged_indexers`` — the catalog grew)
+    OR ``cooldown`` has elapsed since ``flagged_at`` (a release may have been uploaded since). Those
+    are the only two ways a previously-empty search can newly succeed; the weekly clock also self-
+    heals a flag set during a transient indexer outage. Blank/unparseable ``flagged_at`` -> due."""
+    if set(int(i) for i in (current_indexers or [])) - set(int(i) for i in (flagged_indexers or [])):
+        return True
+    if not flagged_at or pd.isna(flagged_at):
+        return True
+    try:
+        return (now - pd.to_datetime(flagged_at, utc=True)) >= cooldown
+    except Exception:
+        return True
