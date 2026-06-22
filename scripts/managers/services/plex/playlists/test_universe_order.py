@@ -5,6 +5,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     apply_universe_timeline,
     build_universe_maps,
     collection_universe_key,
+    franchise_tier,
     is_stale,
     merge_movie_orders,
     movie_order_from_children,
@@ -33,6 +34,30 @@ def test_collection_universe_key_matches_kometa_names():
     assert collection_universe_key("X-Men Universe") == "xmen"
     assert collection_universe_key("Some Random Collection") is None
     assert collection_universe_key(None) is None
+
+
+# ── data-driven floor promotion: tier by curation / cross-validation ────────────
+def test_franchise_tier_curated_is_always_zero():
+    # hand-curated (floor / config overlay) → tier 0 regardless of sources
+    assert franchise_tier(True, None) == 0
+    assert franchise_tier(True, []) == 0
+    assert franchise_tier(True, ["p179"]) == 0
+
+
+def test_franchise_tier_generated_promoted_by_corroboration():
+    # cross-validated by ≥2 independent edges → auto-promoted to the curated tier
+    assert franchise_tier(False, ["p2512", "wiki-cat"]) == 0
+    assert franchise_tier(False, ["p179", "p2512", "infobox"]) == 0
+    # single-source / unvetted generated → tier 2 (deprioritized)
+    assert franchise_tier(False, ["p179"]) == 2
+    assert franchise_tier(False, []) == 2
+    assert franchise_tier(False, None) == 2
+
+
+def test_franchise_tier_threshold_is_tunable():
+    # a stricter bar (require 3 corroborating sources) demotes a 2-source family
+    assert franchise_tier(False, ["p2512", "wiki-cat"], min_sources=3) == 2
+    assert franchise_tier(False, ["p2512", "wiki-cat", "infobox"], min_sources=3) == 0
 
 
 # ── saga key → human label, and id → saga reverse index (acquisition attribution) ─

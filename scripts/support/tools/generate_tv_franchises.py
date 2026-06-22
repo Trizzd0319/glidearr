@@ -362,14 +362,33 @@ def _merge_nodes(dst: dict, src: dict) -> None:
                 cur["date"] = meta["date"]
 
 
+def _stamp_sources(catalog: dict, edge_src: dict) -> None:
+    """Record per-franchise the EDGE SOURCES that corroborate it — ``franchise["sources"]`` = the
+    sorted subset of {p2512, p179, wiki-cat, infobox} whose edges connect its members. The catalog
+    loader PROMOTES a generated family corroborated by ≥2 independent sources to the curated acquisition
+    tier (cross-validation = trust), and the list makes the JSON diff self-documenting for hand-vetting."""
+    tvdb_to_key = {tv: k for k, v in catalog.items() for tv in v["shows"]}
+    acc: dict = {}
+    for src, src_edges in edge_src.items():
+        for (a, b) in src_edges:
+            k = tvdb_to_key.get(a) or tvdb_to_key.get(b)
+            if k:
+                acc.setdefault(k, set()).add(src)
+    for k, v in catalog.items():
+        v["sources"] = sorted(acc.get(k, set()))
+
+
 def generate(*, min_members: int = 2, deny=None, wiki: bool = True, infobox: bool = True):
     """Fetch the franchise graph — Wikidata spin-off (P2512) ∪ part-of-the-series (P179) ∪ (when
     ``wiki``) the Wikipedia franchise-category tree ∪ (when ``infobox``) the article infobox
     ``related``/``spin_offs`` links — and build the catalog. The Wikipedia category members are fetched
-    ONCE and their QIDs resolved ONCE, shared by both Wikipedia edges. Returns ``(catalog, edges, nodes)``."""
+    ONCE and their QIDs resolved ONCE, shared by both Wikipedia edges. Each franchise is stamped with
+    the edge ``sources`` that corroborate it (for the loader's auto-promotion). Returns
+    ``(catalog, edges, nodes)``."""
     e_spin, n_spin = fetch_p2512()
     e_part, n_part = fetch_p179()
     edges = e_spin + e_part
+    edge_src: dict = {"p2512": e_spin, "p179": e_part}
     nodes = dict(n_part)
     _merge_nodes(nodes, n_spin)
     if wiki or infobox:
@@ -378,12 +397,16 @@ def generate(*, min_members: int = 2, deny=None, wiki: bool = True, infobox: boo
         if wiki:
             e_wiki, n_wiki = fetch_wikipedia_categories(members, resolved)
             edges += e_wiki
+            edge_src["wiki-cat"] = e_wiki
             _merge_nodes(nodes, n_wiki)
         if infobox:
             e_ib, n_ib = fetch_infobox_related(members, resolved)
             edges += e_ib
+            edge_src["infobox"] = e_ib
             _merge_nodes(nodes, n_ib)
-    return build_franchises(edges, nodes, min_members=min_members, deny=deny), edges, nodes
+    catalog = build_franchises(edges, nodes, min_members=min_members, deny=deny)
+    _stamp_sources(catalog, edge_src)
+    return catalog, edges, nodes
 
 
 def main(argv=None) -> int:

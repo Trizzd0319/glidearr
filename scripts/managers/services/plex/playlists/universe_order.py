@@ -158,6 +158,17 @@ def stem_franchise_clusters(series_rows, *, deny=None) -> dict:
     return out
 
 
+def franchise_tier(is_curated, sources, min_sources: int = 2) -> int:
+    """Acquisition-priority tier for a TV-franchise catalog entry. 0 when it's hand-curated (the baked
+    floor / config overlay) OR a GENERATED family CROSS-VALIDATED by ≥ ``min_sources`` independent
+    edges (its ``sources`` — e.g. a Wikidata spin-off AND a Wikipedia category agree); else 2
+    (single-source / unvetted generated). This is the data-driven floor promotion: trust scales with
+    corroboration, read straight off the generated catalog. PURE."""
+    if is_curated:
+        return 0
+    return 0 if len(sources or []) >= int(min_sources) else 2
+
+
 def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
                            deny_tvdbs=None, cluster_same_stem=True) -> dict:
     """Synthetic ``tvfran:`` universe-source entries — the SINGLE seam that makes discovered TV

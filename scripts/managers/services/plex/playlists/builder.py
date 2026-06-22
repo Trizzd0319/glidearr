@@ -47,6 +47,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     apply_universe_timeline,
     build_universe_maps,
     collection_universe_key,
+    franchise_tier,
     is_stale,
     merge_movie_orders,
     movie_order_from_children,
@@ -598,11 +599,13 @@ class PlexPlaylistBuilderManager(BaseManager):
         ``{franchise_key: {"shows": [tvdb…], "titles": [...], "tier": int}}``, fed to
         :func:`tv_franchise_universes` alongside the owned-inventory clusters.
 
-        Each entry carries a ``tier`` for ACQUISITION priority, by KEY provenance (not by which file's
-        data won the merge): a key present in the hand-curated floor OR the config overlay is tier 0
-        (known/trusted — Grey's, One Chicago, …); a key only in the auto-generated Wikidata catalog is
-        tier 2 (unvetted). So a curated family stays prioritized even when the generated catalog also
-        lists it. Recomputed per call (the files are tiny + a manager is a long-lived singleton, so a
+        Each entry carries a ``tier`` for ACQUISITION priority. A key in the hand-curated floor OR the
+        config overlay is tier 0 (known/trusted — Grey's, One Chicago, …). A GENERATED family is
+        auto-PROMOTED to tier 0 when it's cross-validated by ≥ ``tv_franchise_promote_min_sources``
+        (default 2) independent edges (its ``sources`` list — e.g. a Wikidata spin-off AND a Wikipedia
+        category agree); a single-source generated family stays tier 2 (unvetted). So the floor
+        promotion is automatic + data-driven off the generated catalog — read it when present, ignore it
+        when absent. Recomputed per call (the files are tiny + a manager is a long-lived singleton, so a
         stale memo would freeze a regenerated catalog)."""
         catalog: dict = {}
         curated_keys: set = set()
@@ -623,9 +626,13 @@ class PlexPlaylistBuilderManager(BaseManager):
         if isinstance(overlay, dict) and overlay:
             catalog.update(overlay)                            # config overlay wins (no rebuild)
             curated_keys.update(overlay.keys())                # operator-added → trusted
-        for k, v in catalog.items():                           # stamp acquisition tier by key provenance
-            if isinstance(v, dict):
-                v["tier"] = 0 if k in curated_keys else 2
+        try:
+            min_src = int(self._pl_cfg().get("tv_franchise_promote_min_sources", 2))
+        except (TypeError, ValueError):
+            min_src = 2
+        for k, v in catalog.items():                           # acquisition tier: curated, or auto-promote
+            if isinstance(v, dict):                            # a cross-validated generated family to tier 0
+                v["tier"] = franchise_tier(k in curated_keys, v.get("sources"), min_src)
         return catalog
 
     def _universe_timeline_catalog(self) -> dict:
