@@ -873,17 +873,45 @@ def run_franchise_catalog(cfg: dict, dry_run: bool) -> None:
     if dry_run:
         log.info(f"  [franchise] catalog stale (>{ttl_days:.0f}d) — would spawn a detached regen (dry-run).")
         return
+    # Output → a log file (not DEVNULL) so a failed/rate-limited regen is diagnosable.
+    log_path: Path | None = _REPO_ROOT / "scripts" / "support" / "logs" / "franchise_regen.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logf = open(log_path, "a", encoding="utf-8")
+    except OSError:
+        logf, log_path = subprocess.DEVNULL, None
     kwargs: dict = {"cwd": str(_REPO_ROOT), "stdin": subprocess.DEVNULL,
-                    "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+                    "stdout": logf, "stderr": subprocess.STDOUT, "close_fds": True}
+    # DETACHED + broken out of the launcher's Job Object so the regen OUTLIVES a daemon restart.
+    # A main.py run calls supervisor.restart(), which stops THIS daemon; without breakaway the
+    # in-flight regen (a child of the daemon) is reaped with it and a long rate-limited rebuild can
+    # NEVER finish — it restarts from scratch every cycle. Mirrors the supervisor's own daemon spawn,
+    # with the same OSError fallback for launchers whose job forbids breakaway.
+    base = breakaway = 0
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008   # DETACHED_PROCESS (no console)
+        base = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        breakaway = subprocess.CREATE_BREAKAWAY_FROM_JOB
     else:
         kwargs["start_new_session"] = True
+    cmd = [sys.executable, "-m", "scripts.support.tools.generate_tv_franchises"]
+
+    def _spawn(extra_flags: int):
+        kw = dict(kwargs)
+        if os.name == "nt":
+            kw["creationflags"] = base | extra_flags
+        return subprocess.Popen(cmd, **kw)
+
     try:
-        proc = subprocess.Popen([sys.executable, "-m", "scripts.support.tools.generate_tv_franchises"], **kwargs)
+        try:
+            proc = _spawn(breakaway)
+        except OSError:
+            proc = _spawn(0)                                    # job forbids breakaway — still detached
     except Exception as e:
         log.warning(f"[franchise] could not spawn regen: {e}")
         return
+    finally:
+        if hasattr(logf, "close"):                             # child inherited its own dup; close ours
+            logf.close()
     state["gen_pid"] = proc.pid
     state["last_attempt_ts"] = now
     try:
@@ -892,7 +920,8 @@ def run_franchise_catalog(cfg: dict, dry_run: bool) -> None:
     except OSError:
         pass
     log.info(f"  [franchise] catalog stale (>{ttl_days:.0f}d) — spawned detached regen (pid {proc.pid}); "
-             f"it grinds through Wikidata/Wikipedia rate limits in the background, no cycle impact.")
+             f"grinds through Wikidata/Wikipedia rate limits in the background, no cycle impact"
+             + (f"; logging to {log_path}." if log_path else "."))
 
 
 def run_cycle(cfg: dict, loader: ConfigLoader, cursor: dict, dry_run: bool,
