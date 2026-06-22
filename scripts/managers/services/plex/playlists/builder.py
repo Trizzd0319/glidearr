@@ -413,15 +413,22 @@ class PlexPlaylistBuilderManager(BaseManager):
                                  f"({len(universes)} cached).")
         return {"universes": universes}
 
-    def _movie_universe_order(self, movie_inventory, owned_movies=None) -> dict:
-        """``{tmdb_id: position}`` saga order — MERGED from the mdblist universe lists (primary,
-        self-updating) + the operator's Kometa universe Plex collections (if present). ``{}`` when
-        the feature is off → callers degrade to release date."""
+    def _movie_universe_order(self, movie_inventory, owned_movies=None, *, prefer_plex=False) -> dict:
+        """``{tmdb_id: position}`` saga order — MERGED from the mdblist/chronolist universe order + the
+        operator's Kometa universe Plex collections. ``{}`` when the feature is off → release date.
+
+        ``prefer_plex`` picks the winner on overlap. The MOVIE-only playlist passes ``True`` so a Kometa
+        user's hand-curated COLLECTION order leads. The COMBINED (movie+show) playlist keeps the default
+        ``False`` so the chronolist bake leads — the bake is the only source with a UNIFIED movie+show
+        rank, and a movies-only collection order winning there would bunch all films ahead of the shows."""
         if not self._universe_timeline_enabled():
             return {}
         owned_tmdbs = {t for m in (owned_movies or []) if (t := _to_int(m.get("tmdb_id"))) is not None}
         _, list_order, _, _ = build_universe_maps(self._universe_source(), owned_tmdbs, {})
-        return {**self._plex_collection_order(movie_inventory, owned_movies), **list_order}  # list wins
+        plex_order = self._plex_collection_order(movie_inventory, owned_movies)
+        if prefer_plex:
+            return {**list_order, **plex_order}        # Kometa Plex-collection curation wins
+        return {**plex_order, **list_order}            # bake/list wins (interleave-safe)
 
     def _movie_universe_membership(self, owned_movies=None) -> dict:
         """``{tmdb_id: set(universe_keys)}`` GROUPING from the fetched universe lists — forms a

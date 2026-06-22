@@ -57,7 +57,8 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                             for u in tracked} if resume_on else {})
         return self._build_for_users(tracked, owned, inventory, watched_by_user, affinity_by_user,
                                      csm_ages=self._movie_csm_ages(),
-                                     universe_order=self._movie_universe_order(inventory, owned),
+                                     universe_order=self._movie_universe_order(inventory, owned,
+                                                                               prefer_plex=True),
                                      universe_membership=self._movie_universe_membership(owned),
                                      resume_boost=resume_on, resume_order=resume_order,
                                      resume_weight=resume_weight, recency_by_user=recency_by_user)

@@ -113,6 +113,19 @@ def test_movie_universe_order_skips_movie_not_tagged_for_that_universe():
     assert m._movie_universe_order(inv, owned) == {100: 0}              # xmen-only film excluded
 
 
+# ── precedence: prefer_plex flips Kometa collection order ahead of the bake ──────
+def test_movie_universe_order_prefer_plex_flips_precedence(monkeypatch):
+    m = _mgr(config=_ON)
+    m.plex_api = _FakePlexAPI()                                          # MCU collection [cm, iron]
+    inv = {"603": {"rating_key": "iron"}, "604": {"rating_key": "cm"}}
+    owned = [{"tmdb_id": 603}, {"tmdb_id": 604}]                         # no tags → list membership guard
+    # bake orders them the OTHER way (iron=0, cm=1) so the winner is visible
+    monkeypatch.setattr(m, "_universe_source",
+                        lambda: {"universes": {"mcu": {"timeline": True, "movies": [603, 604], "shows": []}}})
+    assert m._movie_universe_order(inv, owned) == {603: 0, 604: 1}                    # bake wins (default)
+    assert m._movie_universe_order(inv, owned, prefer_plex=True) == {604: 0, 603: 1}  # Plex collection wins
+
+
 # ── movie reader works tag-free (Kometa users with no Radarr universe_name tags) ──
 def test_plex_collection_order_works_without_radarr_tags(monkeypatch):
     m = _mgr(config=_ON)

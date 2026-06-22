@@ -69,6 +69,8 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
             tracked, owned_eps, owned_movies, tv_inv, movie_inv, series_scores, series_genres,
             series_certs, jit_by_user, tv_watched, movie_watched, affinity,
             series_csm_ages=self._series_csm_ages(), movie_csm_ages=self._movie_csm_ages(),
+            # bake leads here (prefer_plex=False): the combined playlist interleaves movies + shows on
+            # the bake's unified rank — a movies-only Plex-collection order winning would break that.
             universe_order=self._movie_universe_order(movie_inv, owned_movies),
             universe_membership=self._movie_universe_membership(owned_movies),
             franchise_by_series=franchise_by_series, series_timeline=series_timeline,
