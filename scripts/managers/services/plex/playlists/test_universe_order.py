@@ -5,6 +5,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     apply_universe_timeline,
     build_universe_maps,
     collection_universe_key,
+    detect_kometa,
     franchise_tier,
     is_stale,
     merge_movie_orders,
@@ -34,6 +35,22 @@ def test_collection_universe_key_matches_kometa_names():
     assert collection_universe_key("X-Men Universe") == "xmen"
     assert collection_universe_key("Some Random Collection") is None
     assert collection_universe_key(None) is None
+
+
+# ── Kometa Defaults detection from collection titles ────────────────────────────
+def test_detect_kometa_from_separator_titles():
+    titles = ["Universe Collections", "Streaming Collections", "Ratings Collections",
+              "Marvel Cinematic Universe", "Star Wars Universe", "My Random Collection"]
+    d = detect_kometa(titles)
+    assert d["detected"] is True
+    assert len(d["separators"]) == 3 and "universe collections" in d["separators"]
+    assert d["universe_keys"] == ["mcu", "star"]                 # recognised universe collections
+
+
+def test_detect_kometa_needs_two_separators():
+    assert detect_kometa(["Universe Collections", "Marvel Cinematic Universe"])["detected"] is False
+    assert detect_kometa([])["detected"] is False
+    assert detect_kometa(["Some Collection", "Another"])["detected"] is False
 
 
 # ── data-driven floor promotion: tier by curation / cross-validation ────────────

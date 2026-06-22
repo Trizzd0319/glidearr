@@ -47,11 +47,13 @@ from scripts.managers.services.plex.playlists.universe_order import (
     apply_universe_timeline,
     build_universe_maps,
     collection_universe_key,
+    detect_kometa,
     franchise_tier,
     is_stale,
     merge_movie_orders,
     movie_order_from_children,
     movie_universe_keys,
+    saga_member_sets,
     series_order_from_children,
     split_list_media,
     tv_franchise_universes,
@@ -432,17 +434,25 @@ class PlexPlaylistBuilderManager(BaseManager):
 
     def _plex_collection_order(self, movie_inventory, owned_movies=None) -> dict:
         """``{tmdb_id: position}`` from the operator's Kometa UNIVERSE Plex collections (read IN
-        COLLECTION ORDER), gated to movies whose ``universe_name`` matches the collection's universe
-        (anti-contamination). ``{}`` with no Plex API / no movie inventory. Secondary to the list
-        source — present only to honour a custom Plex curation a Kometa user may have."""
+        COLLECTION ORDER). A child film earns a saga index only if it belongs to THIS universe — proven
+        by its Radarr ``universe_name`` tag OR (tag-free) by membership in the universe's canonical
+        list/bake — so a Kometa user with ZERO universe tags still gets ordering, while a film mis-filed
+        in the wrong Plex collection is excluded (it's in another universe's list). ``{}`` with no Plex
+        API / no movie inventory. Secondary to the list source — honours a custom Plex curation."""
         if not self.plex_api or not movie_inventory:
             return {}
         rk_to_tmdb = self._inventory_rk_to_tmdb(movie_inventory)
-        keys_by_tmdb = movie_universe_keys(owned_movies)
+        keys_by_tmdb = movie_universe_keys(owned_movies)           # Radarr universe_name tags (may be empty)
+        members = saga_member_sets(self._universe_source())        # tag-free list/bake membership
         try:
             cols = metadata_items(self.plex_api.get_collections())
         except Exception:
             return {}
+        det = detect_kometa([d.get("title") for d in cols])
+        if det["detected"]:
+            self.logger.log_info(f"[UniverseOrder] Kometa Defaults detected "
+                                 f"({len(det['separators'])} separator collection(s); "
+                                 f"{len(det['universe_keys'])} universe collection(s) recognised).")
         orders, matched = [], 0
         for d in cols:
             rk = d.get("ratingKey")
@@ -456,7 +466,11 @@ class PlexPlaylistBuilderManager(BaseManager):
             except Exception:
                 continue
             child_rks = [str(c.get("ratingKey")) for c in kids if c.get("ratingKey") is not None]
+            # Belong-to-this-universe guard, tag-free: the Radarr ``universe_name`` tag (if any) UNIONed
+            # with the universe's canonical list membership — so a tag-less Kometa install still orders,
+            # and a film in the wrong Plex collection is still excluded (it's not in THIS universe's list).
             allowed = {t for t, ks in keys_by_tmdb.items() if key in ks}
+            allowed |= set((members.get(key) or {}).get("movies") or {})
             order = movie_order_from_children(child_rks, rk_to_tmdb, allowed_tmdbs=allowed)
             if order:
                 orders.append(order)

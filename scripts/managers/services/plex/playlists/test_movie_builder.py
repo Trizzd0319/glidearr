@@ -107,6 +107,36 @@ def test_movie_universe_order_skips_movie_not_tagged_for_that_universe():
     assert m._movie_universe_order(inv, owned) == {100: 0}              # xmen-only film excluded
 
 
+# ── movie reader works tag-free (Kometa users with no Radarr universe_name tags) ──
+def test_plex_collection_order_works_without_radarr_tags(monkeypatch):
+    m = _mgr(config=_ON)
+    m.plex_api = _FakePlexAPI()                                          # MCU collection: [cm, iron]
+    inv = {"603": {"rating_key": "iron"}, "604": {"rating_key": "cm"}}
+    owned = [{"tmdb_id": 603}, {"tmdb_id": 604}]                         # NO universe_name tags
+    monkeypatch.setattr(m, "_universe_source",
+                        lambda: {"universes": {"mcu": {"movies": [604, 603], "shows": []}}})
+    # tag-free anti-contamination via list membership → collection order cm(604)=0, iron(603)=1
+    assert m._plex_collection_order(inv, owned) == {604: 0, 603: 1}
+
+
+def test_plex_collection_order_excludes_film_not_in_universe_list(monkeypatch):
+    # 'foreign' (200) sits in the MCU Plex collection but is NOT in the mcu canonical list → it must
+    # not inherit an MCU index (anti-contamination preserved, now via list membership not the tag).
+    class _API:
+        def get_collections(self, section_id=None):
+            return {"MediaContainer": {"Metadata": [
+                {"ratingKey": "c1", "title": "Marvel Cinematic Universe"}]}}
+        def get_collection_children(self, rk):
+            return {"MediaContainer": {"Metadata": [{"ratingKey": "real"}, {"ratingKey": "foreign"}]}}
+    m = _mgr(config=_ON)
+    m.plex_api = _API()
+    inv = {"100": {"rating_key": "real"}, "200": {"rating_key": "foreign"}}
+    owned = [{"tmdb_id": 100}, {"tmdb_id": 200}]                         # no tags
+    monkeypatch.setattr(m, "_universe_source",
+                        lambda: {"universes": {"mcu": {"movies": [100], "shows": []}}})  # only 100 is MCU
+    assert m._plex_collection_order(inv, owned) == {100: 0}              # foreign(200) excluded
+
+
 # ── TV: Plex SHOW-collection order reader (Phase 1b parity with the movie reader) ──
 def test_tvdb_from_guids_parses_modern_legacy_and_misses():
     f = MoviePlaylistBuilderManager._tvdb_from_guids

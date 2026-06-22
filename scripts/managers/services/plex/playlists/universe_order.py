@@ -570,6 +570,36 @@ def collection_universe_key(title) -> str | None:
     return UNIVERSE_COLLECTION_NAMES.get(str(title or "").strip().casefold())
 
 
+# Kometa Defaults emit canonical "<Word> Collections" SEPARATOR collections (one per default set);
+# their presence is a reliable fingerprint of a Kometa-managed library — kometa.wiki defaults/separators.
+_KOMETA_SEPARATORS = frozenset({
+    "universe collections", "streaming collections", "ratings collections", "resolution collections",
+    "content rating collections", "genre collections", "network collections", "studio collections",
+    "franchise collections", "country collections", "decade collections", "year collections",
+    "award collections", "based on collections", "director collections", "producer collections",
+    "writer collections", "actor collections", "seasonal collections", "audio language collections",
+    "subtitle language collections",
+})
+
+
+def detect_kometa(titles) -> dict:
+    """Heuristic Kometa-Defaults detection from Plex collection titles alone: Kometa emits canonical
+    ``"<Word> Collections"`` SEPARATOR collections, and ≥2 distinct ones ⇒ a Defaults install. Returns
+    ``{"detected": bool, "separators": [...], "universe_keys": [...]}`` — the recognised universe keys
+    come from :func:`collection_universe_key`. Lets the Plex-collection readers note that an operator's
+    universes are Kometa-managed. PURE."""
+    seen_sep: set = set()
+    uni: set = set()
+    for t in titles or []:
+        norm = str(t or "").strip().casefold()
+        if norm in _KOMETA_SEPARATORS:
+            seen_sep.add(norm)
+        k = collection_universe_key(t)
+        if k is not None:
+            uni.add(k)
+    return {"detected": len(seen_sep) >= 2, "separators": sorted(seen_sep), "universe_keys": sorted(uni)}
+
+
 # Reverse of UNIVERSE_COLLECTION_NAMES (key -> a Title-Cased display name), built once. Used by
 # the acquisition logs to print 'Marvel Cinematic Universe' instead of the bare 'mcu' key.
 _UNIVERSE_KEY_TO_NAME = {v: k.title() for k, v in UNIVERSE_COLLECTION_NAMES.items()}
