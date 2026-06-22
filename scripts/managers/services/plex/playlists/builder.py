@@ -52,6 +52,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     merge_movie_orders,
     movie_order_from_children,
     movie_universe_keys,
+    series_order_from_children,
     split_list_media,
     tv_franchise_universes,
     tv_group_maps,
@@ -466,6 +467,67 @@ class PlexPlaylistBuilderManager(BaseManager):
                                  f"{len(merged)} owned movie(s).")
         return merged
 
+    @staticmethod
+    def _tvdb_from_guids(item) -> int | None:
+        """tvdb id from a Plex item's external ``Guid[]`` (FREE parse, no Discover hop) — handles the
+        modern ``tvdb://12345`` and the legacy ``com.plexapp.agents.thetvdb://12345?lang=en`` agent
+        forms; ``None`` for a non-tvdb / bare ``plex://`` item (it simply won't get a saga position)."""
+        cands = [g.get("id", "") for g in (item.get("Guid") or []) if isinstance(g, dict)]
+        cands.append(item.get("guid", "") or "")
+        for gid in cands:
+            if "tvdb" not in gid:
+                continue
+            tail = gid.rsplit("/", 1)[-1].split("?", 1)[0]     # 12345 (modern + legacy agent form)
+            if tail.isdigit():
+                return int(tail)
+        return None
+
+    def _plex_tv_collection_order(self, tvdb_to_sid):
+        """``({series_id: franchise}, {series_id: position})`` from the operator's Kometa UNIVERSE
+        SHOW collections (read IN COLLECTION ORDER) — the TV analogue of :meth:`_plex_collection_order`.
+        Owned episodes are Sonarr-sourced (no Plex show ratingKey), so each child show is joined to a
+        ``series_id`` by free-parsing its tvdb from the Plex ``Guid[]`` and looking it up in
+        ``tvdb_to_sid``. ``({}, {})`` with no Plex API / no owned series. Secondary to the curated/list
+        source — present only to honour a custom Plex curation a Kometa user may have."""
+        if not self.plex_api or not tvdb_to_sid:
+            return {}, {}
+        try:
+            cols = metadata_items(self.plex_api.get_collections())
+        except Exception:
+            return {}, {}
+        fran_all, time_all, matched = {}, {}, 0
+        for d in cols:
+            rk = d.get("ratingKey")
+            key = collection_universe_key(d.get("title")) if rk is not None else None
+            if key is None:
+                continue
+            try:
+                kids = metadata_items(self.plex_api.get_collection_children(rk, include_guids=True))
+            except Exception:
+                continue
+            ordered, rk_to_sid = [], {}
+            for c in kids:
+                crk = c.get("ratingKey")
+                if crk is None:
+                    continue
+                crk = str(crk)
+                ordered.append(crk)
+                tvdb = self._tvdb_from_guids(c)
+                sid = tvdb_to_sid.get(tvdb) if tvdb is not None else None
+                if sid is not None:
+                    rk_to_sid[crk] = sid
+            if not rk_to_sid:
+                continue                                       # a MOVIE universe collection → no shows matched
+            fran, tmap = series_order_from_children(ordered, rk_to_sid, key, with_timeline=True)
+            if fran:
+                fran_all.update(fran)
+                time_all.update(tmap)
+                matched += 1
+        if fran_all:
+            self.logger.log_info(f"[UniverseOrder] {matched} Plex universe SHOW collection(s) → "
+                                 f"{len(fran_all)} owned series.")
+        return fran_all, time_all
+
     def _tv_franchise_maps(self, owned_eps):
         """``({series_id: franchise}, {series_id: timeline_index})`` for owned series — the canonical
         merge of the bundled curated TV franchises (One Chicago, Law & Order, …) + the fetched
@@ -490,6 +552,17 @@ class PlexPlaylistBuilderManager(BaseManager):
             if tv is not None:
                 tvdb_to_sid.setdefault(tv, sid)
         fran, timeline = tv_group_maps(list(seen.items()), self._universe_source(), tvdb_to_sid)
+        # Secondary: honour a Kometa user's custom SHOW-collection order, but ONLY for owned series the
+        # curated/list source didn't already group — the bake/list wins where it has an opinion (mirrors
+        # the movie path's "list wins"), and a series it deliberately air-date-ordered keeps that. Plex's
+        # custom collection order becomes timeline_index for the remaining (gap) series.
+        plex_fran, plex_time = self._plex_tv_collection_order(tvdb_to_sid)
+        for sid, fkey in plex_fran.items():
+            if sid in fran:
+                continue
+            fran[sid] = fkey
+            if sid in plex_time:
+                timeline[sid] = plex_time[sid]
         if fran:
             self.logger.log_info(f"[UniverseOrder] {len(set(fran.values()))} TV franchise(s) → "
                                  f"{len(fran)} owned series grouped.")

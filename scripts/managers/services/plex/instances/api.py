@@ -269,10 +269,13 @@ class PlexAPI:
         return self._request("GET", f"{self.base_url}/library/collections",
                              params=params, fallback=fallback)
 
-    def get_collection_children(self, rating_key, fallback=None):
-        """GET /library/collections/{rk}/children — member items of a collection."""
+    def get_collection_children(self, rating_key, fallback=None, *, include_guids=False):
+        """GET /library/collections/{rk}/children — member items of a collection. ``include_guids=True``
+        adds ``includeGuids=1`` so each child carries its external ``Guid[]`` (needed to free-parse a
+        show's tvdb when the inventory doesn't already pair its Plex ratingKey)."""
+        params = {"includeGuids": 1} if include_guids else None
         return self._request("GET", f"{self.base_url}/library/collections/{rating_key}/children",
-                             fallback=fallback)
+                             params=params, fallback=fallback)
 
     def get_playlists(self, token: str | None = None, fallback=None):
         """GET /playlists — all playlists (we keep only video playlists). ``token`` scopes the

@@ -107,6 +107,51 @@ def test_movie_universe_order_skips_movie_not_tagged_for_that_universe():
     assert m._movie_universe_order(inv, owned) == {100: 0}              # xmen-only film excluded
 
 
+# ── TV: Plex SHOW-collection order reader (Phase 1b parity with the movie reader) ──
+def test_tvdb_from_guids_parses_modern_legacy_and_misses():
+    f = MoviePlaylistBuilderManager._tvdb_from_guids
+    assert f({"Guid": [{"id": "tvdb://12345"}]}) == 12345
+    assert f({"Guid": [{"id": "imdb://tt1"}, {"id": "tvdb://77"}]}) == 77        # picks the tvdb one
+    assert f({"guid": "com.plexapp.agents.thetvdb://9001?lang=en"}) == 9001      # legacy agent form
+    assert f({"Guid": [{"id": "tmdb://550"}]}) is None                           # no tvdb present
+    assert f({"Guid": [], "guid": "plex://show/abc"}) is None                    # bare plex:// → no hop
+    assert f({}) is None
+
+
+class _FakeTVPlexAPI:
+    """One universe SHOW collection ('Marvel Cinematic Universe') whose children come back IN
+    COLLECTION ORDER (Loki before WandaVision) carrying tvdb Guids; one unowned show + a non-universe
+    collection that must be ignored."""
+    def get_collections(self, section_id=None):
+        return {"MediaContainer": {"Metadata": [
+            {"ratingKey": "u1", "title": "Marvel Cinematic Universe"},
+            {"ratingKey": "u2", "title": "Some Random Collection"}]}}           # non-universe → ignored
+
+    def get_collection_children(self, rk, include_guids=False):
+        if rk == "u1":
+            return {"MediaContainer": {"Metadata": [
+                {"ratingKey": "loki",   "Guid": [{"id": "tvdb://400000"}]},
+                {"ratingKey": "wanda",  "Guid": [{"id": "tvdb://400001"}]},
+                {"ratingKey": "extern", "Guid": [{"id": "tvdb://999999"}]}]}}    # unowned → no position
+        return {"MediaContainer": {"Metadata": []}}
+
+
+def test_plex_tv_collection_order_orders_owned_series_by_collection():
+    m = _mgr()
+    m.plex_api = _FakeTVPlexAPI()
+    tvdb_to_sid = {400000: 11, 400001: 22}                                       # owns Loki + WandaVision
+    fran, timeline = m._plex_tv_collection_order(tvdb_to_sid)
+    assert fran == {11: "mcu", 22: "mcu"}                                        # both grouped under the universe
+    assert timeline == {11: 0, 22: 1}                                           # collection order → timeline_index
+    # unowned show consumed no position (dense over owned survivors)
+
+
+def test_plex_tv_collection_order_empty_without_api_or_series():
+    assert MoviePlaylistBuilderManager._plex_tv_collection_order(_mgr(), {1: 2}) == ({}, {})  # no plex_api
+    m = _mgr(); m.plex_api = _FakeTVPlexAPI()
+    assert m._plex_tv_collection_order({}) == ({}, {})                           # no owned series
+
+
 def _on_with_list_and_key():
     return {"plex": {"playlists": {"universe_timeline": {"enabled": True}}}, "mdblist": {"apikey": "k"}}
 
