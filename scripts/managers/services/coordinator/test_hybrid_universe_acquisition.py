@@ -7,10 +7,12 @@ import scripts.managers.services.coordinator.hybrid_universe_acquisition as hua
 
 
 class _Logger:
+    def __init__(self): self.tables = []
     def log_info(self, *a, **k): pass
     def log_debug(self, *a, **k): pass
     def log_warning(self, *a, **k): pass
     def log_error(self, *a, **k): pass
+    def log_table(self, headers, rows, **k): self.tables.append((headers, rows))
 
 
 class _Acq:
@@ -75,10 +77,55 @@ def test_run_backfills_engaged_saga(monkeypatch):
     cache = _Cache({"plex/playlists/universe_source": SRC,
                     "radarr.movies.standard.full": [{"tmdbId": 1, "title": "Iron Man"}],   # 1 owned
                     "tautulli/group/household/tmdb_completions": {"1": {"pct": 1.0, "threshold": 0.8}}})
-    out = _mgr(ON, cache, _Reg(acq)).run()
+    mgr = _mgr(ON, cache, _Reg(acq))
+    out = mgr.run()
     assert out["enabled"] and out["selected"] == 2
     assert ("movie", 2) in acq.calls and ("show", 100) in acq.calls   # unowned members grabbed
     assert ("movie", 1) not in acq.calls                              # owned → not a gap
+    # The decision table names the saga in human form (not the bare 'mcu' key).
+    headers, rows = mgr.logger.tables[-1]
+    assert headers[0] == "saga"
+    assert all(r[0] == "Marvel Cinematic Universe" for r in rows)
+
+
+def test_run_builds_titled_per_saga_preview(monkeypatch):
+    monkeypatch.setattr(hua, "ArrGateway", lambda *a, **k: object())
+    acq = _Acq()
+    cache = _Cache({"plex/playlists/universe_source": SRC,
+                    "radarr.movies.standard.full": [{"tmdbId": 1, "title": "Iron Man"}],   # owned + watched
+                    "plex/playlists/saga_member_titles": {"100": "Loki"},                  # show title source
+                    "tautulli/group/household/tmdb_completions": {"1": {"pct": 1.0, "threshold": 0.8}}})
+    out = _mgr(ON, cache, _Reg(acq)).run()
+    assert out["sagas"] == 1
+    preview = cache.get("plex/playlists/universe_acquire_preview")
+    assert preview["dry_run"] is True and preview["selected"] == 2
+    saga = preview["sagas"][0]
+    assert saga["display"] == "Marvel Cinematic Universe"          # key resolved to a human name
+    assert saga["engaged_by"] == ["Iron Man"]                      # the watched member that engaged it (why)
+    assert saga["owned"] == 1 and saga["total_members"] == 3       # 1 of 3 owned
+    titles = [b["title"] for b in saga["backfill"]]
+    assert titles == ["movie 2", "Loki"]                           # start-first; Loki resolved, Avengers falls back
+    assert saga["start_at"] == "movie 2"                           # where backfill starts (first unowned, rank 1)
+    assert all(b["this_run"] for b in saga["backfill"])            # both fit under max_per_run=5
+
+
+def test_unowned_movie_title_resolves_from_list_titles(monkeypatch):
+    # the fix: an UNOWNED universe movie now shows its real name (from the mdblist list's own titles
+    # cached on the universe-source entry), not "movie <id>". Owned Radarr still wins where present.
+    monkeypatch.setattr(hua, "ArrGateway", lambda *a, **k: object())
+    acq = _Acq()
+    src = {"universes": {"mcu": {"timeline": True, "items": [
+        {"media": "movie", "tmdb": 1}, {"media": "movie", "tmdb": 2}, {"media": "show", "tvdb": 100}],
+        "titles": {"movie:1": "Iron Man", "movie:2": "The Avengers"}}}}     # list named both films
+    cache = _Cache({"plex/playlists/universe_source": src,
+                    "radarr.movies.standard.full": [{"tmdbId": 1, "title": "Iron Man"}],   # owns #1 only
+                    "plex/playlists/saga_member_titles": {"100": "Loki"},
+                    "tautulli/group/household/tmdb_completions": {"1": {"pct": 1.0, "threshold": 0.8}}})
+    _mgr(ON, cache, _Reg(acq)).run()
+    saga = cache.get("plex/playlists/universe_acquire_preview")["sagas"][0]
+    titles = [b["title"] for b in saga["backfill"]]
+    assert titles == ["The Avengers", "Loki"]                 # unowned film named from the list, not "movie 2"
+    assert saga["start_at"] == "The Avengers"
 
 
 def test_run_disabled_when_a_flag_is_off():
