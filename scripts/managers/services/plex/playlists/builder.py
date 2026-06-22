@@ -70,6 +70,7 @@ _INVENTORY_KEY = "plex/episodes/owned_inventory"
 _STATS_KEY = "plex/episodes/resolution_stats"
 _PLAN_KEY = "plex/playlists/tv_plan"          # + /{safe_user}
 _UNIVERSE_SRC_KEY = "plex/playlists/universe_source"   # fetched universe lists (cache VOLUME)
+_KOMETA_FRANCHISE_KEY = "plex/playlists/kometa_franchises"   # franchises LEARNED from the live Kometa collections
 _UNIVERSE_TTL_DAYS = 7                                  # re-fetch a universe list at most weekly
 # Layer-2 cross-named TV-franchise catalog files (co-located with this package), in load order:
 # the hand-vetted baked floor, then the generated catalog (overlays the floor). The
@@ -545,7 +546,9 @@ class PlexPlaylistBuilderManager(BaseManager):
         cols = self._all_collections()
         kometa = detect_kometa([d.get("title") for d in cols])["detected"]    # trust unknown collections only on Kometa
         fran_all, time_all, matched = {}, {}, 0
-        for d in cols:
+        learned: dict = {}                                     # {key: {display, shows[tvdb], titles}} to PERSIST
+        seen_tvdb: set = set()                                 # first-wins tiebreak: a show lands in ONE franchise
+        for d in sorted(cols, key=lambda c: _collection_norm(c.get("title"))):   # stable order → stable tiebreak
             rk = d.get("ratingKey")
             if rk is None:
                 continue
@@ -565,7 +568,7 @@ class PlexPlaylistBuilderManager(BaseManager):
                 kids = metadata_items(self.plex_api.get_collection_children(rk, include_guids=True))
             except Exception:
                 continue
-            ordered, rk_to_sid = [], {}
+            ordered, rk_to_sid, members = [], {}, []
             for c in kids:
                 crk = c.get("ratingKey")
                 if crk is None:
@@ -573,7 +576,10 @@ class PlexPlaylistBuilderManager(BaseManager):
                 crk = str(crk)
                 ordered.append(crk)
                 tvdb = self._tvdb_from_guids(c)
-                sid = tvdb_to_sid.get(tvdb) if tvdb is not None else None
+                if tvdb is None:
+                    continue
+                members.append((tvdb, c.get("title")))
+                sid = tvdb_to_sid.get(tvdb)
                 if sid is not None:
                     rk_to_sid[crk] = sid
             if not rk_to_sid or (tentative and len(set(rk_to_sid.values())) < 2):
@@ -583,10 +589,35 @@ class PlexPlaylistBuilderManager(BaseManager):
                 fran_all.update(fran)
                 time_all.update(tmap)
                 matched += 1
+            # Learn the franchise's full membership for Kometa-independent grouping (first-wins dedup).
+            ent = learned.setdefault(key, {"display": title, "shows": [], "titles": [], "source": "kometa-plex"})
+            for tvdb, name in members:
+                if tvdb not in seen_tvdb:
+                    seen_tvdb.add(tvdb)
+                    ent["shows"].append(tvdb)
+                    ent["titles"].append(name or "")
+        if learned:
+            self._persist_kometa_franchises(learned)           # only when we actually read some — never wipe
         if fran_all:
             self.logger.log_info(f"[UniverseOrder] {matched} Plex universe/franchise SHOW collection(s) → "
                                  f"{len(fran_all)} owned series.")
         return fran_all, time_all
+
+    def _persist_kometa_franchises(self, learned) -> None:
+        """Persist franchises LEARNED from the live Kometa collections (``{key: {shows[tvdb], titles,
+        source}}``) so glidearr groups them even when Kometa is later absent — Kometa as a one-time
+        teacher, not a runtime dependency. ``_tv_franchise_catalog`` reads this back as a trusted overlay.
+        Best-effort; the caller only invokes it with a NON-empty catalog, so a Kometa-less run never wipes
+        the learned list."""
+        if not self.global_cache:
+            return
+        try:
+            self.global_cache.set(_KOMETA_FRANCHISE_KEY, learned)
+            self.logger.log_info(f"[UniverseOrder] learned {len(learned)} franchise(s) "
+                                 f"({sum(len(v['shows']) for v in learned.values())} shows) from Kometa "
+                                 f"collections (persisted for Kometa-independent grouping).")
+        except Exception as e:
+            self.logger.log_debug(f"[UniverseOrder] could not persist learned Kometa franchises: {e}")
 
     def _tv_franchise_maps(self, owned_eps, *, prefer_plex=False):
         """``({series_id: franchise}, {series_id: timeline_index})`` for owned series — the canonical
@@ -732,8 +763,9 @@ class PlexPlaylistBuilderManager(BaseManager):
     def _tv_franchise_catalog(self) -> dict:
         """The Layer-2 cross-named TV-franchise catalog (tvdb-keyed) the same-stem clusterer can't
         derive — Grey's↔Station 19↔Private Practice, Buffy↔Angel, … — merged from the baked floor,
-        the generated catalog (if present) and the ``plex.playlists.tv_franchises`` config overlay
-        (each later source overlays the earlier). ``{}`` when none exist. Shape is
+        the generated catalog (if present), the franchises LEARNED + persisted from the operator's live
+        Kometa collections, and the ``plex.playlists.tv_franchises`` config overlay (each later source
+        overlays the earlier; the learned Kometa families let grouping survive a Kometa-less run). Shape is
         ``{franchise_key: {"shows": [tvdb…], "titles": [...], "tier": int}}``, fed to
         :func:`tv_franchise_universes` alongside the owned-inventory clusters.
 
@@ -760,6 +792,10 @@ class PlexPlaylistBuilderManager(BaseManager):
                 continue
             except Exception as e:
                 self.logger.log_debug(f"[UniverseOrder] tv-franchise catalog read skipped ({fname}): {e}")
+        learned = self._cache_get(_KOMETA_FRANCHISE_KEY, {})   # franchises LEARNED from the operator's Kometa
+        if isinstance(learned, dict) and learned:              # collections — trusted (their own curation) and
+            catalog.update(learned)                            # PERSISTED, so grouping survives a Kometa-less run
+            curated_keys.update(learned.keys())
         overlay = self._pl_cfg().get("tv_franchises", {})
         if isinstance(overlay, dict) and overlay:
             catalog.update(overlay)                            # config overlay wins (no rebuild)

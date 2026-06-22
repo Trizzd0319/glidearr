@@ -268,6 +268,37 @@ def test_plex_tv_collection_order_trusts_unknown_kometa_franchise(monkeypatch):
     assert timeline == {1: 0, 2: 1}                 # collection order
 
 
+class _FakeTVEmptyAPI:
+    """Kometa gone: a show section with NO collections to read."""
+    def get_sections(self):
+        return {"MediaContainer": {"Metadata": [{"key": "2", "title": "TV", "type": "show"}]}}
+
+    def get_collections(self, section_id=None):
+        return {"MediaContainer": {"Metadata": []}}
+
+
+def test_kometa_franchises_learned_persisted_and_fed_to_catalog():
+    from scripts.managers.services.plex.playlists.builder import _KOMETA_FRANCHISE_KEY
+    cache = _Cache()
+    m = _mgr(cache=cache)
+    m.plex_api = _FakeTVTrustAPI()
+    m._plex_tv_collection_order({601: 1, 602: 2})                      # owns the 2 CSI shows
+    learned = cache.get(_KOMETA_FRANCHISE_KEY)
+    assert learned["csi"]["shows"] == [601, 602]                      # learned membership persisted
+    cat = m._tv_franchise_catalog()
+    assert cat["csi"]["shows"] == [601, 602] and cat["csi"]["tier"] == 0   # fed back as a TRUSTED family
+
+
+def test_kometa_franchises_not_wiped_when_kometa_absent():
+    from scripts.managers.services.plex.playlists.builder import _KOMETA_FRANCHISE_KEY
+    cache = _Cache()
+    cache.set(_KOMETA_FRANCHISE_KEY, {"csi": {"shows": [601, 602], "titles": ["a", "b"], "source": "kometa-plex"}})
+    m = _mgr(cache=cache)
+    m.plex_api = _FakeTVEmptyAPI()                                    # Kometa removed — no collections
+    m._plex_tv_collection_order({601: 1})
+    assert cache.get(_KOMETA_FRANCHISE_KEY)["csi"]["shows"] == [601, 602]   # learned list survives, not wiped
+
+
 def test_plex_tv_collection_order_empty_without_api_or_series():
     assert MoviePlaylistBuilderManager._plex_tv_collection_order(_mgr(), {1: 2}) == ({}, {})  # no plex_api
     m = _mgr(); m.plex_api = _FakeTVPlexAPI()
