@@ -236,6 +236,15 @@ def empty_config() -> dict:
         # the series there so the watch-based upgrade path raises it later. This supersedes the two
         # legacy strategies below.
         "pilot_floor_climb": {"enabled": True},
+        # Interactive pilot search (default ON, used when pilot_floor_climb is on): instead of the
+        # blind tier-by-tier climb, do ONE Sonarr manual search per stub (GET /release?episodeId=) —
+        # it returns every candidate with its resolution, so we grab the lowest available resolution
+        # in one shot (jumping straight past tiers with no results) and, when NOTHING is found at any
+        # resolution, flag the show UNACQUIRABLE. An unacquirable stub stays dead until a NEW indexer
+        # is added OR recheck_days elapses (the only two ways an empty search can newly succeed; the
+        # clock also self-heals a flag set during a transient indexer outage). floor_res = optional
+        # minimum resolution to consider (0 = any). enabled:false falls back to the blind climb.
+        "pilot_interactive": {"enabled": True, "recheck_days": 7, "floor_res": 0},
         # Legacy escape hatch (only used when pilot_floor_climb is OFF). best_tier_first ON makes a
         # stub pilot target the HIGHEST tier whose grab keeps the space reserve, diverting DOWN one
         # rung per empty run (never likelihood-gated). OFF = legacy floor-first/step-up across runs.
