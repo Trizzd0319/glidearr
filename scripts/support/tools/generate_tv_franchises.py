@@ -32,6 +32,11 @@ from scripts.managers.services.plex.playlists.franchise_graph import (
 )
 
 _ENDPOINT = "https://query.wikidata.org/sparql"
+_WIKI_API = "https://en.wikipedia.org/w/api.php"
+# Wikipedia's hand-curated franchise tree: each subcategory of this root is one franchise, its member
+# pages the franchise's shows. Catches cross-named families the Wikidata P2512/P179 edges miss (the
+# member pages are still filtered to actual TVDB-id series before they count — same guard as the others).
+_FRANCHISE_ROOT_CAT = "Category:Television series by franchise"
 _UA = "glidearr-tv-franchise-gen/1.0 (offline catalog build; contact via project repo)"
 
 # P179 ('part of the series') over-capture guards. The P4835 filter already drops episode/season
@@ -146,40 +151,152 @@ def fetch_p179():
                                 deny_types=_BAD_FRANCHISE_TYPES)
 
 
-def generate(*, min_members: int = 2, deny=None):
-    """Fetch the Wikidata graph (spin-off P2512 ∪ part-of-the-series P179) and build the franchise
-    catalog. Returns ``(catalog, edges, nodes)``."""
-    e_spin, n_spin = fetch_p2512()
-    e_part, n_part = fetch_p179()
-    edges = e_spin + e_part
-    nodes = dict(n_part)
-    for tv, meta in n_spin.items():                              # P2512 metadata wins, but fill gaps
-        cur = nodes.get(tv)
+def _wiki_api(params: dict, *, timeout: int = 30, retries: int = 6) -> dict:
+    """One MediaWiki action-API GET → parsed JSON, honouring 429/503 ``Retry-After`` rate-limiting."""
+    url = _WIKI_API + "?" + urllib.parse.urlencode({**params, "format": "json"})
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 503) and attempt < retries - 1:
+                wait = min(int(e.headers.get("Retry-After", "10") or "10"), 60) * (attempt + 1)
+                print(f"  wiki rate-limited ({e.code}); waiting {wait}s…", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise
+    raise RuntimeError("unreachable")
+
+
+def _wiki_members(category: str, cmtype: str, *, with_qid: bool = False):
+    """Yield the members of a category (following ``continue`` paging). ``cmtype='subcat'`` →
+    ``{title}``; ``cmtype='page'`` with ``with_qid`` → article pages as ``{title, qid}`` (the Wikidata
+    item id from pageprops, namespace-0 articles only)."""
+    if with_qid:
+        params = {"action": "query", "generator": "categorymembers", "gcmtitle": category,
+                  "gcmtype": cmtype, "gcmnamespace": 0, "gcmlimit": "500",
+                  "prop": "pageprops", "ppprop": "wikibase_item"}
+        cont: dict = {}
+        while True:
+            d = _wiki_api({**params, **cont})
+            for p in ((d.get("query") or {}).get("pages") or {}).values():
+                yield {"title": p.get("title"), "qid": (p.get("pageprops") or {}).get("wikibase_item")}
+            if d.get("continue"):
+                cont = d["continue"]
+            else:
+                return
+    else:
+        params = {"action": "query", "list": "categorymembers", "cmtitle": category,
+                  "cmtype": cmtype, "cmlimit": "500"}
+        cont = {}
+        while True:
+            d = _wiki_api({**params, **cont})
+            for m in (d.get("query") or {}).get("categorymembers", []):
+                yield {"title": m.get("title")}
+            if d.get("continue"):
+                cont = d["continue"]
+            else:
+                return
+
+
+def _resolve_qids_to_tvdb(qids, *, batch: int = 180) -> dict:
+    """``[QID…]`` → ``{QID: (tvdb, label, date)}`` via WDQS, KEEPING only items that carry a TVDB id
+    (``P4835``) — the same actual-TV-series filter the P2512/P179 edges use. Batched VALUES so a few
+    queries resolve hundreds of pages."""
+    out: dict = {}
+    qids = [q for q in qids if q and str(q).startswith("Q")]
+    for i in range(0, len(qids), batch):
+        values = " ".join(f"wd:{q}" for q in qids[i:i + batch])
+        q = ("SELECT ?item ?tvdb ?label ?date WHERE { VALUES ?item { %s } "
+             "?item wdt:P4835 ?tvdb . ?item rdfs:label ?label . FILTER(LANG(?label) = 'en') "
+             "OPTIONAL { ?item wdt:P571 ?date } }" % values)
+        for b in _sparql(q):
+            qid = ((b.get("item") or {}).get("value") or "").rsplit("/", 1)[-1]
+            tv = _int((b.get("tvdb") or {}).get("value"))
+            if tv is not None and qid not in out:
+                out[qid] = (tv, (b.get("label") or {}).get("value"), (b.get("date") or {}).get("value"))
+    return out
+
+
+def fetch_wikipedia_categories():
+    """Wikipedia ``Category:Television series by franchise`` → ``(edges, nodes)``. Each subcategory is a
+    franchise; its member articles are resolved to TVDB-id series and star-connected (so they union
+    with the Wikidata graph and catch cross-named families P2512/P179 miss)."""
+    subcats = [m["title"] for m in _wiki_members(_FRANCHISE_ROOT_CAT, "subcat")]
+    cat_qids: dict = {}
+    all_qids: set = set()
+    skipped = 0
+    for cat in subcats:
+        try:
+            qids = [m["qid"] for m in _wiki_members(cat, "page", with_qid=True) if m.get("qid")]
+        except urllib.error.URLError as e:                      # a persistent rate-limit/parse on one
+            skipped += 1                                        # category never aborts the whole sweep
+            print(f"  wiki category skipped ({cat}): {e}", file=sys.stderr)
+            continue
+        if len(qids) >= 2:                                       # a 1-member category can't be a franchise
+            cat_qids[cat] = qids
+            all_qids.update(qids)
+        time.sleep(0.3)                                          # be polite to the API
+    if skipped:
+        print(f"  ({skipped} of {len(subcats)} categories skipped on fetch error)", file=sys.stderr)
+    resolved = _resolve_qids_to_tvdb(sorted(all_qids))
+    groups: dict = {}
+    for cat, qids in cat_qids.items():
+        members = [resolved[q] for q in qids if q in resolved]   # TVDB-bearing series only
+        if len(members) >= 2:
+            groups[cat] = {"members": members, "types": set()}
+    return franchise_star_edges(groups, min_members=2)
+
+
+def _merge_nodes(dst: dict, src: dict) -> None:
+    """Fold ``src`` node metadata into ``dst`` in place: add missing tvdbs, fill empty title/date gaps
+    (existing values win, so the FIRST source's metadata is authoritative)."""
+    for tv, meta in src.items():
+        cur = dst.get(tv)
         if cur is None:
-            nodes[tv] = meta
+            dst[tv] = dict(meta)
         else:
             if not cur.get("title") and meta.get("title"):
                 cur["title"] = meta["title"]
             if cur.get("date") is None and meta.get("date"):
                 cur["date"] = meta["date"]
+
+
+def generate(*, min_members: int = 2, deny=None, wiki: bool = True):
+    """Fetch the franchise graph — Wikidata spin-off (P2512) ∪ part-of-the-series (P179) ∪ (when
+    ``wiki``) the Wikipedia ``Television series by franchise`` category tree — and build the catalog.
+    Returns ``(catalog, edges, nodes)``."""
+    e_spin, n_spin = fetch_p2512()
+    e_part, n_part = fetch_p179()
+    edges = e_spin + e_part
+    nodes = dict(n_part)
+    _merge_nodes(nodes, n_spin)
+    if wiki:
+        e_wiki, n_wiki = fetch_wikipedia_categories()
+        edges += e_wiki
+        _merge_nodes(nodes, n_wiki)
     return build_franchises(edges, nodes, min_members=min_members, deny=deny), edges, nodes
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Generate the TV-franchise catalog from Wikidata (P2512 + P179).")
+    ap = argparse.ArgumentParser(
+        description="Generate the TV-franchise catalog from Wikidata (P2512 + P179) + Wikipedia categories.")
     ap.add_argument("--out", default=None, help="output JSON path (default: the package catalog file)")
     ap.add_argument("--min-members", type=int, default=2, help="minimum series per franchise")
+    ap.add_argument("--no-wiki", action="store_true", help="skip the Wikipedia franchise-category edge")
     ap.add_argument("--dry-run", action="store_true", help="print stats only, do not write")
     args = ap.parse_args(argv)
 
     try:
-        catalog, edges, nodes = generate(min_members=args.min_members)
+        catalog, edges, nodes = generate(min_members=args.min_members, wiki=not args.no_wiki)
     except Exception as e:                                       # network / parse — fail loud, write nothing
         print(f"generation failed: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
     members = sum(len(v["shows"]) for v in catalog.values())
-    print(f"{len(edges)} edges (P2512 + P179), {len(nodes)} tvdb series "
+    src = "P2512 + P179" + ("" if args.no_wiki else " + Wikipedia categories")
+    print(f"{len(edges)} edges ({src}), {len(nodes)} tvdb series "
           f"-> {len(catalog)} franchises ({members} member series)")
     biggest = sorted(catalog.items(), key=lambda kv: -len(kv[1]["shows"]))[:8]
     for k, v in biggest:
