@@ -40,6 +40,11 @@ Each cycle:
   6. A cursor file persists progress so restarts resume where they left off; a stop
      sentinel lets the supervisor shut it down cleanly within ~1.5s.
 
+Each cycle also runs a few periodic, budget-paced SIDE tasks: Common Sense Media age
+lookups (MDBList), and — at most once every ``franchise_catalog_ttl_days`` (default 14) —
+a DETACHED regen of the TV-franchise catalog (Wikidata + Wikipedia), spawned as a background
+subprocess so its slow, heavily rate-limited fetch never blocks a cycle.
+
 Cache buckets (file = {tmdb_id}.json.gz, 7-day TTL) and all paths/constants are
 single-sourced in managers/factories/daemons/daemon_paths.py.
 """
@@ -52,6 +57,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -813,6 +819,82 @@ def run_commonsense_tv(cfg: dict, series: list[dict], dry_run: bool) -> None:
              f"{len(todo) - looked:,} shows left | MDBList ~{used + looked:,}/{limit:,}")
 
 
+# ── TV-franchise catalog (Wikidata + Wikipedia) — periodic, detached ─────────────
+FRANCHISE_TTL_DAYS    = 14          # regenerate the TV-franchise catalog at most this often
+FRANCHISE_RETRY_HOURS = 6           # after a (possibly failed) attempt, don't respawn the regen this soon
+
+
+def _franchise_state_path() -> Path:
+    return CACHE_TRAKT.parent / "franchise_catalog_state.json"
+
+
+def run_franchise_catalog(cfg: dict, dry_run: bool) -> None:
+    """Periodically regenerate the TV-franchise catalog (Wikidata P2512/P179 + Wikipedia categories +
+    infobox related/spin-off links) by spawning ``generate_tv_franchises`` as a DETACHED subprocess —
+    so the slow, heavily rate-limited Wikidata/Wikipedia fetch (it backs off 55-120s on every 429)
+    grinds in the background and NEVER blocks the enrichment cycle. A catalog fresher than
+    ``franchise_catalog_ttl_days`` is left alone; at most ONE regen runs at a time (pid-guarded); a
+    recent attempt isn't immediately respawned. The generated catalog is the tier-2 (auto/unvetted)
+    layer the acquisition already deprioritises, so refreshing it unattended is safe — promote good
+    families into the committed floor by hand. Opt-out: ``daemons.enrich.franchise_catalog=false``."""
+    enrich_cfg = (cfg.get("daemons", {}) or {}).get("enrich", {}) or {}
+    if not enrich_cfg.get("franchise_catalog", True):
+        return
+    try:
+        import scripts.support.tools.generate_tv_franchises as gen_tool
+        catalog = Path(gen_tool._catalog_path())
+        gen_src = Path(gen_tool.__file__)
+    except Exception as e:
+        log.debug(f"[franchise] generator unavailable: {e}")
+        return
+    ttl_days = float(enrich_cfg.get("franchise_catalog_ttl_days", FRANCHISE_TTL_DAYS))
+    now = time.time()
+    # Fresh = within TTL AND not older than the generator CODE — so adding an edge / fixing the
+    # generator triggers a rebuild on the next cycle, not only after the TTL lapses.
+    fresh = (catalog.exists()
+             and (now - catalog.stat().st_mtime) < ttl_days * 86_400
+             and catalog.stat().st_mtime >= gen_src.stat().st_mtime)
+    if fresh:
+        return
+    spath = _franchise_state_path()
+    state: dict = {}
+    if spath.exists():
+        try:
+            state = json.loads(spath.read_text())
+        except Exception:
+            pass
+    gen_pid = state.get("gen_pid")
+    if gen_pid and _pid_alive(int(gen_pid)):
+        log.info(f"  [franchise] regen already running (pid {gen_pid}); skipping.")
+        return
+    last = float(state.get("last_attempt_ts", 0) or 0)
+    if last and (now - last) < FRANCHISE_RETRY_HOURS * 3600:
+        return                                                  # recently attempted (maybe still rate-limited)
+    if dry_run:
+        log.info(f"  [franchise] catalog stale (>{ttl_days:.0f}d) — would spawn a detached regen (dry-run).")
+        return
+    kwargs: dict = {"cwd": str(_REPO_ROOT), "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | 0x00000008   # DETACHED_PROCESS (no console)
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen([sys.executable, "-m", "scripts.support.tools.generate_tv_franchises"], **kwargs)
+    except Exception as e:
+        log.warning(f"[franchise] could not spawn regen: {e}")
+        return
+    state["gen_pid"] = proc.pid
+    state["last_attempt_ts"] = now
+    try:
+        spath.parent.mkdir(parents=True, exist_ok=True)
+        spath.write_text(json.dumps(state, indent=2))
+    except OSError:
+        pass
+    log.info(f"  [franchise] catalog stale (>{ttl_days:.0f}d) — spawned detached regen (pid {proc.pid}); "
+             f"it grinds through Wikidata/Wikipedia rate limits in the background, no cycle impact.")
+
+
 def run_cycle(cfg: dict, loader: ConfigLoader, cursor: dict, dry_run: bool,
               show_items: bool = False) -> tuple[dict, bool]:
     enrich_cfg  = (cfg.get("daemons", {}) or {}).get("enrich", {}) or {}
@@ -956,6 +1038,11 @@ def run_cycle(cfg: dict, loader: ConfigLoader, cursor: dict, dry_run: bool,
         run_commonsense_tv(cfg, series, dry_run)
     except Exception as e:
         log.warning(f"[commonsense-tv] step failed: {e}")
+    # ── TV-franchise catalog regen (Wikidata + Wikipedia) — periodic, spawned detached ──
+    try:
+        run_franchise_catalog(cfg, dry_run)
+    except Exception as e:
+        log.warning(f"[franchise] step failed: {e}")
     return stats, stop
 
 
