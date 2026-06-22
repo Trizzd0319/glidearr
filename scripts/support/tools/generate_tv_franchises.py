@@ -102,7 +102,7 @@ def _sparql(query: str, *, timeout: int = 90, retries: int = 5) -> list[dict]:
                 return json.load(r)["results"]["bindings"]
         except urllib.error.HTTPError as e:
             if e.code == 429 and attempt < retries - 1:
-                wait = min(int(e.headers.get("Retry-After", "65") or "65"), 120)
+                wait = min(int(e.headers.get("Retry-After", "65") or "65"), 300)   # honour WDQS's real backoff
                 print(f"  rate-limited (429); waiting {wait}s…", file=sys.stderr)
                 time.sleep(wait)
                 continue
@@ -383,27 +383,44 @@ def generate(*, min_members: int = 2, deny=None, wiki: bool = True, infobox: boo
     ``wiki``) the Wikipedia franchise-category tree ∪ (when ``infobox``) the article infobox
     ``related``/``spin_offs`` links — and build the catalog. The Wikipedia category members are fetched
     ONCE and their QIDs resolved ONCE, shared by both Wikipedia edges. Each franchise is stamped with
-    the edge ``sources`` that corroborate it (for the loader's auto-promotion). Returns
-    ``(catalog, edges, nodes)``."""
-    e_spin, n_spin = fetch_p2512()
-    e_part, n_part = fetch_p179()
-    edges = e_spin + e_part
-    edge_src: dict = {"p2512": e_spin, "p179": e_part}
-    nodes = dict(n_part)
-    _merge_nodes(nodes, n_spin)
+    the edge ``sources`` that corroborate it (for the loader's auto-promotion).
+
+    Each edge SOURCE is isolated: one that is unreachable or rate-limited to exhaustion — WDQS
+    especially — is SKIPPED with a warning and the catalog is built from the edges that DID land, so a
+    single failing source never crashes the whole regen. Only a TOTAL wipe-out (no edge at all) raises,
+    leaving the prior catalog untouched. Returns ``(catalog, edges, nodes)``."""
+    edges: list = []
+    edge_src: dict = {}
+    nodes: dict = {}
+
+    def _absorb(label, fn):
+        try:
+            e, n = fn()
+        except Exception as ex:                                  # rate-limit exhaustion / network / parse
+            print(f"  [{label}] edge skipped — source failed ({type(ex).__name__}): {ex}", file=sys.stderr)
+            return
+        if e:
+            edges.extend(e)
+            edge_src[label] = e
+        _merge_nodes(nodes, n)
+
+    _absorb("p2512", fetch_p2512)                                # Wikidata (WDQS) — most rate-limited
+    _absorb("p179", fetch_p179)
     if wiki or infobox:
-        members = _franchise_category_members()
-        resolved = _resolve_qids_to_tvdb(sorted({q for ms in members.values() for (_, q) in ms}))
-        if wiki:
-            e_wiki, n_wiki = fetch_wikipedia_categories(members, resolved)
-            edges += e_wiki
-            edge_src["wiki-cat"] = e_wiki
-            _merge_nodes(nodes, n_wiki)
-        if infobox:
-            e_ib, n_ib = fetch_infobox_related(members, resolved)
-            edges += e_ib
-            edge_src["infobox"] = e_ib
-            _merge_nodes(nodes, n_ib)
+        try:
+            members = _franchise_category_members()
+            resolved = _resolve_qids_to_tvdb(sorted({q for ms in members.values() for (_, q) in ms}))
+        except Exception as ex:
+            print(f"  [wiki] category members unavailable — skipping wiki edges ({ex})", file=sys.stderr)
+            members, resolved = {}, {}
+        if wiki and members:
+            _absorb("wiki-cat", lambda: fetch_wikipedia_categories(members, resolved))
+        if infobox and members:
+            _absorb("infobox", lambda: fetch_infobox_related(members, resolved))
+
+    if not edges:
+        raise RuntimeError("every franchise edge failed (rate-limited / unreachable) — "
+                           "refusing to overwrite the catalog with nothing")
     catalog = build_franchises(edges, nodes, min_members=min_members, deny=deny)
     _stamp_sources(catalog, edge_src)
     return catalog, edges, nodes
