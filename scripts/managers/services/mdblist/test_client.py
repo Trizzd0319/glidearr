@@ -80,6 +80,25 @@ def test_list_items_reads_tmdb_from_id_and_ids(monkeypatch):
                           {"tmdb": 1396, "tvdb": 81189, "media": "show"}]
 
 
+def test_list_items_captures_titles_keyed_media_id(monkeypatch):
+    # mdblist rows carry a display title; list_items surfaces them keyed "<media>:<id>" so an UNOWNED
+    # universe movie still resolves to a real name downstream (the saga preview), no extra API call.
+    monkeypatch.setattr(client, "_http_get", _stub(200, {
+        "movies": [{"id": 1726, "mediatype": "movie", "title": "Iron Man"},
+                   {"id": 24428, "mediatype": "movie", "title": "The Avengers"}],
+        "shows": [{"tvdb_id": 280619, "mediatype": "show", "title": "Agent Carter"}],
+    }))
+    r = client.list_items("k", {"id": 117444})
+    assert r["items"][0] == {"tmdb": 1726, "tvdb": None, "media": "movie"}   # item shape unchanged (ids only)
+    assert r["titles"] == {"movie:1726": "Iron Man", "movie:24428": "The Avengers",
+                           "show:280619": "Agent Carter"}
+
+
+def test_list_items_titles_empty_when_rows_have_none(monkeypatch):
+    monkeypatch.setattr(client, "_http_get", _stub(200, [{"tmdb_id": 1726, "mediatype": "movie"}]))
+    assert client.list_items("k", {"id": 1})["titles"] == {}            # no title field → no entry, no crash
+
+
 def test_supporter_tier_with_budget(monkeypatch):
     monkeypatch.setattr(client, "_http_get", _stub(200, {
         "username": "trizzd", "patron_status": "active_patron",

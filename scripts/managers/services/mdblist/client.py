@@ -74,11 +74,13 @@ def list_items(apikey: str, ref: dict, *, base_url: str = BASE_URL,
     ``ref`` selects the list: ``{"imdb": "ls539646485"}`` | ``{"mdblist": "k0meta/external/15110"}``
     | ``{"id": 15110}``. Returns (never raises):
         {"ok": bool, "items": [{"tmdb": int|None, "tvdb": int|None, "media": "movie"|"show"|None}],
-         "error": str|None}
-    Items keep the list's order. Alias-tolerant parse; any non-200/parse failure → ok=False, [] so
-    the caller degrades to release/air-date ordering."""
+         "titles": {"movie:<tmdb>"|"show:<tvdb>": str}, "error": str|None}
+    Items keep the list's order. ``titles`` maps each item's media+id to the row's display title (when
+    the API returns one) — so a universe MOVIE that the operator does NOT own still resolves to a real
+    name downstream (the saga preview) instead of "movie <id>", with no extra API call. Alias-tolerant
+    parse; any non-200/parse failure → ok=False, [], {} so the caller degrades to release/air-date order."""
     if not apikey or not isinstance(ref, dict) or not ref:
-        return {"ok": False, "items": [], "error": "missing/invalid apikey/ref"}
+        return {"ok": False, "items": [], "titles": {}, "error": "missing/invalid apikey/ref"}
     if ref.get("imdb"):
         path = IMDB_LIST_PATH.format(ident=ref["imdb"])
     elif ref.get("id") is not None:
@@ -87,18 +89,27 @@ def list_items(apikey: str, ref: dict, *, base_url: str = BASE_URL,
         parts = str(ref["mdblist"]).strip("/").split("/", 1)
         path = LIST_BY_SLUG_PATH.format(user=parts[0], slug=parts[1] if len(parts) > 1 else "")
     else:
-        return {"ok": False, "items": [], "error": "unrecognized ref"}
+        return {"ok": False, "items": [], "titles": {}, "error": "unrecognized ref"}
     # The fetch AND the body parse are both inside the guard — a shape-drift in the body (e.g.
     # ``{"movies": 5}``) must soft-degrade to ok=False, not raise, so _universe_source keeps LAST-GOOD.
     try:
         status, _headers, body = _http_get(f"{base_url.rstrip('/')}{path}",
                                            {"apikey": apikey, "limit": limit}, timeout)
         if status != 200:
-            return {"ok": False, "items": [], "error": f"HTTP {status}"}
-        items = [it for raw in _list_rows(body) if (it := _parse_list_item(raw)) is not None]
+            return {"ok": False, "items": [], "titles": {}, "error": f"HTTP {status}"}
+        items, titles = [], {}
+        for raw in _list_rows(body):
+            it = _parse_list_item(raw)
+            if it is None:
+                continue
+            items.append(it)
+            mid = it["tmdb"] if it["media"] == "movie" else it["tvdb"]
+            t = _first(raw, "title", "name", "original_title") if isinstance(raw, dict) else None
+            if mid is not None and t:
+                titles[f'{it["media"]}:{mid}'] = str(t).strip()
     except Exception as e:                        # noqa: BLE001 — never raise to callers
-        return {"ok": False, "items": [], "error": str(e)[:80]}
-    return {"ok": True, "items": items, "error": None}
+        return {"ok": False, "items": [], "titles": {}, "error": str(e)[:80]}
+    return {"ok": True, "items": items, "titles": titles, "error": None}
 
 
 def _list_rows(body) -> list:
