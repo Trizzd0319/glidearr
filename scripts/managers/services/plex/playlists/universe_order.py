@@ -261,19 +261,26 @@ UNIVERSE_LISTS: dict[str, dict] = {
     # endpoint — and the Kometa ``external/<n>`` numbers resolved to unrelated lists (anime, art
     # films), so every ref here was re-sourced. Override/extend per install via
     # ``plex.playlists.universe_lists`` in config.json (no image rebuild).
+    #
+    # ``timeline``: True ONLY when the list's ORDER is a true in-universe chronology that differs from
+    # release order (so it should override dates as ``timeline_index``). When a list is merely release-
+    # ordered — or, worse, REVERSE-release (newest-first, which several public mdblist lists are) — use
+    # False: ``order_within_group`` then orders by release date ASCENDING (earliest first = story
+    # continuity), which is what these franchises want. (The chronolists bake supersedes the order for
+    # any universe it covers, so these flags only decide the universes the bake does NOT cover.)
     "mcu":       {"id": 117444, "timeline": True},                 # MCU (timeline order)
     "star":      {"id": 119979, "timeline": True},                 # Star Wars: the Skywalker Saga
     "trek":      {"id": 102138, "timeline": True},                 # Star Trek (chronological)
     "xmen":      {"id": 92827,  "timeline": True},                 # X-Men universe
     "dcu":       {"id": 49433,  "timeline": True},                 # DC Extended Universe
     "arrow":     {"id": 140366, "timeline": True},                 # Arrowverse (TV)
-    "avp":       {"id": 101434, "timeline": True},                 # Alien vs Predator
-    "conjuring": {"id": 68164,  "timeline": True},                 # The Conjuring universe
-    "fast":      {"id": 76743,  "timeline": True},                 # Fast & Furious
+    "avp":       {"id": 101434, "timeline": True},                 # Alien vs Predator (list is release-asc)
+    "conjuring": {"id": 68164,  "timeline": True},                 # The Conjuring (true in-universe order)
+    "fast":      {"id": 76743,  "timeline": False},                # Fast & Furious (list is REVERSE-release → order by date)
     "dca":       {"mdblist": "johnfawkes/dca", "timeline": True},  # DC Animated
     "middle":    {"id": 120168, "timeline": True},                 # Middle-earth (LOTR + Hobbit)
-    "mummy":     {"id": 16827,  "timeline": True},                 # The Mummy / Scorpion King
-    "rocky":     {"id": 49530,  "timeline": True},                 # Rocky & Creed
+    "mummy":     {"id": 16827,  "timeline": True},                 # The Mummy / Scorpion King (list is release-asc)
+    "rocky":     {"id": 49530,  "timeline": False},                # Rocky & Creed (list is REVERSE-release → order by date)
     "askew":     {"id": 80700,  "timeline": True},                 # View Askewniverse
     "wizard":    {"id": 159768, "timeline": True},                 # Wizarding World
 }
@@ -286,15 +293,17 @@ def universe_lists(config_overrides: dict | None = None) -> dict:
     return {**UNIVERSE_LISTS, **(config_overrides or {})}
 
 
-def split_list_media(items, timeline) -> dict:
+def split_list_media(items, timeline, titles=None) -> dict:
     """A ``client.list_items()`` result → ``{"timeline": bool, "movies": [tmdb…], "shows": [tvdb…],
-    "items": [{media, tmdb|tvdb, rank}…]}`` IN LIST ORDER.
+    "items": [{media, tmdb|tvdb, rank}…], "titles": {"movie:<tmdb>"|"show:<tvdb>": str}}`` IN LIST ORDER.
 
     ``movies``/``shows`` are the legacy per-media views (unchanged). ``items`` is the UNIFIED
     single-axis view: films AND shows share one ``rank`` (their position in the source saga list),
     so a universe's movies and episodes can be interleaved on ONE timeline (MCU: …film… →
     WandaVision → Loki → …film…). ``rank`` reflects whatever order ``list_items`` produced.
-    Purely additive — existing consumers (build_universe_maps, the resolvers) read movies/shows."""
+    ``titles`` (the list rows' display names, carried verbatim from ``list_items``) lets a consumer
+    resolve a member id → real title even when the operator doesn't OWN it (the saga preview's movie
+    names). Purely additive — existing consumers (build_universe_maps, the resolvers) read movies/shows."""
     movies, shows, unified = [], [], []
     for it in (items or []):
         media = it.get("media")
@@ -304,7 +313,78 @@ def split_list_media(items, timeline) -> dict:
         elif media == "show" and it.get("tvdb") is not None:
             shows.append(it["tvdb"])
             unified.append({"media": "show", "tvdb": it["tvdb"], "rank": len(unified)})
-    return {"timeline": bool(timeline), "movies": movies, "shows": shows, "items": unified}
+    return {"timeline": bool(timeline), "movies": movies, "shows": shows, "items": unified,
+            "titles": dict(titles or {})}
+
+
+def universe_timeline_entry(items) -> dict:
+    """A baked chronolists timeline ``items`` list (the full in-universe MOVIE+SHOW order) → a
+    ``split_list_media``-shaped universe-source entry (``timeline:True``). Movies key on ``tmdb``,
+    shows on ``tvdb``; ``rank`` is dense in list order; ``titles`` collects each member's name
+    media-keyed (``"movie:<tmdb>"|"show:<tvdb>"``) so an UNOWNED member still resolves to a real name
+    downstream (the saga preview). De-duped by (media, id), first-wins. PURE."""
+    movies, shows, unified, titles = [], [], [], {}
+    seen: set = set()
+    for it in (items or []):
+        media = it.get("media")
+        if media == "movie":
+            mid = _coerce_int(it.get("tmdb"))
+            if mid is None or ("movie", mid) in seen:
+                continue
+            seen.add(("movie", mid))
+            movies.append(mid)
+            unified.append({"media": "movie", "tmdb": mid, "rank": len(unified)})
+            if it.get("title"):
+                titles[f"movie:{mid}"] = it["title"]
+        elif media == "show":
+            mid = _coerce_int(it.get("tvdb"))
+            if mid is None or ("show", mid) in seen:
+                continue
+            seen.add(("show", mid))
+            shows.append(mid)
+            unified.append({"media": "show", "tvdb": mid, "rank": len(unified)})
+            if it.get("title"):
+                titles[f"show:{mid}"] = it["title"]
+    return {"timeline": True, "movies": movies, "shows": shows, "items": unified, "titles": titles}
+
+
+def apply_universe_timeline(universes, timeline_catalog, *, topup=True) -> dict:
+    """Make the baked chronolists timeline LEAD the universe source. For each universe in
+    ``timeline_catalog`` (``{key: {"items": [{media, tmdb|tvdb, title}…]}}`` — the full in-universe
+    MOVIE+SHOW order, generated by ``support/tools/generate_universe_timeline``), REPLACE that universe's
+    entry with one built from the bake, so the authoritative interleaved order (films AND shows, e.g.
+    MCU: …Endgame → Loki → WandaVision…) drives grouping, retention AND acquisition — not a movies-only
+    mdblist list. A baked TV-only universe (Arrowverse, Buffy, …) is ADDED even if mdblist never had it.
+
+    mdblist is demoted to a NEW-RELEASE signal: when an mdblist entry for the same key already exists and
+    ``topup`` is set, any of ITS movies absent from the bake are appended after the baked order (tagged
+    ``src='mdblist'``) so a just-released film surfaces before the next bake regeneration. A universe only
+    in ``universes`` (mdblist-only, not covered by chronolists) passes through verbatim. Returns a NEW
+    dict. PURE — no I/O."""
+    if not timeline_catalog:
+        return universes
+    out = dict(universes or {})
+    for key, spec in timeline_catalog.items():
+        items = spec.get("items") if isinstance(spec, dict) else None
+        if not items:
+            continue
+        entry = universe_timeline_entry(items)
+        prior = out.get(key)
+        if topup and isinstance(prior, dict):
+            have = set(entry["movies"])
+            ptitles = prior.get("titles") or {}
+            for t in (prior.get("movies") or []):
+                ti = _coerce_int(t)
+                if ti is None or ti in have:
+                    continue
+                have.add(ti)
+                entry["movies"].append(ti)
+                entry["items"].append({"media": "movie", "tmdb": ti,
+                                       "rank": len(entry["items"]), "src": "mdblist"})
+                if ptitles.get(f"movie:{ti}"):
+                    entry["titles"][f"movie:{ti}"] = ptitles[f"movie:{ti}"]
+        out[key] = entry
+    return out
 
 
 def is_stale(fetched_at, now_ordinal, ttl_days) -> bool:

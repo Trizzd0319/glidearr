@@ -44,6 +44,7 @@ from scripts.managers.services.plex.playlists.tv_resolver import (
     watched_episode_recency,
 )
 from scripts.managers.services.plex.playlists.universe_order import (
+    apply_universe_timeline,
     build_universe_maps,
     collection_universe_key,
     is_stale,
@@ -65,6 +66,11 @@ _UNIVERSE_TTL_DAYS = 7                                  # re-fetch a universe li
 # the hand-vetted baked floor, then the generated catalog (overlays the floor). The
 # `plex.playlists.tv_franchises` config key overlays both. See coordinator/tv_franchise_discovery.md.
 _TV_FRANCHISE_FILES = ("tv_franchises.json", "tv_franchises.generated.json")
+# In-universe MOVIE+SHOW watch order, generated from chronolists.com by
+# `support/tools/generate_universe_timeline` (editorially sourced; movies keyed by tmdb, shows by tvdb).
+# This LEADS the universe source — its full interleaved order replaces the movies-only mdblist list for
+# every covered universe. Overlay/extend per install via `plex.playlists.universe_timeline.universes`.
+_UNIVERSE_TIMELINE_FILE = "universe_timeline.json"
 
 
 def _to_int(v):
@@ -368,10 +374,10 @@ class PlexPlaylistBuilderManager(BaseManager):
         universes = dict(cached.get("universes") or {})
         fetched = dict(cached.get("fetched") or {})
         key = self._mdblist_key()
+        refreshed = 0
         if key:
             now = date.today().toordinal()
             ttl = self._universe_ttl_days()
-            refreshed = 0
             for uk, defn in universe_lists(self._cfg_universe_lists()).items():
                 if not isinstance(defn, dict):     # a config typo (bare string) can't abort the run
                     continue
@@ -379,14 +385,28 @@ class PlexPlaylistBuilderManager(BaseManager):
                     continue
                 res = mdblist_client.list_items(key, defn)
                 if res.get("ok") and res.get("items"):
-                    universes[uk] = split_list_media(res["items"], bool(defn.get("timeline", True)))
+                    universes[uk] = split_list_media(res["items"], bool(defn.get("timeline", True)),
+                                                     titles=res.get("titles"))
                     fetched[uk] = now
                     refreshed += 1
                 # else: leave the prior entry untouched (LAST-GOOD)
-            if refreshed and self.global_cache:
-                self.global_cache.set(_UNIVERSE_SRC_KEY, {"universes": universes, "fetched": fetched})
-                self.logger.log_info(f"[UniverseOrder] refreshed {refreshed} universe list(s) from mdblist "
-                                     f"({len(universes)} cached).")
+        # The ``timeline`` flag is config-authoritative: re-stamp each entry from the CURRENT
+        # universe_lists() defn so flipping a list to ``timeline: False`` (a reverse-sorted list → order
+        # by release date ascending) takes effect on the NEXT run, not only after the TTL re-fetch.
+        defns = universe_lists(self._cfg_universe_lists())
+        for uk in list(universes):
+            d = defns.get(uk)
+            if isinstance(universes[uk], dict) and isinstance(d, dict):
+                universes[uk] = {**universes[uk], "timeline": bool(d.get("timeline", True))}
+        # Let the baked chronolists timeline LEAD: replace each covered universe's entry with the full
+        # in-universe MOVIE+SHOW order (films AND shows), demoting mdblist to a new-release top-up. Runs
+        # here (live grouping + refresh-run cache write) AND in the synthetic refresh, so the interleaved
+        # order is present no matter which path of the run touches the cache first.
+        universes = apply_universe_timeline(universes, self._universe_timeline_catalog())
+        if refreshed and self.global_cache:
+            self.global_cache.set(_UNIVERSE_SRC_KEY, {"universes": universes, "fetched": fetched})
+            self.logger.log_info(f"[UniverseOrder] refreshed {refreshed} universe list(s) from mdblist "
+                                 f"({len(universes)} cached).")
         return {"universes": universes}
 
     def _movie_universe_order(self, movie_inventory, owned_movies=None) -> dict:
@@ -495,11 +515,19 @@ class PlexPlaylistBuilderManager(BaseManager):
             cached = dict(self._cache_get(_UNIVERSE_SRC_KEY, {}) or {})
             universes = {k: v for k, v in (cached.get("universes") or {}).items()
                          if not str(k).startswith("tvfran:")}            # strip prior synthetic
-            # Film-universe show tvdbs — a TV franchise that a film universe (Arrowverse, Star Trek…)
-            # already groups must NOT be re-emitted as a tvfran: entry (no double-grouping).
+            # Let the baked chronolists timeline LEAD: rebuild each covered universe's entry from the full
+            # in-universe MOVIE+SHOW order (MCU, Star Wars, Arrowverse, Buffy, …), demoting mdblist to a
+            # new-release top-up. Regenerated every run; carries each member's title (so unowned films get
+            # named) — reaching grouping, retention AND acquisition through the cache below.
+            tl_catalog = self._universe_timeline_catalog()
+            universes = apply_universe_timeline(universes, tl_catalog)
+            # Universe show tvdbs — now INCLUDING the baked saga shows — so a TV franchise a universe
+            # already groups (Arrowverse, Star Trek, the MCU/SW shows, AND chronolists' own TV franchises
+            # like Buffy/One Chicago) is NOT re-emitted as a tvfran: entry (no double-grouping).
             deny = {ti for v in universes.values() for tv in (v.get("shows") or [])
                     if (ti := _to_int(tv)) is not None}
-            syn = tv_franchise_universes(rows, self._tv_franchise_catalog(),
+            catalog = self._tv_franchise_catalog()
+            syn = tv_franchise_universes(rows, catalog,
                                          engaged_tvdbs=self._watchlisted_show_tvdbs(), deny_tvdbs=deny)
             fetched = {k: v for k, v in (cached.get("fetched") or {}).items()
                        if k != "__tvfran__"}                            # drop only our marker; mdblist TTL untouched
@@ -507,11 +535,43 @@ class PlexPlaylistBuilderManager(BaseManager):
             if syn:
                 fetched["__tvfran__"] = date.today().toordinal()         # bookkeeping; not read by the mdblist TTL loop
             self.global_cache.set(_UNIVERSE_SRC_KEY, {"universes": universes, "fetched": fetched})
+            self._publish_saga_member_titles(rows, catalog)
+            tl_keys = [k for k in (tl_catalog or {}) if k in universes]
+            if tl_keys:
+                shows = sum(len((universes[k] or {}).get("shows") or []) for k in tl_keys)
+                self.logger.log_info(f"[UniverseOrder] {len(tl_keys)} chronolist universe(s) lead the "
+                                     f"timeline ({shows} interleaved show(s) across them).")
             if syn:
                 self.logger.log_info(f"[UniverseOrder] {len(syn)} engaged TV franchise(s) "
                                      f"(owned or watchlisted) feeding grouping, retention and acquisition.")
         except Exception as e:
             self.logger.log_debug(f"[UniverseOrder] synthetic franchise refresh skipped: {e}")
+
+    def _publish_saga_member_titles(self, rows, catalog) -> None:
+        """Cache ``plex/playlists/saga_member_titles`` = ``{str(tvdb): title}`` for every TV-franchise
+        member — owned series (from the rows) + the TV catalog's UNOWNED siblings (its parallel
+        titles/shows arrays). The universe-acquisition preview + the future GUI resolve a backfilled
+        tvfran: member's id to a real title from this. (Chronolist-led universes carry their members'
+        titles in the universe-source entry itself — read directly by the coordinator's ``_titles_map``
+        — so they need no publish here.)"""
+        if not self.global_cache:
+            return
+        try:
+            titles: dict = {}
+            for r in (rows or []):
+                tv = _to_int(r.get("tvdbId"))
+                if tv is not None and r.get("title"):
+                    titles.setdefault(tv, r["title"])
+            for entry in (catalog or {}).values():
+                if not isinstance(entry, dict):
+                    continue
+                for t, s in zip(entry.get("titles") or [], entry.get("shows") or []):
+                    si = _to_int(s)
+                    if si is not None and t:
+                        titles.setdefault(si, t)
+            self.global_cache.set("plex/playlists/saga_member_titles", {str(k): v for k, v in titles.items()})
+        except Exception as e:
+            self.logger.log_debug(f"[UniverseOrder] saga-member-titles publish skipped: {e}")
 
     def _watchlisted_show_tvdbs(self) -> set:
         """Household-watchlisted SHOW tvdbs (intent to watch) from the watchlist union — these may be
@@ -553,6 +613,30 @@ class PlexPlaylistBuilderManager(BaseManager):
         overlay = self._pl_cfg().get("tv_franchises", {})
         if isinstance(overlay, dict) and overlay:
             catalog.update(overlay)                            # config overlay wins (no rebuild)
+        return catalog
+
+    def _universe_timeline_catalog(self) -> dict:
+        """The baked in-universe MOVIE+SHOW order (``universe_timeline.json``, generated from
+        chronolists.com) — the full chronological interleave per universe — merged with the
+        ``plex.playlists.universe_timeline.universes`` config overlay (which wins per key, so an operator
+        re-orders or adds a whole universe with one config block, no rebuild). ``{}`` when neither
+        exists. Shape ``{universe_key: {"display"?, "sources"?, "items": [{"media", "tmdb"|"tvdb",
+        "title"?}…]}}``, fed to :func:`apply_universe_timeline`. Recomputed per call (tiny file; a manager
+        is a long-lived singleton, so a stale memo would freeze a JSON/overlay edit)."""
+        catalog: dict = {}
+        pkg_dir = os.path.dirname(os.path.abspath(__file__))
+        try:
+            with open(os.path.join(pkg_dir, _UNIVERSE_TIMELINE_FILE), encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                catalog.update(data)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            self.logger.log_debug(f"[UniverseOrder] universe-timeline overlay read skipped: {e}")
+        overlay = (self._pl_cfg().get("universe_timeline", {}) or {}).get("universes", {})
+        if isinstance(overlay, dict) and overlay:
+            catalog.update(overlay)                            # config overlay wins per universe (no rebuild)
         return catalog
 
     # ── config knobs ────────────────────────────────────────────────────────────

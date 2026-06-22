@@ -3,12 +3,24 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
+import pytest
+
 from scripts.managers.services.plex.playlists.movie_builder import (
     _FRESH_PLAN_KEY,
     _PLAN_KEY,
     _PROTECTED_KEY,
     MoviePlaylistBuilderManager,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_universe_timeline_bake(monkeypatch):
+    """Unit tests must not pick up the committed ``universe_timeline.json`` chronolists bake — restrict
+    ``_universe_timeline_catalog`` to each test's config overlay so the test fully controls the timeline."""
+    def _cfg_only(self):
+        ov = (self._pl_cfg().get("universe_timeline", {}) or {}).get("universes", {})
+        return dict(ov) if isinstance(ov, dict) else {}
+    monkeypatch.setattr(MoviePlaylistBuilderManager, "_universe_timeline_catalog", _cfg_only)
 
 
 class _Log:
@@ -192,6 +204,45 @@ def test_config_franchise_feeds_synthetic_universe_entry():
     syn = cache.get(B._UNIVERSE_SRC_KEY)["universes"]["tvfran:testverse"]
     assert syn["shows"] == [900001, 900002] and syn["timeline"] is True
     assert [it["tvdb"] for it in syn["items"]] == [900001, 900002]
+
+
+def test_universe_source_restamps_timeline_flag_from_config():
+    # the timeline flag is config-authoritative: a cached entry's stale timeline:True is overridden by
+    # the CURRENT universe_lists() defn, so flipping a reverse-sorted list (fast/rocky) to False orders
+    # it by release date on the NEXT run — without waiting for the 7-day TTL re-fetch.
+    import scripts.managers.services.plex.playlists.builder as B
+    cache = _Cache()
+    cache.set(B._UNIVERSE_SRC_KEY, {
+        "universes": {"fast": {"timeline": True, "movies": [1, 2], "shows": [],   # stale: fetched as True
+                               "items": [{"media": "movie", "tmdb": 1, "rank": 0},
+                                         {"media": "movie", "tmdb": 2, "rank": 1}]}},
+        "fetched": {"fast": 9_999_999}})                                  # fresh → NOT re-fetched
+    src = _mgr(cache=cache, config=_ON)._universe_source()                # no mdblist key; re-stamp still applies
+    assert src["universes"]["fast"]["timeline"] is False                 # corrected from UNIVERSE_LISTS (fast=False)
+
+
+def test_universe_timeline_bake_leads_full_interleave_into_cache():
+    # the chronolists bake LEADS: its full movie+show order replaces the movies-only mdblist entry in the
+    # cache (for the cache-reading consumers — retention + acquisition), and a new mdblist film tops up.
+    # Driven here by the config overlay (self-contained, no file dependency).
+    import scripts.managers.services.plex.playlists.builder as B
+    cache = _Cache()
+    cache.set(B._UNIVERSE_SRC_KEY, {
+        "universes": {"dcu": {"timeline": True, "movies": [10, 99], "shows": [],
+                              "items": [{"media": "movie", "tmdb": 10, "rank": 0},
+                                        {"media": "movie", "tmdb": 99, "rank": 1}],
+                              "titles": {"movie:99": "Brand New"}}},     # 99 = a film not yet in the bake
+        "fetched": {"dcu": 5}})
+    cfg = {"plex": {"playlists": {"universe_timeline": {"enabled": True, "universes": {
+        "dcu": {"items": [{"media": "movie", "tmdb": 10, "title": "The Suicide Squad"},
+                          {"media": "show", "tvdb": 700, "title": "Peacemaker"}]}}}}}}
+    m = _mgr(cache=cache, config=cfg)
+    m._tv_franchise_maps([])                                          # triggers _refresh_synthetic_universes
+    dcu = cache.get(B._UNIVERSE_SRC_KEY)["universes"]["dcu"]
+    assert [(it["media"], it.get("tmdb", it.get("tvdb"))) for it in dcu["items"]] == [
+        ("movie", 10), ("show", 700), ("movie", 99)]                 # baked order, then the new film topped up
+    assert dcu["shows"] == [700] and dcu["titles"]["show:700"] == "Peacemaker"
+    assert dcu["items"][-1].get("src") == "mdblist"                  # 99 flagged as the mdblist top-up
 
 
 def test_watchlisted_franchise_feeds_synthetic_universe_entry():

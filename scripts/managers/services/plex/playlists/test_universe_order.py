@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from scripts.managers.services.plex.playlists.universe_order import (
+    apply_universe_timeline,
     build_universe_maps,
     collection_universe_key,
     is_stale,
@@ -21,6 +22,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     unified_universe_order,
     universe_acquire_plan,
     universe_lists,
+    universe_timeline_entry,
 )
 
 
@@ -155,6 +157,14 @@ def test_universe_lists_merges_config_overrides():
                            "newverse": {"imdb": "ls999", "timeline": True}})
     assert over["mcu"] == {"mdblist": "me/mine", "timeline": False}   # override wins
     assert over["newverse"]["imdb"] == "ls999"                        # brand-new universe added
+
+
+def test_reverse_sorted_franchises_flagged_order_by_date():
+    # fast & rocky public mdblist lists are newest-first; they MUST be timeline:False so the playlist
+    # orders them by release date ASCENDING (earliest first = story continuity), not the list's reverse.
+    base = universe_lists()
+    assert base["fast"]["timeline"] is False and base["rocky"]["timeline"] is False
+    assert base["mcu"]["timeline"] is True and base["mummy"]["timeline"] is True   # true/ascending kept
 
 
 def test_split_list_media_partitions_in_order():
@@ -414,3 +424,74 @@ def test_tv_franchise_universes_entries_round_trip_through_consumers():
     uni = unified_universe_order(src, set(), {1: 100}, include_unowned=True)["tvfran:laworder"]
     assert [(m["media"], m["id"], m["owned"]) for m in uni] == [
         ("show", 1, True), ("show", 2, False), ("show", 3, False)]
+
+
+def test_split_list_media_carries_list_titles():
+    items = [{"tmdb": 1726, "tvdb": None, "media": "movie"},
+             {"tmdb": None, "tvdb": 280619, "media": "show"}]
+    e = split_list_media(items, True, titles={"movie:1726": "Iron Man", "show:280619": "Agent Carter"})
+    assert e["movies"] == [1726] and e["shows"] == [280619]
+    assert e["titles"] == {"movie:1726": "Iron Man", "show:280619": "Agent Carter"}
+    assert split_list_media(items, True)["titles"] == {}               # default → empty, back-compat
+
+
+# ── universe_timeline.json: the chronolists bake LEADS the full MOVIE+SHOW order ─────────────────
+def _bake(*entries):
+    # (media, id, title) tuples → a timeline_catalog universe spec (the generator's `items` shape).
+    return {"items": [{"media": m, ("tmdb" if m == "movie" else "tvdb"): i, "title": t}
+                      for m, i, t in entries]}
+
+
+def test_universe_timeline_entry_builds_split_shape_with_titles():
+    e = universe_timeline_entry([{"media": "movie", "tmdb": 10, "title": "A"},
+                                 {"media": "show", "tvdb": 100, "title": "Show"},
+                                 {"media": "movie", "tmdb": 20, "title": "B"}])
+    assert e["timeline"] is True and e["movies"] == [10, 20] and e["shows"] == [100]
+    assert [(it["media"], it.get("tmdb", it.get("tvdb")), it["rank"]) for it in e["items"]] == [
+        ("movie", 10, 0), ("show", 100, 1), ("movie", 20, 2)]      # full interleave, dense rank
+    assert e["titles"] == {"movie:10": "A", "show:100": "Show", "movie:20": "B"}
+
+
+def test_universe_timeline_entry_dedups_first_wins():
+    e = universe_timeline_entry([{"media": "movie", "tmdb": 10, "title": "A"},
+                                 {"media": "movie", "tmdb": 10, "title": "dup"}])
+    assert e["movies"] == [10] and e["titles"] == {"movie:10": "A"}
+
+
+def test_apply_timeline_replaces_universe_with_full_interleave():
+    # the bake LEADS: a movies-only mdblist entry is replaced by the chronolists movie+show order.
+    universes = {"mcu": split_list_media([{"media": "movie", "tmdb": 10},
+                                          {"media": "movie", "tmdb": 20}], True)}
+    cat = {"mcu": _bake(("show", 100, "Eyes"), ("movie", 10, "A"), ("show", 101, "Loki"), ("movie", 20, "B"))}
+    out = apply_universe_timeline(universes, cat)["mcu"]
+    assert [(it["media"], it.get("tmdb", it.get("tvdb"))) for it in out["items"]] == [
+        ("show", 100), ("movie", 10), ("show", 101), ("movie", 20)]
+    assert out["shows"] == [100, 101] and out["titles"]["movie:10"] == "A"
+
+
+def test_apply_timeline_tops_up_new_mdblist_film():
+    # a film in the mdblist list but NOT yet in the bake (a fresh release) is appended + tagged.
+    universes = {"mcu": split_list_media([{"media": "movie", "tmdb": 10}, {"media": "movie", "tmdb": 99}],
+                                         True, titles={"movie:99": "Brand New"})}
+    cat = {"mcu": _bake(("movie", 10, "A"))}                        # bake lacks 99
+    out = apply_universe_timeline(universes, cat)["mcu"]
+    assert out["movies"] == [10, 99]                               # 99 topped up after the baked order
+    assert out["items"][-1] == {"media": "movie", "tmdb": 99, "rank": 1, "src": "mdblist"}
+    assert out["titles"]["movie:99"] == "Brand New"                # carried from the mdblist entry
+
+
+def test_apply_timeline_adds_tv_only_universe_and_passes_through_others():
+    universes = {"fast": split_list_media([{"media": "movie", "tmdb": 5}], True)}   # mdblist-only, not on chronolists
+    cat = {"buffyverse": _bake(("show", 70327, "Buffy"), ("show", 71035, "Angel"))}
+    out = apply_universe_timeline(universes, cat)
+    assert out["buffyverse"]["shows"] == [70327, 71035]            # TV-only universe added from the bake
+    assert out["fast"] is universes["fast"]                        # uncovered mdblist universe untouched
+    assert apply_universe_timeline(universes, {}) is universes      # empty bake → exact no-op
+
+
+def test_apply_timeline_items_feed_unified_cross_media_acquisition_order():
+    # the payoff: the baked cross-media order (film → show → film) reaches acquisition's saga walk.
+    src = {"universes": apply_universe_timeline(
+        {}, {"mcu": _bake(("movie", 10, "A"), ("show", 100, "Loki"), ("movie", 20, "B"))})}
+    uni = unified_universe_order(src, {10, 20}, {100: 500}, include_unowned=True)["mcu"]
+    assert [(m["media"], m["id"]) for m in uni] == [("movie", 10), ("show", 100), ("movie", 20)]
