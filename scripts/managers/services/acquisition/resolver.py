@@ -52,6 +52,10 @@ class Resolver:
         # cache by Sonarr series tmdbId (separate files — movie/show tmdbIds share a space).
         self._movie_age_cache = None
         self._show_age_cache = None
+        # Plain-language reason for the LAST profile pick (pinned / score-tier / fallback). Set by
+        # _pick_profile (which can't return it without changing a tested signature) and read by the
+        # caller right after — safe because the resolver runs the candidate loop single-threaded.
+        self._last_profile_reason = ""
 
     def prepare(self, cand: dict) -> dict:
         is_show = cand.get("type") == "show"
@@ -153,12 +157,14 @@ class Resolver:
             return out
 
         profile = self._pick_profile(gw, inst)
+        profile_reason = self._last_profile_reason
         root = self._pick_root_folder(gw, inst, is_show, route_category)
         size, unit = self._expected_size(profile, runtime, is_movie=not is_show)
 
         out.update({
             "instance": inst,
             "quality_profile": profile,
+            "profile_reason": profile_reason,
             "root_folder": root,
             "expected_size_gb": size,
             "size_unit": unit,
@@ -218,21 +224,39 @@ class Resolver:
             self._show_age_cache = age_cache.load(age_cache.TV_AGE_CACHE_PATH)
         return age_cache.age_for(tmdb_id, cache=self._show_age_cache)
 
+    @staticmethod
+    def _res_label(res: int) -> str:
+        """A resolution tier int (from ``target_resolution_for_score``) → a log label:
+        2160 -> '2160p', 0/480 -> 'SD'."""
+        try:
+            res = int(res)
+        except (TypeError, ValueError):
+            return "?"
+        return f"{res}p" if res > 480 else "SD"
+
     def _pick_profile(self, gw, inst, score=None) -> dict:
         profiles = gw.quality_profiles(inst) or []
         want = (self._acq.get("quality_profile") or "").strip().lower()
-        chosen = None
+        chosen, reason = None, ""
         if want:
             # Explicit config override by profile name — always wins.
             chosen = next((p for p in profiles if str(p.get("name", "")).lower() == want), None)
+            if chosen is not None:
+                reason = f"pinned to '{chosen.get('name')}' by acquisition.quality_profile"
         if chosen is None and not want and score is not None and profiles:
             # Matrix-driven: map the watchability/acquisition score to a target
             # resolution tier and pick the highest-quality profile at or under it,
             # so high-want adds get higher quality and low-want adds get 720p/SD —
             # instead of always defaulting to the first ("Any") profile.
             chosen = self._profile_for_score(profiles, int(score))
+            if chosen is not None:
+                reason = (f"score {int(score)} picks up to the "
+                          f"{self._res_label(self._target_resolution_for_score(int(score)))} tier")
         if chosen is None and profiles:
             chosen = profiles[0]
+            reason = ("pinned name not found; using first available profile" if want
+                      else "first available profile (no score/pin)")
+        self._last_profile_reason = reason
         return self._profile_view(chosen)
 
     @staticmethod
@@ -289,6 +313,7 @@ class Resolver:
         profile = self._pick_profile(gw, enriched["instance"], score=score)
         size, unit = self._expected_size(profile, int(enriched.get("runtime") or 0), is_movie=not is_show)
         enriched["quality_profile"]  = profile
+        enriched["profile_reason"]   = self._last_profile_reason
         enriched["expected_size_gb"] = size
         enriched["size_unit"]        = unit
         return enriched
@@ -348,6 +373,8 @@ class Resolver:
             view = self._profile_view(raw)
             size, unit = self._expected_size(view, int(enriched.get("runtime") or 0), is_movie=True)
             enriched["quality_profile"]  = view
+            enriched["profile_reason"]   = (f"dual-version HD baseline (clamped to '{view.get('name')}' "
+                                            f"as the <=1080p durable floor; 4K copy added separately)")
             enriched["expected_size_gb"] = size
             enriched["size_unit"]        = unit
         enriched["dual_baseline"] = True
@@ -405,6 +432,7 @@ class Resolver:
         companion.update({
             "instance": inst_4k,
             "quality_profile": profile,
+            "profile_reason": f"4K instance top quality ('{profile.get('name')}', premium tier)",
             "root_folder": root,
             "expected_size_gb": size,
             "size_unit": unit,
