@@ -639,6 +639,14 @@ def collection_group_key(title, franchise_index=None) -> str | None:
     return franchise_index.get(_collection_norm(title)) if franchise_index else None
 
 
+def is_collection_noise(title) -> bool:
+    """True for a Kometa STRUCTURAL collection — a separator (``<Word> Collections``) or a streaming
+    rollup (``<Word> Shows``) — which is never a franchise. Lets an UNRECOGNISED, non-noise SHOW
+    collection be trusted as a franchise group (its members ARE the franchise). PURE."""
+    t = str(title or "").strip()
+    return t.endswith((" Collections", " Shows"))
+
+
 # Reverse of UNIVERSE_COLLECTION_NAMES (key -> a Title-Cased display name), built once. Used by
 # the acquisition logs to print 'Marvel Cinematic Universe' instead of the bare 'mcu' key.
 _UNIVERSE_KEY_TO_NAME = {v: k.title() for k, v in UNIVERSE_COLLECTION_NAMES.items()}

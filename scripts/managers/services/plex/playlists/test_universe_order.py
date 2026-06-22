@@ -9,6 +9,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     detect_kometa,
     franchise_tier,
     franchise_title_index,
+    is_collection_noise,
     is_stale,
     merge_movie_orders,
     movie_order_from_children,
@@ -56,6 +57,15 @@ def test_collection_group_key_matches_franchise_collections():
     assert collection_group_key("Streaming Collections", idx) is None        # separator → ignored
     assert collection_group_key("Totally Unknown Show", idx) is None
     assert collection_group_key("One Chicago", None) is None                 # no index → only universes
+
+
+def test_is_collection_noise_filters_separators_and_streaming():
+    assert is_collection_noise("Universe Collections") is True               # separator
+    assert is_collection_noise("Streaming Collections") is True
+    assert is_collection_noise("Netflix Shows") is True                      # streaming rollup
+    assert is_collection_noise("CSI") is False                               # a real franchise
+    assert is_collection_noise("One Chicago") is False
+    assert is_collection_noise("Arrowverse (Watch Order)") is False
 
 
 # ── Kometa Defaults detection from collection titles ────────────────────────────

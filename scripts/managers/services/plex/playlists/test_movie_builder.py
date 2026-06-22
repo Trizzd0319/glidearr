@@ -232,6 +232,42 @@ def test_plex_tv_collection_order_recognises_franchise_and_custom_named(monkeypa
     assert timeline == {1: 0, 2: 1, 3: 0}                                   # collection order, per group
 
 
+class _FakeTVTrustAPI:
+    """A Kometa install (2 separators) with an UNKNOWN franchise (CSI, 2 owned shows), a single-show
+    'franchise' (The Rookie, 1 owned), and a streaming rollup (Netflix Shows) that must be ignored."""
+    def get_sections(self):
+        return {"MediaContainer": {"Metadata": [{"key": "2", "title": "TV", "type": "show"}]}}
+
+    def get_collections(self, section_id=None):
+        return {"MediaContainer": {"Metadata": [
+            {"ratingKey": "sep1", "title": "Universe Collections"},      # separators → Kometa detected
+            {"ratingKey": "sep2", "title": "Streaming Collections"},
+            {"ratingKey": "csi",  "title": "CSI"},                       # unknown franchise, 2 owned
+            {"ratingKey": "solo", "title": "The Rookie"},                # 1 owned → skip (not a franchise here)
+            {"ratingKey": "nflx", "title": "Netflix Shows"}]}}           # streaming noise → skip
+
+    def get_collection_children(self, rk, include_guids=False):
+        kids = {
+            "csi":  [{"ratingKey": "a", "Guid": [{"id": "tvdb://601"}]},
+                     {"ratingKey": "b", "Guid": [{"id": "tvdb://602"}]}],
+            "solo": [{"ratingKey": "c", "Guid": [{"id": "tvdb://603"}]}],
+            "nflx": [{"ratingKey": "d", "Guid": [{"id": "tvdb://604"}]},
+                     {"ratingKey": "e", "Guid": [{"id": "tvdb://605"}]}],
+        }.get(rk, [])
+        return {"MediaContainer": {"Metadata": kids}}
+
+
+def test_plex_tv_collection_order_trusts_unknown_kometa_franchise(monkeypatch):
+    m = _mgr()
+    m.plex_api = _FakeTVTrustAPI()
+    monkeypatch.setattr(m, "_tv_franchise_catalog", lambda: {})
+    monkeypatch.setattr(m, "_universe_timeline_catalog", lambda: {})
+    tvdb_to_sid = {601: 1, 602: 2, 603: 3, 604: 4, 605: 5}               # owns everything
+    fran, timeline = m._plex_tv_collection_order(tvdb_to_sid)
+    assert fran == {1: "csi", 2: "csi"}              # CSI (2 owned) trusted; Rookie(1) + Netflix(noise) skipped
+    assert timeline == {1: 0, 2: 1}                 # collection order
+
+
 def test_plex_tv_collection_order_empty_without_api_or_series():
     assert MoviePlaylistBuilderManager._plex_tv_collection_order(_mgr(), {1: 2}) == ({}, {})  # no plex_api
     m = _mgr(); m.plex_api = _FakeTVPlexAPI()

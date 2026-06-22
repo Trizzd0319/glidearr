@@ -45,12 +45,14 @@ from scripts.managers.services.plex.playlists.tv_resolver import (
 )
 from scripts.managers.services.plex.playlists.universe_order import (
     CURATED_TV_FRANCHISES,
+    _collection_norm,
     apply_universe_timeline,
     build_universe_maps,
     collection_group_key,
     collection_universe_key,
     detect_kometa,
     franchise_title_index,
+    is_collection_noise,
     franchise_tier,
     is_stale,
     merge_movie_orders,
@@ -541,12 +543,24 @@ class PlexPlaylistBuilderManager(BaseManager):
         fidx = franchise_title_index({**self._tv_franchise_catalog(), **self._universe_timeline_catalog()},
                                      CURATED_TV_FRANCHISES)
         cols = self._all_collections()
+        kometa = detect_kometa([d.get("title") for d in cols])["detected"]    # trust unknown collections only on Kometa
         fran_all, time_all, matched = {}, {}, 0
         for d in cols:
             rk = d.get("ratingKey")
-            key = collection_group_key(d.get("title"), fidx) if rk is not None else None
-            if key is None:
+            if rk is None:
                 continue
+            title = d.get("title")
+            key = collection_group_key(title, fidx)
+            tentative = key is None
+            if tentative:
+                # An unrecognised collection on a Kometa install IS a franchise when it isn't a
+                # separator/streaming rollup AND has >=2 owned member shows — so CSI / Power / Yellowstone
+                # group from the collection ITSELF, no hand-maintained key list. Single-show + noise skip.
+                if not kometa or is_collection_noise(title):
+                    continue
+                key = _collection_norm(title)
+                if not key:
+                    continue
             try:
                 kids = metadata_items(self.plex_api.get_collection_children(rk, include_guids=True))
             except Exception:
@@ -562,8 +576,8 @@ class PlexPlaylistBuilderManager(BaseManager):
                 sid = tvdb_to_sid.get(tvdb) if tvdb is not None else None
                 if sid is not None:
                     rk_to_sid[crk] = sid
-            if not rk_to_sid:
-                continue                                       # a MOVIE universe collection → no shows matched
+            if not rk_to_sid or (tentative and len(set(rk_to_sid.values())) < 2):
+                continue                                       # no owned shows, or a single-show "franchise"
             fran, tmap = series_order_from_children(ordered, rk_to_sid, key, with_timeline=True)
             if fran:
                 fran_all.update(fran)
