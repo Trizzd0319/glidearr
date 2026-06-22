@@ -1,0 +1,1657 @@
+{
+ "arrow": {
+  "display": "DC Arrowverse",
+  "slug": "dctv",
+  "sources": [
+   {
+    "title": "Arrowverse.info",
+    "link": "https://arrowverse.info/"
+   }
+  ],
+  "version": 2,
+  "items": [
+   {
+    "media": "show",
+    "tvdb": 257655,
+    "tmdb": 1412,
+    "title": "Arrow",
+    "imdb": "tt2193021"
+   },
+   {
+    "media": "show",
+    "tvdb": 279121,
+    "tmdb": 60735,
+    "title": "The Flash",
+    "imdb": "tt3107288"
+   },
+   {
+    "media": "show",
+    "tvdb": 273690,
+    "tmdb": 60743,
+    "title": "Constantine",
+    "imdb": "tt3489184"
+   },
+   {
+    "media": "show",
+    "tvdb": 298305,
+    "tmdb": 62125,
+    "title": "Vixen",
+    "imdb": "tt4406248"
+   },
+   {
+    "media": "show",
+    "tvdb": 295759,
+    "tmdb": 62688,
+    "title": "Supergirl",
+    "imdb": "tt4016454"
+   },
+   {
+    "media": "show",
+    "tvdb": 295760,
+    "tmdb": 62643,
+    "title": "DC's Legends of Tomorrow",
+    "imdb": "tt4532368"
+   },
+   {
+    "media": "show",
+    "tvdb": 328982,
+    "tmdb": 75486,
+    "title": "Freedom Fighters: The Ray",
+    "imdb": "tt5957358"
+   },
+   {
+    "media": "show",
+    "tvdb": 332525,
+    "tmdb": 71663,
+    "title": "Black Lightning",
+    "imdb": "tt6045840"
+   },
+   {
+    "media": "show",
+    "tvdb": 361315,
+    "tmdb": 89247,
+    "title": "Batwoman",
+    "imdb": "tt8712204"
+   },
+   {
+    "media": "show",
+    "tvdb": 361868,
+    "tmdb": 80986,
+    "title": "DC's Stargirl",
+    "imdb": "tt8722888"
+   },
+   {
+    "media": "show",
+    "tvdb": 375655,
+    "tmdb": 95057,
+    "title": "Superman & Lois",
+    "imdb": "tt11192306"
+   }
+  ]
+ },
+ "bsg": {
+  "display": "Battlestar Galactica",
+  "slug": "bsg",
+  "sources": [
+   {
+    "title": "Lincoln Cannon",
+    "link": "https://lincoln.metacannon.net/2020/02/ultimate-battlestar-galactica-watch-order.html"
+   }
+  ],
+  "version": 2,
+  "items": [
+   {
+    "media": "show",
+    "tvdb": 85040,
+    "tmdb": 877,
+    "title": "Caprica",
+    "imdb": "tt0799862"
+   },
+   {
+    "media": "movie",
+    "tmdb": 257368,
+    "title": "Battlestar Galactica: Blood & Chrome",
+    "imdb": "tt1704292"
+   },
+   {
+    "media": "show",
+    "tvdb": 73545,
+    "tmdb": 1972,
+    "title": "Battlestar Galactica",
+    "imdb": "tt0407362"
+   },
+   {
+    "media": "movie",
+    "tmdb": 69315,
+    "title": "Battlestar Galactica: Razor",
+    "imdb": "tt0991178"
+   },
+   {
+    "media": "movie",
+    "tmdb": 105077,
+    "title": "Battlestar Galactica: The Plan",
+    "imdb": "tt1286130"
+   }
+  ]
+ },
+ "buffyverse": {
+  "display": "Buffy & Angel",
+  "slug": "buffy",
+  "sources": [
+   {
+    "title": "The Watcher's Council",
+    "link": "https://josswhedon.blogspot.com/2012/04/buffy-and-angel-episode-viewing-order.html"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "show",
+    "tvdb": 70327,
+    "tmdb": 95,
+    "title": "Buffy the Vampire Slayer",
+    "imdb": "tt0118276"
+   },
+   {
+    "media": "show",
+    "tvdb": 71035,
+    "tmdb": 2426,
+    "title": "Angel",
+    "imdb": "tt0162065"
+   }
+  ]
+ },
+ "dcu": {
+  "display": "DC Extended Universe",
+  "slug": "dceu",
+  "sources": [
+   {
+    "title": "Digital Spy",
+    "link": "https://www.digitalspy.com/movies/a25604201/dceu-timeline-worlds-of-dc-movies-in-order/"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "movie",
+    "tmdb": 297762,
+    "title": "Wonder Woman",
+    "imdb": "tt0451279"
+   },
+   {
+    "media": "movie",
+    "tmdb": 464052,
+    "title": "Wonder Woman 1984",
+    "imdb": "tt7126948"
+   },
+   {
+    "media": "movie",
+    "tmdb": 49521,
+    "title": "Man of Steel",
+    "imdb": "tt0770828"
+   },
+   {
+    "media": "movie",
+    "tmdb": 209112,
+    "title": "Batman v Superman: Dawn of Justice",
+    "imdb": "tt2975590"
+   },
+   {
+    "media": "movie",
+    "tmdb": 297761,
+    "title": "Suicide Squad",
+    "imdb": "tt1386697"
+   },
+   {
+    "media": "movie",
+    "tmdb": 495764,
+    "title": "Birds of Prey (and the Fantabulous Emancipation of One Harley Quinn)",
+    "imdb": "tt7713068"
+   },
+   {
+    "media": "movie",
+    "tmdb": 141052,
+    "title": "Justice League",
+    "imdb": "tt0974015"
+   },
+   {
+    "media": "movie",
+    "tmdb": 297802,
+    "title": "Aquaman",
+    "imdb": "tt1477834"
+   },
+   {
+    "media": "movie",
+    "tmdb": 287947,
+    "title": "Shazam!",
+    "imdb": "tt0448115"
+   },
+   {
+    "media": "movie",
+    "tmdb": 436969,
+    "title": "The Suicide Squad",
+    "imdb": "tt6334354"
+   },
+   {
+    "media": "show",
+    "tvdb": 391153,
+    "tmdb": 110492,
+    "title": "Peacemaker",
+    "imdb": "tt13146488"
+   },
+   {
+    "media": "movie",
+    "tmdb": 436270,
+    "title": "Black Adam",
+    "imdb": "tt6443346"
+   },
+   {
+    "media": "movie",
+    "tmdb": 594767,
+    "title": "Shazam! Fury of the Gods",
+    "imdb": "tt10151854"
+   },
+   {
+    "media": "movie",
+    "tmdb": 298618,
+    "title": "The Flash",
+    "imdb": "tt0439572"
+   },
+   {
+    "media": "movie",
+    "tmdb": 565770,
+    "title": "Blue Beetle",
+    "imdb": "tt9362930"
+   },
+   {
+    "media": "movie",
+    "tmdb": 572802,
+    "title": "Aquaman and the Lost Kingdom",
+    "imdb": "tt9663764"
+   }
+  ]
+ },
+ "doctorwho": {
+  "display": "Doctor Who",
+  "slug": "doctor-who",
+  "sources": [
+   {
+    "title": "Digital Spy",
+    "link": "https://www.digitalspy.com/tv/cult/a852656/doctor-who-timeline-whoniverse-viewing-order/"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "show",
+    "tvdb": 78804,
+    "tmdb": 57243,
+    "title": "Doctor Who (2005)",
+    "imdb": "tt0436992"
+   },
+   {
+    "media": "show",
+    "tvdb": 79511,
+    "tmdb": 424,
+    "title": "Torchwood",
+    "imdb": "tt0485301"
+   },
+   {
+    "media": "show",
+    "tvdb": 79708,
+    "tmdb": 203,
+    "title": "The Sarah Jane Adventures",
+    "imdb": "tt0862620"
+   },
+   {
+    "media": "show",
+    "tvdb": 309893,
+    "tmdb": 64073,
+    "title": "Class",
+    "imdb": "tt5079788"
+   },
+   {
+    "media": "show",
+    "tvdb": 449991,
+    "tmdb": 239770,
+    "title": "Doctor Who (2023)",
+    "imdb": "tt31433814"
+   }
+  ]
+ },
+ "fast": {
+  "display": "Fast & Furious",
+  "sources": [
+   {
+    "title": "release order (curated; not on chronolists)",
+    "link": ""
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "movie",
+    "tmdb": 9799,
+    "title": "The Fast and the Furious"
+   },
+   {
+    "media": "movie",
+    "tmdb": 584,
+    "title": "2 Fast 2 Furious"
+   },
+   {
+    "media": "movie",
+    "tmdb": 9615,
+    "title": "The Fast and the Furious: Tokyo Drift"
+   },
+   {
+    "media": "movie",
+    "tmdb": 13804,
+    "title": "Fast & Furious"
+   },
+   {
+    "media": "movie",
+    "tmdb": 51497,
+    "title": "Fast Five"
+   },
+   {
+    "media": "movie",
+    "tmdb": 82992,
+    "title": "Fast & Furious 6"
+   },
+   {
+    "media": "movie",
+    "tmdb": 168259,
+    "title": "Furious 7"
+   },
+   {
+    "media": "movie",
+    "tmdb": 337339,
+    "title": "The Fate of the Furious"
+   },
+   {
+    "media": "movie",
+    "tmdb": 384018,
+    "title": "Fast & Furious Presents: Hobbs & Shaw"
+   },
+   {
+    "media": "movie",
+    "tmdb": 385128,
+    "title": "F9"
+   },
+   {
+    "media": "movie",
+    "tmdb": 385687,
+    "title": "Fast X"
+   }
+  ],
+  "slug": null
+ },
+ "mcu": {
+  "display": "Marvel Cinematic Universe",
+  "slug": "mcu",
+  "sources": [
+   {
+    "title": "Digital Spy",
+    "link": "https://www.digitalspy.com/movies/a825774/marvel-cinematic-universe-in-chronological-order/"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "show",
+    "tvdb": 443358,
+    "tmdb": 241388,
+    "title": "Eyes of Wakanda",
+    "imdb": "tt13968252"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1771,
+    "title": "Captain America: The First Avenger",
+    "imdb": "tt0458339"
+   },
+   {
+    "media": "show",
+    "tvdb": 281485,
+    "tmdb": 61550,
+    "title": "Marvel's Agent Carter",
+    "imdb": "tt3475734"
+   },
+   {
+    "media": "movie",
+    "tmdb": 299537,
+    "title": "Captain Marvel",
+    "imdb": "tt4154664"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1726,
+    "title": "Iron Man",
+    "imdb": "tt0371746"
+   },
+   {
+    "media": "movie",
+    "tmdb": 10138,
+    "title": "Iron Man 2",
+    "imdb": "tt1228705"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1724,
+    "title": "The Incredible Hulk",
+    "imdb": "tt0800080"
+   },
+   {
+    "media": "movie",
+    "tmdb": 10195,
+    "title": "Thor",
+    "imdb": "tt0800369"
+   },
+   {
+    "media": "movie",
+    "tmdb": 24428,
+    "title": "The Avengers",
+    "imdb": "tt0848228"
+   },
+   {
+    "media": "show",
+    "tvdb": 263365,
+    "tmdb": 1403,
+    "title": "Marvel's Agents of S.H.I.E.L.D.",
+    "imdb": "tt2364582"
+   },
+   {
+    "media": "movie",
+    "tmdb": 76338,
+    "title": "Thor: The Dark World",
+    "imdb": "tt1981115"
+   },
+   {
+    "media": "movie",
+    "tmdb": 68721,
+    "title": "Iron Man 3",
+    "imdb": "tt1300854"
+   },
+   {
+    "media": "movie",
+    "tmdb": 100402,
+    "title": "Captain America: The Winter Soldier",
+    "imdb": "tt1843866"
+   },
+   {
+    "media": "movie",
+    "tmdb": 118340,
+    "title": "Guardians of the Galaxy",
+    "imdb": "tt2015381"
+   },
+   {
+    "media": "movie",
+    "tmdb": 283995,
+    "title": "Guardians of the Galaxy Vol. 2",
+    "imdb": "tt3896198"
+   },
+   {
+    "media": "show",
+    "tvdb": 393201,
+    "tmdb": 232125,
+    "title": "I Am Groot",
+    "imdb": "tt13623148"
+   },
+   {
+    "media": "show",
+    "tvdb": 281662,
+    "tmdb": 61889,
+    "title": "Marvel's Daredevil",
+    "imdb": "tt3322312"
+   },
+   {
+    "media": "show",
+    "tvdb": 284190,
+    "tmdb": 38472,
+    "title": "Marvel's Jessica Jones",
+    "imdb": "tt2357547"
+   },
+   {
+    "media": "movie",
+    "tmdb": 99861,
+    "title": "Avengers: Age of Ultron",
+    "imdb": "tt2395427"
+   },
+   {
+    "media": "show",
+    "tvdb": 304219,
+    "tmdb": 62126,
+    "title": "Marvel's Luke Cage",
+    "imdb": "tt3322314"
+   },
+   {
+    "media": "movie",
+    "tmdb": 102899,
+    "title": "Ant-Man",
+    "imdb": "tt0478970"
+   },
+   {
+    "media": "show",
+    "tvdb": 317953,
+    "tmdb": 62127,
+    "title": "Marvel's Iron Fist",
+    "imdb": "tt3322310"
+   },
+   {
+    "media": "movie",
+    "tmdb": 271110,
+    "title": "Captain America: Civil War",
+    "imdb": "tt3498820"
+   },
+   {
+    "media": "movie",
+    "tmdb": 497698,
+    "title": "Black Widow",
+    "imdb": "tt3480822"
+   },
+   {
+    "media": "show",
+    "tvdb": 326490,
+    "tmdb": 62285,
+    "title": "Marvel's The Defenders",
+    "imdb": "tt4230076"
+   },
+   {
+    "media": "movie",
+    "tmdb": 284052,
+    "title": "Doctor Strange",
+    "imdb": "tt1211837"
+   },
+   {
+    "media": "movie",
+    "tmdb": 284054,
+    "title": "Black Panther",
+    "imdb": "tt1825683"
+   },
+   {
+    "media": "movie",
+    "tmdb": 315635,
+    "title": "Spider-Man: Homecoming",
+    "imdb": "tt2250912"
+   },
+   {
+    "media": "movie",
+    "tmdb": 284053,
+    "title": "Thor: Ragnarok",
+    "imdb": "tt3501632"
+   },
+   {
+    "media": "show",
+    "tvdb": 320558,
+    "tmdb": 68716,
+    "title": "Marvel's Inhumans",
+    "imdb": "tt4154858"
+   },
+   {
+    "media": "show",
+    "tvdb": 331980,
+    "tmdb": 67178,
+    "title": "Marvel's The Punisher",
+    "imdb": "tt5675620"
+   },
+   {
+    "media": "show",
+    "tvdb": 332027,
+    "tmdb": 67466,
+    "title": "Marvel's Runaways",
+    "imdb": "tt1236246"
+   },
+   {
+    "media": "show",
+    "tvdb": 341455,
+    "tmdb": 66190,
+    "title": "Marvel's Cloak & Dagger",
+    "imdb": "tt5614844"
+   },
+   {
+    "media": "movie",
+    "tmdb": 363088,
+    "title": "Ant-Man and the Wasp",
+    "imdb": "tt5095030"
+   },
+   {
+    "media": "movie",
+    "tmdb": 299536,
+    "title": "Avengers: Infinity War",
+    "imdb": "tt4154756"
+   },
+   {
+    "media": "movie",
+    "tmdb": 299534,
+    "title": "Avengers: Endgame",
+    "imdb": "tt4154796"
+   },
+   {
+    "media": "show",
+    "tvdb": 362472,
+    "tmdb": 84958,
+    "title": "Loki",
+    "imdb": "tt9140554"
+   },
+   {
+    "media": "show",
+    "tvdb": 367147,
+    "tmdb": 91363,
+    "title": "What If...?",
+    "imdb": "tt10168312"
+   },
+   {
+    "media": "show",
+    "tvdb": 412428,
+    "tmdb": 138505,
+    "title": "Marvel Zombies",
+    "imdb": "tt16027014"
+   },
+   {
+    "media": "show",
+    "tvdb": 362392,
+    "tmdb": 85271,
+    "title": "WandaVision",
+    "imdb": "tt9140560"
+   },
+   {
+    "media": "movie",
+    "tmdb": 533535,
+    "title": "Deadpool & Wolverine",
+    "imdb": "tt6263850"
+   },
+   {
+    "media": "movie",
+    "tmdb": 566525,
+    "title": "Shang-Chi and the Legend of the Ten Rings",
+    "imdb": "tt9376612"
+   },
+   {
+    "media": "show",
+    "tvdb": 362496,
+    "tmdb": 88396,
+    "title": "The Falcon and the Winter Soldier",
+    "imdb": "tt9208876"
+   },
+   {
+    "media": "movie",
+    "tmdb": 524434,
+    "title": "Eternals",
+    "imdb": "tt9032400"
+   },
+   {
+    "media": "movie",
+    "tmdb": 429617,
+    "title": "Spider-Man: Far from Home",
+    "imdb": "tt6320628"
+   },
+   {
+    "media": "movie",
+    "tmdb": 634649,
+    "title": "Spider-Man: No Way Home",
+    "imdb": "tt10872600"
+   },
+   {
+    "media": "movie",
+    "tmdb": 453395,
+    "title": "Doctor Strange in the Multiverse of Madness",
+    "imdb": "tt9419884"
+   },
+   {
+    "media": "show",
+    "tvdb": 367146,
+    "tmdb": 88329,
+    "title": "Hawkeye",
+    "imdb": "tt10160804"
+   },
+   {
+    "media": "show",
+    "tvdb": 368611,
+    "tmdb": 92749,
+    "title": "Moon Knight",
+    "imdb": "tt10234724"
+   },
+   {
+    "media": "movie",
+    "tmdb": 505642,
+    "title": "Black Panther: Wakanda Forever",
+    "imdb": "tt9114286"
+   },
+   {
+    "media": "show",
+    "tvdb": 412431,
+    "tmdb": 122226,
+    "title": "Echo",
+    "imdb": "tt13966962"
+   },
+   {
+    "media": "show",
+    "tvdb": 368613,
+    "tmdb": 92783,
+    "title": "She-Hulk: Attorney at Law",
+    "imdb": "tt10857160"
+   },
+   {
+    "media": "show",
+    "tvdb": 368612,
+    "tmdb": 92782,
+    "title": "Ms. Marvel",
+    "imdb": "tt10857164"
+   },
+   {
+    "media": "movie",
+    "tmdb": 616037,
+    "title": "Thor: Love and Thunder",
+    "imdb": "tt10648342"
+   },
+   {
+    "media": "show",
+    "tvdb": 393204,
+    "tmdb": 114471,
+    "title": "Ironheart",
+    "imdb": "tt13623126"
+   },
+   {
+    "media": "movie",
+    "tmdb": 894205,
+    "title": "Werewolf by Night",
+    "imdb": "tt15318872"
+   },
+   {
+    "media": "movie",
+    "tmdb": 774752,
+    "title": "The Guardians of the Galaxy Holiday Special",
+    "imdb": "tt13623136"
+   },
+   {
+    "media": "movie",
+    "tmdb": 640146,
+    "title": "Ant-Man and the Wasp: Quantumania",
+    "imdb": "tt10954600"
+   },
+   {
+    "media": "movie",
+    "tmdb": 447365,
+    "title": "Guardians of the Galaxy Vol. 3",
+    "imdb": "tt6791350"
+   },
+   {
+    "media": "show",
+    "tvdb": 393203,
+    "tmdb": 114472,
+    "title": "Secret Invasion",
+    "imdb": "tt13157618"
+   },
+   {
+    "media": "movie",
+    "tmdb": 609681,
+    "title": "The Marvels",
+    "imdb": "tt10676048"
+   },
+   {
+    "media": "show",
+    "tvdb": 412429,
+    "tmdb": 138501,
+    "title": "Agatha All Along",
+    "imdb": "tt15571732"
+   },
+   {
+    "media": "show",
+    "tvdb": 422712,
+    "tmdb": 202555,
+    "title": "Daredevil: Born Again",
+    "imdb": "tt18923754"
+   },
+   {
+    "media": "movie",
+    "tmdb": 822119,
+    "title": "Captain America: Brave New World",
+    "imdb": "tt14513804"
+   },
+   {
+    "media": "movie",
+    "tmdb": 986056,
+    "title": "Thunderbolts*",
+    "imdb": "tt20969586"
+   },
+   {
+    "media": "movie",
+    "tmdb": 617126,
+    "title": "The Fantastic 4: First Steps",
+    "imdb": "tt10676052"
+   },
+   {
+    "media": "show",
+    "tvdb": 428629,
+    "tmdb": 198178,
+    "title": "Wonder Man",
+    "imdb": "tt21066182"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1439930,
+    "title": "The Punisher: One Last Kill",
+    "imdb": "tt36042156"
+   }
+  ]
+ },
+ "mi": {
+  "display": "Mission: Impossible",
+  "slug": "mi",
+  "sources": [],
+  "version": 1,
+  "items": [
+   {
+    "media": "movie",
+    "tmdb": 954,
+    "title": "Mission: Impossible",
+    "imdb": "tt0117060"
+   },
+   {
+    "media": "movie",
+    "tmdb": 955,
+    "title": "Mission: Impossible II",
+    "imdb": "tt0120755"
+   },
+   {
+    "media": "movie",
+    "tmdb": 956,
+    "title": "Mission: Impossible III",
+    "imdb": "tt0317919"
+   },
+   {
+    "media": "movie",
+    "tmdb": 56292,
+    "title": "Mission: Impossible - Ghost Protocol",
+    "imdb": "tt1229238"
+   },
+   {
+    "media": "movie",
+    "tmdb": 177677,
+    "title": "Mission: Impossible - Rogue Nation",
+    "imdb": "tt2381249"
+   },
+   {
+    "media": "movie",
+    "tmdb": 353081,
+    "title": "Mission: Impossible - Fallout",
+    "imdb": "tt4912910"
+   },
+   {
+    "media": "movie",
+    "tmdb": 575264,
+    "title": "Mission: Impossible - Dead Reckoning Part One",
+    "imdb": "tt9603212"
+   },
+   {
+    "media": "movie",
+    "tmdb": 575265,
+    "title": "Mission: Impossible - The Final Reckoning",
+    "imdb": "tt9603208"
+   }
+  ]
+ },
+ "one chicago": {
+  "display": "Chicago",
+  "slug": "chicago",
+  "sources": [
+   {
+    "title": "Game Over Gallery",
+    "link": "https://petitcartonvert.tumblr.com/post/158289265736/chicago-franchise-episodes-timeline"
+   }
+  ],
+  "version": 2,
+  "items": [
+   {
+    "media": "show",
+    "tvdb": 258541,
+    "tmdb": 44006,
+    "title": "Chicago Fire",
+    "imdb": "tt2261391"
+   },
+   {
+    "media": "show",
+    "tvdb": 269641,
+    "tmdb": 58841,
+    "title": "Chicago P.D.",
+    "imdb": "tt2805096"
+   },
+   {
+    "media": "show",
+    "tvdb": 75692,
+    "tmdb": 2734,
+    "title": "Law & Order: Special Victims Unit",
+    "imdb": "tt0203259"
+   },
+   {
+    "media": "show",
+    "tvdb": 295640,
+    "tmdb": 62650,
+    "title": "Chicago Med",
+    "imdb": "tt4655480"
+   },
+   {
+    "media": "show",
+    "tvdb": 311896,
+    "tmdb": 67993,
+    "title": "Chicago Justice",
+    "imdb": "tt5640060"
+   },
+   {
+    "media": "show",
+    "tvdb": 350071,
+    "tmdb": 80748,
+    "title": "FBI",
+    "imdb": "tt7491982"
+   }
+  ]
+ },
+ "rocky": {
+  "display": "Rocky & Creed",
+  "sources": [
+   {
+    "title": "release order (curated; not on chronolists)",
+    "link": ""
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "movie",
+    "tmdb": 1366,
+    "title": "Rocky"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1367,
+    "title": "Rocky II"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1371,
+    "title": "Rocky III"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1374,
+    "title": "Rocky IV"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1375,
+    "title": "Rocky V"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1246,
+    "title": "Rocky Balboa"
+   },
+   {
+    "media": "movie",
+    "tmdb": 312221,
+    "title": "Creed"
+   },
+   {
+    "media": "movie",
+    "tmdb": 480530,
+    "title": "Creed II"
+   },
+   {
+    "media": "movie",
+    "tmdb": 677179,
+    "title": "Creed III"
+   }
+  ],
+  "slug": null
+ },
+ "star": {
+  "display": "Star Wars",
+  "slug": "star-wars",
+  "sources": [
+   {
+    "title": "StarWars.com",
+    "link": "https://www.starwars.com/news/star-wars-the-clone-wars-chronological-episodeorder"
+   },
+   {
+    "title": "Screen Rant",
+    "link": "https://screenrant.com/clone-wars-timeline-seasons-events-when-explained/"
+   },
+   {
+    "title": "Digital Spy",
+    "link": "https://www.digitalspy.com/movies/a825727/star-wars-timeline-chronology-phantom-menace-to-last-jedi/"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "show",
+    "tvdb": 393197,
+    "tmdb": 114479,
+    "title": "The Acolyte",
+    "imdb": "tt12262202"
+   },
+   {
+    "media": "show",
+    "tvdb": 420659,
+    "tmdb": 203085,
+    "title": "Star Wars: Tales of the Jedi",
+    "imdb": "tt20723374"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1893,
+    "title": "Star Wars: Episode I - The Phantom Menace",
+    "imdb": "tt0120915"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1894,
+    "title": "Star Wars: Episode II - Attack of the Clones",
+    "imdb": "tt0121765"
+   },
+   {
+    "media": "show",
+    "tvdb": 83268,
+    "tmdb": 4194,
+    "title": "Star Wars: The Clone Wars",
+    "imdb": "tt0458290"
+   },
+   {
+    "media": "movie",
+    "tmdb": 12180,
+    "title": "Star Wars: The Clone Wars",
+    "imdb": "tt1185834"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1895,
+    "title": "Star Wars: Episode III - Revenge of the Sith",
+    "imdb": "tt0121766"
+   },
+   {
+    "media": "show",
+    "tvdb": 385376,
+    "tmdb": 105971,
+    "title": "Star Wars: The Bad Batch",
+    "imdb": "tt12708542"
+   },
+   {
+    "media": "movie",
+    "tmdb": 348350,
+    "title": "Solo: A Star Wars Story",
+    "imdb": "tt3778644"
+   },
+   {
+    "media": "show",
+    "tvdb": 393199,
+    "tmdb": 92830,
+    "title": "Obi-Wan Kenobi",
+    "imdb": "tt8466564"
+   },
+   {
+    "media": "show",
+    "tvdb": 283468,
+    "tmdb": 60554,
+    "title": "Star Wars Rebels",
+    "imdb": "tt2930604"
+   },
+   {
+    "media": "show",
+    "tvdb": 393189,
+    "tmdb": 83867,
+    "title": "Andor",
+    "imdb": "tt9253284"
+   },
+   {
+    "media": "movie",
+    "tmdb": 330459,
+    "title": "Rogue One: A Star Wars Story",
+    "imdb": "tt3748528"
+   },
+   {
+    "media": "movie",
+    "tmdb": 11,
+    "title": "Star Wars",
+    "imdb": "tt0076759"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1891,
+    "title": "The Empire Strikes Back",
+    "imdb": "tt0080684"
+   },
+   {
+    "media": "movie",
+    "tmdb": 1892,
+    "title": "Return of the Jedi",
+    "imdb": "tt0086190"
+   },
+   {
+    "media": "show",
+    "tvdb": 361753,
+    "tmdb": 82856,
+    "title": "The Mandalorian",
+    "imdb": "tt8111088"
+   },
+   {
+    "media": "show",
+    "tvdb": 393589,
+    "tmdb": 115036,
+    "title": "The Book of Boba Fett",
+    "imdb": "tt13668894"
+   },
+   {
+    "media": "show",
+    "tvdb": 420600,
+    "tmdb": 202879,
+    "title": "Star Wars: Skeleton Crew",
+    "imdb": "tt20600980"
+   },
+   {
+    "media": "show",
+    "tvdb": 393187,
+    "tmdb": 114461,
+    "title": "Ahsoka",
+    "imdb": "tt13622776"
+   },
+   {
+    "media": "show",
+    "tvdb": 351575,
+    "tmdb": 79093,
+    "title": "Star Wars Resistance",
+    "imdb": "tt8336340"
+   },
+   {
+    "media": "movie",
+    "tmdb": 140607,
+    "title": "Star Wars: The Force Awakens",
+    "imdb": "tt2488496"
+   },
+   {
+    "media": "movie",
+    "tmdb": 181808,
+    "title": "Star Wars: The Last Jedi",
+    "imdb": "tt2527336"
+   },
+   {
+    "media": "movie",
+    "tmdb": 181812,
+    "title": "Star Wars: The Rise of Skywalker",
+    "imdb": "tt2527338"
+   }
+  ]
+ },
+ "stargate": {
+  "display": "Stargate",
+  "slug": "stargate",
+  "sources": [
+   {
+    "title": "Gateworld",
+    "link": "https://www.gateworld.net/news/2021/04/stargate-watch-order-three-ways-enjoy-entire-franchise/#canon"
+   }
+  ],
+  "version": 2,
+  "items": [
+   {
+    "media": "movie",
+    "tmdb": 2164,
+    "title": "Stargate",
+    "imdb": "tt0111282"
+   },
+   {
+    "media": "show",
+    "tvdb": 72449,
+    "tmdb": 4629,
+    "title": "Stargate SG-1",
+    "imdb": "tt0118480"
+   },
+   {
+    "media": "show",
+    "tvdb": 70851,
+    "tmdb": 2290,
+    "title": "Stargate Atlantis",
+    "imdb": "tt0374455"
+   },
+   {
+    "media": "movie",
+    "tmdb": 13001,
+    "title": "Stargate: The Ark of Truth",
+    "imdb": "tt0942903"
+   },
+   {
+    "media": "movie",
+    "tmdb": 12914,
+    "title": "Stargate: Continuum",
+    "imdb": "tt0929629"
+   },
+   {
+    "media": "show",
+    "tvdb": 83237,
+    "tmdb": 5148,
+    "title": "Stargate Universe",
+    "imdb": "tt1286039"
+   }
+  ]
+ },
+ "trek": {
+  "display": "Star Trek",
+  "slug": "star-trek",
+  "sources": [
+   {
+    "title": "The Star Trek Chronology Project",
+    "link": "http://thestartrekchronologyproject.blogspot.com/"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "show",
+    "tvdb": 73893,
+    "tmdb": 314,
+    "title": "Star Trek: Enterprise",
+    "imdb": "tt0244365"
+   },
+   {
+    "media": "show",
+    "tvdb": 376108,
+    "tmdb": 82491,
+    "title": "Star Trek: Short Treks",
+    "imdb": "tt9059594"
+   },
+   {
+    "media": "show",
+    "tvdb": 77526,
+    "tmdb": 253,
+    "title": "Star Trek",
+    "imdb": "tt0060028"
+   },
+   {
+    "media": "show",
+    "tvdb": 328711,
+    "tmdb": 67198,
+    "title": "Star Trek: Discovery",
+    "imdb": "tt5171438"
+   },
+   {
+    "media": "show",
+    "tvdb": 382389,
+    "tmdb": 103516,
+    "title": "Star Trek: Strange New Worlds",
+    "imdb": "tt12327578"
+   },
+   {
+    "media": "show",
+    "tvdb": 73566,
+    "tmdb": 1992,
+    "title": "Star Trek: The Animated Series",
+    "imdb": "tt0069637"
+   },
+   {
+    "media": "movie",
+    "tmdb": 152,
+    "title": "Star Trek: The Motion Picture",
+    "imdb": "tt0079945"
+   },
+   {
+    "media": "movie",
+    "tmdb": 154,
+    "title": "Star Trek II: The Wrath of Khan",
+    "imdb": "tt0084726"
+   },
+   {
+    "media": "movie",
+    "tmdb": 157,
+    "title": "Star Trek III: The Search for Spock",
+    "imdb": "tt0088170"
+   },
+   {
+    "media": "movie",
+    "tmdb": 168,
+    "title": "Star Trek IV: The Voyage Home",
+    "imdb": "tt0092007"
+   },
+   {
+    "media": "movie",
+    "tmdb": 172,
+    "title": "Star Trek V: The Final Frontier",
+    "imdb": "tt0098382"
+   },
+   {
+    "media": "movie",
+    "tmdb": 174,
+    "title": "Star Trek VI: The Undiscovered Country",
+    "imdb": "tt0102975"
+   },
+   {
+    "media": "show",
+    "tvdb": 71470,
+    "tmdb": 655,
+    "title": "Star Trek: The Next Generation",
+    "imdb": "tt0092455"
+   },
+   {
+    "media": "show",
+    "tvdb": 72073,
+    "tmdb": 580,
+    "title": "Star Trek: Deep Space Nine",
+    "imdb": "tt0106145"
+   },
+   {
+    "media": "show",
+    "tvdb": 74550,
+    "tmdb": 1855,
+    "title": "Star Trek: Voyager",
+    "imdb": "tt0112178"
+   },
+   {
+    "media": "movie",
+    "tmdb": 193,
+    "title": "Star Trek: Generations",
+    "imdb": "tt0111280"
+   },
+   {
+    "media": "movie",
+    "tmdb": 199,
+    "title": "Star Trek: First Contact",
+    "imdb": "tt0117731"
+   },
+   {
+    "media": "movie",
+    "tmdb": 200,
+    "title": "Star Trek: Insurrection",
+    "imdb": "tt0120844"
+   },
+   {
+    "media": "movie",
+    "tmdb": 201,
+    "title": "Star Trek: Nemesis",
+    "imdb": "tt0253754"
+   },
+   {
+    "media": "show",
+    "tvdb": 367138,
+    "tmdb": 85948,
+    "title": "Star Trek: Lower Decks",
+    "imdb": "tt9184820"
+   },
+   {
+    "media": "show",
+    "tvdb": 385811,
+    "tmdb": 106393,
+    "title": "Star Trek: Prodigy",
+    "imdb": "tt9795876"
+   },
+   {
+    "media": "movie",
+    "tmdb": 13475,
+    "title": "Star Trek",
+    "imdb": "tt0796366"
+   },
+   {
+    "media": "movie",
+    "tmdb": 54138,
+    "title": "Star Trek Into Darkness",
+    "imdb": "tt1408101"
+   },
+   {
+    "media": "movie",
+    "tmdb": 188927,
+    "title": "Star Trek Beyond",
+    "imdb": "tt2660888"
+   },
+   {
+    "media": "show",
+    "tvdb": 364093,
+    "tmdb": 85949,
+    "title": "Star Trek: Picard",
+    "imdb": "tt8806524"
+   }
+  ]
+ },
+ "underworld": {
+  "display": "Underworld",
+  "slug": "underworld",
+  "sources": [
+   {
+    "title": "Radio Times",
+    "link": "https://www.radiotimes.com/movies/underworld-movies-in-order-chronological/"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "movie",
+    "tmdb": 12437,
+    "title": "Underworld: Rise of the Lycans",
+    "imdb": "tt0834001"
+   },
+   {
+    "media": "movie",
+    "tmdb": 277,
+    "title": "Underworld",
+    "imdb": "tt0320691"
+   },
+   {
+    "media": "movie",
+    "tmdb": 834,
+    "title": "Underworld: Evolution",
+    "imdb": "tt0401855"
+   },
+   {
+    "media": "movie",
+    "tmdb": 161337,
+    "title": "Underworld: Endless War",
+    "imdb": "tt2381375"
+   },
+   {
+    "media": "movie",
+    "tmdb": 52520,
+    "title": "Underworld: Awakening",
+    "imdb": "tt1496025"
+   },
+   {
+    "media": "movie",
+    "tmdb": 346672,
+    "title": "Underworld: Blood Wars",
+    "imdb": "tt3717252"
+   }
+  ]
+ },
+ "walkingdead": {
+  "display": "The Walking Dead",
+  "slug": "walking-dead",
+  "sources": [
+   {
+    "title": "GamesRadar",
+    "link": "https://www.gamesradar.com/how-to-watch-walking-dead-order-chronological-release/"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "show",
+    "tvdb": 290853,
+    "tmdb": 62286,
+    "title": "Fear the Walking Dead",
+    "imdb": "tt3743822"
+   },
+   {
+    "media": "show",
+    "tvdb": 153021,
+    "tmdb": 1402,
+    "title": "The Walking Dead",
+    "imdb": "tt1520211"
+   },
+   {
+    "media": "show",
+    "tvdb": 411314,
+    "tmdb": 136248,
+    "title": "Tales of the Walking Dead",
+    "imdb": "tt15669534"
+   },
+   {
+    "media": "show",
+    "tvdb": 372787,
+    "tmdb": 94305,
+    "title": "The Walking Dead: World Beyond",
+    "imdb": "tt10148174"
+   },
+   {
+    "media": "show",
+    "tvdb": 427202,
+    "tmdb": 206586,
+    "title": "The Walking Dead: The Ones Who Live",
+    "imdb": "tt9859436"
+   },
+   {
+    "media": "show",
+    "tvdb": 427464,
+    "tmdb": 211684,
+    "title": "The Walking Dead: Daryl Dixon",
+    "imdb": "tt13062500"
+   },
+   {
+    "media": "show",
+    "tvdb": 417549,
+    "tmdb": 194583,
+    "title": "The Walking Dead: Dead City",
+    "imdb": "tt18546730"
+   }
+  ]
+ },
+ "wizard": {
+  "display": "Wizarding World",
+  "slug": "harry-potter",
+  "sources": [
+   {
+    "title": "Digital Spy",
+    "link": "https://www.digitalspy.com/movies/a835822/harry-potter-timeline/"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "movie",
+    "tmdb": 259316,
+    "title": "Fantastic Beasts and Where to Find Them",
+    "imdb": "tt3183660"
+   },
+   {
+    "media": "movie",
+    "tmdb": 338952,
+    "title": "Fantastic Beasts: The Crimes of Grindelwald",
+    "imdb": "tt4123430"
+   },
+   {
+    "media": "movie",
+    "tmdb": 338953,
+    "title": "Fantastic Beasts: The Secrets of Dumbledore",
+    "imdb": "tt4123432"
+   },
+   {
+    "media": "movie",
+    "tmdb": 671,
+    "title": "Harry Potter and the Philosopher's Stone",
+    "imdb": "tt0241527"
+   },
+   {
+    "media": "movie",
+    "tmdb": 672,
+    "title": "Harry Potter and the Chamber of Secrets",
+    "imdb": "tt0295297"
+   },
+   {
+    "media": "movie",
+    "tmdb": 673,
+    "title": "Harry Potter and the Prisoner of Azkaban",
+    "imdb": "tt0304141"
+   },
+   {
+    "media": "movie",
+    "tmdb": 674,
+    "title": "Harry Potter and the Goblet of Fire",
+    "imdb": "tt0330373"
+   },
+   {
+    "media": "movie",
+    "tmdb": 675,
+    "title": "Harry Potter and the Order of the Phoenix",
+    "imdb": "tt0373889"
+   },
+   {
+    "media": "movie",
+    "tmdb": 767,
+    "title": "Harry Potter and the Half-Blood Prince",
+    "imdb": "tt0417741"
+   },
+   {
+    "media": "movie",
+    "tmdb": 12444,
+    "title": "Harry Potter and the Deathly Hallows: Part 1",
+    "imdb": "tt0926084"
+   },
+   {
+    "media": "movie",
+    "tmdb": 12445,
+    "title": "Harry Potter and the Deathly Hallows: Part 2",
+    "imdb": "tt1201607"
+   }
+  ]
+ },
+ "xmen": {
+  "display": "X-Men",
+  "slug": "xmen-a",
+  "sources": [
+   {
+    "title": "Digital Spy",
+    "link": "https://www.digitalspy.com/movies/a844881/x-men-chronological-order-timeline/"
+   }
+  ],
+  "version": 1,
+  "items": [
+   {
+    "media": "movie",
+    "tmdb": 49538,
+    "title": "X-Men: First Class",
+    "imdb": "tt1270798"
+   },
+   {
+    "media": "movie",
+    "tmdb": 127585,
+    "title": "X-Men: Days of Future Past",
+    "imdb": "tt1877832"
+   },
+   {
+    "media": "movie",
+    "tmdb": 2080,
+    "title": "X-Men Origins: Wolverine",
+    "imdb": "tt0458525"
+   },
+   {
+    "media": "movie",
+    "tmdb": 36657,
+    "title": "X-Men",
+    "imdb": "tt0120903"
+   },
+   {
+    "media": "movie",
+    "tmdb": 36658,
+    "title": "X2",
+    "imdb": "tt0290334"
+   },
+   {
+    "media": "movie",
+    "tmdb": 36668,
+    "title": "X-Men: The Last Stand",
+    "imdb": "tt0376994"
+   },
+   {
+    "media": "movie",
+    "tmdb": 76170,
+    "title": "The Wolverine",
+    "imdb": "tt1430132"
+   }
+  ]
+ }
+}
