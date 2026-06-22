@@ -1081,6 +1081,87 @@ def _fmt_age(iso: str) -> str:
     return f"{secs / 86400:.1f}d ago"
 
 
+def _franchise_catalog_report() -> None:
+    """Print what the Wikidata+Wikipedia TV-franchise catalog has gathered — the wiki-sourced
+    counterpart to the per-bucket cache report. Shows the generated catalog's family/show counts,
+    the per-edge corroboration breakdown (which of spin-off P2512 / series P179 / wiki-category /
+    infobox built each family) and how many generated families that cross-validation auto-promotes to
+    the curated tier, the hand-curated floor, and the background regen state. Pure read; graceful when
+    the catalog predates source tracking (sources fill in on the next regen) or doesn't exist yet."""
+    try:
+        import scripts.support.tools.generate_tv_franchises as gen_tool
+        gen_path = Path(gen_tool._catalog_path())
+    except Exception:
+        return
+    floor_path = gen_path.parent / "tv_franchises.json"
+
+    def _load(p: Path) -> dict:
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            return {k: v for k, v in data.items() if isinstance(v, dict) and "shows" in v}
+        except Exception:
+            return {}
+
+    def _shows(fams: dict) -> int:
+        return sum(len(v.get("shows", [])) for v in fams.values())
+
+    def _age_of(p: Path) -> str:
+        try:
+            return _fmt_age(datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat())
+        except Exception:
+            return ""
+
+    gen   = _load(gen_path)
+    floor = _load(floor_path)
+
+    print()
+    print("  TV-franchise catalog (Wikidata + Wikipedia):")
+    if not gen and not floor:
+        print("    (none yet - the background regen has not produced a catalog)")
+        return
+
+    if gen:
+        built = _age_of(gen_path)
+        suffix = f"   (built {built})" if built else ""
+        print(f"    {'generated':<20}{len(gen):>4,} families  {_shows(gen):>5,} shows{suffix}")
+        # corroboration: per-edge family counts + how many clear the >=2-source promotion bar
+        src_labels = [("p2512", "spin-off(P2512)"), ("p179", "series(P179)"),
+                      ("wiki-cat", "wiki-category"), ("infobox", "infobox")]
+        per_src = {s: 0 for s, _ in src_labels}
+        promoted = 0
+        for v in gen.values():
+            srcs = v.get("sources") or []
+            for s in srcs:
+                if s in per_src:
+                    per_src[s] += 1
+            if len(srcs) >= 2:
+                promoted += 1
+        if any(per_src.values()):
+            parts = "   ".join(f"{lbl} {per_src[s]:,}" for s, lbl in src_labels if per_src[s])
+            print(f"    {'corroboration':<20}{parts}")
+            print(f"    {'promoted (>=2 src)':<20}{promoted:,} families auto-raised to the curated tier")
+        else:
+            print(f"    {'corroboration':<20}pending - rebuilds with edge sources on the next regen")
+    if floor:
+        print(f"    {'floor (curated)':<20}{len(floor):>4,} families  {_shows(floor):>5,} shows")
+
+    # ── background regen state (last attempt + whether a regen is grinding right now) ──
+    try:
+        spath = _franchise_state_path()
+        if spath.exists():
+            st = json.loads(spath.read_text())
+            last, gen_pid = st.get("last_attempt_ts"), st.get("gen_pid")
+            when = _fmt_age(datetime.fromtimestamp(float(last), tz=timezone.utc).isoformat()) if last else ""
+            running = bool(gen_pid and _pid_alive(int(gen_pid)))
+            run_s = f"RUNNING (pid {gen_pid})" if running else "finished/idle"
+            print(f"    {'regen':<20}" + (f"last attempt {when}; {run_s}" if when else run_s))
+        else:
+            print(f"    {'regen':<20}idle (no regen attempted yet)")
+    except Exception:
+        pass
+
+
 def print_status() -> None:
     """Print a one-shot progress report from the cursor + on-disk cache, then return.
 
@@ -1088,7 +1169,8 @@ def print_status() -> None:
     time — including while the supervisor-spawned daemon is mid-cycle. Mirrors the
     per-pool position/total the daemon persists plus the actual file counts per
     cache bucket (the two can differ: an item is 'complete' even when an endpoint
-    returned no data, so a bucket legitimately holds fewer files than the pool size).
+    returned no data, so a bucket legitimately holds fewer files than the pool size),
+    and finally what the Wikidata+Wikipedia TV-franchise catalog has gathered.
     """
     # ── Liveness ──────────────────────────────────────────────────────────────
     pid = None
@@ -1143,6 +1225,9 @@ def print_status() -> None:
             print(f"    {bdir.name:<18}{count:>8,}")
         else:
             print(f"    {bdir.name:<18}{'(none yet)':>10}")
+
+    # ── Wiki-sourced TV-franchise catalog (Wikidata + Wikipedia) ──────────────
+    _franchise_catalog_report()
     print("=" * 64)
 
 
