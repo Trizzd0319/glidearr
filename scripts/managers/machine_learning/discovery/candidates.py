@@ -50,7 +50,8 @@ def movie_candidates(rows, now, *, tz=None, owned_tmdbs=None, min_votes=0) -> li
         out.append({"media": "movie", "tmdb_id": tmdb, "title": r.get("title"), "release": rel,
                     "years_ago": years_ago(rel, now, tz=tz), "owned": tmdb in owned,
                     "genres": list(r.get("genres") or []), "votes": _to_int(r.get("vote_count")),
-                    "year": _to_int(r.get("year")), "rating": r.get("rating")})
+                    "year": _to_int(r.get("year")), "rating": r.get("rating"),
+                    "certification": r.get("certification")})
     return out
 
 

@@ -42,6 +42,7 @@ from scripts.managers.services.plex.playlists.builder import PlexPlaylistBuilder
 from scripts.managers.services.plex.playlists.combined_builder import CombinedPlaylistBuilderManager
 from scripts.managers.services.plex.playlists.movie_builder import MoviePlaylistBuilderManager
 from scripts.managers.services.plex.playlists.writeback import PlaylistWritebackManager
+from scripts.managers.services.plex.discovery import DiscoveryShelfBuilderManager
 from scripts.managers.services.plex.ratings import PlexRatingsManager
 from scripts.managers.services.plex.users import PlexUsersManager
 from scripts.managers.services.plex.validator import PlexValidatorManager
@@ -69,6 +70,7 @@ class PlexManager(BaseManager, ComponentManagerMixin):
     playlist_builder:  Optional[PlexPlaylistBuilderManager] = None
     movie_playlist_builder: Optional[MoviePlaylistBuilderManager] = None
     combined_playlist_builder: Optional[CombinedPlaylistBuilderManager] = None
+    discovery_shelf:   Optional[DiscoveryShelfBuilderManager] = None
     playlist_writeback: Optional[PlaylistWritebackManager] = None
 
     @LoggerManager().log_function_entry
@@ -133,6 +135,7 @@ class PlexManager(BaseManager, ComponentManagerMixin):
             "playlist_builder": [],
             "movie_playlist_builder": [],
             "combined_playlist_builder": [],
+            "discovery_shelf": [],
             "playlist_writeback": [],
             "validator_manager": [],
         }
@@ -151,6 +154,7 @@ class PlexManager(BaseManager, ComponentManagerMixin):
             "playlist_builder": PlexPlaylistBuilderManager,
             "movie_playlist_builder": MoviePlaylistBuilderManager,
             "combined_playlist_builder": CombinedPlaylistBuilderManager,
+            "discovery_shelf": DiscoveryShelfBuilderManager,
             "playlist_writeback": PlaylistWritebackManager,
             "validator_manager": PlexValidatorManager,
         }
@@ -427,6 +431,16 @@ class PlexManager(BaseManager, ComponentManagerMixin):
                 self.combined_playlist_builder.run()
         except Exception as e:
             self.logger.log_error(f"[Plex] combined playlist builder failed: {e}")
+
+        # "This Week in History" anniversary shelves — read-only per-user builder. Runs AFTER the
+        # movie/combined builders (so the owned inventories + sections are warm) and BEFORE write-back
+        # (which renders the two cached plans). Self-gates on plex.playlists.this_week_in_history.enabled
+        # → byte-identical when off; NO grabs, NO deletes.
+        try:
+            if self.discovery_shelf and (self._cap_enabled("episodes") or self._cap_enabled("movies")):
+                self.discovery_shelf.run()
+        except Exception as e:
+            self.logger.log_error(f"[Plex] anniversary shelf builder failed: {e}")
 
         # Per-user playlist WRITE-BACK (P2-5c) — runs LAST, after the dry-run builders have
         # cached the per-user plans this phase. DEFAULT-OFF / fail-closed: the manager runs the
