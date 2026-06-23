@@ -420,6 +420,39 @@ def test_extra_family_not_written_when_flag_off():
     assert stats["created"] == 1                               # only Up Next
 
 
+def test_twih_families_written_when_enabled():
+    # this_week_in_history ON + cached anniversary plans ⇒ the two new families are created.
+    cache = _Cache({
+        "plex/playlists/twih_movie_plan/kid": _plan("a"),      # Anniversary Picks (owned movie rk 'a')
+        "plex/playlists/twih_show_plan/kid": _plan("c"),       # On This Week (owned episode rk 'c')
+    })
+    api = _FakeAPI(token="OWNER")
+    cfg = {"plex": {"playlists": {"writeback": {"enabled": True},
+                                  "this_week_in_history": {"enabled": True}}}}
+    m = _mgr(cache, api, config=cfg)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    titles = {w[2]["title"] for w in api.writes if w[0] == "create"}
+    assert titles == {"Kid Anniversary Picks", "Kid On This Week"}
+    assert cache.get(f"{_ANCHOR_KEY}/kid::Anniversary Picks") is not None
+    assert cache.get(f"{_ANCHOR_KEY}/kid::On This Week") is not None
+
+
+def test_twih_family_torn_down_when_flag_off():
+    # feature OFF ⇒ a leftover "Anniversary Picks" playlist is deleted, never stranded.
+    cache = _Cache({
+        "plex/playlists/twih_movie_plan/kid": _plan("a"),       # cached but feature OFF
+        f"{_ANCHOR_KEY}/kid::Anniversary Picks": "777",
+        f"{_ANCHOR_KEY}/_index": {"kid::Anniversary Picks": "777"},
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"777": [{"ratingKey": "a", "playlistItemID": "p1"}]})
+    m = _mgr(cache, api)                                         # default config: feature absent → off
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [{"uuid": "u-kid"}], users, _TV_INV, {})
+    assert ("delete", "777", None, "KIDTOK") in api.writes
+    assert cache.get(f"{_ANCHOR_KEY}/kid::Anniversary Picks") is None
+
+
 def test_orphan_sweep_deletes_namespaced_extra_family_anchor():
     cache = _Cache({
         f"{_ANCHOR_KEY}/gone::Touch & Go": "556",
