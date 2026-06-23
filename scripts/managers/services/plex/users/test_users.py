@@ -252,3 +252,80 @@ def test_mint_skips_and_counts_pin_protected_without_pin():
                "is_managed": True, "protected": True}]
     assert m._mint_tokens(roster) == 1                  # counted
     assert "Kid" not in m.user_tokens                   # skipped
+
+
+# ── allowed_sections: the per-user library allowlist (fail-CLOSED) ────────────
+def _sections_mgr(*, sections=None, grants=None, config=None, api=None):
+    m = object.__new__(PlexUsersManager)
+    m.logger = _Logger()
+    c = _Cache()
+    c.d["plex/sections"] = sections if sections is not None else {
+        "1": {"type": "movie"}, "2": {"type": "show"}, "3": {"type": "movie"}}
+    m.global_cache = c
+    m.config = config or {"plex": {"playlists": {"this_week_in_history": {"enabled": True}}}}
+    m.plex_api = api
+    m._section_grants = grants or {}
+    m._user_sections = {}
+    return m
+
+
+def test_allowed_sections_admin_gets_all_and_persists_keys_only():
+    m = _sections_mgr()
+    assert m.allowed_sections({"safe_user": "rob", "is_admin": True}) == {"1", "2", "3"}
+    assert m.global_cache.d["plex/user_sections"]["rob"] == ["1", "2", "3"]   # section keys only
+
+
+def test_allowed_sections_unresolved_managed_fails_closed():
+    m = _sections_mgr()                                  # no grant for kid, trust off
+    assert m.allowed_sections({"safe_user": "kid", "is_admin": False}) == set()
+    assert m.global_cache.d["plex/user_sections"]["kid"] == []
+
+
+def test_allowed_sections_trust_home_managed_opens_to_all():
+    m = _sections_mgr(config={"plex": {"playlists": {"this_week_in_history": {
+        "enabled": True, "trust_home_managed": True}}}})
+    assert m.allowed_sections({"safe_user": "kid", "is_admin": False}) == {"1", "2", "3"}
+
+
+def test_allowed_sections_explicit_and_all_grants():
+    assert _sections_mgr(grants={"kid": {"1"}}).allowed_sections(
+        {"safe_user": "kid", "is_admin": False}) == {"1"}
+    assert _sections_mgr(grants={"kid": "ALL"}).allowed_sections(
+        {"safe_user": "kid", "is_admin": False}) == {"1", "2", "3"}
+
+
+def test_allowed_sections_empty_when_section_index_cold():
+    m = _sections_mgr(sections={})                       # libraries not warm yet → no allowlist
+    assert m.allowed_sections({"safe_user": "rob", "is_admin": True}) == set()
+
+
+# ── _resolve_section_grants: parse plex.tv shared_servers ─────────────────────
+class _ShareAPI:
+    def __init__(self, payload, mid="MID"): self._p = payload; self._mid = mid
+    def get_machine_id(self): return self._mid
+    def get_shared_servers(self, fallback=None): return self._p
+
+
+def test_resolve_grants_matches_email_and_parses_alllibraries():
+    m = _sections_mgr(api=_ShareAPI([{"machineIdentifier": "MID", "email": "kid@x.com",
+                                      "allLibraries": True}]))
+    m._safe_by_uuid = {"u2": "kid"}
+    roster = [{"uuid": "u2", "title": "Kid", "email": "kid@x.com", "is_admin": False}]
+    assert m._resolve_section_grants(roster) == {"kid": "ALL"}
+
+
+def test_resolve_grants_specific_sections_and_other_server_ignored():
+    payload = {"sharedServers": [
+        {"machineIdentifier": "OTHER", "email": "kid@x.com", "allLibraries": True},   # other server
+        {"machineIdentifier": "MID", "email": "kid@x.com",
+         "Section": [{"key": "1", "shared": True}, {"key": "9", "shared": False}]}]}
+    m = _sections_mgr(api=_ShareAPI(payload))
+    m._safe_by_uuid = {"u2": "kid"}
+    roster = [{"uuid": "u2", "title": "Kid", "email": "kid@x.com", "is_admin": False}]
+    assert m._resolve_section_grants(roster) == {"kid": {"1"}}    # unshared/other-server dropped
+
+
+def test_resolve_grants_off_when_feature_disabled():
+    m = _sections_mgr(config={"plex": {"playlists": {}}},
+                      api=_ShareAPI([{"allLibraries": True}]))
+    assert m._resolve_section_grants([{"uuid": "u", "title": "x", "is_admin": False}]) == {}

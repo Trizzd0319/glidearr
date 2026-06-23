@@ -28,6 +28,8 @@ from scripts.support.utilities.logger.logger import LoggerManager
 
 _USERS_KEY = "plex/users"
 _IDENTITY_KEY = "plex/identity_map"
+_SECTIONS_KEY = "plex/sections"             # global library section index (PlexLibrariesManager)
+_USER_SECTIONS_KEY = "plex/user_sections"   # NET-NEW per-user allowlist: safe_user → [section keys]
 
 
 class PlexUsersManager(BaseManager):
@@ -87,6 +89,8 @@ class PlexUsersManager(BaseManager):
         self.user_tokens.clear()
         self._safe_by_uuid = {}
         self._server_tokens = {}      # per-run cache of derived per-server write tokens
+        self._section_grants = {}     # safe_user → "ALL" | set(section-id str): plex.tv share grants
+        self._user_sections = {}      # safe_user → [section keys]: the persisted allowlist artifact
 
         # 1. Token-scope probe — the HARD gate (DESIGN §4.2). On failure: warn once,
         #    write empty roster, degrade to owner-only; NEVER fall through to broader
@@ -126,6 +130,7 @@ class PlexUsersManager(BaseManager):
         # 5. Build the in-memory tracked set (only users with a usable token) +
         #    persist the PII-minimized roster and identity map.
         self._build_tracked(roster, identity_map)
+        self._section_grants = self._resolve_section_grants(roster)
         self._persist(roster, identity_map)
         self._warn_ungated_managed_users(roster)
         stats["users_tracked"] = len(self.tracked_users)
@@ -351,6 +356,148 @@ class PlexUsersManager(BaseManager):
                 "tautulli_user_id": ident.get("tautulli_user_id"),
                 "rating_groups": ident.get("rating_groups", ["household"]),
             })
+
+    # ── per-user library allowlist (the NET-NEW library-scope dimension) ──────────
+    def allowed_sections(self, tracked_user) -> set:
+        """The Plex library SECTION KEYS a tracked user may see — the per-user library allowlist
+        for content generation. Owner/admin → ALL sections. A non-admin is scoped to their plex.tv
+        share grant (``allLibraries`` → all; an explicit section list → those) and FAILS CLOSED to
+        an empty set when no grant resolves, UNLESS the operator sets
+        ``plex.playlists.this_week_in_history.trust_home_managed`` (then all sections — still age-gated
+        downstream). Resolved against the warm ``plex/sections`` index; persisted (section keys ONLY —
+        never a token/email) under ``plex/user_sections``."""
+        keys = self._all_section_keys()
+        if not keys:
+            return set()
+        if tracked_user.get("is_admin"):
+            return self._record_user_sections(tracked_user, set(keys))
+        grant = (getattr(self, "_section_grants", {}) or {}).get(tracked_user.get("safe_user"))
+        if grant == "ALL":
+            return self._record_user_sections(tracked_user, set(keys))
+        if isinstance(grant, set) and grant:
+            return self._record_user_sections(tracked_user, {k for k in keys if str(k) in grant})
+        if self._trust_home_managed():
+            return self._record_user_sections(tracked_user, set(keys))
+        return self._record_user_sections(tracked_user, set())          # fail-closed
+
+    def _record_user_sections(self, tracked_user, sections: set) -> set:
+        safe = tracked_user.get("safe_user")
+        if safe:
+            self._user_sections[safe] = sorted(str(s) for s in sections)
+            if self.global_cache:
+                try:
+                    self.global_cache.set(_USER_SECTIONS_KEY, dict(self._user_sections))
+                except Exception:
+                    pass
+        return sections
+
+    def _all_section_keys(self) -> set:
+        """All library section KEYS from the warm ``plex/sections`` index ({key: {...}})."""
+        if not self.global_cache:
+            return set()
+        try:
+            sections = self.global_cache.get(_SECTIONS_KEY) or {}
+        except Exception:
+            return set()
+        return {str(k) for k in sections} if isinstance(sections, dict) else set()
+
+    def _twih_cfg(self) -> dict:
+        pl = ((self.config.get("plex", {}) if self.config else {}) or {}).get("playlists", {}) or {}
+        return (pl.get("this_week_in_history", {}) or {})
+
+    def _trust_home_managed(self) -> bool:
+        return bool(self._twih_cfg().get("trust_home_managed", False))
+
+    def _resolve_section_grants(self, roster) -> dict:
+        """Best-effort per-user library grants from plex.tv ``shared_servers``, keyed by safe_user:
+        ``"ALL"`` (allLibraries) or a set of granted section-id strings. ``{}`` when the shelf feature
+        is off, the call yields nothing, or no user matches → callers then fail closed. Owner/admin are
+        not scoped here (they always get all). One external call, gated on the feature flag so a
+        disabled shelf adds NO plex.tv traffic."""
+        if not self._twih_cfg().get("enabled", False):
+            return {}
+        api = self.plex_api
+        if api is None or not hasattr(api, "get_shared_servers"):
+            return {}
+        try:
+            raw = api.get_shared_servers(fallback=None)
+        except Exception:
+            return {}
+        entries = self._shared_entries(raw, getattr(api, "get_machine_id", lambda: None)())
+        if not entries:
+            return {}
+        by_ident: dict = {}
+        for e in entries:
+            grant = self._entry_grant(e)
+            for tok in self._entry_idents(e):
+                by_ident.setdefault(tok, grant)
+        safe_map = self._ensure_safe_map(roster)
+        out: dict = {}
+        for u in roster:
+            if u.get("is_admin"):
+                continue
+            for tok in self._user_idents(u):
+                if tok in by_ident:
+                    out[safe_map[u["uuid"]]] = by_ident[tok]
+                    break
+        return out
+
+    @staticmethod
+    def _shared_entries(raw, machine_id=None) -> list:
+        """Normalize the shared_servers payload (list / ``sharedServers`` / MediaContainer) to a list
+        of share dicts, restricted to THIS server when a ``machineIdentifier`` is present."""
+        if isinstance(raw, list):
+            items = raw
+        elif isinstance(raw, dict):
+            items = (raw.get("sharedServers") or raw.get("SharedServer")
+                     or (raw.get("MediaContainer") or {}).get("SharedServer") or [])
+        else:
+            items = []
+        out = []
+        for e in items:
+            if not isinstance(e, dict):
+                continue
+            mid = e.get("machineIdentifier") or e.get("machineId")
+            if machine_id and mid and str(mid) != str(machine_id):
+                continue                                 # a share to a DIFFERENT server
+            out.append(e)
+        return out
+
+    @staticmethod
+    def _entry_grant(e):
+        """A share entry → ``"ALL"`` (allLibraries) or the set of granted section-id strings."""
+        if e.get("allLibraries") or e.get("allLibrariesAccess"):
+            return "ALL"
+        ids: set = set()
+        for sid in (e.get("librarySectionIDs") or e.get("librarySectionIds") or []):
+            ids.add(str(sid))
+        sections = e.get("sections") or e.get("Section") or []
+        if isinstance(sections, dict):
+            sections = [sections]
+        for s in sections:
+            if not isinstance(s, dict):
+                continue
+            if not (s.get("shared", True) in (True, 1, "1", "true")):
+                continue
+            for f in ("key", "id", "librarySectionID", "sectionKey"):
+                if s.get(f) is not None:
+                    ids.add(str(s.get(f)))
+        return ids
+
+    @staticmethod
+    def _entry_idents(e) -> set:
+        """Every identity token a share entry exposes (lowercased), for matching to a Home user."""
+        user = e.get("user") if isinstance(e.get("user"), dict) else {}
+        toks = [e.get("email"), e.get("invitedEmail"), e.get("username"), e.get("userID"),
+                e.get("userId"), e.get("id"), user.get("email"), user.get("id"),
+                user.get("username"), user.get("uuid")]
+        return {str(t).strip().lower() for t in toks if t not in (None, "")}
+
+    @staticmethod
+    def _user_idents(u) -> set:
+        """Every identity token a Home user exposes (lowercased), for matching to a share entry."""
+        toks = [u.get("email"), u.get("id"), u.get("uuid"), u.get("title")]
+        return {str(t).strip().lower() for t in toks if t not in (None, "")}
 
     def _degrade_owner_only(self):
         """Scope-fail / no-Home fallback: record the account token as the single

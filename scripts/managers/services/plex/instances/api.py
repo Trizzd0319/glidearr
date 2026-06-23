@@ -441,6 +441,15 @@ class PlexAPI:
         return self._request("GET", f"{_PLEX_TV}/api/v2/resources", token=token,
                              params={"includeHttps": 1}, external=True, fallback=fallback)
 
+    def get_shared_servers(self, fallback=None):
+        """GET plex.tv/api/v2/shared_servers — the accounts THIS server is shared to, each with
+        the library sections granted (``librarySectionIDs`` / an ``allLibraries`` flag). Owner/admin
+        token. Used to scope a shared/managed user's discovery shelf to libraries they may access.
+        Returns whatever plex.tv yields (a JSON list/dict) or ``fallback``; the caller parses
+        defensively and fails CLOSED on an unresolved grant."""
+        return self._request("GET", f"{_PLEX_TV}/api/v2/shared_servers",
+                             external=True, fallback=fallback)
+
     def server_access_token(self, user_auth: str, fallback=None):
         """Derive THIS PMS's per-user access token from a user's account authToken: find the
         resource whose ``clientIdentifier`` == our ``machineIdentifier`` and return its
