@@ -162,7 +162,7 @@ _DOC_LEAVES = [
     ("plex.playlists.cold_start_kids_prior", "true", "Seed a kid profile's empty playlist from the household's kid-show taste (cold-start prior)"),
     ("plex.playlists.this_week_in_history.enabled", "false", "Build per-profile 'Anniversary Picks' (movies) + 'On This Week' (shows) shelves of titles released/aired this calendar week in any past year (off until enabled)"),
     ("plex.playlists.this_week_in_history.cap", "7", "Max items on each anniversary shelf (ordered by watchability)"),
-    ("plex.playlists.this_week_in_history.min_votes", "0", "TMDb-vote popularity floor on NET-NEW anniversary picks (0 = off)"),
+    ("plex.playlists.this_week_in_history.min_votes", "0", "TMDb-vote popularity floor on anniversary MOVIE picks (owned AND net-new; the show shelf is never floored) — drops any movie below this vote count, or with no vote data (0 = off)"),
     ("plex.playlists.this_week_in_history.timezone", "", "IANA timezone that pins the household week, e.g. America/New_York (blank = PMS/local)"),
     ("plex.playlists.this_week_in_history.opt_in_users", "", "Comma-separated profile titles/keys to build the shelf for (blank + enabled = all tracked users)"),
     ("plex.playlists.this_week_in_history.trust_home_managed", "false", "When a managed profile's library grant can't be resolved, default it to ALL libraries (still age-gated) instead of an empty shelf"),

@@ -358,8 +358,9 @@ def empty_config() -> dict:
                      #   aired during the current Sun–Sat week in ANY past year. Two opt-in playlists
                      #   ("<name> Anniversary Picks" + "<name> On This Week"), ordered by watchability,
                      #   each capped small. opt_in_users = profiles to build for (empty + enabled ⇒
-                     #   ALL tracked users). min_votes = a TMDb-vote popularity floor on net-new picks
-                     #   (0 = off). timezone pins the household week (blank ⇒ PMS/local). trust_home_managed:
+                     #   ALL tracked users). min_votes = a TMDb-vote popularity floor on the MOVIE picks
+                     #   (owned AND net-new; the show shelf is never floored), 0 = off. timezone pins the
+                     #   household week (blank ⇒ PMS/local). trust_home_managed:
                      #   when a managed profile's library grant can't be resolved, default it to ALL
                      #   libraries (still AGE-gated) instead of failing closed to an empty shelf. OFF →
                      #   nothing built, byte-identical.
