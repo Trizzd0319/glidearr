@@ -64,6 +64,13 @@ def test_net_new_unowned_go_to_preview_not_playlist():
     assert [n["tmdb_id"] for n in net_new] == [1] and net_new[0]["owned"] is False
 
 
+def test_net_new_rows_carry_genres_and_votes_for_demand_ordering():
+    scored = [{"media": "movie", "tmdb_id": 7, "owned": False, "score": 80,
+               "genres": ["Action", "Sci-Fi"], "votes": 1234, "title": "Net New"}]
+    _, net_new = gated_plan(scored, level=ADULT, cap=5, resolve=movie_resolver(_MOVIE_INV))
+    assert net_new[0]["genres"] == ["Action", "Sci-Fi"] and net_new[0]["votes"] == 1234
+
+
 def test_age_gate_fail_closed_for_restricted_profile():
     scored = [_movie(1, 90, cert="R"), _movie(2, 80, cert="G"), _movie(2, 80, cert=None)]
     items, _ = gated_plan(scored, level=LITTLE_KID, cap=5, resolve=movie_resolver(_MOVIE_INV))

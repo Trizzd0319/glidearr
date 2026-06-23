@@ -129,6 +129,9 @@ def gated_plan(scored, *, level, cap, resolve, seen=None):
                 "score": c.get("score"), "why": c.get("why", ""), "owned": False,
                 "tmdb_id": c.get("tmdb_id"), "tvdb_id": c.get("tvdb_id"),
                 "on_this_day": bool(c.get("on_this_day")),
+                # Carried for Phase-3 demand ordering of net-new grabs (else demand_score sees no
+                # genres/votes and silently degrades to score order).
+                "genres": list(c.get("genres") or []), "votes": c.get("votes"),
             })
     # WITHIN each group, a title whose anniversary is EXACTLY today leads ("on this very day"), then
     # watchability. The net-new cap is applied AFTER this sort so today's finds make the cut.
