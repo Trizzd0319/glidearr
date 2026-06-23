@@ -467,12 +467,37 @@ def test_configure_playlists_declined_writes_nothing():
     assert "playlists" not in cfg["plex"]
 
 
-def test_configure_playlists_notices_when_scans_off():
-    p = _ConfirmPrompter({"plex.has_playlist_options": True})   # all toggles default off
-    cfg = {"plex": {}}                                          # episodes/movies off
+def test_configure_playlists_prompts_scans_and_notices_when_both_declined():
+    # The owned-media scans are now PROMPTED (their only onboarding prompt). Declining both records
+    # them off and warns that nothing can be built.
+    p = _ConfirmPrompter({"plex.has_playlist_options": True})   # scans default off → declined
+    cfg = {"plex": {}}
     PlexStep(logger=None)._configure_playlists(p, cfg)
-    assert any("episodes.enabled" in n for n in p.notices)      # points at the prerequisite
+    assert cfg["plex"]["episodes"]["enabled"] is False
+    assert cfg["plex"]["movies"]["enabled"] is False
+    assert any("owned-media scans off" in n for n in p.notices)
     assert cfg["plex"]["playlists"]["writeback"]["enabled"] is False
+
+
+def test_configure_playlists_enables_owned_media_scans():
+    p = _ConfirmPrompter({"plex.has_playlist_options": True,
+                          "plex.episodes.enabled": True, "plex.movies.enabled": True})
+    cfg = {"plex": {}}
+    PlexStep(logger=None)._configure_playlists(p, cfg)
+    assert cfg["plex"]["episodes"]["enabled"] is True and cfg["plex"]["movies"]["enabled"] is True
+    assert not any("scans off" in n for n in p.notices)
+
+
+def test_configure_playlists_twih_prompts_trust_home_managed():
+    p = _TwihPrompter(
+        {"plex.has_playlist_options": True, "plex.episodes.enabled": True,
+         "plex.playlists.this_week_in_history.enabled": True,
+         "plex.playlists.this_week_in_history.cap": 7,
+         "plex.playlists.this_week_in_history.trust_home_managed": True},
+        {"plex.playlists.this_week_in_history.opt_in_users": ""})
+    cfg = {"plex": {"episodes": {"enabled": True}}}
+    PlexStep(logger=None)._configure_playlists(p, cfg, _TWIH_ROSTER)
+    assert cfg["plex"]["playlists"]["this_week_in_history"]["trust_home_managed"] is True
 
 
 def test_profile_ages_declined_writes_nothing():

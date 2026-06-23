@@ -307,8 +307,8 @@ class PlexStep(Step):
           • this_week_in_history     — per-profile "anniversary" shelves (released/aired this
                                        calendar week in any past year), with a per-profile opt-in.
         Playlists build on the owned-media scans (``plex.episodes.enabled`` /
-        ``plex.movies.enabled``); a notice points there when they're off. No-op when the
-        operator declines the entry prompt."""
+        ``plex.movies.enabled``), which are PROMPTED here (their only onboarding prompt). No-op when
+        the operator declines the entry prompt."""
         plex = cfg.get("plex", {}) or {}
         pl = dict(plex.get("playlists") or {})
         wb = dict(pl.get("writeback") or {})
@@ -319,11 +319,22 @@ class PlexStep(Step):
                                 "Set up personal 'Up Next' playlists for each profile?",
                                 default=already):
             return
-        scans_on = (bool((plex.get("episodes", {}) or {}).get("enabled"))
-                    or bool((plex.get("movies", {}) or {}).get("enabled")))
-        if not scans_on:
-            prompter.notice("   Note: playlists need the owned-media scans — set "
-                            "plex.episodes.enabled / plex.movies.enabled to build them.")
+        # The owned-media scans are the PREREQUISITE for every playlist/shelf — prompt to enable them
+        # here (they have no other onboarding prompt). Each defaults to its current config value.
+        ep = dict(plex.get("episodes") or {})
+        mv = dict(plex.get("movies") or {})
+        ep["enabled"] = bool(prompter.confirm(
+            "plex.episodes.enabled",
+            "   Scan owned EPISODES from Plex? (required to build TV playlists/shelves)",
+            default=bool(ep.get("enabled", False))))
+        mv["enabled"] = bool(prompter.confirm(
+            "plex.movies.enabled",
+            "   Scan owned MOVIES from Plex? (required to build movie playlists/shelves)",
+            default=bool(mv.get("enabled", False))))
+        cfg.setdefault("plex", {})["episodes"] = ep
+        cfg["plex"]["movies"] = mv
+        if not (ep["enabled"] or mv["enabled"]):
+            prompter.notice("   Note: with both owned-media scans off, no playlists/shelves can be built.")
 
         wb["enabled"] = bool(prompter.confirm(
             "plex.playlists.writeback.enabled",
@@ -352,6 +363,11 @@ class PlexStep(Step):
                 "   How many titles on each anniversary shelf?",
                 default=int(twih.get("cap", 7) or 7)))
             twih["opt_in_users"] = self._twih_opt_in(prompter, roster, twih.get("opt_in_users"))
+            twih["trust_home_managed"] = bool(prompter.confirm(
+                "plex.playlists.this_week_in_history.trust_home_managed",
+                "   Give managed (kid) profiles a shelf from ALL libraries (still age-gated)? "
+                "Off = they only see explicitly-shared libraries.",
+                default=bool(twih.get("trust_home_managed", False))))
         else:
             twih["enabled"] = False
 
