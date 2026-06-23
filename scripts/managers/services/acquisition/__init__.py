@@ -18,6 +18,7 @@ import math
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.acquisition.demand import demand_priority, demand_score
+from scripts.managers.machine_learning.playlists.per_user import genre_match
 from scripts.managers.machine_learning.space.routing_targets import uhd_remote_play_ok
 from scripts.managers.machine_learning.space.tightness import tightness_with_hysteresis
 from scripts.managers.services.acquisition.adder import Adder
@@ -115,6 +116,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             # rather than collapsing every candidate's demand to 0 under tightness.
             eligible.sort(key=lambda x: _finite(x.get("score"), 0.0), reverse=True)
             return
+        tight_any = False
         for e in eligible:
             gw = gateways.get("sonarr" if e.get("type") == "show" else "radarr")
             t = self._instance_tightness(gw, e.get("instance"), band, band_cache)
@@ -122,10 +124,45 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             if t <= 0.0:
                 e["demand_priority"] = base                          # roomy → watchability-led
                 continue
+            tight_any = True
             demand = demand_score(e.get("genres") or [], affinities,
                                   popularity=self._votes_to_unit(e.get("votes")), threshold=threshold)
             e["demand_priority"] = demand_priority(base, demand, t)
         eligible.sort(key=lambda x: x.get("demand_priority", _finite(x.get("score"), 0.0)), reverse=True)
+        # Fairness floor — only under scarcity (so roomy runs stay byte-identical to score-desc).
+        if tight_any:
+            self._reserve_fairness(eligible, affinities, int(acq.get("max_adds_per_run", 10) or 0),
+                                   threshold)
+
+    def _reserve_fairness(self, eligible: list, affinities: list, cap: int, threshold: float) -> None:
+        """Guarantee each active user's TOP on-taste pick a place in the top ``cap``, so demand-weighting
+        under scarcity can't permanently starve a single user's niche taste. Each reserved pick keeps its
+        own demand-priority position; it just can't be cut. No-op when the cap doesn't bind."""
+        if cap <= 0 or cap >= len(eligible):
+            return
+        reserved_ids = set()
+        for aff in affinities:
+            if not aff:
+                continue
+            best, best_m = None, -1.0
+            for e in eligible:                              # eligible is priority-sorted → ties keep the
+                m = genre_match(e.get("genres") or [], aff)  # first (highest-priority) on-taste pick
+                if isinstance(m, (int, float)) and m >= threshold and m > best_m:
+                    best, best_m = e, m
+            if best is not None:
+                reserved_ids.add(id(best))
+        if not reserved_ids:
+            return
+        reserved = [e for e in eligible if id(e) in reserved_ids]        # already demand-priority order
+        nonreserved = [e for e in eligible if id(e) not in reserved_ids]
+        keep = reserved[:cap]
+        fill = nonreserved[:max(0, cap - len(keep))]
+
+        def _pri(x):
+            return x.get("demand_priority", _finite(x.get("score"), 0.0))
+        top = sorted(keep + fill, key=_pri, reverse=True)
+        rest = sorted(reserved[cap:] + nonreserved[len(fill):], key=_pri, reverse=True)
+        eligible[:] = top + rest
 
     def _instance_tightness(self, gw, inst, band: float, cache: dict) -> float:
         """Acquisition space-tightness ``t∈[0,1]`` for an instance: 0 with comfortable headroom above

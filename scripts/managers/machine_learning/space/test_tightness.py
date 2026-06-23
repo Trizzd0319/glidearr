@@ -52,3 +52,18 @@ def test_hysteresis_matches_plain_tightness_when_never_engaged():
     floor = 100.0
     for free in (90, 110, 125, 135, 200):
         assert tightness_with_hysteresis(free, floor, prev_t=0.0) == tightness(free, floor)
+
+
+def test_no_oscillation_over_a_hovering_sequence():
+    # Free space hovers around the band edge (135 ↔ 128). WITHOUT hysteresis this flips
+    # released→engaged→released every step (grab→fill→delete→grab). WITH it, once engaged at 128 it
+    # stays engaged at 135 (below the 140 release mark) — a stable fixed point, not a limit cycle.
+    floor, t, engaged = 100.0, 0.0, []
+    for free in (135, 128, 135, 128, 135):
+        t = tightness_with_hysteresis(free, floor, t)
+        engaged.append(t > 0)
+    assert engaged == [False, True, True, True, True]    # engages once, never flips back
+
+    # Sanity: the SAME sequence with plain tightness DOES oscillate (proves the test isn't vacuous).
+    plain = [tightness(free, floor) > 0 for free in (135, 128, 135, 128, 135)]
+    assert plain == [False, True, False, True, False]
