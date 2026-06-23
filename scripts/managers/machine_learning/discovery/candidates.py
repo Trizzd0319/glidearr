@@ -48,7 +48,9 @@ def movie_candidates(rows, now, *, tz=None, owned_tmdbs=None, min_votes=0) -> li
             continue
         seen.add(tmdb)
         out.append({"media": "movie", "tmdb_id": tmdb, "title": r.get("title"), "release": rel,
-                    "years_ago": years_ago(rel, now, tz=tz), "owned": tmdb in owned})
+                    "years_ago": years_ago(rel, now, tz=tz), "owned": tmdb in owned,
+                    "genres": list(r.get("genres") or []), "votes": _to_int(r.get("vote_count")),
+                    "year": _to_int(r.get("year")), "rating": r.get("rating")})
     return out
 
 
@@ -74,6 +76,8 @@ def episode_candidates(rows, now, *, tz=None) -> list:
                 "series_title": r.get("series_title") or r.get("title"), "season": season,
                 "episode": _to_int(r.get("episode") if r.get("episode") is not None else r.get("episode_number")),
                 "air": air, "years_ago": ya, "owned": True,
+                "genres": list(r.get("genres") or []), "votes": _to_int(r.get("vote_count")),
+                "year": _to_int(r.get("year")), "rating": r.get("rating"),
             }
     return list(by_series.values())
 
