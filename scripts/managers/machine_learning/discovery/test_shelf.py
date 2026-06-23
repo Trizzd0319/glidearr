@@ -5,6 +5,7 @@ from __future__ import annotations
 from scripts.managers.machine_learning.discovery.shelf import (
     gated_plan,
     movie_resolver,
+    personalize,
     show_resolver,
 )
 from scripts.managers.machine_learning.playlists.cert_gate import LITTLE_KID, ADULT
@@ -52,6 +53,24 @@ def test_age_gate_csm_fallback_admits_kid_safe_title():
     scored = [_movie(1, 90, cert=None, csm=5)]                 # no cert, CSM age 5 → little-kid ok
     items, _ = gated_plan(scored, level=LITTLE_KID, cap=5, resolve=movie_resolver(_MOVIE_INV))
     assert [i["rating_key"] for i in items] == ["rk1"]
+
+
+def test_personalize_reorders_by_user_genre_affinity():
+    scored = [
+        {"media": "movie", "tmdb_id": 1, "title": "Comedy Hit", "genres": ["Comedy"], "score": 90},
+        {"media": "movie", "tmdb_id": 2, "title": "Action Flick", "genres": ["Action"], "score": 80},
+    ]
+    assert [c["tmdb_id"] for c in scored] == [1, 2]            # household order (Comedy higher)
+    action_lover = personalize(scored, {"action": 1.0, "comedy": 0.0}, hh_max=90,
+                               weights=(0.9, 0.1, 0.65))
+    assert [c["tmdb_id"] for c in action_lover] == [2, 1]      # Action lover flips the order
+    assert action_lover[0]["score"] > action_lover[1]["score"]
+
+
+def test_personalize_no_affinity_preserves_household_order():
+    scored = [{"tmdb_id": 1, "genres": ["Comedy"], "score": 90},
+              {"tmdb_id": 2, "genres": ["Action"], "score": 80}]
+    assert [c["tmdb_id"] for c in personalize(scored, {}, hh_max=90, weights=(0.9, 0.1, 0.65))] == [1, 2]
 
 
 def test_show_resolver_prefers_pilot_then_anniversary_episode():

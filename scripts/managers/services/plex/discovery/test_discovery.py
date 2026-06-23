@@ -130,6 +130,33 @@ def test_save_detection_records_watchlisted_anniversary_titles():
     assert "tautulli/affinity" not in c.d and "people_matrix/affinity" not in c.d
 
 
+def test_two_users_get_taste_ordered_movie_shelves():
+    movies = [
+        {"tmdbId": 1, "title": "Comedy Hit", "inCinemas": "2010-01-02T00:00:00Z", "year": 2010,
+         "genres": ["Comedy"], "hasFile": True, "certification": "PG", "ratings": {"tmdb": {"votes": 900}}},
+        {"tmdbId": 4, "title": "Action Flick", "inCinemas": "2010-01-03T00:00:00Z", "year": 2010,
+         "genres": ["Action"], "hasFile": True, "certification": "PG", "ratings": {"tmdb": {"votes": 500}}},
+    ]
+    cache = _Cache({
+        "radarr.movies.radarr.full": movies,
+        "plex/movies/owned_inventory": {"1": {"rating_key": "rkC"}, "4": {"rating_key": "rkA"}},
+        "plex/episodes/owned_inventory": {},
+        "plex/sections": {"1": {"type": "movie"}},
+        "tautulli/users/rob/affinity": {"genres": {"action": 1.0}},   # Rob loves Action
+        "tautulli/users/sam/affinity": {"genres": {"comedy": 1.0}},   # Sam loves Comedy
+    })
+    rob = {**_ROB, "tautulli_username": "rob"}
+    sam = {"safe_user": "sam", "title": "Sam", "is_admin": True, "restriction_profile": None,
+           "tautulli_username": "sam"}
+    m, c = _mgr(tracked=[rob, sam], allowed={"rob": {"1"}, "sam": {"1"}}, config=_ON, cache=cache)
+    m.run()
+    rob_order = [i["rating_key"] for i in c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"]]
+    sam_order = [i["rating_key"] for i in c.d[f"{_TWIH_MOVIE_PLAN_KEY}/sam"]["items"]]
+    assert rob_order[0] == "rkA"        # action lover → Action first (despite Comedy's higher votes)
+    assert sam_order[0] == "rkC"        # comedy lover → Comedy first
+    assert rob_order != sam_order       # individualized per user
+
+
 def test_restricted_profile_age_gates_out_pg13_movie():
     kid = {"safe_user": "kid", "title": "Kid", "is_admin": False, "restriction_profile": "little_kid"}
     m, c = _mgr(tracked=[kid], allowed={"kid": {"1", "2"}}, config=_ON)

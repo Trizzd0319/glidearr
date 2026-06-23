@@ -23,6 +23,7 @@ from scripts.managers.machine_learning.discovery.scoring import score_and_floor
 from scripts.managers.machine_learning.discovery.shelf import (
     gated_plan,
     movie_resolver,
+    personalize,
     show_resolver,
 )
 from scripts.managers.machine_learning.playlists.cert_gate import ADULT, tier_level
@@ -66,7 +67,7 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
                                        min_votes=self._min_votes(cfg))
         show_cands = episode_candidates(owned_eps, now, tz=tzname)
         self._attach_movie_certs(movie_cands)
-        self._attach_show_certs(show_cands, owned_eps)
+        self._attach_show_meta(show_cands, owned_eps)
 
         # Score ONCE, then per-user gate/cap (no N cold passes).
         scorer = AcquisitionScorer(self.global_cache, self.logger, self.config)
@@ -80,6 +81,12 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
         users_mgr = self.registry.get("manager", "PlexUsersManager") if self.registry else None
         profile_ages = self._profile_ages()
 
+        # Per-user re-rank: the household score is the watchability BASE; each viewer's own genre
+        # affinity tilts the order (affinity > household), matching how the other playlists personalize.
+        weights, gm_opts = self._priority_weights(), self._genre_match_opts()
+        hh_max = max((c.get("score") for c in (scored_movies + scored_shows)
+                      if isinstance(c.get("score"), (int, float))), default=0.0) or 1.0
+
         built = 0
         for u in tracked:
             safe = u.get("safe_user")
@@ -88,8 +95,11 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
             level = tier_level(u.get("restriction_profile"),
                                profile_ages.get(u.get("title")) or profile_ages.get(safe))
             allowed = users_mgr.allowed_sections(u) if users_mgr else set()
-            m_scored = scored_movies if (allowed & movie_keys) else []
-            s_scored = scored_shows if (allowed & show_keys) else []
+            user_aff = self._user_affinity(u.get("tautulli_username"))
+            m_scored = (personalize(scored_movies, user_aff, hh_max=hh_max, weights=weights,
+                                    gm_opts=gm_opts) if (allowed & movie_keys) else [])
+            s_scored = (personalize(scored_shows, user_aff, hh_max=hh_max, weights=weights,
+                                    gm_opts=gm_opts) if (allowed & show_keys) else [])
             m_items, _ = gated_plan(m_scored, level=level, cap=cap, resolve=mr)
             s_items, _ = gated_plan(s_scored, level=level, cap=cap, resolve=sr)
             self.global_cache.set(f"{_TWIH_MOVIE_PLAN_KEY}/{safe}", self._plan_dict("twih_movie", m_items))
@@ -237,9 +247,10 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
         for c in movie_cands:
             c["csm_age"] = csm.get(self._coerce_int(c.get("tmdb_id")))
 
-    def _attach_show_certs(self, show_cands, owned_eps) -> None:
-        """Attach ``certification`` + ``csm_age`` to each show candidate by joining tvdb → series_id
-        (owned-episode rows) → the series cert / Common Sense age maps."""
+    def _attach_show_meta(self, show_cands, owned_eps) -> None:
+        """Attach ``certification`` + ``csm_age`` (the age gate) and ``genres`` (the per-user affinity
+        re-rank) to each show candidate by joining tvdb → series_id (owned-episode rows) → the series
+        cert / Common Sense age / genre maps."""
         tvdb_to_series: dict = {}
         for r in owned_eps or []:
             tvdb = self._coerce_int(r.get("series_tvdb_id"))
@@ -247,12 +258,15 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
             if tvdb is not None and sid is not None and tvdb not in tvdb_to_series:
                 tvdb_to_series[tvdb] = sid
         certs, csm = self._series_certs(), self._series_csm_ages()
+        _, series_genres = self._series_scores_and_genres()
         for c in show_cands:
             sid = tvdb_to_series.get(self._coerce_int(c.get("tvdb_id")))
             if sid is None:
                 continue
             c["certification"] = certs.get(sid)
             c["csm_age"] = csm.get(sid)
+            if not c.get("genres"):
+                c["genres"] = list(series_genres.get(sid) or [])
 
     def _movie_csm_ages(self) -> dict:
         """{tmdb_id(int): Common Sense age(int)} from the MDBList movie age cache — the cert-gate

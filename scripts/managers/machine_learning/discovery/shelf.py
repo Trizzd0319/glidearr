@@ -12,6 +12,29 @@ access). No I/O — the inventories + the age tier are inputs.
 from __future__ import annotations
 
 from scripts.managers.machine_learning.playlists.cert_gate import cert_allowed, is_restricted
+from scripts.managers.machine_learning.playlists.per_user import genre_match, priority_score
+
+
+def personalize(scored, user_aff, *, hh_max, weights, gm_opts=None):
+    """Re-rank a HOUSEHOLD-scored candidate pool by ONE user's genre affinity — the same
+    ``priority_score`` blend (affinity > household; no JIT for a trial shelf) the other per-user
+    playlists use, so a viewer's anniversary picks reflect THEIR taste, not just household watchability.
+    Returns new candidate copies whose ``score`` is the per-user blend, sorted desc. With no affinity
+    (unmatched profile / cold start) the household order is preserved unchanged. PURE."""
+    if not user_aff:
+        return list(scored)
+    aff_w, hh_w, jit_w = weights
+    gm_opts = gm_opts or {}
+    out = []
+    for c in scored:
+        base = c.get("score")
+        hh_norm = (float(base) / hh_max) if (isinstance(base, (int, float)) and hh_max) else 0.0
+        gm = genre_match(c.get("genres") or [], user_aff, **gm_opts)
+        ps = priority_score(hh_norm, gm, is_jit=False, affinity_weight=aff_w,
+                            jit_weight=jit_w, household_weight=hh_w)
+        out.append({**c, "score": round(ps * 100, 1)})
+    out.sort(key=lambda c: c.get("score") or 0.0, reverse=True)
+    return out
 
 
 def _age_ok(cand, level) -> bool:
