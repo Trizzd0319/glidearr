@@ -75,6 +75,14 @@ def test_episode_accepts_sonarr_style_field_names():
     assert out and out[0]["tvdb_id"] == 20 and out[0]["episode"] == 3
 
 
+def test_candidates_flag_on_this_day():
+    rows = [{"tmdb_id": 1, "title": "Exactly Today", "release_date": date(2010, 12, 31), "vote_count": 100},
+            {"tmdb_id": 2, "title": "Same Week", "release_date": date(2010, 1, 2), "vote_count": 100}]
+    out = {c["tmdb_id"]: c for c in movie_candidates(rows, _NOW)}   # _NOW = 2024-12-31
+    assert out[1]["on_this_day"] is True                            # 12-31 == today
+    assert out[2]["on_this_day"] is False                          # in the week, but Jan-2 ≠ today
+
+
 def test_partition_net_new_puts_unowned_first_bucket():
     cands = [{"tmdb_id": 1, "owned": False}, {"tmdb_id": 2, "owned": True}, {"tmdb_id": 3, "owned": False}]
     net_new, owned = partition_net_new(cands)

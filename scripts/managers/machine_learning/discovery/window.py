@@ -86,6 +86,18 @@ def released_this_week(release, now, *, tz=None) -> bool:
     return (rd.month, rd.day) in week_window(now)[2]
 
 
+def on_this_day(release, now, *, tz=None) -> bool:
+    """True iff ``release``'s ``(month, day)`` is EXACTLY ``now``'s — the "on this very day in history"
+    boost (a tighter subset of :func:`released_this_week`'s seven-day match). Feb-29 folds onto Feb-28 in a
+    non-leap year (consistent with the window), so a leap-day title counts as "today" on Feb-28."""
+    rd = _as_date(release, tz)
+    if rd is None:
+        return False
+    nd = _as_date(now)
+    return ((rd.month, rd.day) == (nd.month, nd.day)
+            or ((rd.month, rd.day) == (2, 29) and (nd.month, nd.day) == (2, 28)))
+
+
 def years_ago(release, now, *, tz=None):
     """Whole years from ``release`` to this week's anniversary (the "aired N years ago this week" hook).
     Uses the WINDOW DAY's year (so a Jan-2 title in a Dec→Jan week counts to the January side), not a raw

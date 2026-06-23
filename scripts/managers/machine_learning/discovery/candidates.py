@@ -8,7 +8,11 @@ grab). Movies are title-level; TV is SERIES-level (the pilot is the entry point,
 """
 from __future__ import annotations
 
-from scripts.managers.machine_learning.discovery.window import released_this_week, years_ago
+from scripts.managers.machine_learning.discovery.window import (
+    on_this_day,
+    released_this_week,
+    years_ago,
+)
 
 
 def _to_int(v):
@@ -48,7 +52,8 @@ def movie_candidates(rows, now, *, tz=None, owned_tmdbs=None, min_votes=0) -> li
             continue
         seen.add(tmdb)
         out.append({"media": "movie", "tmdb_id": tmdb, "title": r.get("title"), "release": rel,
-                    "years_ago": years_ago(rel, now, tz=tz), "owned": tmdb in owned,
+                    "years_ago": years_ago(rel, now, tz=tz), "on_this_day": on_this_day(rel, now, tz=tz),
+                    "owned": tmdb in owned,
                     "genres": list(r.get("genres") or []), "votes": _to_int(r.get("vote_count")),
                     "year": _to_int(r.get("year")), "rating": r.get("rating"),
                     "certification": r.get("certification")})
@@ -76,7 +81,7 @@ def episode_candidates(rows, now, *, tz=None) -> list:
                 "media": "show", "tvdb_id": tvdb,
                 "series_title": r.get("series_title") or r.get("title"), "season": season,
                 "episode": _to_int(r.get("episode") if r.get("episode") is not None else r.get("episode_number")),
-                "air": air, "years_ago": ya, "owned": True,
+                "air": air, "years_ago": ya, "on_this_day": on_this_day(air, now, tz=tz), "owned": True,
                 "genres": list(r.get("genres") or []), "votes": _to_int(r.get("vote_count")),
                 "year": _to_int(r.get("year")), "rating": r.get("rating"),
             }

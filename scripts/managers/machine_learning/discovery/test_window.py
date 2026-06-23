@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import date, datetime, timezone
 
 from scripts.managers.machine_learning.discovery.window import (
+    on_this_day,
     released_this_week,
     week_window,
     years_ago,
@@ -79,6 +80,14 @@ def test_iso_string_dates_parse_like_datetimes():
     assert years_ago("2010-01-02", now) == 15
     # tz conversion still applies to a tz-aware string: 02:00Z is Jan-1 in US/Eastern
     assert _md("2010-01-02T02:00:00Z", now, "America/New_York") == (1, 1)
+
+
+def test_on_this_day_exact_match_feb29_fold_and_strings():
+    assert on_this_day(date(2010, 5, 30), date(2023, 5, 30))         # exact (month, day)
+    assert not on_this_day(date(2010, 5, 31), date(2023, 5, 30))     # same week, a DIFFERENT day
+    assert not on_this_day(None, date(2023, 5, 30))                  # undateable
+    assert on_this_day(date(2016, 2, 29), date(2023, 2, 28))         # leap-day folds onto Feb-28
+    assert on_this_day("2010-05-30T12:00:00Z", date(2023, 5, 30))    # ISO string parses
 
 
 def test_years_ago_uses_the_window_day_year():
