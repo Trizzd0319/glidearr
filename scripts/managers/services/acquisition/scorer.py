@@ -58,7 +58,7 @@ _COMPONENT_LABEL = {"genre_affinity": "genre", "trakt_rating": "rating",
 
 
 class AcquisitionScorer:
-    def __init__(self, global_cache, logger, config=None):
+    def __init__(self, global_cache, logger, config=None, *, weight_overrides=None):
         self.gc = global_cache
         self.logger = logger
         self._genre_weights = None
@@ -78,6 +78,16 @@ class AcquisitionScorer:
                     else _PEOPLE_AFFINITY_WEIGHT_DEFAULT)
             except Exception:
                 self._weights["people_affinity"] = _PEOPLE_AFFINITY_WEIGHT_DEFAULT
+        # Per-instance weight overrides for a caller scoring a DIFFERENT objective off the same
+        # signals — e.g. the 'This Week in History' anniversary shelf weights all-time popularity
+        # heavier than the add pipeline does (a notable old title should beat a recent obscure one on
+        # a HISTORY shelf). Applied LAST so it can retune any present signal; an unknown key or a
+        # negative/non-numeric value is ignored. _weighted() renormalizes on the present signals, so
+        # raising one weight just dilutes the others' relative pull — no separate formula, no double-
+        # count. None (the add pipeline / tests) → byte-identical.
+        for key, val in (weight_overrides or {}).items():
+            if key in self._weights and isinstance(val, (int, float)) and val >= 0:
+                self._weights[key] = float(val)
 
     def _people_data(self):
         """Lazy-load the people_matrix forward map + household person-affinity from the

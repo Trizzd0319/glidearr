@@ -122,3 +122,33 @@ def test_taste_profile_names_household_cast_and_crew():
 
 def test_taste_profile_empty_without_affinity():
     assert S(_GC({}), None).taste_profile() == {"genres": [], "directors": [], "actors": []}
+
+
+# ── per-instance weight overrides (the anniversary shelf re-weights popularity) ────────
+# A caller scoring a different objective off the same signals can retune any weight; the
+# weighted average renormalizes on the present signals, so the SAME popularity metric just
+# carries more pull. None / {} → byte-identical (the add pipeline is untouched).
+
+def test_weight_override_lets_popularity_outrank_recency():
+    pop = {"votes": 50000, "year": 2005}      # very popular, old → low recency
+    obscure = {"votes": 5, "year": 2026}      # obscure, brand-new → high recency
+    base = S(None, None)
+    # default weights (popularity 0.10 < recency 0.15): the recent obscure title wins
+    assert base.score(obscure)["total"] > base.score(pop)["total"]
+    boosted = S(None, None, weight_overrides={"popularity": 0.60})
+    # popularity re-weighted above recency: the notable old title now wins
+    assert boosted.score(pop)["total"] > boosted.score(obscure)["total"]
+
+
+def test_weight_override_none_or_empty_is_byte_identical():
+    cand = {"genres": ["sci-fi"], "votes": 1200, "year": 2019, "source": "trakt_recommendations"}
+    ref = S(None, None).score(cand)
+    assert S(None, None, weight_overrides=None).score(cand) == ref
+    assert S(None, None, weight_overrides={}).score(cand) == ref
+
+
+def test_weight_override_ignores_unknown_key_and_negative_value():
+    cand = {"votes": 1200, "year": 2019}
+    ref = S(None, None).score(cand)["total"]
+    # an unknown signal name and a negative weight are both ignored → total unchanged
+    assert S(None, None, weight_overrides={"nope": 0.9, "popularity": -1}).score(cand)["total"] == ref
