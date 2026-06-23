@@ -29,6 +29,9 @@ from scripts.managers.machine_learning.discovery.shelf import (
 from scripts.managers.machine_learning.playlists.cert_gate import ADULT, tier_level
 from scripts.managers.services.acquisition.scorer import AcquisitionScorer
 from scripts.managers.services.plex.playlists.builder import PlexPlaylistBuilderManager
+from scripts.managers.services.plex.playlists.movie_resolver import _norm as _norm_movie
+from scripts.managers.services.plex.playlists.movie_resolver import watched_movie_keys
+from scripts.managers.services.plex.playlists.tv_resolver import _norm as _norm_tv
 from scripts.managers.services.plex.playlists.writeback import (
     _TWIH_MOVIE_PLAN_KEY,
     _TWIH_SHOW_PLAN_KEY,
@@ -76,7 +79,7 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
 
         movie_inv = self._cache_get(_MOVIE_INV_KEY, {}) or {}
         ep_inv = self._cache_get(_EP_INV_KEY, {}) or {}
-        mr, sr = movie_resolver(movie_inv), show_resolver(ep_inv)
+        mr, sr = movie_resolver(movie_inv), show_resolver(ep_inv)   # unscoped — the household preview
         movie_keys, show_keys = self._section_type_keys()
         users_mgr = self.registry.get("manager", "PlexUsersManager") if self.registry else None
         profile_ages = self._profile_ages()
@@ -96,16 +99,33 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
                                profile_ages.get(u.get("title")) or profile_ages.get(safe))
             allowed = users_mgr.allowed_sections(u) if users_mgr else set()
             user_aff = self._user_affinity(u.get("tautulli_username"))
-            # Owned inventory carries no per-item section, so the library gate is at MEDIUM level and
-            # FAIL-CLOSED: a user gets a medium's shelf only with access to ALL its sections — a partial
-            # grant yields nothing rather than leaking picks from un-shared libraries of that type.
-            # (Per-section scoping needs `section` on the owned inventories — tracked as a follow-up.)
+            # PER-SECTION library gate (fail-CLOSED): each owned candidate resolves only from a section
+            # this user was actually shared (``section`` on the owned inventories). A viewer granted a
+            # SUBSET of a medium's libraries now gets a properly-scoped shelf instead of nothing; an
+            # un-granted/section-less entry never resolves. Net-new candidates carry no section → still
+            # preview-only. We only personalize a medium the user can reach at all (skips dead work).
+            mr_u = movie_resolver(movie_inv, allowed=allowed)
+            sr_u = show_resolver(ep_inv, allowed=allowed)
+            # EXPLORATORY: the shelf surfaces only titles this viewer HASN'T SEEN, so owned picks are
+            # filtered to per-user UNWATCHED (the same Tautulli finished-set the playlist builders use).
+            # Movies are title-level (finished THIS movie); shows are SERIES-level (watched ANY owned
+            # episode → the whole series is excluded, not just the pilot). No Tautulli match → empty →
+            # fail-OPEN (show owned, don't hide an empty shelf).
+            uid = u.get("tautulli_user_id")
+            movie_watched = self._watched_movies_for(uid)
+            watched_tvdbs = self._watched_series_tvdbs(uid, ep_inv)
+            # Match ALL the identities the watched set carries (ratingKey + the (title,year) tuple that
+            # survives a Plex re-scan) — a bare-ratingKey check goes inert after a re-scan and re-surfaces
+            # finished titles. Series exposure is precomputed in watched_tvdbs (same robustness for TV).
+            m_seen = lambda c, rk, _w=movie_watched: (
+                str(rk) in _w or (_norm_movie(c.get("title")), self._coerce_int(c.get("year"))) in _w)
+            s_seen = lambda c, rk, _t=watched_tvdbs: self._coerce_int(c.get("tvdb_id")) in _t
             m_scored = (personalize(scored_movies, user_aff, hh_max=hh_max, weights=weights,
-                                    gm_opts=gm_opts) if (movie_keys and movie_keys <= allowed) else [])
+                                    gm_opts=gm_opts) if (movie_keys & allowed) else [])
             s_scored = (personalize(scored_shows, user_aff, hh_max=hh_max, weights=weights,
-                                    gm_opts=gm_opts) if (show_keys and show_keys <= allowed) else [])
-            m_items, _ = gated_plan(m_scored, level=level, cap=cap, resolve=mr)
-            s_items, _ = gated_plan(s_scored, level=level, cap=cap, resolve=sr)
+                                    gm_opts=gm_opts) if (show_keys & allowed) else [])
+            m_items, _ = gated_plan(m_scored, level=level, cap=cap, resolve=mr_u, seen=m_seen)
+            s_items, _ = gated_plan(s_scored, level=level, cap=cap, resolve=sr_u, seen=s_seen)
             self.global_cache.set(f"{_TWIH_MOVIE_PLAN_KEY}/{safe}", self._plan_dict("twih_movie", m_items))
             self.global_cache.set(f"{_TWIH_SHOW_PLAN_KEY}/{safe}", self._plan_dict("twih_show", s_items))
             self.logger.log_info(
@@ -272,6 +292,56 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
             if not c.get("genres"):
                 c["genres"] = list(series_genres.get(sid) or [])
 
+    def _watched_movies_for(self, user_id) -> set:
+        """Per-user finished-MOVIE identities (Plex ratingKeys + (title,year)) from Tautulli — the
+        exploratory filter for owned movies. ``set()`` when the profile has no Tautulli match (→ the
+        shelf fails OPEN and shows owned). Mirrors MoviePlaylistBuilderManager._watched_movies_for; the
+        TV twin (``_watched_for``) is inherited from the base builder."""
+        if user_id is None or not self.registry:
+            return set()
+        hm = self.registry.get("manager", "TautulliWatchHistoryManager")
+        if hm is None:
+            taut = self.registry.get("manager", "TautulliManager")
+            hm = getattr(taut, "watch_history", None) if taut else None
+        if not hm or not hasattr(hm, "get_all_history_cached"):
+            return set()
+        try:
+            return watched_movie_keys(hm.get_all_history_cached(user_id))
+        except Exception:
+            return set()
+
+    def _watched_series_tvdbs(self, user_id, ep_inv) -> set:
+        """tvdb ids of series this viewer has watched ANY OWNED episode of — the SERIES-level exposure
+        signal (watching one episode means they've been exposed to the show, so it's not a discovery,
+        even if the watched episode isn't the pilot the shelf would surface). Built by intersecting the
+        user's finished-episode ratingKeys (Tautulli) with the owned-episode inventory, whose keys are
+        ``{tvdb}:{season}:{episode}``. ``set()`` on no Tautulli match → fail-OPEN."""
+        watched_eps = self._watched_for(user_id)
+        if not watched_eps:
+            return set()
+        out: set = set()
+        for join_key, entry in (ep_inv or {}).items():
+            if not isinstance(entry, dict):
+                continue
+            parts = str(join_key).split(":")
+            tvdb = self._coerce_int(parts[0])
+            if tvdb is None or tvdb in out:
+                continue
+            rk = entry.get("rating_key")
+            st = _norm_tv(entry.get("series_title"))
+            season = self._coerce_int(parts[1]) if len(parts) > 1 else None
+            episode = self._coerce_int(parts[2]) if len(parts) > 2 else None
+            ep_title = _norm_tv(entry.get("title"))
+            # Match ANY identity watched_episode_keys carries — the (series,season,episode) tuple is the
+            # one that survives a Plex re-scan (a bare ratingKey often doesn't), the same recovery the
+            # shipped builders rely on.
+            if ((rk is not None and str(rk) in watched_eps)
+                    or (st and season is not None and episode is not None
+                        and (st, season, episode) in watched_eps)
+                    or (st and ep_title and (st, ep_title) in watched_eps)):
+                out.add(tvdb)
+        return out
+
     def _movie_csm_ages(self) -> dict:
         """{tmdb_id(int): Common Sense age(int)} from the MDBList movie age cache — the cert-gate
         fallback for owned movies that carry no certification. {} on any failure."""
@@ -290,8 +360,9 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
 
     # ── per-user library media access (movie/show section-type level) ────────────
     def _section_type_keys(self):
-        """``(movie_section_keys, show_section_keys)`` from the global section index — the medium-level
-        library gate (a user with no movie-type section gets no movie shelf)."""
+        """``(movie_section_keys, show_section_keys)`` from the global section index — the cheap
+        medium-reachability check (a user whose allowlist intersects no movie-type section can't have a
+        movie shelf, so we skip personalizing it). Actual scoping is per-section in the resolvers."""
         sections = self._cache_get(_SECTIONS_KEY, {}) or {}
         movie, show = set(), set()
         if isinstance(sections, dict):

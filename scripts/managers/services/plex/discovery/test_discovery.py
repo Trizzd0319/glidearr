@@ -60,8 +60,8 @@ _OWNED_EPS = [
 def _mgr(*, tracked, allowed, config, cache=None):
     c = cache or _Cache({
         "radarr.movies.radarr.full": _MOVIES,
-        "plex/movies/owned_inventory": {"1": {"rating_key": "rk1"}},
-        "plex/episodes/owned_inventory": {"10:1:1": {"rating_key": "ep1"}},
+        "plex/movies/owned_inventory": {"1": {"rating_key": "rk1", "section": "1"}},
+        "plex/episodes/owned_inventory": {"10:1:1": {"rating_key": "ep1", "section": "2"}},
         "plex/sections": {"1": {"type": "movie"}, "2": {"type": "show"}},
     })
     m = object.__new__(DiscoveryShelfBuilderManager)
@@ -114,19 +114,41 @@ def test_library_gate_empties_plans_for_a_user_without_access():
     assert c.d[f"{_TWIH_SHOW_PLAN_KEY}/rob"]["items"] == []
 
 
-def test_partial_library_grant_yields_no_movie_shelf_fail_closed():
+def test_partial_movie_grant_scopes_to_granted_section():
+    # Two owned anniversary movies in two different movie libraries; Rob is shared only "Kids Movies"
+    # (section 1), not "Adult Movies" (section 2). He should get a SCOPED shelf — only the section-1
+    # pick — not nothing (the old medium-level fail-closed) and not the un-shared section-2 pick.
+    movies = [
+        {"tmdbId": 1, "title": "Kids Pick", "inCinemas": "2010-01-02T00:00:00Z", "year": 2010,
+         "genres": ["Family"], "hasFile": True, "certification": "PG", "ratings": {"tmdb": {"votes": 900}}},
+        {"tmdbId": 2, "title": "Adult Pick", "inCinemas": "2010-01-03T00:00:00Z", "year": 2010,
+         "genres": ["Action"], "hasFile": True, "certification": "PG", "ratings": {"tmdb": {"votes": 800}}},
+    ]
+    cache = _Cache({
+        "radarr.movies.radarr.full": movies,
+        "plex/movies/owned_inventory": {"1": {"rating_key": "rkKids", "section": "1"},
+                                        "2": {"rating_key": "rkAdult", "section": "2"}},
+        "plex/episodes/owned_inventory": {},
+        "plex/sections": {"1": {"type": "movie"}, "2": {"type": "movie"}},
+    })
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1"}}, config=_ON, cache=cache)
+    m.run()
+    movie_rks = [i["rating_key"] for i in c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"]]
+    assert movie_rks == ["rkKids"]            # ONLY the granted section's pick; section 2 excluded
+
+
+def test_owned_entry_without_section_excluded_fail_closed():
+    # A legacy/partial inventory entry that carries no `section` can't prove the user was shared it →
+    # excluded, even though the user holds a scoped grant for that medium (unknown section → fail-closed).
     cache = _Cache({
         "radarr.movies.radarr.full": _MOVIES,
-        "plex/movies/owned_inventory": {"1": {"rating_key": "rk1"}},
-        "plex/episodes/owned_inventory": {"10:1:1": {"rating_key": "ep1"}},
-        "plex/sections": {"1": {"type": "movie"}, "2": {"type": "movie"}, "3": {"type": "show"}},
+        "plex/movies/owned_inventory": {"1": {"rating_key": "rk1"}},      # no `section`
+        "plex/episodes/owned_inventory": {},
+        "plex/sections": {"1": {"type": "movie"}, "2": {"type": "show"}},
     })
-    # Rob is granted movie section 1 (not 2) + show section 3. Owned inventory has no per-item
-    # section, so a PARTIAL movie grant fails closed → no movie shelf; the fully-granted show medium ok.
-    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1", "3"}}, config=_ON, cache=cache)
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1", "2"}}, config=_ON, cache=cache)
     m.run()
-    assert c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"] == []               # movie_keys {1,2} not all granted
-    assert [i["rating_key"] for i in c.d[f"{_TWIH_SHOW_PLAN_KEY}/rob"]["items"]] == ["ep1"]
+    assert c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"] == []
 
 
 def test_save_detection_records_watchlisted_anniversary_titles():
@@ -154,7 +176,8 @@ def test_two_users_get_taste_ordered_movie_shelves():
     ]
     cache = _Cache({
         "radarr.movies.radarr.full": movies,
-        "plex/movies/owned_inventory": {"1": {"rating_key": "rkC"}, "4": {"rating_key": "rkA"}},
+        "plex/movies/owned_inventory": {"1": {"rating_key": "rkC", "section": "1"},
+                                        "4": {"rating_key": "rkA", "section": "1"}},
         "plex/episodes/owned_inventory": {},
         "plex/sections": {"1": {"type": "movie"}},
         "tautulli/users/rob/affinity": {"genres": {"action": 1.0}},   # Rob loves Action
@@ -180,3 +203,110 @@ def test_restricted_profile_age_gates_out_pg13_movie():
     assert c.d[f"{_TWIH_MOVIE_PLAN_KEY}/kid"]["items"] == []
     # the show carries no cert (stubbed) → also excluded fail-closed for the kid.
     assert c.d[f"{_TWIH_SHOW_PLAN_KEY}/kid"]["items"] == []
+
+
+def test_owned_watched_movie_demoted_to_bottom():
+    # An owned anniversary movie the viewer has FINISHED isn't excluded — it's demoted to the BOTTOM as
+    # an anniversary rewatch. The unwatched one leads even though the watched one has a higher score.
+    movies = [
+        {"tmdbId": 1, "title": "Seen It", "inCinemas": "2010-01-02T00:00:00Z", "year": 2010,
+         "genres": ["Action"], "hasFile": True, "certification": "PG", "ratings": {"tmdb": {"votes": 900}}},
+        {"tmdbId": 4, "title": "Never Seen", "inCinemas": "2010-01-03T00:00:00Z", "year": 2010,
+         "genres": ["Action"], "hasFile": True, "certification": "PG", "ratings": {"tmdb": {"votes": 500}}},
+    ]
+    cache = _Cache({
+        "radarr.movies.radarr.full": movies,
+        "plex/movies/owned_inventory": {"1": {"rating_key": "rkSeen", "section": "1"},
+                                        "4": {"rating_key": "rkNew", "section": "1"}},
+        "plex/episodes/owned_inventory": {},
+        "plex/sections": {"1": {"type": "movie"}},
+    })
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1"}}, config=_ON, cache=cache)
+    m._watched_movies_for = lambda uid: {"rkSeen"}        # Rob finished "Seen It"
+    m.run()
+    items = c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"]
+    assert [i["rating_key"] for i in items] == ["rkNew", "rkSeen"]   # unwatched first, rewatch at bottom
+    assert items[0]["seen"] is False and items[1]["seen"] is True
+
+
+def test_owned_watched_show_demoted_series_level():
+    # SERIES-level: watching ANY owned episode demotes the whole show to the rewatch tier (marked seen).
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1", "2"}}, config=_ON)   # default cache: tvdb 10 → ep1
+    m._watched_for = lambda uid: {"ep1"}
+    m.run()
+    items = c.d[f"{_TWIH_SHOW_PLAN_KEY}/rob"]["items"]
+    assert [i["rating_key"] for i in items] == ["ep1"] and items[0]["seen"] is True
+
+
+def test_watched_movie_matched_by_title_year_after_rescan():
+    # A Plex re-scan changed the ratingKey, so the watched set holds ONLY the (title,year) tuple — not
+    # the current inventory ratingKey. The filter must STILL recognise the finished movie (mark it seen
+    # → rewatch tier); a bare-ratingKey check would mis-classify it as unwatched on every re-scan.
+    movies = [
+        {"tmdbId": 1, "title": "Seen It", "inCinemas": "2010-01-02T00:00:00Z", "year": 2010,
+         "genres": ["Action"], "hasFile": True, "certification": "PG", "ratings": {"tmdb": {"votes": 900}}},
+    ]
+    cache = _Cache({
+        "radarr.movies.radarr.full": movies,
+        "plex/movies/owned_inventory": {"1": {"rating_key": "NEW_RK", "section": "1"}},  # post-rescan rk
+        "plex/episodes/owned_inventory": {},
+        "plex/sections": {"1": {"type": "movie"}},
+    })
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1"}}, config=_ON, cache=cache)
+    m._watched_movies_for = lambda uid: {("seen it", 2010)}   # only the surviving tuple identity
+    m.run()
+    items = c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"]
+    assert len(items) == 1 and items[0]["seen"] is True       # recognised via the tuple, not the rk
+
+
+def test_watched_show_matched_by_series_tuple_after_rescan():
+    # TV twin of the churn case: the watched set holds only the (series,season,episode) tuple, not the
+    # post-rescan ratingKeys — the series must still be recognised as seen.
+    owned_eps = [
+        {"series_tvdb_id": 10, "series_id": 100, "series_title": "Show", "season_number": 3,
+         "episode_number": 4, "air_date_utc": "2010-01-02T00:00:00Z", "has_file": True},
+    ]
+    cache = _Cache({
+        "radarr.movies.radarr.full": [],
+        "plex/movies/owned_inventory": {},
+        "plex/episodes/owned_inventory": {
+            "10:1:1": {"rating_key": "NEW_PILOT", "series_title": "Show", "title": "Pilot", "section": "2"},
+            "10:3:4": {"rating_key": "NEW_ANNIV", "series_title": "Show", "title": "Anniversary", "section": "2"}},
+        "plex/sections": {"2": {"type": "show"}},
+    })
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"2"}}, config=_ON, cache=cache)
+    m._load_owned_episodes = lambda: list(owned_eps)
+    m._watched_for = lambda uid: {("show", 3, 4)}             # only the surviving (series,s,e) tuple
+    m.run()
+    items = c.d[f"{_TWIH_SHOW_PLAN_KEY}/rob"]["items"]
+    assert len(items) == 1 and items[0]["seen"] is True
+
+
+def test_watched_non_pilot_episode_demotes_the_series():
+    # The gap episode-level filtering misses: Rob watched a MID-series episode (S3E4), NOT the pilot the
+    # shelf surfaces. Series-level recognition must still mark the show seen (rewatch tier), not unwatched.
+    owned_eps = [
+        {"series_tvdb_id": 10, "series_id": 100, "series_title": "Show", "season_number": 3,
+         "episode_number": 4, "air_date_utc": "2010-01-02T00:00:00Z", "has_file": True},
+    ]
+    cache = _Cache({
+        "radarr.movies.radarr.full": [],
+        "plex/movies/owned_inventory": {},
+        "plex/episodes/owned_inventory": {
+            "10:1:1": {"rating_key": "pilot10", "series_title": "Show", "section": "2"},   # surfaced pilot
+            "10:3:4": {"rating_key": "anniv10", "series_title": "Show", "section": "2"}},   # the watched ep
+        "plex/sections": {"2": {"type": "show"}},
+    })
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"2"}}, config=_ON, cache=cache)
+    m._load_owned_episodes = lambda: list(owned_eps)
+    m._watched_for = lambda uid: {"anniv10"}             # watched S3E4 only — NOT the surfaced pilot
+    m.run()
+    items = c.d[f"{_TWIH_SHOW_PLAN_KEY}/rob"]["items"]
+    assert len(items) == 1 and items[0]["seen"] is True   # series demoted despite the unwatched pilot
+
+
+def test_no_tautulli_match_fails_open_and_shows_owned():
+    # Default _mgr (no Tautulli managers in the registry) → empty watched set → owned still shown.
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1", "2"}}, config=_ON)
+    m.run()
+    assert [i["rating_key"] for i in c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"]] == ["rk1"]

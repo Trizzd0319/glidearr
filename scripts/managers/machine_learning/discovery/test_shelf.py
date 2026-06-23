@@ -27,10 +27,34 @@ def test_owned_movies_resolve_to_rating_keys_in_score_order_and_cap():
     assert [i["ordinal"] for i in items] == [0, 1] and net_new == []
 
 
-def test_cap_limits_owned_items():
-    scored = [_movie(1, 90), _movie(2, 80)]
-    items, _ = gated_plan(scored, level=ADULT, cap=1, resolve=movie_resolver(_MOVIE_INV))
-    assert [i["rating_key"] for i in items] == ["rk1"]         # only the top one
+def test_owned_freebies_uncapped_but_net_new_is_capped():
+    # The cap bounds only NET-NEW (budgeted) picks; owned freebies are all included (free, no grab) so
+    # they sit below the net-new with no upper limit.
+    owned = [_movie(1, 90), _movie(2, 80)]
+    items, _ = gated_plan(owned, level=ADULT, cap=1, resolve=movie_resolver(_MOVIE_INV))
+    assert [i["rating_key"] for i in items] == ["rk1", "rk2"]   # cap=1 does NOT limit owned freebies
+    net = [_movie(1, 90, owned=False), _movie(2, 80, owned=False), _movie(5, 70, owned=False)]
+    _, net_new = gated_plan(net, level=ADULT, cap=2, resolve=movie_resolver(_MOVIE_INV))
+    assert [n["tmdb_id"] for n in net_new] == [1, 2]            # net-new capped at 2
+
+
+def test_on_this_day_leads_its_tier_over_higher_watchability():
+    # Within a tier, a title whose anniversary is EXACTLY today leads even with a lower watchability.
+    today = {"media": "movie", "tmdb_id": 1, "owned": True, "score": 70, "on_this_day": True, "title": "Today"}
+    week = {"media": "movie", "tmdb_id": 2, "owned": True, "score": 90, "on_this_day": False, "title": "ThisWeek"}
+    inv = {"1": {"rating_key": "rkToday"}, "2": {"rating_key": "rkWeek"}}
+    items, _ = gated_plan([week, today], level=ADULT, cap=5, resolve=movie_resolver(inv))
+    assert [i["rating_key"] for i in items] == ["rkToday", "rkWeek"]   # today first despite lower score
+    assert [i["on_this_day"] for i in items] == [True, False]
+
+
+def test_seen_owned_demoted_to_the_bottom_tier():
+    scored = [_movie(1, 90), _movie(2, 80)]                     # both owned + resolvable
+    seen = lambda c, rk: rk == "rk1"                            # tmdb 1 (higher score) already seen
+    items, _ = gated_plan(scored, level=ADULT, cap=5, resolve=movie_resolver(_MOVIE_INV), seen=seen)
+    assert [i["rating_key"] for i in items] == ["rk2", "rk1"]   # unwatched first, the seen rewatch at bottom
+    assert [i["seen"] for i in items] == [False, True]
+    assert [i["ordinal"] for i in items] == [0, 1]             # ordinals reassigned across the two tiers
 
 
 def test_net_new_unowned_go_to_preview_not_playlist():
@@ -78,3 +102,31 @@ def test_show_resolver_prefers_pilot_then_anniversary_episode():
     assert r({"tvdb_id": 10, "season": 3, "episode": 4}) == "pilot10"   # pilot owned → entry point
     assert r({"tvdb_id": 11, "season": 3, "episode": 4}) == "anniv11"   # no pilot → anniversary ep
     assert r({"tvdb_id": 99, "season": 1, "episode": 1}) is None        # nothing owned
+
+
+# ── per-section library scoping (fail-CLOSED) ──────────────────────────────────
+_MOVIE_INV_SECTIONED = {"1": {"rating_key": "rk1", "section": "10"},   # Kids Movies
+                        "2": {"rating_key": "rk2", "section": "20"}}   # Adult Movies
+
+
+def test_movie_resolver_allows_only_granted_section():
+    r = movie_resolver(_MOVIE_INV_SECTIONED, allowed={"10"})           # shared Kids only
+    assert r({"tmdb_id": 1}) == "rk1"                                  # section 10 granted
+    assert r({"tmdb_id": 2}) is None                                   # section 20 un-shared → excluded
+
+
+def test_movie_resolver_no_allowed_keeps_household_wide():
+    r = movie_resolver(_MOVIE_INV_SECTIONED)                           # allowed=None → preview/unscoped
+    assert r({"tmdb_id": 1}) == "rk1" and r({"tmdb_id": 2}) == "rk2"
+
+
+def test_movie_resolver_sectionless_entry_excluded_when_scoped():
+    r = movie_resolver({"1": {"rating_key": "rk1"}}, allowed={"10"})   # legacy entry, no section
+    assert r({"tmdb_id": 1}) is None                                   # unknown section → fail-closed
+    assert movie_resolver({"1": {"rating_key": "rk1"}})({"tmdb_id": 1}) == "rk1"   # unscoped still ok
+
+
+def test_show_resolver_respects_allowed_section():
+    inv = {"10:1:1": {"rating_key": "pilot10", "section": "30"}}
+    assert show_resolver(inv, allowed={"30"})({"tvdb_id": 10, "season": 1, "episode": 1}) == "pilot10"
+    assert show_resolver(inv, allowed={"99"})({"tvdb_id": 10, "season": 1, "episode": 1}) is None

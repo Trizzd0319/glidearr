@@ -356,8 +356,9 @@ def empty_config() -> dict:
                      "home_collections": {"enabled": False, "promote_home": True, "promote_shared": False},
                      # this_week_in_history: a per-user "anniversary" shelf — movies released / shows
                      #   aired during the current Sun–Sat week in ANY past year. Two opt-in playlists
-                     #   ("<name> Anniversary Picks" + "<name> On This Week"), ordered by watchability,
-                     #   each capped small. opt_in_users = profiles to build for (empty + enabled ⇒
+                     #   ("<name> Anniversary Picks" + "<name> On This Week"), ordered by watchability;
+                     #   `cap` bounds only the NET-NEW (to-acquire) picks — the already-owned freebies are
+                     #   UNCAPPED and listed below them. opt_in_users = profiles to build for (empty + enabled ⇒
                      #   ALL tracked users). min_votes = a TMDb-vote popularity floor on the MOVIE picks
                      #   (owned AND net-new; the show shelf is never floored), 0 = off. timezone pins the
                      #   household week (blank ⇒ PMS/local). trust_home_managed:

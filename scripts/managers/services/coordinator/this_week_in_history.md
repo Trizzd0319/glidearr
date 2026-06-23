@@ -19,16 +19,23 @@ refinements below are design-only.
 - **Two COMBINED playlists, per user, OPT-IN (default OFF).** `Released This Week in History` = every
   movie library merged; `Aired This Week in History` = every show library merged. Generated only for users
   who opt in (or show a real consumption signal) — not N×2 always-on playlists for passive accounts.
-- **Exploratory = surface only UNWATCHED titles (the EXPOSURE axis, PER-USER).** The point is exposing a
-  viewer to things they HAVEN'T SEEN, of two kinds: **owned-but-unwatched** (a forgotten gem already in the
-  library — free, instant) and **net-new** (unowned — a grab). EXCLUDE owned-AND-already-watched (zero
-  exploratory value — they've seen it). "Unwatched" is PER-USER, from the same Tautulli watched set the
-  playlist builders already use (`_watched_movies_for` + the TV equivalent); a profile with no Tautulli
-  match fails OPEN — treat its owned as unwatched (show, don't hide an empty shelf).
-- **Owned-unwatched is the FREE fill; net-new is the budgeted discovery.** Owned-unwatched picks cost
-  nothing (no grab/budget/purge) and pass the SAME per-user age/library gate as acquisitions; net-new is
-  what the adaptive budget governs. In a READ-ONLY phase net-new is preview-only — it becomes a real shelf
-  item once acquisition grabs it (unwatched by definition, so it slots straight into the same exploratory shelf).
+- **Ordered by NOVELTY into three tiers (the EXPOSURE axis, PER-USER).** Surface anniversary titles ranked
+  by how new they are to the viewer: **net-new** (unowned, unseen) → **owned-but-unwatched** (rediscovery — a
+  forgotten gem) → **owned-AND-seen** (an anniversary REWATCH prompt at the very bottom). Nothing is excluded;
+  "watched" DEMOTES, it doesn't drop. "Watched" is PER-USER from the same Tautulli finished-set the playlist
+  builders use (`_watched_movies_for` + the TV `_watched_for`); for TV it's SERIES-level (watched ANY owned
+  episode → seen, so a show you're mid-way through demotes even when its pilot isn't the watched episode); a
+  profile with no Tautulli match fails OPEN (treat owned as unwatched). Matching is RE-SCAN-robust — ratingKey
+  OR the stable `(title,year)` / `(series,season,episode)` identities Tautulli also records (a bare-ratingKey
+  test goes inert after a Plex re-scan).
+- **Net-new on top (CAPPED); the owned tiers below (UNCAPPED).** Net-new is the budgeted discovery — the cap
+  bounds it because each pick costs a grab. The owned tiers cost NOTHING (no grab / budget / purge), so ALL
+  owned anniversary titles are included; the tiers are owned-unwatched (rediscovery) above owned-seen
+  (rewatch, the very bottom). WITHIN each tier, a title whose anniversary is EXACTLY today leads ("on this
+  very day in history" — `(month,day)` == today, Feb-29 folding onto Feb-28), THEN watchability-desc. On a Harry Potter anniversary your owned-but-unseen HP films
+  list above the ones you've already watched, both under any net-new discoveries. All pass the SAME per-user
+  age/library gate. READ-ONLY phase: net-new is preview-only; the playlist holds the two owned tiers, and
+  net-new join the TOP once acquisition grabs them (unwatched by definition).
 - **Trial, not a library add.** Net-new grabs live for ONE week; unwatched ones are reclaimed at week-end;
   only earners graduate (watched, saga-absorbed, watchability-promoted, or user-SAVED).
 
@@ -198,14 +205,15 @@ A per-`(user, key)` exposure ledger keeps the queue-top from silting up with tit
   "rolled off last week" list so a missed title is re-findable (no disk).
 - **Make it inviting + show the hook.** Rename to something enticing/unambiguous (e.g. "Anniversary Picks for
   <name>" / "On This Week: <year> Throwbacks") and surface the per-item hook ("aired 15 years ago this week") —
-  free metadata, the feature's whole charm. Keep the shelf small/curated (5–7), ordered by watchability desc.
+  free metadata, the feature's whole charm. Keep the NET-NEW picks small/curated (cap 5–7, watchability desc);
+  the owned freebies are uncapped and listed below them.
 - **TV entry point = the pilot** (or next-unwatched), not a random S6E14 anniversary.
 
 ## Phases (front-load net-new infra + safety)
 | # | Phase | Effort |
 |---|---|---|
 | 1 | **Window engine** (TZ-aware, set-membership, Feb-29 / year-boundary / null-date handling, tested) + movie/owned-TV candidate gen + ownership-key dedup + fail-closed scoring/popularity floor | medium |
-| 2 | **Per-user gating** (allowed-library allowlist + pre-grab age gate) + the **two new writeback playlist families** + the SAVE action; render the shelf with a FIXED conservative cap, NO acquisition/delete yet (read-only preview of net-new picks). **+ per-user UNWATCHED filter** — the shelf is exploratory, so owned picks are owned-but-**unwatched** only (exclude already-watched; fail-OPEN when no Tautulli match) | medium |
+| 2 | **Per-user gating** (allowed-library allowlist + pre-grab age gate) + the **two new writeback playlist families** + the SAVE action; render the shelf with NO acquisition/delete yet (read-only preview of net-new picks). **+ novelty tiers** — per-user, re-scan-robust: net-new (capped) → owned-unwatched (uncapped, rediscovery) → owned-seen (uncapped, anniversary rewatch, bottom); TV exposure is SERIES-level; fail-OPEN when no Tautulli match | medium |
 | 3 | **Bounded acquisition** (own discovery queue, NOT the shared backlog; pipeline ceiling) + the rolling shelf occupancy controller + **demand-aware ordering** (see `demand_aware_acquisition.md`) | medium |
 | 4 | **Saturday rollover** — week-boundary detection + idempotent purge under the destructive + **seeding-aware** + purge-correctness gates. **+ the PRE-ROLL look-ahead** — in the Saturday-evening window compute + pre-acquire NEXT week so files are ready at midnight, with **reclaim-FIRST** ordering (purge-before-prefetch near the floor; fail-safe/lazy when deletions unarmed) | medium |
 | 5 | **Adaptive budget** (Tautulli-sourced C_consume/D_backlog, GB+foreseen-commit, franchise floor) + stress-test (disk full / zero rate / all-weak / huge deferred → all → 0) BEFORE it governs grabs | medium |
