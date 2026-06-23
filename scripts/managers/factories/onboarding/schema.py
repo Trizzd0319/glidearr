@@ -354,6 +354,18 @@ def empty_config() -> dict:
                      #   Cached + dry-run previewed (write-back is separate). OFF → not built.
                      "mood_lists": {"enabled": False},
                      "home_collections": {"enabled": False, "promote_home": True, "promote_shared": False},
+                     # this_week_in_history: a per-user "anniversary" shelf — movies released / shows
+                     #   aired during the current Sun–Sat week in ANY past year. Two opt-in playlists
+                     #   ("<name> Anniversary Picks" + "<name> On This Week"), ordered by watchability,
+                     #   each capped small. opt_in_users = profiles to build for (empty + enabled ⇒
+                     #   ALL tracked users). min_votes = a TMDb-vote popularity floor on net-new picks
+                     #   (0 = off). timezone pins the household week (blank ⇒ PMS/local). trust_home_managed:
+                     #   when a managed profile's library grant can't be resolved, default it to ALL
+                     #   libraries (still AGE-gated) instead of failing closed to an empty shelf. OFF →
+                     #   nothing built, byte-identical.
+                     "this_week_in_history": {"enabled": False, "cap": 7, "min_votes": 0,
+                                              "timezone": "", "opt_in_users": [],
+                                              "trust_home_managed": False},
                  }},
         "mdblist": {"apikey": ""},   # opt-in: aggregated ratings + lists. apikey -> keyring.
         "dry_run": True,

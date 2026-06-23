@@ -37,5 +37,7 @@ def test_headless_zero_env_runs_all_phases_and_keeps_skeleton_complete(monkeypat
     assert set(cfg["english_dub"]) == {
         "cf_scoring", "theatrical_seek", "english_ladder", "lock_owned_dubs", "auto_enroll"}
     assert "playlists" in cfg["plex"]
+    twih = cfg["plex"]["playlists"]["this_week_in_history"]
+    assert twih["enabled"] is False and twih["cap"] == 7 and twih["opt_in_users"] == []
     assert cfg["size_anomaly"]["enabled"] is True
     assert cfg["backup_before_destructive"] is True

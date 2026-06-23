@@ -496,3 +496,53 @@ def test_profile_ages_preserves_other_playlists_settings():
     PlexStep(logger=None)._configure_profile_ages(p, cfg, _AGE_ROSTER)
     assert cfg["plex"]["playlists"]["personal_tilt"] == 60       # untouched
     assert cfg["plex"]["playlists"]["profile_ages"]["Aiden / Raina"] == "teen"
+
+
+# ── _configure_playlists: This Week in History opt-in ─────────────────────────
+class _TwihPrompter:
+    """confirm/integer/text/notice for the anniversary-shelf branch."""
+    def __init__(self, answers, text=None):
+        self.a = answers; self.t = text or {}; self.notices = []
+    def notice(self, m): self.notices.append(m)
+    def confirm(self, path, label, default=False): return self.a.get(path, default)
+    def integer(self, path, label, default=0, required=False): return self.a.get(path, default)
+    def text(self, path, label, default="", required=False, secret=False):
+        return self.t.get(path, default)
+
+
+_TWIH_ROSTER = [
+    {"uuid": "u1", "title": "Trizzd", "is_admin": True},
+    {"uuid": "u2", "title": "Wyatt", "is_admin": False},
+    {"uuid": "u3", "title": "Kids", "is_admin": False},
+]
+
+
+def test_configure_playlists_enables_twih_with_opt_in_numbers():
+    p = _TwihPrompter(
+        {"plex.has_playlist_options": True,
+         "plex.playlists.this_week_in_history.enabled": True,
+         "plex.playlists.this_week_in_history.cap": 5},
+        {"plex.playlists.this_week_in_history.opt_in_users": "2,3"})   # numbers → roster titles
+    cfg = {"plex": {"episodes": {"enabled": True}}}
+    PlexStep(logger=None)._configure_playlists(p, cfg, _TWIH_ROSTER)
+    twih = cfg["plex"]["playlists"]["this_week_in_history"]
+    assert twih["enabled"] is True and twih["cap"] == 5
+    assert twih["opt_in_users"] == ["Wyatt", "Kids"]
+
+
+def test_configure_playlists_twih_off_by_default_still_recorded():
+    p = _TwihPrompter({"plex.has_playlist_options": True})            # TWIH confirm defaults off
+    cfg = {"plex": {"episodes": {"enabled": True}}}
+    PlexStep(logger=None)._configure_playlists(p, cfg, _TWIH_ROSTER)
+    assert cfg["plex"]["playlists"]["this_week_in_history"]["enabled"] is False
+
+
+def test_configure_playlists_twih_accepts_literal_names_without_roster():
+    p = _TwihPrompter(
+        {"plex.has_playlist_options": True,
+         "plex.playlists.this_week_in_history.enabled": True,
+         "plex.playlists.this_week_in_history.cap": 7},
+        {"plex.playlists.this_week_in_history.opt_in_users": "Wyatt, Wyatt, Guest"})
+    cfg = {"plex": {"episodes": {"enabled": True}}}
+    PlexStep(logger=None)._configure_playlists(p, cfg, None)          # no roster → literal, deduped
+    assert cfg["plex"]["playlists"]["this_week_in_history"]["opt_in_users"] == ["Wyatt", "Guest"]

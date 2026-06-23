@@ -195,7 +195,7 @@ class PlexStep(Step):
         self._configure_profile_ages(prompter, cfg, roster)
 
         # Optional: personal "Up Next" playlist behaviour (build tuning + opt-in write-back).
-        self._configure_playlists(prompter, cfg)
+        self._configure_playlists(prompter, cfg, roster)
 
         ok = bool(res["ok"])
         detail = res["version"] if res["ok"] else (res["error"] or "unreachable")
@@ -295,15 +295,17 @@ class PlexStep(Step):
             cfg["plex"]["playlists"] = pl
 
     # ── personal playlist behaviour (build tuning + opt-in write-back) ─────────
-    def _configure_playlists(self, prompter, cfg):
+    def _configure_playlists(self, prompter, cfg, roster=None):
         """Opt-in per-user "Up Next" playlist behaviour → ``plex.playlists.*``. One entry
-        prompt gates three toggles, ALL default-OFF so the default path is unchanged:
+        prompt gates the toggles, ALL default-OFF so the default path is unchanged:
           • writeback.enabled        — actually WRITE the playlists into Plex (also needs
                                        ``dry_run=false`` to actuate);
           • recency_boost.enabled    — lift a show you're caught up on when a new
                                        season/episode lands;
           • cold_start_kids_prior    — seed a no-history kid profile from the household's
                                        age-appropriate viewing.
+          • this_week_in_history     — per-profile "anniversary" shelves (released/aired this
+                                       calendar week in any past year), with a per-profile opt-in.
         Playlists build on the owned-media scans (``plex.episodes.enabled`` /
         ``plex.movies.enabled``); a notice points there when they're off. No-op when the
         operator declines the entry prompt."""
@@ -336,10 +338,50 @@ class PlexStep(Step):
             "   Seed a no-history kid profile from the household's kid-show viewing?",
             default=bool(pl.get("cold_start_kids_prior", False))))
 
+        # "This Week in History" anniversary shelves — another generate-content section,
+        # per-profile opt-in. Off by default; when on, optionally restrict to chosen profiles.
+        twih = dict(pl.get("this_week_in_history") or {})
+        if prompter.confirm(
+                "plex.playlists.this_week_in_history.enabled",
+                "   Build 'Anniversary Picks' + 'On This Week' shelves "
+                "(released/aired this week in past years)?",
+                default=bool(twih.get("enabled", False))):
+            twih["enabled"] = True
+            twih["cap"] = int(prompter.integer(
+                "plex.playlists.this_week_in_history.cap",
+                "   How many titles on each anniversary shelf?",
+                default=int(twih.get("cap", 7) or 7)))
+            twih["opt_in_users"] = self._twih_opt_in(prompter, roster, twih.get("opt_in_users"))
+        else:
+            twih["enabled"] = False
+
         pl["writeback"] = wb
         pl["recency_boost"] = rb
         pl["cold_start_kids_prior"] = cold
+        pl["this_week_in_history"] = twih
         cfg["plex"]["playlists"] = pl
+
+    @staticmethod
+    def _twih_opt_in(prompter, roster, current):
+        """Which profiles get the anniversary shelf. Interactive: print the numbered Home
+        roster as a hint and accept names OR numbers; headless: a comma-separated list from
+        ``…_OPT_IN_USERS``. Blank ⇒ ALL tracked users (the feature is on household-wide)."""
+        if roster:
+            prompter.notice("   Profiles:")
+            for i, u in enumerate(roster, 1):
+                prompter.notice(f"     {i}) {u.get('title')}")
+        raw = prompter.text(
+            "plex.playlists.this_week_in_history.opt_in_users",
+            "   Which profiles get the shelf? (names or numbers, comma-separated; blank = all)",
+            default=",".join(current or []), required=False)
+        by_idx = {str(i): u.get("title") for i, u in enumerate(roster or [], 1)}
+        out, seen = [], set()
+        for tok in [t.strip() for t in (raw or "").split(",") if t.strip()]:
+            title = by_idx.get(tok, tok)
+            if title and title not in seen:
+                seen.add(title)
+                out.append(title)
+        return out
 
     @staticmethod
     def _pins_from_roster(prompter, pins, roster, token, client_identifier):
