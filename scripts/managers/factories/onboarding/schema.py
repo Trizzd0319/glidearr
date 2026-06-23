@@ -385,6 +385,12 @@ def empty_config() -> dict:
             # score renormalizes on the PRESENT signals, so a candidate with no people overlap
             # is unaffected; only co-cast candidates re-rank. 0.0 disables (byte-identical).
             "people_affinity_weight": 0.08,
+            # Demand-aware ordering (OFF by default → byte-identical score-desc). As an instance's free
+            #   space nears the floor, weight a candidate by how MANY household users would watch it
+            #   (breadth) over a single-user pick, so a shared file maximizes value-per-GB; roomy space
+            #   grabs by pure watchability. band = headroom fraction above the floor where weighting
+            #   ramps in (0→full at the floor); threshold = per-user genre-match floor to count as demand.
+            "demand": {"enabled": False, "band": 0.30, "threshold": 0.15},
             # Next-episode (stay-ahead) prefetch tuning — RECOMMENDED ON. Each sub-key
             # is opt-OUT: write {} or {"enabled": False} to disable just that feature.
             # Keep these values IN SYNC with the DEFAULT_* constants in

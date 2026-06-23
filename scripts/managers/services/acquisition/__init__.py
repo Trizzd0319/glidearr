@@ -13,9 +13,13 @@ so the choices are transparent.
 """
 from __future__ import annotations
 
+import math
+
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
+from scripts.managers.machine_learning.acquisition.demand import demand_priority, demand_score
 from scripts.managers.machine_learning.space.routing_targets import uhd_remote_play_ok
+from scripts.managers.machine_learning.space.tightness import tightness_with_hysteresis
 from scripts.managers.services.acquisition.adder import Adder
 from scripts.managers.services.acquisition.candidates import CandidateGatherer
 from scripts.managers.services.acquisition.gateway import ArrGateway
@@ -31,6 +35,15 @@ from datetime import datetime, timezone
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
 from scripts.support.utilities.space_targets import deletions_enabled, space_targets
+
+
+def _finite(val, default: float) -> float:
+    """Coerce to a finite float, else ``default`` (for config knobs / scores that may be missing)."""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return default
+    return f if (f == f and f not in (float("inf"), float("-inf"))) else default
 
 
 class AcquisitionManager(BaseManager, ComponentManagerMixin):
@@ -86,6 +99,89 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         _, U = space_targets(self.config, total_gb=total)
         cache[key] = (free, U)
         return cache[key]
+
+    # ── demand-aware ordering (acquisition.demand.*) ─────────────────────────────
+    def _demand_rank(self, eligible: list, gateways: dict, band_cache: dict, acq: dict) -> None:
+        """Reorder ``eligible`` IN PLACE by demand-aware priority — ``watchability × demand^t``, where
+        ``demand`` is how many household users would watch the title (breadth) and ``t`` is its routed
+        instance's space-tightness. A roomy instance (``t=0``) keeps pure watchability order, so the
+        result is byte-identical to score-desc when no instance is tight (or no user has affinity)."""
+        dcfg = acq.get("demand", {}) or {}
+        band = _finite(dcfg.get("band", 0.30), 0.30)
+        threshold = _finite(dcfg.get("threshold", 0.15), 0.15)
+        affinities = self._per_user_affinities()
+        if not affinities:
+            # No user roster at all → no breadth signal; degrade gracefully to watchability order
+            # rather than collapsing every candidate's demand to 0 under tightness.
+            eligible.sort(key=lambda x: _finite(x.get("score"), 0.0), reverse=True)
+            return
+        for e in eligible:
+            gw = gateways.get("sonarr" if e.get("type") == "show" else "radarr")
+            t = self._instance_tightness(gw, e.get("instance"), band, band_cache)
+            base = _finite(e.get("score"), 0.0)
+            if t <= 0.0:
+                e["demand_priority"] = base                          # roomy → watchability-led
+                continue
+            demand = demand_score(e.get("genres") or [], affinities,
+                                  popularity=self._votes_to_unit(e.get("votes")), threshold=threshold)
+            e["demand_priority"] = demand_priority(base, demand, t)
+        eligible.sort(key=lambda x: x.get("demand_priority", _finite(x.get("score"), 0.0)), reverse=True)
+
+    def _instance_tightness(self, gw, inst, band: float, cache: dict) -> float:
+        """Acquisition space-tightness ``t∈[0,1]`` for an instance: 0 with comfortable headroom above
+        the free-space floor ``T`` (``free_space_limit``, or 25% of the drive), 1 at/below it, with
+        CROSS-RUN hysteresis (the previous ``t`` is persisted) so the mode can't oscillate as free space
+        hovers at the band edge between runs. FAIL-OPEN (free=inf → t=0). Memoised per (service, instance)
+        in the shared band cache (distinct key)."""
+        if gw is None:
+            return 0.0
+        svc = getattr(gw, "service", "?")
+        key = (svc, str(inst), "tight")
+        if key in cache:
+            return cache[key]
+        try:
+            free = float(gw.im.disk_free_gb(inst))
+        except Exception:
+            free = float("inf")
+        try:
+            total = gw.im.disk_total_gb(inst)
+        except Exception:
+            total = None
+        T, _ = space_targets(self.config, total_gb=total)
+        pkey = f"acquisition/demand/tightness/{svc}/{inst}"
+        prev = _finite(self.global_cache.get(pkey), 0.0) if self.global_cache else 0.0
+        t = tightness_with_hysteresis(free, T, prev, band=band)
+        cache[key] = t
+        if self.global_cache:
+            try:
+                self.global_cache.set(pkey, t)
+            except Exception:
+                pass
+        return t
+
+    def _per_user_affinities(self) -> list:
+        """The household's per-user genre affinities (one ``{genre: weight}`` dict per tracked user) for
+        the demand breadth signal — from ``PlexUsersManager.tracked_users`` × the
+        ``tautulli/users/<safe>/affinity`` caches. A user with no history yields ``{}`` (demand then uses
+        the popularity prior for them). ``[]`` when there's no user roster (cold household)."""
+        um = self.registry.get("manager", "PlexUsersManager") if self.registry else None
+        tracked = list(getattr(um, "tracked_users", []) or []) if um else []
+        out = []
+        for u in tracked:
+            safe = u.get("safe_user")
+            aff = (self.global_cache.get(f"tautulli/users/{safe}/affinity")
+                   if (safe and self.global_cache) else None)
+            out.append((aff.get("genres") if isinstance(aff, dict) else None) or {})
+        return out
+
+    @staticmethod
+    def _votes_to_unit(votes) -> float:
+        """TMDb vote count → a 0–1 popularity prior (log-scaled, ~50k votes → 1.0; matches the scorer)."""
+        try:
+            v = float(votes)
+        except (TypeError, ValueError):
+            return 0.0
+        return min(1.0, math.log10(v + 1) / math.log10(50000)) if v > 0 else 0.0
 
     def _space_ok(self, gw, inst, cache: dict) -> bool:
         """True when an instance is at/above its pressure band (free >= U) — comfortable enough
@@ -482,7 +578,15 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
 
         min_score = int(acq.get("min_score", 0) or 0)
         eligible = [e for e in prepared if e["score"] >= min_score]
-        eligible.sort(key=lambda x: x["score"], reverse=True)
+        # Demand-aware ordering (acquisition.demand.enabled, default OFF → plain score-desc,
+        # byte-identical). As an instance's free space nears the floor, weight a candidate by how many
+        # household users would watch it (breadth) so the capped budget fills with broad-appeal media;
+        # a roomy instance keeps pure watchability order. Reorders BEFORE the cap so demand decides
+        # which titles make the cut, not just their order.
+        if bool((acq.get("demand", {}) or {}).get("enabled", False)):
+            self._demand_rank(eligible, gateways, band_cache, acq)
+        else:
+            eligible.sort(key=lambda x: x["score"], reverse=True)
         cap = int(acq.get("max_adds_per_run", 10) or 0)
         selected = eligible[:cap] if cap > 0 else eligible
 
