@@ -62,7 +62,7 @@ def test_scan_builds_tmdb_inventory_and_coverage():
     m = _mgr(cache, _Meta({"5001": 603}))      # only 5001 resolves to a tmdb
     stats = m.run()
     assert cache.get(_INVENTORY_KEY) == {
-        "603": {"rating_key": "5001", "title": "The Matrix", "year": 1999}}
+        "603": {"rating_key": "5001", "title": "The Matrix", "year": 1999, "section": "1"}}
     assert stats["movies_seen"] == 2 and stats["movies_resolved"] == 1
     assert stats["unresolved_no_tmdb"] == 1
     assert cache.get(_STATS_KEY)["resolution_pct"] == 50.0

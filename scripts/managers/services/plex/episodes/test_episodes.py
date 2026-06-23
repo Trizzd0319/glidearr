@@ -93,6 +93,7 @@ def test_resolves_episode_via_show_tvdb():
     stats = m.run()
     inv = cache.get(_INVENTORY_KEY)
     assert inv["555:1:1"]["rating_key"] == "1001"      # the EPISODE key, not the show
+    assert inv["555:1:1"]["section"] == "5"            # source section recorded for per-user scoping
     assert stats["episodes_resolved"] == 1 and stats["resolution_pct"] == 100.0
     assert cache.get(_STATS_KEY)["shows_resolved"] == 1
 

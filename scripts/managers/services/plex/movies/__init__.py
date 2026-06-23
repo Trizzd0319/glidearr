@@ -1,7 +1,7 @@
 """
 plex/movies — owned-movie tmdb→ratingKey map (the movie personal-playlist join + probe).
 ================================================================================
-Builds ``plex/movies/owned_inventory`` = ``{"{tmdb}": {ratingKey, title, year}}`` so the
+Builds ``plex/movies/owned_inventory`` = ``{"{tmdb}": {ratingKey, title, year, section}}`` so the
 movie playlist resolver can turn each owned Radarr movie (``movie_files.parquet``, keyed
 by ``tmdb_id``) into a playable Plex ratingKey. The movie analog of ``plex/episodes`` —
 and SIMPLER, because a movie is a single item with no show→episode tree: scan the movie
@@ -68,7 +68,9 @@ class PlexMoviesManager(BaseManager):
 
     # ── scan ─────────────────────────────────────────────────────────────────
     def _scan_movies(self, key, meta, inventory, stats):
-        """Each movie → tmdb (via the guid_map) → {ratingKey, title, year}."""
+        """Each movie → tmdb (via the guid_map) → {ratingKey, title, year, section}. The source
+        ``section`` key lets per-user consumers (e.g. the anniversary shelf) scope an owned movie to
+        the libraries that user was actually shared, instead of gating at the whole-medium level."""
         for raw in self._iter_section(key, plex_type=1, stats=stats):
             stats["movies_seen"] += 1
             p = parse_item(raw)
@@ -80,6 +82,7 @@ class PlexMoviesManager(BaseManager):
                 "rating_key": str(p["rating_key"]),
                 "title": p["title"],
                 "year": p["year"],
+                "section": str(key),
             }
             stats["movies_resolved"] += 1
 

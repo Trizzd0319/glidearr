@@ -2,7 +2,7 @@
 plex/episodes — owned-episode tvdb→ratingKey map (the personal-playlist join + probe).
 ================================================================================
 Builds ``plex/episodes/owned_inventory`` = ``{"{series_tvdb}:{season}:{episode}":
-{ratingKey, title, series_title, grandparent_rating_key}}`` so the playlist resolver
+{ratingKey, title, series_title, grandparent_rating_key, section}}`` so the playlist resolver
 can turn each owned Sonarr episode (which already carries the same join key, see
 sonarr/cache/owned_episodes.py) into a playable Plex ratingKey.
 
@@ -117,6 +117,7 @@ class PlexEpisodesManager(BaseManager):
                 "title": ep["title"],
                 "series_title": ep["series_title"],
                 "grandparent_rating_key": str(ep["grandparent_rating_key"]),
+                "section": str(key),
             }
             stats["episodes_resolved"] += 1
 
