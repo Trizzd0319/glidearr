@@ -114,6 +114,22 @@ def test_library_gate_empties_plans_for_a_user_without_access():
     assert c.d[f"{_TWIH_SHOW_PLAN_KEY}/rob"]["items"] == []
 
 
+def test_save_detection_records_watchlisted_anniversary_titles():
+    cache = _Cache({
+        "radarr.movies.radarr.full": _MOVIES,
+        "plex/movies/owned_inventory": {"1": {"rating_key": "rk1"}},
+        "plex/episodes/owned_inventory": {"10:1:1": {"rating_key": "ep1"}},
+        "plex/sections": {"1": {"type": "movie"}, "2": {"type": "show"}},
+        "plex/watchlist/union": [{"ids": {"tmdb": 3}}, {"ids": {"tvdb": 10}}],
+    })
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1", "2"}}, config=_ON, cache=cache)
+    m.run()
+    saved = c.d["discovery/saved/rob"]                # isolated key — never the affinity model
+    assert saved["tmdb:3"]["media"] == "movie" and saved["tmdb:3"]["source"] == "watchlist"
+    assert saved["tvdb:10"]["media"] == "show"
+    assert "tautulli/affinity" not in c.d and "people_matrix/affinity" not in c.d
+
+
 def test_restricted_profile_age_gates_out_pg13_movie():
     kid = {"safe_user": "kid", "title": "Kid", "is_admin": False, "restriction_profile": "little_kid"}
     m, c = _mgr(tracked=[kid], allowed={"kid": {"1", "2"}}, config=_ON)

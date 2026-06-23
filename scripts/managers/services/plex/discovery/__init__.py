@@ -99,6 +99,7 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
                 f"owned pick(s) (tier {level}).")
             built += 1
 
+        self._detect_saves(tracked, scored_movies, scored_shows)
         self._publish_preview(scored_movies, scored_shows, cap, mr, sr, built)
         self.logger.log_info(
             f"[Anniversary] built {built} user shelf plan(s) from "
@@ -137,6 +138,48 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
                                   caption="What acquisition would grab this week (Phase 3 — not grabbed now).")
         except Exception:
             pass
+
+    # ── SAVE detection (read-only): an anniversary title on a user's watchlist = a KEEP signal ──
+    def _detect_saves(self, tracked, scored_movies, scored_shows) -> None:
+        """An anniversary candidate that a user has put on their Plex watchlist is an implicit SAVE —
+        recorded (sticky, merge-only) under ``discovery/saved/{safe}``. ISOLATED: this signal is read
+        only by the discovery layer and NEVER feeds ``tautulli/affinity`` / the deletion model. Matches
+        by ownership id (tmdb/tvdb), never title."""
+        union = self._cache_get("plex/watchlist/union", []) or []
+        for u in tracked:
+            safe = u.get("safe_user")
+            if not safe:
+                continue
+            per_user = self._cache_get(f"plex/users/{safe}/watchlist", None)
+            want_tmdb, want_tvdb = self._watchlist_ids(per_user if per_user is not None else union)
+            if not (want_tmdb or want_tvdb):
+                continue
+            saved = dict(self._cache_get(f"discovery/saved/{safe}", {}) or {})
+            before = len(saved)
+            for c in scored_movies:
+                t = self._coerce_int(c.get("tmdb_id"))
+                if t is not None and t in want_tmdb:
+                    saved[f"tmdb:{t}"] = {"media": "movie", "title": c.get("title"), "source": "watchlist"}
+            for c in scored_shows:
+                t = self._coerce_int(c.get("tvdb_id"))
+                if t is not None and t in want_tvdb:
+                    saved[f"tvdb:{t}"] = {"media": "show", "title": c.get("series_title"),
+                                         "source": "watchlist"}
+            if self.global_cache and len(saved) != before:
+                self.global_cache.set(f"discovery/saved/{safe}", saved)
+
+    def _watchlist_ids(self, entries):
+        """``(tmdb_ints, tvdb_ints)`` from a watchlist union/list of ``{ids: {tmdb, tvdb}}`` entries."""
+        tmdb, tvdb = set(), set()
+        for e in entries or []:
+            ids = (e.get("ids") if isinstance(e, dict) else None) or {}
+            t = self._coerce_int(ids.get("tmdb"))
+            v = self._coerce_int(ids.get("tvdb"))
+            if t is not None:
+                tmdb.add(t)
+            if v is not None:
+                tvdb.add(v)
+        return tmdb, tvdb
 
     # ── gather: movies ───────────────────────────────────────────────────────────
     def _normalized_movie_catalog(self):

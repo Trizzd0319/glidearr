@@ -1191,6 +1191,48 @@ def _franchise_catalog_report() -> None:
         pass
 
 
+def _discovery_shelf_report() -> None:
+    """Print what the 'This Week in History' anniversary shelf last produced — the household preview
+    the read-only builder caches at ``discovery/this_week/preview``. Pure disk read; graceful '(none
+    yet)' when the feature is off or hasn't run. No *arr / Trakt calls."""
+    base = CACHE_TRAKT.parent / "discovery" / "this_week"
+    data = None
+    for p in (base / "preview.json", base / "preview.json.gz"):
+        if not p.exists():
+            continue
+        try:
+            if p.suffix == ".gz":
+                import gzip
+                with gzip.open(p, "rt", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+            break
+        except Exception:
+            continue
+
+    print()
+    print("  Anniversary shelf (This Week in History):")
+    if not isinstance(data, dict):
+        print("    (none yet - enable plex.playlists.this_week_in_history and run the reconcile)")
+        return
+    for label, key in (("users built", "users"), ("owned movies", "owned_movies"),
+                       ("owned shows", "owned_shows"), ("net-new movies", "net_new_movies"),
+                       ("net-new shows", "net_new_shows")):
+        try:
+            print(f"    {label:<18}{int(data.get(key, 0)):>8,}")
+        except (TypeError, ValueError):
+            print(f"    {label:<18}{'?':>8}")
+    finds = (data.get("movies") or []) + (data.get("shows") or [])
+    for r in finds[:8]:
+        if not isinstance(r, dict):
+            continue
+        ya = r.get("years_ago")
+        hook = f"{ya}y ago" if isinstance(ya, int) else ""
+        print(f"      - {(r.get('title') or '')[:46]:<46} {hook}")
+
+
 def print_status() -> None:
     """Print a one-shot progress report from the cursor + on-disk cache, then return.
 
@@ -1257,6 +1299,8 @@ def print_status() -> None:
 
     # ── Wiki-sourced TV-franchise catalog (Wikidata + Wikipedia) ──────────────
     _franchise_catalog_report()
+    # ── "This Week in History" anniversary shelf preview ──────────────────────
+    _discovery_shelf_report()
     print("=" * 64)
 
 
