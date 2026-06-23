@@ -96,10 +96,14 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
                                profile_ages.get(u.get("title")) or profile_ages.get(safe))
             allowed = users_mgr.allowed_sections(u) if users_mgr else set()
             user_aff = self._user_affinity(u.get("tautulli_username"))
+            # Owned inventory carries no per-item section, so the library gate is at MEDIUM level and
+            # FAIL-CLOSED: a user gets a medium's shelf only with access to ALL its sections — a partial
+            # grant yields nothing rather than leaking picks from un-shared libraries of that type.
+            # (Per-section scoping needs `section` on the owned inventories — tracked as a follow-up.)
             m_scored = (personalize(scored_movies, user_aff, hh_max=hh_max, weights=weights,
-                                    gm_opts=gm_opts) if (allowed & movie_keys) else [])
+                                    gm_opts=gm_opts) if (movie_keys and movie_keys <= allowed) else [])
             s_scored = (personalize(scored_shows, user_aff, hh_max=hh_max, weights=weights,
-                                    gm_opts=gm_opts) if (allowed & show_keys) else [])
+                                    gm_opts=gm_opts) if (show_keys and show_keys <= allowed) else [])
             m_items, _ = gated_plan(m_scored, level=level, cap=cap, resolve=mr)
             s_items, _ = gated_plan(s_scored, level=level, cap=cap, resolve=sr)
             self.global_cache.set(f"{_TWIH_MOVIE_PLAN_KEY}/{safe}", self._plan_dict("twih_movie", m_items))

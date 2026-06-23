@@ -114,6 +114,21 @@ def test_library_gate_empties_plans_for_a_user_without_access():
     assert c.d[f"{_TWIH_SHOW_PLAN_KEY}/rob"]["items"] == []
 
 
+def test_partial_library_grant_yields_no_movie_shelf_fail_closed():
+    cache = _Cache({
+        "radarr.movies.radarr.full": _MOVIES,
+        "plex/movies/owned_inventory": {"1": {"rating_key": "rk1"}},
+        "plex/episodes/owned_inventory": {"10:1:1": {"rating_key": "ep1"}},
+        "plex/sections": {"1": {"type": "movie"}, "2": {"type": "movie"}, "3": {"type": "show"}},
+    })
+    # Rob is granted movie section 1 (not 2) + show section 3. Owned inventory has no per-item
+    # section, so a PARTIAL movie grant fails closed → no movie shelf; the fully-granted show medium ok.
+    m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1", "3"}}, config=_ON, cache=cache)
+    m.run()
+    assert c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"] == []               # movie_keys {1,2} not all granted
+    assert [i["rating_key"] for i in c.d[f"{_TWIH_SHOW_PLAN_KEY}/rob"]["items"]] == ["ep1"]
+
+
 def test_save_detection_records_watchlisted_anniversary_titles():
     cache = _Cache({
         "radarr.movies.radarr.full": _MOVIES,

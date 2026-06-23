@@ -423,7 +423,10 @@ class PlexUsersManager(BaseManager):
             raw = api.get_shared_servers(fallback=None)
         except Exception:
             return {}
-        entries = self._shared_entries(raw, getattr(api, "get_machine_id", lambda: None)())
+        mid = getattr(api, "get_machine_id", lambda: None)()
+        if not mid:
+            return {}                                # can't confirm which server a share targets → fail closed
+        entries = self._shared_entries(raw, mid)
         if not entries:
             return {}
         by_ident: dict = {}
@@ -485,19 +488,29 @@ class PlexUsersManager(BaseManager):
         return ids
 
     @staticmethod
-    def _entry_idents(e) -> set:
-        """Every identity token a share entry exposes (lowercased), for matching to a Home user."""
-        user = e.get("user") if isinstance(e.get("user"), dict) else {}
-        toks = [e.get("email"), e.get("invitedEmail"), e.get("username"), e.get("userID"),
-                e.get("userId"), e.get("id"), user.get("email"), user.get("id"),
-                user.get("username"), user.get("uuid")]
-        return {str(t).strip().lower() for t in toks if t not in (None, "")}
+    def _ns_tokens(prefix, *values) -> set:
+        """Namespaced, lowercased identity tokens — ``f'{prefix}:{value}'`` — so a match can only land
+        WITHIN a namespace (an account id can never collide with an email or a share-record id)."""
+        return {f"{prefix}:{str(v).strip().lower()}" for v in values if v not in (None, "")}
 
-    @staticmethod
-    def _user_idents(u) -> set:
-        """Every identity token a Home user exposes (lowercased), for matching to a share entry."""
-        toks = [u.get("email"), u.get("id"), u.get("uuid"), u.get("title")]
-        return {str(t).strip().lower() for t in toks if t not in (None, "")}
+    @classmethod
+    def _entry_idents(cls, e) -> set:
+        """Namespaced identity tokens for the INVITED USER on a share entry. The bare SharedServer
+        RECORD id (``e['id']``) is NOT a user identity and is deliberately EXCLUDED — it lives in a
+        different namespace from a Home user's account id and would otherwise cross-match (fail-open)."""
+        user = e.get("user") if isinstance(e.get("user"), dict) else {}
+        return (cls._ns_tokens("acct", e.get("userID"), e.get("userId"), user.get("id"))
+                | cls._ns_tokens("email", e.get("email"), e.get("invitedEmail"), user.get("email"))
+                | cls._ns_tokens("uuid", user.get("uuid")))
+
+    @classmethod
+    def _user_idents(cls, u) -> set:
+        """Namespaced identity tokens for a Home user (account id / email / uuid). Matched against
+        :meth:`_entry_idents` within the same namespace; weak display-name matching is intentionally
+        omitted (a name collision could leak another account's library grant)."""
+        return (cls._ns_tokens("acct", u.get("id"))
+                | cls._ns_tokens("email", u.get("email"))
+                | cls._ns_tokens("uuid", u.get("uuid")))
 
     def _degrade_owner_only(self):
         """Scope-fail / no-Home fallback: record the account token as the single

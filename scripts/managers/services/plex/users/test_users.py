@@ -329,3 +329,22 @@ def test_resolve_grants_off_when_feature_disabled():
     m = _sections_mgr(config={"plex": {"playlists": {}}},
                       api=_ShareAPI([{"allLibraries": True}]))
     assert m._resolve_section_grants([{"uuid": "u", "title": "x", "is_admin": False}]) == {}
+
+
+def test_resolve_grants_ignores_share_record_id_collision():
+    # A share ROW id (3) must NEVER match a Home user's ACCOUNT id (3) — namespacing prevents the
+    # cross-match that would otherwise hand the user a different account's 'allLibraries' grant.
+    payload = [{"machineIdentifier": "MID", "id": 3, "email": "friend@x.com", "allLibraries": True}]
+    m = _sections_mgr(api=_ShareAPI(payload))
+    m._safe_by_uuid = {"u9": "sam"}
+    roster = [{"uuid": "u9", "id": 3, "title": "Sam", "email": "", "is_admin": False}]
+    assert m._resolve_section_grants(roster) == {}      # no spurious grant → allowed_sections fails closed
+
+
+def test_resolve_grants_fails_closed_without_machine_id():
+    # If the local machine id can't be determined, we can't confirm which server a share targets →
+    # take NO grants rather than apply another server's share locally.
+    m = _sections_mgr(api=_ShareAPI([{"email": "kid@x.com", "allLibraries": True}], mid=None))
+    m._safe_by_uuid = {"u2": "kid"}
+    roster = [{"uuid": "u2", "title": "Kid", "email": "kid@x.com", "is_admin": False}]
+    assert m._resolve_section_grants(roster) == {}
