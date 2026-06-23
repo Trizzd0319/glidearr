@@ -32,10 +32,25 @@ def _zone(tz):
 
 
 def _as_date(value, tz=None):
-    """A release/air value → a ``date`` in the household TZ. A tz-AWARE ``datetime`` is converted to
-    ``tz`` first (so the ``(month, day)`` is the household-local one); a naive datetime / plain ``date``
-    is taken as-is. ``None`` for anything undateable."""
+    """A release/air value → a ``date`` in the household TZ. An ISO-8601 ``str`` (Radarr release
+    dates and Sonarr ``airDateUtc`` both arrive as strings) is parsed first; a tz-AWARE ``datetime``
+    (incl. a pandas ``Timestamp``) is converted to ``tz`` so the ``(month, day)`` is household-local;
+    a naive datetime / plain ``date`` is taken as-is. ``None`` for anything undateable (empty/garbage
+    string, pandas ``NaT``, non-date type)."""
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            value = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                return date.fromisoformat(s[:10])       # tolerate a non-standard trailing form
+            except ValueError:
+                return None
     if isinstance(value, datetime):
+        if value != value:                              # pandas NaT / NaN-like → undateable
+            return None
         z = _zone(tz)
         if value.tzinfo is not None and z is not None:
             value = value.astimezone(z)

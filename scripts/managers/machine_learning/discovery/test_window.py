@@ -66,7 +66,19 @@ def test_none_and_unparseable_never_match():
     now = date(2024, 12, 31)
     assert not released_this_week(None, now)
     assert not released_this_week("not-a-date", now)
+    assert not released_this_week("", now)
     assert years_ago(None, now) is None
+
+
+def test_iso_string_dates_parse_like_datetimes():
+    now = date(2024, 12, 31)                                     # week Dec 29 2024 – Jan 4 2025
+    # Sonarr airDateUtc / Radarr release dates arrive as ISO strings, not date objects.
+    assert released_this_week("2010-01-02T01:00:00Z", now)       # full UTC datetime string
+    assert released_this_week("2010-01-02", now)                 # date-only string
+    assert not released_this_week("2010-06-01T00:00:00Z", now)   # out of window
+    assert years_ago("2010-01-02", now) == 15
+    # tz conversion still applies to a tz-aware string: 02:00Z is Jan-1 in US/Eastern
+    assert _md("2010-01-02T02:00:00Z", now, "America/New_York") == (1, 1)
 
 
 def test_years_ago_uses_the_window_day_year():
