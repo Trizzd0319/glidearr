@@ -7,11 +7,21 @@ to age-appropriate content: a Little Kid sees only G/TV-Y/TV-G, an Older Kid add
 PG/TV-Y7/TV-PG, a Teen adds PG-13/TV-14, and an unrestricted (adult) profile sees
 everything. https://support.plex.tv/articles/parental-controls/
 
-Pure + deterministic. Fail-CLOSED for restricted profiles: an unknown/unrated cert
-is EXCLUDED for a kid (never show a child content we can't vouch for), but allowed
-for an adult.
+Deterministic (same input → same tier). The ONLY side-effect is a diagnostic: an
+unrecognised config age-override is logged once and then IGNORED (never honoured — a
+config typo must not silently un-gate a child). Fail-CLOSED for restricted profiles:
+an unknown/unrated cert is EXCLUDED for a kid (never show a child content we can't
+vouch for), but allowed for an adult.
 """
 from __future__ import annotations
+
+import logging
+
+_log = logging.getLogger(__name__)
+
+# Unrecognised override values we've already warned about — so a typo'd config override is
+# surfaced ONCE, not once per (user × playlist builder) call that re-resolves the same tier.
+_warned_overrides: set = set()
 
 # Age tier levels: 0 = little kid … 3 = adult / unrestricted.
 LITTLE_KID, OLDER_KID, TEEN, ADULT = 0, 1, 2, 3
@@ -42,18 +52,50 @@ _RESTRICTION_TIER = {
 _CSM_AGE_BANDS = ((6, LITTLE_KID), (9, OLDER_KID), (14, TEEN))
 
 
+def _resolve_tier(name) -> "int | None":
+    """Normalise a restriction-profile / override name to a tier level, or ``None`` when it
+    names no tier we recognise. Handles case, surrounding space, and ``-``/``_``/space
+    variants (``Older-Kid`` ≡ ``older_kid`` ≡ ``older kid``)."""
+    key = str(name).strip().lower().replace("-", "_")
+    if key in _RESTRICTION_TIER:
+        return _RESTRICTION_TIER[key]
+    key2 = key.replace("_", " ")
+    if key2 in _RESTRICTION_TIER:
+        return _RESTRICTION_TIER[key2]
+    return None
+
+
+def _warn_unknown_override(override) -> None:
+    """Warn ONCE per distinct unrecognised override value. A typo'd ``profile_ages`` override
+    (``"kiddo"``, ``"pg13"`` — none are tier names) must never silently un-gate a child, so we
+    surface it for the operator to fix instead of letting a kid profile fail open to ADULT."""
+    val = str(override).strip()
+    if val.lower() in _warned_overrides:
+        return
+    _warned_overrides.add(val.lower())
+    _log.warning(
+        "playlists age-gate: unrecognised profile age override %r — ignoring it and falling "
+        "back to the Plex restriction profile. Use one of: little_kid, older_kid, teen, adult. "
+        "A typo here would otherwise leave a managed (kid/teen) profile ungated.", val)
+
+
 def tier_level(restriction_profile=None, override=None) -> int:
     """Resolve a profile's age-tier level (0 little kid … 3 adult/unrestricted).
-    A config ``override`` wins; then Plex's ``restriction_profile``; else unrestricted."""
-    for src in (override, restriction_profile):
-        if src is None:
-            continue
-        key = str(src).strip().lower().replace("-", "_")
-        if key in _RESTRICTION_TIER:
-            return _RESTRICTION_TIER[key]
-        key2 = key.replace("_", " ")
-        if key2 in _RESTRICTION_TIER:
-            return _RESTRICTION_TIER[key2]
+
+    A RECOGNISED config ``override`` wins; otherwise Plex's ``restriction_profile``; else
+    unrestricted (ADULT). An ``override`` that is empty/whitespace counts as "not set" and
+    falls through. An ``override`` that is set but names NO known tier (a config typo) is NOT
+    honoured — letting it resolve to ADULT would silently un-gate a child — so it is IGNORED
+    (fall back to ``restriction_profile``) and logged once (see ``_warn_unknown_override``)."""
+    if override is not None and str(override).strip():
+        tier = _resolve_tier(override)
+        if tier is not None:
+            return tier
+        _warn_unknown_override(override)        # set but unrecognised → warn + ignore, never fail open
+    if restriction_profile is not None:
+        tier = _resolve_tier(restriction_profile)
+        if tier is not None:
+            return tier
     return ADULT
 
 

@@ -1,6 +1,9 @@
 """Tests for playlists/cert_gate — age-tier resolution + content-rating gating."""
 from __future__ import annotations
 
+import logging
+
+from scripts.managers.machine_learning.playlists import cert_gate
 from scripts.managers.machine_learning.playlists.cert_gate import (
     ADULT,
     LITTLE_KID,
@@ -25,6 +28,45 @@ def test_tier_level_from_restriction_profile():
 def test_config_override_wins():
     assert tier_level("teen", override="little_kid") == LITTLE_KID
     assert tier_level(None, override="teen") == TEEN
+
+
+def test_unrecognised_override_is_ignored_not_failed_open(caplog):
+    # A typo'd profile_ages override ("kiddo" — not a tier name) must NOT silently un-gate a
+    # managed child to ADULT. It is IGNORED (we fall back to the Plex restriction profile) and
+    # a warning naming the bad value is logged.
+    cert_gate._warned_overrides.clear()
+    with caplog.at_level(logging.WARNING, logger="scripts.managers.machine_learning.playlists.cert_gate"):
+        # Plex DID report a tier → the typo is ignored, gating is preserved (kid stays a kid).
+        assert tier_level("little_kid", override="kiddo") == LITTLE_KID
+    assert any("kiddo" in r.getMessage() for r in caplog.records)
+
+
+def test_unrecognised_override_with_no_plex_tier_warns_loudly(caplog):
+    # The dangerous case: Plex OMITTED restrictionProfile and the only gate was a typo'd
+    # override. It still falls through to ADULT (no tier to fall back to) — but LOUDLY, never
+    # silently, so the operator can spot the typo.
+    cert_gate._warned_overrides.clear()
+    with caplog.at_level(logging.WARNING, logger="scripts.managers.machine_learning.playlists.cert_gate"):
+        assert tier_level(None, override="pg13") == ADULT
+    assert any("pg13" in r.getMessage() for r in caplog.records)
+
+
+def test_unrecognised_override_warns_once_per_value(caplog):
+    # Resolved per (user × builder), so dedupe: the same typo logs ONCE, not on every call.
+    cert_gate._warned_overrides.clear()
+    with caplog.at_level(logging.WARNING, logger="scripts.managers.machine_learning.playlists.cert_gate"):
+        tier_level("teen", override="kid")
+        tier_level("teen", override="kid")
+        tier_level("teen", override="Kid")        # same value, different case
+    assert len([r for r in caplog.records if "kid" in r.getMessage().lower()]) == 1
+
+
+def test_empty_override_is_unset_not_adult():
+    # An empty/whitespace override means "not set" — fall through to the restriction profile,
+    # NOT un-gate to ADULT. (Empty string is an ADULT signal only as a Plex restriction_profile.)
+    assert tier_level("little_kid", override="") == LITTLE_KID
+    assert tier_level("little_kid", override="   ") == LITTLE_KID
+    assert tier_level("little_kid", override=None) == LITTLE_KID
 
 
 def test_little_kid_allows_only_youngest_and_fails_closed_on_unknown():
