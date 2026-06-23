@@ -6,9 +6,11 @@ Sun–Sat calendar week in ANY past year — acquire the most watchable into a r
 wouldn't otherwise find; when they engage, acquisition + recommendations pivot toward it. The shelf is
 ephemeral by construction, so the disk footprint self-cleans every week.
 
-**Status.** Designed, NOT built. Several capabilities this leans on are net-new rather than reuse (flagged
-below), and the destructive paths need safety gates before anything grabs or deletes — the phasing
-front-loads both.
+**Status.** Phases 1-2 BUILT + tested (the read-only per-user shelves: window engine, candidate gen, the
+two writeback families, per-user age/library gating, per-user taste re-rank, SAVE detection, the preview).
+Phases 3-7 designed, NOT built — the destructive paths (acquisition, rollover purge) need their safety gates
+before anything grabs or deletes, and the phasing front-loads both. The PRE-ROLL + exploratory-unwatched
+refinements below are design-only.
 
 ## Concept
 - **Window.** today → its Sun–Sat week → seven concrete dates → match a title when its release/air
@@ -17,9 +19,16 @@ front-loads both.
 - **Two COMBINED playlists, per user, OPT-IN (default OFF).** `Released This Week in History` = every
   movie library merged; `Aired This Week in History` = every show library merged. Generated only for users
   who opt in (or show a real consumption signal) — not N×2 always-on playlists for passive accounts.
-- **Net-new FIRST; owned is free fallback.** The shelf prioritizes UNOWNED candidates (the point is net-new
-  finds). Owned titles that also aired this week fill only the slots net-new can't, and are FREE (no grab,
-  no budget spend, no purge) — but pass the SAME per-user age/library gate as acquisitions.
+- **Exploratory = surface only UNWATCHED titles (the EXPOSURE axis, PER-USER).** The point is exposing a
+  viewer to things they HAVEN'T SEEN, of two kinds: **owned-but-unwatched** (a forgotten gem already in the
+  library — free, instant) and **net-new** (unowned — a grab). EXCLUDE owned-AND-already-watched (zero
+  exploratory value — they've seen it). "Unwatched" is PER-USER, from the same Tautulli watched set the
+  playlist builders already use (`_watched_movies_for` + the TV equivalent); a profile with no Tautulli
+  match fails OPEN — treat its owned as unwatched (show, don't hide an empty shelf).
+- **Owned-unwatched is the FREE fill; net-new is the budgeted discovery.** Owned-unwatched picks cost
+  nothing (no grab/budget/purge) and pass the SAME per-user age/library gate as acquisitions; net-new is
+  what the adaptive budget governs. In a READ-ONLY phase net-new is preview-only — it becomes a real shelf
+  item once acquisition grabs it (unwatched by definition, so it slots straight into the same exploratory shelf).
 - **Trial, not a library add.** Net-new grabs live for ONE week; unwatched ones are reclaimed at week-end;
   only earners graduate (watched, saga-absorbed, watchability-promoted, or user-SAVED).
 
@@ -62,6 +71,28 @@ destructive gates (`backup_gate.effective_dry_run` degrade-to-dry-run, `space_ta
   ≥ threshold, in-progress (any playback > 0), user-SAVED, saga-absorbed, or watchability-promoted past the
   keep-bar. Persist `last_rollover (year, ISO-week)`; catch up a missed run; if the gate degrades to dry-run,
   record the purge as OWED.
+- **Pre-roll look-ahead + RECLAIM-FIRST ordering (no cold-start delay, never breach the floor).** The app is
+  stateless / external-scheduler, so there's no resident timer: on any run inside the PRE-ROLL WINDOW
+  `[local_week_boundary − lead_hours, boundary)` (household TZ), compute NEXT week's candidates, rank them
+  demand-aware, and start the grabs so files finish downloading before midnight — the post-midnight run then
+  slots in already-present files (no delay). Idempotent: persist `pre_acquired (year, ISO-week)` so re-runs
+  in the window don't double-grab. The space hazard — pre-acquire wants room BEFORE the midnight purge frees
+  it — is resolved by the SWAP insight: a size-bounded shelf rollover is "swap this week's unwatched trials
+  for next week's picks," roughly space-NEUTRAL, so order it RECLAIM-FIRST.
+    - **Plenty of headroom** → pre-acquire freely; let the old trials purge at midnight (a brief overlap of
+      both weeks' content is fine).
+    - **Near the floor** → purge the unwatched trials about to roll off FIRST (doomed at midnight anyway),
+      INCREMENTALLY (free just enough for the highest-priority next-week picks — don't strip the current shelf
+      hours early), then pre-acquire only as much as fits ABOVE the floor.
+    - **Can't reclaim** (deletions unarmed — no consent / no `free_space_limit`) → pre-acquisition is
+      hard-bounded by the floor, so near the floor it pre-fetches little/nothing and the new shelf fills
+      LAZILY after midnight once space frees — the fail-SAFE (accept the delay, NEVER dip below the floor);
+      LOG the inert state so it's observable.
+  The demand-aware tightness `t` (see `demand_aware_acquisition.md`) is the throttle — as the pre-roll nears
+  the floor the budget shrinks and only the BROADEST-appeal next-week picks pre-fetch. The last-hours-watch
+  race (purge a trial at 10pm, someone starts it at 11:45) is covered by the purge-correctness gates: the
+  in-progress exemption (any playback > 0 → HELD) + the atomic check-and-delete re-reading watch state
+  immediately before each delete.
 - **Watched / saved discovery = strong signal, ISOLATED.** A hit feeds a SEPARATE `discovery_affinity` layer
   (own cache key) read only by shelf ranking, and nudges `discovery_share`. The PRIMARY shared model is fed
   ONLY by real ≥-completion watches (which already flow through Tautulli history at weight 1) — NEVER by a
@@ -174,9 +205,9 @@ A per-`(user, key)` exposure ledger keeps the queue-top from silting up with tit
 | # | Phase | Effort |
 |---|---|---|
 | 1 | **Window engine** (TZ-aware, set-membership, Feb-29 / year-boundary / null-date handling, tested) + movie/owned-TV candidate gen + ownership-key dedup + fail-closed scoring/popularity floor | medium |
-| 2 | **Per-user gating** (allowed-library allowlist + pre-grab age gate) + the **two new writeback playlist families** + the SAVE action; render the shelf with a FIXED conservative cap, NO acquisition/delete yet (read-only preview of net-new picks) | medium |
-| 3 | **Bounded acquisition** (own discovery queue, NOT the shared backlog; pipeline ceiling) + the rolling shelf occupancy controller | medium |
-| 4 | **Saturday rollover** — week-boundary detection + idempotent purge under the destructive + **seeding-aware** + purge-correctness gates | medium |
+| 2 | **Per-user gating** (allowed-library allowlist + pre-grab age gate) + the **two new writeback playlist families** + the SAVE action; render the shelf with a FIXED conservative cap, NO acquisition/delete yet (read-only preview of net-new picks). **+ per-user UNWATCHED filter** — the shelf is exploratory, so owned picks are owned-but-**unwatched** only (exclude already-watched; fail-OPEN when no Tautulli match) | medium |
+| 3 | **Bounded acquisition** (own discovery queue, NOT the shared backlog; pipeline ceiling) + the rolling shelf occupancy controller + **demand-aware ordering** (see `demand_aware_acquisition.md`) | medium |
+| 4 | **Saturday rollover** — week-boundary detection + idempotent purge under the destructive + **seeding-aware** + purge-correctness gates. **+ the PRE-ROLL look-ahead** — in the Saturday-evening window compute + pre-acquire NEXT week so files are ready at midnight, with **reclaim-FIRST** ordering (purge-before-prefetch near the floor; fail-safe/lazy when deletions unarmed) | medium |
 | 5 | **Adaptive budget** (Tautulli-sourced C_consume/D_backlog, GB+foreseen-commit, franchise floor) + stress-test (disk full / zero rate / all-weak / huge deferred → all → 0) BEFORE it governs grabs | medium |
 | 6 | **Learning loop** — ISOLATED discovery-affinity, `discovery_share` (floored + EMA + exploration, opportunity-normalized), exposure-ledger re-grab cooldown, closed-loop diversity, cold-start seed | medium |
 | 7 | **Unowned-TV** episode-calendar harvest (TVDB/Trakt) | large |
@@ -188,7 +219,9 @@ A per-`(user, key)` exposure ledger keeps the queue-top from silting up with tit
 - Cold-start households (no history) get a popularity-prior bootstrap, not personalization.
 
 ## See also
-- `universe_acquisition.md` (the franchise backfill this yields to AND feeds via engagement),
+- `demand_aware_acquisition.md` (the space-tightness `t` that throttles the pre-roll + ranks net-new grabs by
+  household breadth as free space nears the floor — built through Phase 5),
+  `universe_acquisition.md` (the franchise backfill this yields to AND feeds via engagement),
   `catchup_retention.md` (retention graduates fall under; downgrade-not-delete), the acquisition scorer,
   `cert_gate` (rating gate), `space_pressure` / `space_targets` (free/reserve + the shared affinity the
   isolation protects), `backup_gate` (destructive gates), plex playlists writeback (the per-user shelves).
