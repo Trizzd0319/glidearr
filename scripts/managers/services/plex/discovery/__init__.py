@@ -41,6 +41,7 @@ _MOVIE_INV_KEY = "plex/movies/owned_inventory"
 _EP_INV_KEY = "plex/episodes/owned_inventory"
 _SECTIONS_KEY = "plex/sections"
 _PREVIEW_KEY = "discovery/this_week/preview"           # household would-shelf preview (read by --status)
+_DEFAULT_POPULARITY_WEIGHT = 0.30   # anniversary-shelf popularity weight (vs the add pipeline's 0.10)
 
 
 class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
@@ -72,8 +73,11 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
         self._attach_movie_certs(movie_cands)
         self._attach_show_meta(show_cands, owned_eps)
 
-        # Score ONCE, then per-user gate/cap (no N cold passes).
-        scorer = AcquisitionScorer(self.global_cache, self.logger, self.config)
+        # Score ONCE, then per-user gate/cap (no N cold passes). This shelf's scorer weights all-time
+        # popularity heavier than the add pipeline (a notable past title should beat a recent obscure
+        # one on a HISTORY shelf) — same metric, just re-weighted; the add pipeline is untouched.
+        scorer = AcquisitionScorer(self.global_cache, self.logger, self.config,
+                                   weight_overrides=self._scorer_weight_overrides(cfg))
         scored_movies = score_and_floor(movie_cands, scorer, floor=floor)
         scored_shows = score_and_floor(show_cands, scorer, floor=floor)
 
@@ -405,6 +409,21 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
             return int(cfg.get("min_votes", 0) or 0)
         except (TypeError, ValueError):
             return 0
+
+    def _popularity_weight(self, cfg) -> float:
+        """The all-time-popularity signal weight for the anniversary shelf — higher than the add
+        pipeline's 0.10 so a NOTABLE past title outranks a recent obscure one on a HISTORY shelf
+        (0 = popularity ignored). Reuses the scorer's existing log-scaled-votes metric; only its
+        weight changes. Invalid/negative → the default."""
+        try:
+            w = float(cfg.get("popularity_weight", _DEFAULT_POPULARITY_WEIGHT))
+            return w if w >= 0 else _DEFAULT_POPULARITY_WEIGHT
+        except (TypeError, ValueError):
+            return _DEFAULT_POPULARITY_WEIGHT
+
+    def _scorer_weight_overrides(self, cfg) -> dict:
+        """Per-shelf scorer weight overrides (see ``AcquisitionScorer(weight_overrides=…)``)."""
+        return {"popularity": self._popularity_weight(cfg)}
 
     def _household_now(self, cfg):
         tzname = cfg.get("timezone")

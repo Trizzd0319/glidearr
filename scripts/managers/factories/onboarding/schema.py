@@ -360,14 +360,17 @@ def empty_config() -> dict:
                      #   `cap` bounds only the NET-NEW (to-acquire) picks — the already-owned freebies are
                      #   UNCAPPED and listed below them. opt_in_users = profiles to build for (empty + enabled ⇒
                      #   ALL tracked users). min_votes = a TMDb-vote popularity floor on the MOVIE picks
-                     #   (owned AND net-new; the show shelf is never floored), 0 = off. timezone pins the
+                     #   (owned AND net-new; the show shelf is never floored), 0 = off. popularity_weight
+                     #   = how heavily all-time vote volume boosts a title's shelf rank (reuses the scorer's
+                     #   log-scaled popularity; 0.30 default vs the add pipeline's 0.10 — a notable old title
+                     #   beats a recent obscure one; 0 = popularity ignored). timezone pins the
                      #   household week (blank ⇒ PMS/local). trust_home_managed:
                      #   when a managed profile's library grant can't be resolved, default it to ALL
                      #   libraries (still AGE-gated) instead of failing closed to an empty shelf. OFF →
                      #   nothing built, byte-identical.
                      "this_week_in_history": {"enabled": False, "cap": 7, "min_votes": 0,
-                                              "timezone": "", "opt_in_users": [],
-                                              "trust_home_managed": False},
+                                              "popularity_weight": 0.30, "timezone": "",
+                                              "opt_in_users": [], "trust_home_managed": False},
                  }},
         "mdblist": {"apikey": ""},   # opt-in: aggregated ratings + lists. apikey -> keyring.
         "dry_run": True,

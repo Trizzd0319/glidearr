@@ -163,6 +163,7 @@ _DOC_LEAVES = [
     ("plex.playlists.this_week_in_history.enabled", "false", "Build per-profile 'Anniversary Picks' (movies) + 'On This Week' (shows) shelves of titles released/aired this calendar week in any past year (off until enabled)"),
     ("plex.playlists.this_week_in_history.cap", "7", "Max NET-NEW (to-acquire) picks per anniversary shelf — the already-owned freebies are UNCAPPED and listed below the net-new finds"),
     ("plex.playlists.this_week_in_history.min_votes", "0", "TMDb-vote popularity floor on anniversary MOVIE picks (owned AND net-new; the show shelf is never floored) — drops any movie below this vote count, or with no vote data (0 = off)"),
+    ("plex.playlists.this_week_in_history.popularity_weight", "0.30", "How heavily a title's all-time vote volume boosts its anniversary-shelf rank — reuses the scorer's log-scaled popularity, just re-weighted (0.30 default vs the add pipeline's 0.10, so a notable old title beats a recent obscure one; 0 = popularity ignored)"),
     ("plex.playlists.this_week_in_history.timezone", "", "IANA timezone that pins the household week, e.g. America/New_York (blank = PMS/local)"),
     ("plex.playlists.this_week_in_history.opt_in_users", "", "Comma-separated profile titles/keys to build the shelf for (blank + enabled = all tracked users)"),
     ("plex.playlists.this_week_in_history.trust_home_managed", "false", "When a managed profile's library grant can't be resolved, default it to ALL libraries (still age-gated) instead of an empty shelf"),

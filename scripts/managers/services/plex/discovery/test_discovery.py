@@ -6,6 +6,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from scripts.managers.services.plex.discovery import (
+    _DEFAULT_POPULARITY_WEIGHT,
     _PREVIEW_KEY,
     DiscoveryShelfBuilderManager,
 )
@@ -310,3 +311,43 @@ def test_no_tautulli_match_fails_open_and_shows_owned():
     m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1", "2"}}, config=_ON)
     m.run()
     assert [i["rating_key"] for i in c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"]] == ["rk1"]
+
+
+def test_popularity_weight_defaults_and_validates():
+    m = object.__new__(DiscoveryShelfBuilderManager)
+    assert m._popularity_weight({}) == _DEFAULT_POPULARITY_WEIGHT           # absent → default
+    assert m._popularity_weight({"popularity_weight": 0.5}) == 0.5          # explicit
+    assert m._popularity_weight({"popularity_weight": 0}) == 0.0            # 0 = popularity ignored (honored)
+    assert m._popularity_weight({"popularity_weight": -1}) == _DEFAULT_POPULARITY_WEIGHT   # negative → default
+    assert m._popularity_weight({"popularity_weight": "x"}) == _DEFAULT_POPULARITY_WEIGHT  # non-numeric → default
+    assert m._scorer_weight_overrides({"popularity_weight": 0.4}) == {"popularity": 0.4}
+
+
+def test_popularity_weight_reorders_owned_shelf_end_to_end():
+    # Two owned anniversary movies (both Dec-30, in the Dec 29–Jan 4 window; neither is on_this_day so they
+    # sort purely by score): a notable OLD title vs a recent OBSCURE one. With popularity ignored, recency
+    # wins (obscure-but-recent leads); with popularity weighted heavily, the popular old title leads — the
+    # exact knob the anniversary shelf needs, plumbed manager → scorer → ranking.
+    movies = [
+        {"tmdbId": 7, "title": "Popular Classic", "inCinemas": "2005-12-30T00:00:00Z", "year": 2005,
+         "genres": ["Action"], "hasFile": True, "ratings": {"tmdb": {"votes": 50000}}},
+        {"tmdbId": 8, "title": "Recent Obscure", "inCinemas": "2022-12-30T00:00:00Z", "year": 2022,
+         "genres": ["Action"], "hasFile": True, "ratings": {"tmdb": {"votes": 5}}},
+    ]
+    base = {
+        "radarr.movies.radarr.full": movies,
+        "plex/movies/owned_inventory": {"7": {"rating_key": "rkPop", "section": "1"},
+                                        "8": {"rating_key": "rkObs", "section": "1"}},
+        "plex/episodes/owned_inventory": {},
+        "plex/sections": {"1": {"type": "movie"}},
+    }
+
+    def order(pop_w):
+        cfg = {"plex": {"playlists": {"this_week_in_history": {
+            "enabled": True, "popularity_weight": pop_w}}}}
+        m, c = _mgr(tracked=[_ROB], allowed={"rob": {"1"}}, config=cfg, cache=_Cache(dict(base)))
+        m.run()
+        return [i["rating_key"] for i in c.d[f"{_TWIH_MOVIE_PLAN_KEY}/rob"]["items"]]
+
+    assert order(0.0)[0] == "rkObs"     # popularity off → recency wins → recent obscure leads
+    assert order(0.6)[0] == "rkPop"     # popularity weighted heavily → notable old title leads
