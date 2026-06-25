@@ -18,7 +18,7 @@ Public API:
   * bare_universe_protected(keep_policy, date_added, now, *, age_days) -> bool
         whether a bare 'universe' title is still ageing and spared from the delete pass.
   * build_movie_delete_candidates(df, score_map, marked, *, franchise_file_ids,
-        no_delete_cutoff, include_unwatched, ceiling, universe_age_days, now) -> list[tuple]
+        no_delete_cutoff, include_unwatched, ceiling, universe_age_days, now, stats) -> list[tuple]
 
 Candidate tuple shape (preserved verbatim from the service for the apply loop):
     (tier, score, critic_or_None, -size, idx, int(movie_file_id), size)
@@ -31,6 +31,7 @@ from __future__ import annotations
 import pandas as pd
 
 from scripts.managers.machine_learning.scoring.critic import critic_avg
+from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
 
 # Critic source columns the per-row blend reads (scales live in scoring.critic).
 _CRITIC_COLS = (
@@ -71,13 +72,19 @@ def build_movie_delete_candidates(
     ceiling: int,
     universe_age_days=None,
     now=None,
+    stats=None,
 ) -> "list[tuple]":
     """Build the tiered, guarded, lowest-rated-first movie delete queue.
 
     Guards (skip): no movie file on disk; keep_forever/keep_movie/keep_universe;
-    franchise entry or franchise-file id; watched within COLLECTION_WINDOW_DAYS
+    franchise entry or franchise-file id; a HOT franchise/universe member whose borrowed
+    ``universe_credit`` >= ``UNIVERSE_PROTECT_MIN`` (mirrors the plan_movie_downgrades guard so an
+    UNTAGGED saga member protected from a mere step-down isn't shed outright; recency-decayed, so a
+    stale saga member becomes deletable again — default None column -> no guard, byte-identical);
+    watched within COLLECTION_WINDOW_DAYS
     (``no_delete_cutoff``); a still-ageing bare 'universe' title when ``universe_age_days``
-    is set (default None -> no extra guard, byte-identical). Tiering: tier 0 = marked-for-deletion (watched +
+    is set (default None -> no extra guard, byte-identical). ``stats`` (optional mutable dict) is
+    bumped with ``skipped_universe`` per protected hot-saga row when supplied. Tiering: tier 0 = marked-for-deletion (watched +
     grace-expired); tier 1 = unwatched low-watchability (only when
     ``include_unwatched`` and score < ``ceiling`` and not freshly added within the
     window). ``marked`` is the bool Series the service derived from
@@ -102,6 +109,21 @@ def build_movie_delete_candidates(
             now, age_days=universe_age_days,
         ):
             continue
+        # Borrowed franchise/universe credit (per-movie, recency-decayed by refresh_scores): an
+        # UNTAGGED hot-saga member resists DELETION just as plan_movie_downgrades makes it resist a
+        # step-down — a single-watch film in a saga you rewatch isn't shed before its quality is even
+        # lowered. As the saga goes stale the credit decays below the floor and it's deletable again.
+        # Byte-identical when the column is absent / credit unset (the universe_credit column is only
+        # present once refresh_scores has run the credit pass).
+        if "universe_credit" in df.columns:
+            uc = df.at[idx, "universe_credit"]
+            try:
+                if uc is not None and pd.notna(uc) and float(uc) >= UNIVERSE_PROTECT_MIN:
+                    if stats is not None:
+                        stats["skipped_universe"] = stats.get("skipped_universe", 0) + 1
+                    continue
+            except (TypeError, ValueError):
+                pass
         lw = df.at[idx, "last_watched_at"] if "last_watched_at" in df.columns else None
         if lw:
             try:

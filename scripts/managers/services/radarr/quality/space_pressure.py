@@ -712,7 +712,8 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         recently-watched (within COLLECTION_WINDOW_DAYS) are never deleted.
         """
         stats = {"checked": 0, "deleted": 0, "failed": 0, "bytes_freed": 0.0,
-                 "tier_watched": 0, "tier_unwatched": 0, "target_met": False}
+                 "tier_watched": 0, "tier_unwatched": 0, "skipped_universe": 0,
+                 "target_met": False}
 
         if self._coordinator_owns_deletion():
             # Cross-service coordinator deletes movies + TV together on one ranked
@@ -772,11 +773,14 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             ceiling=ceiling,
             universe_age_days=self._universe_delete_age_days(),
             now=now,
+            stats=stats,
         )
 
+        _uni = stats.get("skipped_universe", 0)
         self.logger.log_info(
             f"[SpacePressure] '{instance}': {free_space_gb:.1f} GB free — target loop to {U:.0f} GB "
-            f"({len(candidates)} candidate(s), lowest-rated first)."
+            f"({len(candidates)} candidate(s), lowest-rated first"
+            f"{f'; {_uni} held by hot-universe credit' if _uni else ''})."
         )
 
         freed_gb = 0.0

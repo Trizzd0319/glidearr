@@ -192,6 +192,58 @@ def test_build_excludes_still_ageing_bare_universe():
         df, sm, _marked(df), universe_age_days=90, now=NOW, **common)} == {501}
 
 
+# ── borrowed franchise/universe credit (hot saga resists deletion; stale one drops) ──
+def _credit_df(credit):
+    old = (NOW - timedelta(days=400)).isoformat()
+    df = pd.DataFrame([{
+        "movie_file_id": 700, "keep_policy": None, "is_franchise_entry": False,
+        "last_watched_at": old, "marked_for_deletion": True,
+        "size_bytes": 10 * 1024**3, "universe_credit": credit,
+    }])
+    df["is_franchise_entry"] = df["is_franchise_entry"].astype(bool)
+    return df
+
+
+def test_hot_universe_credit_protected_from_deletion():
+    # A marked, low-score, old-watched movie that WOULD be a tier-0 delete candidate is held because
+    # it carries borrowed credit >= UNIVERSE_PROTECT_MIN (an untagged hot-saga member) — deletion must
+    # not be more aggressive than the downgrade guard that already protects it.
+    df = _credit_df(2.0)
+    st = {}
+    out = build_movie_delete_candidates(
+        df, {df.index[0]: 1}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
+    assert out == []
+    assert st["skipped_universe"] == 1
+
+
+def test_stale_universe_credit_is_deletable():
+    # The same movie with a DECAYED credit (< UNIVERSE_PROTECT_MIN) is no longer protected — the
+    # recency bias makes a stale saga member deletable again. No stats bump.
+    df = _credit_df(0.4)
+    st = {}
+    out = build_movie_delete_candidates(
+        df, {df.index[0]: 1}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
+    assert {c[5] for c in out} == {700}
+    assert st.get("skipped_universe", 0) == 0
+
+
+def test_universe_credit_guard_byte_identical_when_column_absent():
+    # No universe_credit column (the common case until refresh_scores' credit pass runs) -> the guard
+    # never fires and the queue is identical with or without a stats dict passed.
+    df = _build_df()
+    base = build_movie_delete_candidates(
+        df, SCORE_MAP, _marked(df), franchise_file_ids=FRANCHISE_FILE_IDS,
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20)
+    st = {}
+    withstats = build_movie_delete_candidates(
+        df, SCORE_MAP, _marked(df), franchise_file_ids=FRANCHISE_FILE_IDS,
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
+    assert base == withstats
+    assert st.get("skipped_universe", 0) == 0
+
+
 def test_tier0_before_tier1_and_neutral_critic():
     df = _build_df()
     out = build_movie_delete_candidates(
