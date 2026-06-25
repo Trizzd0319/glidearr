@@ -164,6 +164,31 @@ def scenario_coalesce_unguarded():
     return _df(rows), set()
 
 
+def scenario_hot_universe_credit():
+    """A HOT saga (universe_credit >= UNIVERSE_PROTECT_MIN, broadcast per-series onto every row)
+    protects all its files — the marked, otherwise-deletable E05 must be spared, mirroring the
+    series downgrade guard (deletion must not be more aggressive than the step-down it resists)."""
+    rows = [
+        _row(series_id=6, season_number=1, episode_number=1,
+             is_pilot=True, episode_file_id=11006, universe_credit=2.0),
+        _row(series_id=6, season_number=1, episode_number=5,
+             episode_file_id=60000, marked_for_deletion=True, universe_credit=2.0),
+    ]
+    return _df(rows), {60000}
+
+
+def scenario_cold_universe_credit():
+    """A COLD saga (decayed credit < the floor) is NOT protected by the credit guard — the marked
+    standalone file stays deletable (byte-identical to no guard)."""
+    rows = [
+        _row(series_id=7, season_number=1, episode_number=1,
+             is_pilot=True, episode_file_id=11007, universe_credit=0.4),
+        _row(series_id=7, season_number=1, episode_number=5,
+             episode_file_id=70000, marked_for_deletion=True, universe_credit=0.4),
+    ]
+    return _df(rows), set()  # 70000 deletable
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Assertions
 # ──────────────────────────────────────────────────────────────────────────────
@@ -179,7 +204,7 @@ def test_protected_set():
     print("test_build_protected_file_ids:")
     mgr = _mgr()
     for fn in (scenario_recent_air_sibling, scenario_household_sibling,
-               scenario_keep_season_sibling):
+               scenario_keep_season_sibling, scenario_hot_universe_credit):
         df, expected = fn()
         got = set(mgr._build_protected_file_ids(df, _NOW))
         # the shared multi-ep file id must be present
@@ -190,6 +215,11 @@ def test_protected_set():
     df, _ = scenario_independent_delete()
     got = set(mgr._build_protected_file_ids(df, _NOW))
     _check("independent file 30000 not protected", 30000 not in got, f"got {got}")
+
+    # a cold saga (credit below the floor) is NOT protected by the credit guard
+    df, _ = scenario_cold_universe_credit()
+    got = set(mgr._build_protected_file_ids(df, _NOW))
+    _check("cold-saga file 70000 not protected", 70000 not in got, f"got {got}")
 
 
 def test_delete_pass():

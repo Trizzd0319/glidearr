@@ -16,6 +16,7 @@ from scripts.managers.machine_learning.space.delete_planner import (
     bare_universe_protected,
     build_movie_delete_candidates,
 )
+from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
 
 NOW = datetime(2026, 6, 8, tzinfo=timezone.utc)
 COLLECTION_WINDOW_DAYS = 30
@@ -242,6 +243,99 @@ def test_universe_credit_guard_byte_identical_when_column_absent():
         no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
     assert base == withstats
     assert st.get("skipped_universe", 0) == 0
+
+
+def test_universe_credit_at_floor_is_protected():
+    # Inclusive boundary: credit EXACTLY at UNIVERSE_PROTECT_MIN is held (the guard is `>=`).
+    # An undecayed single watch yields credit ~1.0, so this is a real production value, not a
+    # degenerate edge — a `>` regression would silently make at-floor saga members deletable.
+    df = _credit_df(UNIVERSE_PROTECT_MIN)
+    st = {}
+    out = build_movie_delete_candidates(
+        df, {df.index[0]: 1}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
+    assert out == []
+    assert st["skipped_universe"] == 1
+
+
+def test_nan_or_none_universe_credit_is_deletable():
+    # Column present but the cell is NaN/None (partial population) -> unprotected (deletable),
+    # no stat bump. Exercises the `uc is not None and pd.notna(uc)` short-circuit.
+    for credit in (np.nan, None):
+        df = _credit_df(credit)
+        st = {}
+        out = build_movie_delete_candidates(
+            df, {df.index[0]: 1}, _marked(df), franchise_file_ids=frozenset(),
+            no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
+        assert {c[5] for c in out} == {700}, credit
+        assert st.get("skipped_universe", 0) == 0, credit
+
+
+def test_malformed_universe_credit_is_deletable():
+    # A non-numeric credit can't coerce -> the except branch passes (does NOT protect), so the row
+    # stays deletable with no stat bump. A bad value must never shield a title from deletion.
+    df = _credit_df("garbage")
+    st = {}
+    out = build_movie_delete_candidates(
+        df, {df.index[0]: 1}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
+    assert {c[5] for c in out} == {700}
+    assert st.get("skipped_universe", 0) == 0
+
+
+def test_keep_tagged_high_credit_not_counted_universe():
+    # A keep-tagged row with high credit is dropped by the KEEP guard (which runs first), so it must
+    # be excluded WITHOUT a skipped_universe bump — the stat counts only UNTAGGED hot-saga members.
+    df = _credit_df(2.0)
+    df.at[df.index[0], "keep_policy"] = "keep_movie"
+    st = {}
+    out = build_movie_delete_candidates(
+        df, {df.index[0]: 1}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
+    assert out == []
+    assert st.get("skipped_universe", 0) == 0
+
+
+def test_multiple_protected_rows_accumulate():
+    # skipped_universe is INCREMENTED per protected row (not set): two hot rows -> 2, while the
+    # decayed row is the only one left deletable.
+    old = (NOW - timedelta(days=400)).isoformat()
+    df = pd.DataFrame([
+        {"movie_file_id": 701, "keep_policy": None, "is_franchise_entry": False,
+         "last_watched_at": old, "marked_for_deletion": True, "size_bytes": 10 * 1024**3,
+         "universe_credit": 2.0},
+        {"movie_file_id": 702, "keep_policy": None, "is_franchise_entry": False,
+         "last_watched_at": old, "marked_for_deletion": True, "size_bytes": 10 * 1024**3,
+         "universe_credit": 1.5},
+        {"movie_file_id": 703, "keep_policy": None, "is_franchise_entry": False,
+         "last_watched_at": old, "marked_for_deletion": True, "size_bytes": 10 * 1024**3,
+         "universe_credit": 0.4},
+    ])
+    df["is_franchise_entry"] = df["is_franchise_entry"].astype(bool)
+    st = {}
+    out = build_movie_delete_candidates(
+        df, {i: 1 for i in df.index}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
+    assert {c[5] for c in out} == {703}
+    assert st["skipped_universe"] == 2
+
+
+def test_unwatched_hot_credit_protected():
+    # The guard fires BEFORE the marked/unwatched tier split, so an unwatched tier-1 candidate
+    # (low score, old date_added) with high credit is held too — not just marked tier-0 rows.
+    old = (NOW - timedelta(days=400)).isoformat()
+    df = pd.DataFrame([{
+        "movie_file_id": 704, "keep_policy": None, "is_franchise_entry": False,
+        "last_watched_at": None, "date_added": old, "marked_for_deletion": False,
+        "size_bytes": 10 * 1024**3, "universe_credit": 2.0,
+    }])
+    df["is_franchise_entry"] = df["is_franchise_entry"].astype(bool)
+    st = {}
+    out = build_movie_delete_candidates(
+        df, {df.index[0]: 1}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20, stats=st)
+    assert out == []
+    assert st["skipped_universe"] == 1
 
 
 def test_tier0_before_tier1_and_neutral_critic():

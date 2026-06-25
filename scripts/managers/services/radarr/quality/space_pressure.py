@@ -56,6 +56,7 @@ from scripts.managers.machine_learning.space.delete_planner import (
 )
 from scripts.managers.machine_learning.space.downgrade_planner import (
     plan_movie_downgrades,
+    UNIVERSE_PROTECT_MIN,
 )
 from scripts.managers.machine_learning.space.upgrade_planner import (
     plan_movie_upgrades,
@@ -956,6 +957,20 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 now, age_days=_univ_age,
             ):
                 continue
+            # Borrowed franchise/universe credit (per-movie, recency-decayed by refresh_scores):
+            # an UNTAGGED hot-saga member resists DELETION just as plan_movie_downgrades makes it
+            # resist a step-down — mirror of the brain delete-planner guard (build_movie_delete_candidates)
+            # so the coordinated pool spares it too (run_deletions, the single-service fallback, already
+            # does). Skipped for the 4K-copy reclaim pool (ignore_score_ceiling): there the 1080p baseline
+            # survives, so the bonus copy is pure reclaim and loses no title — the same reason the score
+            # ceiling is relaxed there. Byte-identical when the column is absent / credit unset.
+            if not ignore_score_ceiling and "universe_credit" in df.columns:
+                _uc = df.at[idx, "universe_credit"]
+                try:
+                    if _uc is not None and pd.notna(_uc) and float(_uc) >= UNIVERSE_PROTECT_MIN:
+                        continue
+                except (TypeError, ValueError):
+                    pass
             lw = df.at[idx, "last_watched_at"] if "last_watched_at" in df.columns else None
             if lw:
                 try:

@@ -38,6 +38,7 @@ from scripts.managers.machine_learning.classification.franchise import (
     resolve_franchise_entries,
 )
 from scripts.managers.machine_learning.classification.keep_policy import build_keep_policy_map
+from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
 from scripts.managers.machine_learning.lifecycle.grace_policy import (
     grace_mark,
     grace_window_multiplier,
@@ -1061,6 +1062,25 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                     df.at[idx, "marked_for_deletion"] = False
                     stats["skipped_keep"] += 1
                     continue
+
+            # Borrowed franchise/universe credit guard: an UNTAGGED hot-saga member (recency-decayed
+            # credit >= UNIVERSE_PROTECT_MIN, from TMDB-collection membership — NOT a keep tag) resists
+            # grace deletion just as plan_movie_downgrades makes it resist a quality step-down. Unlike the
+            # PERMANENT guards above, this protection DECAYS, so the flag is left set (not cleared): once
+            # the saga goes stale the credit drops below the floor and the still-marked movie is deleted.
+            if "universe_credit" in df.columns:
+                _uc = df.at[idx, "universe_credit"]
+                try:
+                    if _uc is not None and pd.notna(_uc) and float(_uc) >= UNIVERSE_PROTECT_MIN:
+                        self.logger.log_info(
+                            f"UNIVERSE CREDIT GUARD: '{title}' carries hot franchise/universe credit "
+                            f"({float(_uc):.1f}) — sparing from deletion (deletion must not be more "
+                            f"aggressive than the downgrade it resists)."
+                        )
+                        stats["skipped_universe"] += 1
+                        continue
+                except (TypeError, ValueError):
+                    pass
 
             fid = df.at[idx, "movie_file_id"]
             if pd.isna(fid):

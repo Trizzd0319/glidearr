@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import pandas as pd
 
+from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
+
 
 def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "frozenset":
     """Return the frozenset of ``episode_file_id`` values that must NEVER be deleted
@@ -35,6 +37,10 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
       * recent-air  — file ids on rows that aired within ``recent_air_days``.
       * household   — file ids on rows where ``all_household_watched`` is present
                       AND falsy (a household member still hasn't watched).
+      * universe    — file ids of any series whose recency-decayed borrowed franchise/
+                      universe credit reaches ``UNIVERSE_PROTECT_MIN`` (a HOT saga resists
+                      DELETION just as ``plan_series_downgrades`` makes it resist a step-down;
+                      byte-identical when the column is absent / cold, i.e. 0.0 < the floor).
     """
     if "episode_file_id" not in df.columns:
         return frozenset()
@@ -86,6 +92,18 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
         # present (not NaN) AND falsy → a household member still hasn't watched;
         # NaN = legacy row / no household config → not a guard.
         _add_fids(ahw.notna() & ~ahw.astype(bool))
+
+    # ── Hot franchise/universe credit guard ──────────────────────────────────
+    # A hot saga (recency-decayed borrowed credit, broadcast per-series onto every
+    # episode row by _apply_universe_credit) resists DELETION just as
+    # plan_series_downgrades makes it resist a quality step-down — deletion must not be
+    # more aggressive than the downgrade it already survives. Any series whose credit
+    # reaches the floor protects all of its on-disk files; as the saga goes stale the
+    # credit decays below the floor and the files become deletable again. Byte-identical
+    # when the column is absent or cold (0.0 everywhere < UNIVERSE_PROTECT_MIN).
+    if "universe_credit" in df.columns:
+        _uc = pd.to_numeric(df["universe_credit"], errors="coerce")
+        _add_fids(_uc.notna() & (_uc >= UNIVERSE_PROTECT_MIN))
 
     return frozenset(protected)
 

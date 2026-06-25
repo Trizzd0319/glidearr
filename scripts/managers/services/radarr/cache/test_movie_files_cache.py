@@ -18,6 +18,9 @@ class _Log:
     def log_info(self, *a, **k): pass
     def log_warning(self, *a, **k): pass
     def log_debug(self, *a, **k): pass
+    def log_error(self, *a, **k): pass
+    def log_success(self, *a, **k): pass
+    def log_table(self, *a, **k): pass
 
 
 def _mgr(tmp_path):
@@ -115,3 +118,31 @@ def test_cache_does_not_change_the_written_parquet(tmp_path):
     m2.save("standard", df)
     cold = (tmp_path / "nocache.parquet").read_bytes()
     assert hashlib.sha256(warm).hexdigest() == hashlib.sha256(cold).hexdigest()
+
+
+# ── grace-delete pass: borrowed franchise/universe credit guard ───────────────
+def _delete_mgr(tmp_path):
+    m = _mgr(tmp_path)
+    m.dry_run = True                                  # dry_run: no Radarr API calls
+    m.radarr_api = object()                           # not None (guard short-circuits before use)
+    m.config = {"free_space_limit": 100.0, "deletions_consent": True}
+    m._resolve_instance = lambda inst: inst
+    return m
+
+
+def test_delete_marked_universe_credit_guard(tmp_path):
+    # An UNTAGGED hot-saga member (universe_credit >= UNIVERSE_PROTECT_MIN) is spared from the
+    # grace-delete pass — deletion must not be more aggressive than the downgrade it resists. A
+    # decayed-credit sibling is still deleted, so the guard is recency-gated, not a blanket skip.
+    m = _delete_mgr(tmp_path)
+    m.save("standard", _df([
+        {"title": "HotSaga", "year": 2001, "movie_id": 1, "movie_file_id": 11,
+         "marked_for_deletion": True, "keep_policy": None, "is_franchise_entry": False,
+         "universe_credit": 2.0, "size_bytes": 5 * 1024 ** 3},
+        {"title": "StaleSaga", "year": 2002, "movie_id": 2, "movie_file_id": 12,
+         "marked_for_deletion": True, "keep_policy": None, "is_franchise_entry": False,
+         "universe_credit": 0.4, "size_bytes": 5 * 1024 ** 3},
+    ]))
+    stats = m.delete_marked_files("standard")
+    assert stats["skipped_universe"] == 1             # hot saga spared
+    assert stats["deleted"] == 1                      # decayed saga still deleted (dry_run)
