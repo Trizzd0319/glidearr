@@ -50,11 +50,12 @@ def test_step_targets_precomputed_profile_res_is_byte_identical():
 
 
 # ── movies ────────────────────────────────────────────────────────────────────
-def _row(movie_id, resolution, size_gib, runtime=100.0, keep_policy=None):
+def _row(movie_id, resolution, size_gib, runtime=100.0, keep_policy=None, universe_credit=None):
     return dict(
         movie_id=movie_id, resolution=resolution, quality_profile_name=f"p{resolution}",
         size_bytes=int(size_gib * _GIB), runtime_minutes=runtime, keep_policy=keep_policy,
         is_watched=False, last_watched_at=None, collection_name=None, title=f"m{movie_id}",
+        universe_credit=universe_credit,
     )
 
 
@@ -144,13 +145,37 @@ def test_universe_left_to_universe_manager():
     assert stats["skipped_protected"] == 2
 
 
+def test_movie_untagged_hot_collection_protected_from_downgrade():
+    # An UNTAGGED saga member (keep_policy=None — the common case, membership from its TMDB collection)
+    # with borrowed credit >= UNIVERSE_PROTECT_MIN is held at tier by the plan_movie_downgrades guard.
+    df = pd.DataFrame([_row(1, 2160, 20.0, keep_policy=None, universe_credit=2.0)])
+    cands, stats = _plan(df, need_gb=50.0)
+    assert cands == []
+    assert stats["skipped_universe"] == 1
+
+
+def test_movie_stale_collection_credit_is_droppable():
+    # The same untagged movie with a DECAYED credit (< UNIVERSE_PROTECT_MIN) is no longer protected —
+    # the recency bias makes a stale saga's members droppable again.
+    df = pd.DataFrame([_row(1, 2160, 20.0, keep_policy=None, universe_credit=0.4)])
+    cands, stats = _plan(df, need_gb=13.0)
+    assert [c["movie_id"] for c in cands] == [1]
+    assert stats["skipped_universe"] == 0
+
+
+# NOTE: KEEP-TAGGED universe movies never reach this guard (skipped at the keep_policy guard) — their
+# credit-gated step-down floor is the universe manager's (space.universe_quality.downgrade_target,
+# tested in test_universe_quality.py).
+
+
 # ── series (TV) ─────────────────────────────────────────────────────────────────
 def _ep(series_id, resolution, size_gib, score, runtime_sec=1800, keep_policy=None,
-        last_watched=None, air_date=None):
+        last_watched=None, air_date=None, universe_credit=None):
     return dict(
         series_id=series_id, watchability_score=score, keep_policy=keep_policy,
         size_bytes=int(size_gib * _GIB), series_title=f"s{series_id}", resolution=resolution,
         last_watched_at=last_watched, runtime_seconds=runtime_sec, air_date_utc=air_date,
+        universe_credit=universe_credit,
     )
 
 
@@ -204,6 +229,30 @@ def test_series_guards():
     assert stats["skipped_high_score"] == 1
     assert stats["skipped_already"] == 1
     assert stats["skipped_recent"] == 1
+
+
+def test_series_hot_universe_credit_protected_from_downgrade():
+    # A low-score 4K series that WOULD be a downgrade candidate is held at tier because it
+    # carries borrowed franchise/universe credit >= UNIVERSE_PROTECT_MIN (a hot saga sibling).
+    df = pd.DataFrame([
+        _ep(1, 2160, 10.0, 0, universe_credit=2.0),   # hot saga -> protected
+        _ep(2, 2160, 10.0, 0, universe_credit=2.0),
+    ])
+    cands, stats = _plan_series(df, need_gb=50.0)
+    assert cands == []
+    assert stats["skipped_universe"] == 2
+
+
+def test_series_stale_universe_credit_is_droppable():
+    # The same series with a DECAYED credit (< UNIVERSE_PROTECT_MIN) is no longer protected —
+    # the recency bias makes a stale saga's members droppable again.
+    df = pd.DataFrame([
+        _ep(1, 2160, 10.0, 0, universe_credit=0.4),   # decayed -> not protected
+        _ep(1, 2160, 10.0, 0, universe_credit=0.4),
+    ])
+    cands, stats = _plan_series(df, need_gb=15.0)
+    assert [c["sid"] for c in cands] == [1]
+    assert stats["skipped_universe"] == 0
 
 
 def _plan_series_tier(df, *, need_gb):

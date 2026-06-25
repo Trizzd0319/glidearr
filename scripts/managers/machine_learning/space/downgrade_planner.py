@@ -129,15 +129,18 @@ def plan_movie_downgrades(
     need_gb (or at the floor resolution).
 
     Guards (skip): keep_forever / keep_movie / keep_universe / bare universe (universe
-    quality is owned by the universe manager); recently watched; high watchability score
+    quality is owned by the universe manager — incl. its credit-gated step-down); hot
+    franchise/universe credit (>= UNIVERSE_PROTECT_MIN) for movies NOT universe-tagged (the
+    common case — saga membership comes from the TMDB collection, no keep tag needed); recently
+    watched; high watchability score
     (>= protect_threshold); already at/below the floor resolution; first-step reclaim <= 0
     (current file already smaller than the next-lower tier — stepping down would re-grab a
     BIGGER file). Returns ``(candidates, stats)``; candidates (lowest score first) carry
     the chosen ``target_profile`` + cumulative ``reclaim_gb``."""
     stats = {
         "candidates_found": 0, "already_at_720p": 0, "skipped_protected": 0,
-        "skipped_high_score": 0, "skipped_recent": 0, "est_reclaim_gb": 0.0,
-        "target_met": False,
+        "skipped_high_score": 0, "skipped_recent": 0, "skipped_universe": 0,
+        "est_reclaim_gb": 0.0, "target_met": False,
     }
     if not ranked_profiles:
         return [], stats
@@ -155,6 +158,7 @@ def plan_movie_downgrades(
         size_bytes  = df.at[idx, "size_bytes"] if "size_bytes" in df.columns else None
         runtime     = df.at[idx, "runtime_minutes"] if "runtime_minutes" in df.columns else None
         movie_id    = df.at[idx, "movie_id"] if "movie_id" in df.columns else None
+        uni_credit  = df.at[idx, "universe_credit"] if "universe_credit" in df.columns else None
         score       = score_map.get(idx, 5)
 
         if pd.isna(movie_id):
@@ -162,10 +166,23 @@ def plan_movie_downgrades(
         if keep_policy in ("keep_forever", "keep_movie"):
             stats["skipped_protected"] += 1
             continue
-        # Universe quality (keep_universe AND bare universe) is owned by the universe
-        # manager. Space-pressure still DELETES bare 'universe' as a last resort.
+        # Universe quality (keep_universe AND bare universe) is owned by the universe manager
+        # — including the borrowed-credit step-down floor (universe_quality.downgrade_target).
+        # Space-pressure still DELETES bare 'universe' as a last resort.
         if keep_policy in ("keep_universe", "universe"):
             stats["skipped_protected"] += 1
+            continue
+        # Borrowed franchise/universe credit (per-movie, recency-decayed by refresh_scores): an
+        # UNTAGGED saga member (no keep tag — the common case; membership from the TMDB collection)
+        # sitting in a HOT saga resists step-down. As the saga goes stale the credit decays below the
+        # floor and it becomes droppable again. Keep-tagged universe titles never reach here (skipped
+        # above) — their credit-gated step-down is the universe manager's.
+        try:
+            _uc = float(uni_credit) if (uni_credit is not None and pd.notna(uni_credit)) else 0.0
+        except (TypeError, ValueError):
+            _uc = 0.0
+        if _uc >= UNIVERSE_PROTECT_MIN:
+            stats["skipped_universe"] += 1
             continue
         if is_watched and lw:
             try:
@@ -255,6 +272,13 @@ def _max_ts(series):
         return None
 
 
+# A series whose borrowed franchise/universe credit (set by refresh_scores, recency-decayed) is at
+# least this many watch-counts is PROTECTED from space-pressure downgrade — a hot saga keeps its
+# members at their earned tier. As the saga goes stale the credit decays below this and its members
+# become droppable again (the user's "recency bias drop for space being easier to drop them down").
+UNIVERSE_PROTECT_MIN = 1.0
+
+
 def plan_series_downgrades(
     df,
     ranked_profiles: list,
@@ -272,16 +296,17 @@ def plan_series_downgrades(
     apply the guards, then STEP each eligible series DOWN the resolution ladder one tier at
     a time, spread across the pool, until ``need_gb`` is reclaimed.
 
-    Guards (skip): keep tag; high score (>= ceiling); nothing on disk; already at/below the
-    floor resolution; recently WATCHED; recently AIRED; first-step reclaim <= 0.
+    Guards (skip): keep tag; hot franchise/universe credit (>= UNIVERSE_PROTECT_MIN); high score
+    (>= ceiling); nothing on disk; already at/below the floor resolution; recently WATCHED; recently
+    AIRED; first-step reclaim <= 0.
 
     Returns ``(candidates, stats)``; each candidate carries sid/title/score/n_eps/cur_gib/
     indices and the chosen ``target_profile`` (+ id/name) + cumulative ``reclaim_gb``. PURE.
     The service applies each per-series target (PUT + SeriesSearch + stamp)."""
     stats = {
         "candidates": 0, "skipped_protected": 0, "skipped_high_score": 0,
-        "skipped_recent": 0, "skipped_already": 0, "est_reclaim_gb": 0.0,
-        "target_met": False,
+        "skipped_recent": 0, "skipped_already": 0, "skipped_universe": 0,
+        "est_reclaim_gb": 0.0, "target_met": False,
     }
     if not ranked_profiles:
         return [], stats
@@ -300,6 +325,13 @@ def plan_series_downgrades(
             continue
         score = float(score_vals.max())   # constant per series; max ignores NaN
 
+        # Borrowed franchise/universe credit (per-series, recency-decayed by refresh_scores). A hot
+        # saga's members carry a high credit and resist downgrade; a stale saga's has decayed away.
+        uni_credit = 0.0
+        if "universe_credit" in rows.columns:
+            _uc = pd.to_numeric(rows["universe_credit"], errors="coerce").dropna()
+            uni_credit = float(_uc.max()) if len(_uc) else 0.0
+
         keep_policy = None
         if "keep_policy" in rows.columns:
             kp = rows["keep_policy"].dropna()
@@ -315,6 +347,9 @@ def plan_series_downgrades(
         # ── protections ──
         if keep_policy in keep_tags:
             stats["skipped_protected"] += 1
+            continue
+        if uni_credit >= UNIVERSE_PROTECT_MIN:
+            stats["skipped_universe"] += 1
             continue
         if score >= ceiling:
             stats["skipped_high_score"] += 1

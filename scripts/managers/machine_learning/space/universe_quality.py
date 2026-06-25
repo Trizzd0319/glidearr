@@ -29,9 +29,13 @@ from scripts.managers.machine_learning.likelihood.watch_likelihood import (
     profile_id_for_likelihood,
     radarr_ladder,
     radarr_ladder_english,
+    resolution_cap_for_likelihood,
 )
 from scripts.managers.machine_learning.sizing.size_model import estimate_gb_for_profile
-from scripts.managers.machine_learning.space.downgrade_planner import step_targets
+from scripts.managers.machine_learning.space.downgrade_planner import (
+    UNIVERSE_PROTECT_MIN,
+    step_targets,
+)
 from scripts.managers.machine_learning.space.dual_version import hd_capped_likelihood
 
 
@@ -91,13 +95,20 @@ def downgrade_single_rank(ranked_profiles, current_profile_id, *, min_rank=0):
     return None if ci <= min_rank else ranked_profiles[ci - 1]
 
 
-def downgrade_target(row, ranked_profiles, current_profile_id, config, *, min_rank=0):
+def downgrade_target(row, ranked_profiles, current_profile_id, config, *, min_rank=0, likelihood=None):
     """One RESOLUTION-TIER step down — same runtime-sized logic movies/TV use
     (downgrade_planner.step_targets): the best-quality profile at the next-lower resolution
     whose estimated grab (rate/min × runtime) still reduces the current file. Universe
     floors at the LOWEST real resolution (``floor_resolution=1``) so franchises can bottom
     out below the 720p movie/TV floor over passes. None when nothing reduces. Falls back to
-    ``downgrade_single_rank`` when the row's resolution is unknown."""
+    ``downgrade_single_rank`` when the row's resolution is unknown.
+
+    Borrowed franchise/universe credit: a HOT member (its ``universe_credit`` row field >=
+    UNIVERSE_PROTECT_MIN, with ``likelihood`` supplied) floors at the resolution its credit-bearing
+    likelihood EARNS (``resolution_cap_for_likelihood``) instead of resolution 1 — so a rewatched saga
+    resists the step-down to its earned tier (and HOLDS, returning None, once it is at/under that tier).
+    As the credit DECAYS below the threshold the member reverts to the universe floor (1) and is fully
+    droppable again — the user's "recency bias drop." Cold / no-credit members are byte-identical."""
     cur_res = row.get("resolution") if hasattr(row, "get") else None
     if cur_res is not None and pd.notna(cur_res):
         sz = row.get("size_bytes")
@@ -108,6 +119,16 @@ def downgrade_target(row, ranked_profiles, current_profile_id, config, *, min_ra
             return (estimate_gb_for_profile(p, float(_rt), 1)
                     if (_rt is not None and pd.notna(_rt) and float(_rt) > 0) else 0.0)
 
-        targets, _cum = step_targets(ranked_profiles, cur_res, cur_gib, _est, 1)
+        floor_res = 1
+        if likelihood is not None:
+            uc = row.get("universe_credit") if hasattr(row, "get") else None
+            try:
+                uc = float(uc) if (uc is not None and pd.notna(uc)) else 0.0
+            except (TypeError, ValueError):
+                uc = 0.0
+            if uc >= UNIVERSE_PROTECT_MIN:
+                floor_res = resolution_cap_for_likelihood(likelihood, config=config)
+
+        targets, _cum = step_targets(ranked_profiles, cur_res, cur_gib, _est, floor_res)
         return targets[0] if targets else None
     return downgrade_single_rank(ranked_profiles, current_profile_id, min_rank=min_rank)

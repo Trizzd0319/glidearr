@@ -11,13 +11,15 @@ Radarr universe pass, Radarr active-watcher upgrades, and the Sonarr JIT upgrade
 pass — so "earn your quality tier" is applied consistently.
 
 Likelihood (0–100) = max(engagement floor, affinity propensity):
-  * ENGAGEMENT floors it: rewatched → 90, watched once / ≥90% → watched_floor,
-    20–90% → started_floor, abandoned (<20%) → ≤ abandoned_ceiling.
+  * ENGAGEMENT floors it, GRADED BY WATCH COUNT: watched once → watched_floor (50),
+    each further rewatch adds ``rewatch_step`` up to rewatch_floor (90). So one watch
+    → ~1080p, twice → high-1080p, but only REGULAR rewatches (≈3+) clear the 4K gate.
+    Partial views: 20–90% → started_floor, abandoned (<20%) → ≤ abandoned_ceiling.
   * AFFINITY (cast/crew/studio/genre, via the watchability_score) raises it for
-    UNTOUCHED titles, but is CAPPED at ``affinity_cap`` (75) which is BELOW the
-    top-4K band — so affinity alone can reach high-4K but never the top-4K tier,
-    which stays reserved for rewatched content. A cold unwatched title with no
-    affinity (e.g. the Alien films) lands low and stays at the floor profile.
+    UNTOUCHED titles, but is CAPPED at ``affinity_cap`` (75) which is kept BELOW
+    ``uhd_cutoff`` (77) — so affinity alone reaches 1080p but NEVER 4K, which stays
+    reserved for rewatched content. A cold unwatched title with no affinity lands low
+    and stays at the 720p floor (the steep, sticky low end).
 
 Two ladders:
   * RADARR — an EXPLICIT profile-id ladder (config ``radarr_quality_ladder``): an
@@ -34,9 +36,11 @@ All thresholds/weights are config-tunable via a ``watch_likelihood`` block and t
 from __future__ import annotations
 
 _DEFAULTS = {
-    # Engagement floors (0-100).
-    "rewatch_floor":        90.0,   # watch_count >= 2          → top-4K
-    "watched_floor":        50.0,   # watched once / ≥90% done  → high-1080 (+affinity may lift)
+    # Engagement floors (0-100). GRADED by watch_count: floor = watched_floor + (wc-1)*rewatch_step,
+    # capped at rewatch_floor. So 1 watch → 50, 2 → 64, 3 → 78, 4+ → 90 (with rewatch_step 14).
+    "rewatch_floor":        90.0,   # the cap a regularly-rewatched title reaches → top-4K
+    "rewatch_step":         14.0,   # likelihood added per rewatch beyond the first
+    "watched_floor":        50.0,   # watched once / ≥90% done  → 1080p (+affinity may lift, never 4K)
     "started_floor":        40.0,   # 20–90% complete           → high-1080
     "abandoned_ceiling":    25.0,   # 0–20% complete (tried, stopped)
     # Untouched / affinity propensity (capped below the top-4K band).
@@ -50,31 +54,40 @@ _DEFAULTS = {
     "untouched_pct_floor":  0.0,
     "untouched_base":       12.0,
     "untouched_score_gain": 1.0,
-    "affinity_cap":         75.0,   # < top-4K cutoff ⇒ affinity alone never hits top-4K
+    "affinity_cap":         75.0,   # < uhd_cutoff ⇒ affinity alone reaches 1080p but NEVER 4K
     # Affinity weight multiplier applied to the scorer's cast/crew/studio/genre caps.
     "affinity_boost":       1.8,
-    # Resolution cutoffs (Sonarr / fallback): likelihood → max resolution.
-    "uhd_cutoff":           70.0,
+    # Resolution cutoffs (Sonarr / fallback): likelihood → max resolution. uhd_cutoff is kept ABOVE
+    # affinity_cap so only rewatch engagement (≈3+ watches) earns 4K — never taste alone.
+    "uhd_cutoff":           77.0,
     "fhd_cutoff":           40.0,
     "hd_cutoff":            20.0,
     "uhd_res":              2160,
     "fhd_res":              1080,
     "hd_res":               720,
     "floor_res":            720,
+    # Universe / franchise propagation: a title in a HOT universe (rewatched siblings) earns BORROWED
+    # effective watch-count, so a single real watch can elevate immediately. heat = rewatched_siblings /
+    # group_size (a loose mega-group self-dilutes); full credit at heat_full; recency-decayed.
+    "universe_credit_cap":            2.0,    # max watch-counts a hot universe lends a sibling
+    "universe_heat_full":             0.30,   # rewatched-fraction of the group that earns FULL credit
+    "universe_recency_halflife_days": 30.0,   # lent credit halves every N days since the group's last watch
 }
 
 # Radarr explicit profile ladder (ascending [min_likelihood, profile_id]). Profiles:
 #   3 HD-720p · 4 HD-1080p · 6 HD-720p/1080p · 7 HD Bluray+WEB · 8 Remux+WEB-1080p ·
 #   5 Ultra-HD(low-4K) · 9 Remux 2160p(high-4K) · 10 UHD Bluray+WEB(top-4K).
+# Recalibrated: 720p is the sticky low end (<40), 1080p is the broad default (40–77, incl. all
+# affinity-only titles), and the 4K trio (5/9/10) sits at ≥77 so ONLY rewatch engagement reaches it
+# (watched 3× → ~78 → Ultra-HD; 4×+ → 90 → UHD Bluray+WEB). Affinity (≤75) tops out at Remux+WEB 1080p.
 _DEFAULT_RADARR_LADDER = [
     [0,  3],
-    [20, 4],
-    [30, 6],
-    [40, 7],
+    [40, 4],
+    [45, 7],
     [55, 8],
-    [65, 5],
-    [70, 9],
-    [85, 10],
+    [77, 5],
+    [85, 9],
+    [90, 10],
 ]
 
 
@@ -214,9 +227,19 @@ def explain_likelihood(row, *, config=None) -> dict:
             "winner": "engagement" if floor >= affinity else "affinity",
         }
 
-    if wc >= 2:
-        return _floor_branch("rewatched", _cfg(config, "rewatch_floor"))   # full top-tier floor
-    if watched or comp >= 90 or wc >= 1:
+    # Borrowed "universe credit": a hot franchise/universe (rewatched siblings) lends extra effective
+    # watch-count, so a single real watch elevates immediately. 0 until a pre-pass injects it → byte-
+    # identical when absent. Added to wc BEFORE the graded floor, so 1 watch + ~2 credit ⇒ 3 ⇒ 4K.
+    credit = max(0.0, _num(_get(row, "universe_credit"), 0.0))
+    ewc = wc + credit
+    if ewc >= 1:
+        # GRADED by EFFECTIVE watch count: 1→50, 2→64, 3→78, 4+→90 — 4K earned by regular (or
+        # universe-elevated) rewatching, never one cold play.
+        floor = min(_cfg(config, "rewatch_floor"),
+                    _cfg(config, "watched_floor") + (ewc - 1) * _cfg(config, "rewatch_step"))
+        tier = "rewatched" if ewc >= 3 else ("universe" if wc < 1 and credit > 0 else "watched")
+        return _floor_branch(tier, floor)
+    if watched or comp >= 90:
         return _floor_branch("watched", _cfg(config, "watched_floor"))
     if comp >= 20:
         return _floor_branch("started", _cfg(config, "started_floor"))
@@ -286,3 +309,104 @@ def resolution_cap_for_likelihood(likelihood, *, config=None) -> int:
     if L >= _cfg(config, "hd_cutoff"):
         return int(_cfg(config, "hd_res"))
     return int(_cfg(config, "floor_res"))
+
+
+def universe_credit(rewatched_siblings, group_size, *, days_since_watch=0.0, config=None) -> float:
+    """Borrowed effective-watch-count a title earns from a HOT franchise/universe — the value a pre-pass
+    writes into a title's ``universe_credit`` row field.
+
+    ``heat = rewatched_siblings / group_size`` self-dilutes loose mega-groups (4/167 ≈ 0.02 → ~nothing,
+    while MCU 10/34 ≈ 0.29 → ~full); FULL credit at ``universe_heat_full``; halved every
+    ``universe_recency_halflife_days`` since the group's last watch; capped at ``universe_credit_cap``
+    (in watch-counts). 0 for a cold or single-member group — so it's purely additive, never a penalty."""
+    gs = _num(group_size, 0.0)
+    rw = _num(rewatched_siblings, 0.0)
+    if gs < 2 or rw < 1:
+        return 0.0
+    cap = _cfg(config, "universe_credit_cap")
+    full = max(1e-6, _cfg(config, "universe_heat_full"))
+    hl = _cfg(config, "universe_recency_halflife_days")
+    heat = min(1.0, (rw / gs) / full)
+    # Clamp to >= 0 so a future-dated last_watched (clock skew / bad metadata) decays as "just watched"
+    # (decay <= 1.0) instead of overshooting the cap via a negative exponent.
+    days = max(0.0, _num(days_since_watch))
+    decay = 0.5 ** (days / hl) if hl > 0 else 1.0
+    return round(cap * heat * decay, 3)
+
+
+def series_universe_credits(fran_map, series_stats, *, config=None, rewatch_min=2) -> dict:
+    """``{series_id: universe_credit}`` from TV franchise membership + per-series watch stats.
+
+    ``fran_map`` = ``{series_id: franchise/universe name}`` (e.g. from ``tv_group_maps_from_series``);
+    ``series_stats`` = ``{series_id: {"watch_count": n, "days_since": days_since_last_watch}}``. For each
+    franchise group it computes :func:`universe_credit` from the rewatched-sibling fraction (a sibling is
+    "rewatched" at ``watch_count >= rewatch_min``), recency-decayed by the group's MOST-RECENT watch, and
+    gives EVERY member that same borrowed credit — so a single-watch member of a hot saga is the one it
+    actually elevates. Members of cold / single-member groups get nothing (key absent → caller reads 0)."""
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for sid, uni in (fran_map or {}).items():
+        if uni:
+            groups[uni].append(sid)
+    out: dict = {}
+    for members in groups.values():
+        size = len(members)
+        if size < 2:
+            continue
+        rewatched = sum(1 for sid in members
+                        if _num((series_stats.get(sid) or {}).get("watch_count")) >= rewatch_min)
+        if rewatched < 1:
+            continue
+        days = min((_num((series_stats.get(sid) or {}).get("days_since"), 1e9) for sid in members),
+                   default=1e9)
+        credit = universe_credit(rewatched, size, days_since_watch=days, config=config)
+        if credit > 0:
+            for sid in members:
+                out[sid] = credit
+    return out
+
+
+def movie_universe_credits(universe_map, movie_stats, *, config=None, rewatch_min=2,
+                           drop_labels=frozenset()) -> dict:
+    """``{movie_id: universe_credit}`` from movie universe membership + per-movie watch stats.
+
+    The movie twin of :func:`series_universe_credits`, sharing the same :func:`universe_credit` math.
+    The one difference is membership: ``universe_map`` = ``{movie_id: label}`` where ``label`` is a
+    PIPE-SEPARATED universe string (e.g. ``"mcu"`` or ``"dc|mcu"``) — a film can belong to several
+    universes at once (Radarr's ``universe_name`` column). ``movie_stats`` =
+    ``{movie_id: {"watch_count": n, "days_since": days_since_last_watch}}``. Each universe is its own
+    group; the credit is computed per group from the rewatched-sibling fraction (a sibling is
+    "rewatched" at ``watch_count >= rewatch_min``), recency-decayed by the group's most-recent watch.
+    A film in several universes keeps its HOTTEST (the max) — the liveliest saga it sits in protects
+    it. Cold / single-member groups contribute nothing (key absent → caller reads 0).
+
+    ``drop_labels`` (compared lower-cased) are junk/placeholder group names to ignore — e.g. the bare
+    ``"universe"`` / ``"franchise"`` / ``"standalone"`` placeholders (playlists.models.PLACEHOLDER_AFFINITY)
+    — so they never fuse unrelated films into one bogus saga group."""
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for mid, label in (universe_map or {}).items():
+        seen = set()   # dedupe repeated labels in one film's pipe string ("mcu|mcu") so it isn't
+        for uni in str(label or "").split("|"):   # double-counted in group_size / rewatched-sibling count
+            uni = uni.strip()
+            if uni and uni.lower() not in drop_labels and uni not in seen:
+                seen.add(uni)
+                groups[uni].append(mid)
+    out: dict = {}
+    for members in groups.values():
+        size = len(members)
+        if size < 2:
+            continue
+        rewatched = sum(1 for mid in members
+                        if _num((movie_stats.get(mid) or {}).get("watch_count")) >= rewatch_min)
+        if rewatched < 1:
+            continue
+        days = min((_num((movie_stats.get(mid) or {}).get("days_since"), 1e9) for mid in members),
+                   default=1e9)
+        credit = universe_credit(rewatched, size, days_since_watch=days, config=config)
+        if credit <= 0:
+            continue
+        for mid in members:
+            if credit > out.get(mid, 0.0):   # a multi-universe film keeps its hottest saga's credit
+                out[mid] = credit
+    return out

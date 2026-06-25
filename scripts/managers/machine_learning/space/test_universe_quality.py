@@ -40,11 +40,11 @@ def test_universe_action_band():
     assert universe_action(9900.0, 9000.0, 9900.0) is None
 
 
-# ── upgrade target (default Radarr ladder: [0,3][20,4][30,6][40,7][55,8][65,5][70,9][85,10]) ──
+# ── upgrade target (recalibrated default ladder: [0,3][40,4][45,7][55,8][77,5][85,9][90,10]) ──
 def test_upgrade_target_steps_up_to_earned_tier():
     ranked = [{"id": 3}, {"id": 4}]
-    # likelihood 25 -> earned profile 4 (rank 1) > current 3 (rank 0) -> step to id 4.
-    assert upgrade_target(ranked, 3, 25, {})["id"] == 4
+    # likelihood 42 -> earned profile 4 (rank 1) > current 3 (rank 0) -> step to id 4 (1080p starts at 40 now).
+    assert upgrade_target(ranked, 3, 42, {})["id"] == 4
 
 
 def test_upgrade_target_none_when_at_or_above_tier():
@@ -87,6 +87,35 @@ def test_downgrade_target_unknown_resolution_falls_back_to_single_rank():
     unknown = {"resolution": None, "size_bytes": None, "runtime_minutes": None}
     # _TIER ids order [4,1,3,2]; current 3 at index 2 -> one rank down -> index 1 -> id 1.
     assert downgrade_target(unknown, _TIER, 3, {})["id"] == 1
+
+
+# ── universe-credit step-down floor (a hot saga resists; a stale one drops) ─────────
+def _urow(resolution, *, credit=None, size_gib=50.0):
+    r = {"resolution": resolution, "size_bytes": int(size_gib * _GIB), "runtime_minutes": 100.0}
+    if credit is not None:
+        r["universe_credit"] = credit
+    return r
+
+
+def test_downgrade_target_cold_member_is_byte_identical():
+    # No credit (or below the protect floor) -> floor stays 1, behaves exactly as before: a 720 file
+    # steps to the next-lower tier (480, id 4), with or without a likelihood passed.
+    cold = _urow(720, credit=0.0)
+    assert downgrade_target(cold, _TIER, 99, {})["id"] == 4                  # no likelihood
+    assert downgrade_target(cold, _TIER, 99, {}, likelihood=90)["id"] == 4   # likelihood but cold -> same
+
+
+def test_downgrade_target_hot_member_holds_at_earned_4k():
+    # Hot rewatched member: likelihood 90 -> cap 2160 -> floor 2160 -> a 2160 file can't step down (hold).
+    hot = _urow(2160, credit=2.0)
+    assert downgrade_target(hot, _TIER, 99, {}, likelihood=90) is None
+
+
+def test_downgrade_target_hot_member_floors_at_earned_1080():
+    # Hot but lower likelihood (64 -> cap 1080): a 2160 file steps to the best 1080 (Remux id 3) and
+    # NO further; once AT 1080 it holds. It never drops to 720/480 like a cold member would.
+    assert downgrade_target(_urow(2160, credit=2.0), _TIER, 99, {}, likelihood=64)["id"] == 3
+    assert downgrade_target(_urow(1080, credit=2.0), _TIER, 99, {}, likelihood=64) is None
 
 
 # ── English twin ladder (keeps English-locked films on the parallel English tiers) ──

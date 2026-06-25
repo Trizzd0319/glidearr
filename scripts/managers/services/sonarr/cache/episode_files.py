@@ -56,6 +56,7 @@ from scripts.managers.machine_learning.acquisition.next_episode_planner import (
     order_series_by_recency,
     series_budget_multiplier,
 )
+from scripts.managers.machine_learning.likelihood.watch_likelihood import series_universe_credits
 from scripts.managers.services.plex.playlists.universe_order import tv_group_maps_from_series
 from scripts.managers.machine_learning.acquisition.pilot_stepping import (
     choose_lowest_available_tier,
@@ -630,6 +631,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         df["watchability_percentile"] = _sid_num.map(
             lambda s: _pct_by_series.get(int(s)) if pd.notna(s) else None
         )
+        # Franchise/universe credit: a hot saga lends borrowed effective-watch-count to its members,
+        # so the likelihood-gated upgrade AND downgrade passes elevate a single-watch sibling (and let
+        # it fall again as the saga's last watch recedes). Non-destructive annotation; 0 when no heat.
+        try:
+            self._apply_universe_credit(instance, df)
+        except Exception as e:
+            self.logger.log_debug(f"[Universe] credit pass skipped for '{instance}': {e}")
         self.save(instance, df)
         vals = list(score_by_series.values())
         self.logger.log_info(
@@ -641,6 +649,37 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_debug(f"[SizeAnomaly] report failed for '{instance}': {e}")
         return len(score_by_series)
+
+    def _apply_universe_credit(self, instance: str, df) -> None:
+        """Broadcast a per-series ``universe_credit`` column onto every episode row: borrowed
+        effective-watch-count from a HOT TV franchise/universe (rewatched siblings), recency-decayed.
+        Read by ``watch_likelihood`` so the upgrade + downgrade passes elevate a single-watch member of
+        a hot saga. Sonarr-only; 0 everywhere when there's no franchise heat (byte-identical effect)."""
+        series_cache = getattr(self.sonarr_cache, "series", None)
+        if series_cache is None or "series_id" not in df.columns:
+            df["universe_credit"] = 0.0
+            return
+        rows = [s for s in series_cache.iter_all_series(instance) if isinstance(s, dict)]
+        source = self.global_cache.get(self._UNIVERSE_SRC_KEY) if self.global_cache else None
+        fran, _timeline = tv_group_maps_from_series(rows, source or {})
+        _sid = pd.to_numeric(df["series_id"], errors="coerce")
+        stats: dict = {}
+        if "watch_count" in df.columns:
+            _wc = df.assign(_s=_sid).dropna(subset=["_s"]).groupby("_s")["watch_count"].max()
+            for sid, v in _wc.items():
+                stats.setdefault(int(sid), {})["watch_count"] = float(v) if pd.notna(v) else 0.0
+        if "last_watched_at" in df.columns:
+            now = pd.Timestamp.now(tz="UTC")
+            _lw = pd.to_datetime(df["last_watched_at"], utc=True, errors="coerce")
+            _last = pd.DataFrame({"_s": _sid, "_lw": _lw}).dropna(subset=["_s"]).groupby("_s")["_lw"].max()
+            for sid, ts in _last.items():
+                stats.setdefault(int(sid), {})["days_since"] = (now - ts).days if pd.notna(ts) else 1e9
+        credits = series_universe_credits(fran or {}, stats, config=self.config)
+        df["universe_credit"] = _sid.map(lambda s: credits.get(int(s), 0.0) if pd.notna(s) else 0.0)
+        if credits:
+            self.logger.log_info(
+                f"[Universe] '{instance}': lent franchise credit to {len(credits)} series "
+                f"(max {max(credits.values()):.2f} watch-counts).")
 
     @timeit("report_size_anomalies")
     def report_size_anomalies(self, instance: str, df=None) -> list:

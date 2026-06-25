@@ -250,7 +250,7 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         if not candidates:
             self.logger.log_info(
                 f"[SpacePressure-TV] '{instance}': {free_space_gb:.0f}GB free (<{U:.0f}GB) but no "
-                f"downgrade candidates (score<{ceiling:.0f}, not keep/recent/at-floor)."
+                f"downgrade candidates (score<{ceiling:.0f}, not keep/hot-universe/recent/at-floor)."
             )
             return stats
 
@@ -322,6 +322,7 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 ["candidates",       stats["candidates"]],
                 ["score over ceil",  stats["skipped_high_score"]],
                 ["keep-tagged",      stats["skipped_protected"]],
+                ["hot-universe",     stats.get("skipped_universe", 0)],
                 ["recent",           stats["skipped_recent"]],
                 ["at/below floor",   stats["skipped_already"]],
                 ["failed",           stats["failed"]],
@@ -338,6 +339,7 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 "series the planner picked as candidates",
                 "series skipped for watchability score over the ceiling",
                 "series skipped because keep-tagged",
+                "series skipped — hot franchise/universe credit holds them at tier",
                 "series skipped for a recent watch or air date",
                 "series already at or below the 720p floor",
                 "series whose PUT/search call errored",

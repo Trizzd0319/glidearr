@@ -167,6 +167,11 @@ def aggregate_series_signals(df) -> "dict[int, dict]":
     has_cert = "certification" in df.columns
     has_watched = "is_watched" in df.columns
     has_household = "all_household_watched" in df.columns
+    # Signals the recalibrated likelihood curve consumes (per-series MAX across episodes): rewatch
+    # intensity, the affinity-bearing score, and the borrowed franchise/universe credit (0 if absent).
+    has_wc = "watch_count" in df.columns
+    has_score = "watchability_score" in df.columns
+    has_uni = "universe_credit" in df.columns
     for _, row in df.iterrows():
         sid = row.get("series_id")
         if pd.isna(sid):
@@ -181,6 +186,7 @@ def aggregate_series_signals(df) -> "dict[int, dict]":
             series_data[sid] = {
                 "title": title, "latest_watch": None, "certs": set(),
                 "keep_policy": policy, "watched_eps": 0, "household_eps": 0,
+                "watch_count": 0.0, "watchability_score": 0.0, "universe_credit": 0.0,
             }
         # pd.notna guards a missing watch date: a bare ``if lw`` lets NaN through
         # (NaN is truthy), and pd.to_datetime(NaN) returns NaT rather than raising —
@@ -201,6 +207,13 @@ def aggregate_series_signals(df) -> "dict[int, dict]":
             series_data[sid]["household_eps"] += 1
         if cert:
             series_data[sid]["certs"].add(cert)
+        for col, key, present in (("watch_count", "watch_count", has_wc),
+                                  ("watchability_score", "watchability_score", has_score),
+                                  ("universe_credit", "universe_credit", has_uni)):
+            if present:
+                v = row.get(col)
+                if pd.notna(v):
+                    series_data[sid][key] = max(series_data[sid][key], float(v))
     return series_data
 
 

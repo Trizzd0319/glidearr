@@ -248,11 +248,13 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
             return upgrade_target(ranked_profiles, current_profile_id, L, self.config, min_rank=min_rank)
         return downgrade_single_rank(ranked_profiles, current_profile_id, min_rank=min_rank)
 
-    def _downgrade_target(self, row, ranked_profiles, current_profile_id, *, min_rank=0):
+    def _downgrade_target(self, row, ranked_profiles, current_profile_id, *, min_rank=0, likelihood=None):
         """Thin delegation to space.universe_quality.downgrade_target — one resolution-tier
         step down (best-quality, runtime-sized), legacy single-rank fallback when the row's
-        resolution is unknown."""
-        return downgrade_target(row, ranked_profiles, current_profile_id, self.config, min_rank=min_rank)
+        resolution is unknown. ``likelihood`` (credit-bearing) lets a hot franchise member floor
+        at its earned tier instead of bottoming out."""
+        return downgrade_target(row, ranked_profiles, current_profile_id, self.config,
+                                min_rank=min_rank, likelihood=likelihood)
 
 
     # ── Diagnostic: tag audit ──────────────────────────────────────────────────────
@@ -760,9 +762,12 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                 )
             else:
                 # Downgrade: one resolution-tier step down, best-quality reduction,
-                # runtime-sized — same logic as the movie/TV space-pressure passes.
+                # runtime-sized — same logic as the movie/TV space-pressure passes. The
+                # credit-bearing likelihood lets a HOT franchise member resist the drop to
+                # its earned tier (and a stale one fall again as its credit decays).
                 target_profile = self._downgrade_target(
                     df.loc[idx], ranked_profiles, current_qp, min_rank=min_rank,
+                    likelihood=likelihood,
                 )
 
             if target_profile is None:

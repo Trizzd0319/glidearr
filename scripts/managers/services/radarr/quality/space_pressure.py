@@ -60,6 +60,10 @@ from scripts.managers.machine_learning.space.downgrade_planner import (
 from scripts.managers.machine_learning.space.upgrade_planner import (
     plan_movie_upgrades,
 )
+from scripts.managers.machine_learning.likelihood.watch_likelihood import (
+    movie_universe_credits,
+)
+from scripts.managers.machine_learning.playlists.models import PLACEHOLDER_AFFINITY
 from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
 from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.watch_likelihood import (
@@ -533,6 +537,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             "skipped_protected":  0,
             "skipped_high_score": 0,
             "skipped_recent":     0,
+            "skipped_universe":   0,
             "failed":             0,
         }
 
@@ -672,6 +677,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 ["stepped down",        stats['downgraded']],
                 ["at/below floor",      stats['already_at_720p']],
                 ["protected",           stats['skipped_protected']],
+                ["hot-universe",        stats.get('skipped_universe', 0)],
                 ["high-score protected", stats['skipped_high_score']],
                 ["recently watched",    stats['skipped_recent']],
                 ["failed",              stats['failed']],
@@ -682,6 +688,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 "movies stepped down one quality rank",
                 "movies already at or below the 720p floor",
                 "movies protected from downgrade by keep policy",
+                "movies protected — hot franchise/universe credit holds an untagged saga member at tier",
                 "movies protected by a high watchability score",
                 "movies skipped for a recent watch",
                 "movies whose PUT/search call errored",
@@ -1283,6 +1290,13 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # instead of bunching at the low end of the 0-100 score).
         _sc = pd.to_numeric(df["watchability_score"], errors="coerce")
         df["watchability_percentile"] = (_sc.rank(pct=True, method="average") * 100).round(1)
+        # Franchise/universe credit: a hot saga lends borrowed effective-watch-count to its members,
+        # so the likelihood-gated upgrade AND the space-pressure downgrade pass elevate a single-watch
+        # member (and let it fall again as the saga's last watch recedes). Non-destructive; 0 when cold.
+        try:
+            self._apply_universe_credit(instance, df)
+        except Exception as e:
+            self.logger.log_debug(f"[Universe] credit pass skipped for '{instance}': {e}")
         # The score is a non-destructive annotation — persist it even in dry_run
         # so the Parquet is sortable by watchability ("least valuable first").
         mfm.save(instance, df)
@@ -1296,6 +1310,57 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_debug(f"[SizeAnomaly] report/remediate failed for '{instance}': {e}")
         return len(score_map)
+
+    def _apply_universe_credit(self, instance: str, df) -> None:
+        """Broadcast a per-movie ``universe_credit`` column: borrowed effective-watch-count from a HOT
+        saga (rewatched siblings), recency-decayed. Membership is the movie's TMDB COLLECTION
+        (``collection_name`` — populated automatically from TMDB metadata, NO keep tag required, so it
+        works for every user) unioned with any curated ``universe_name`` labels (pipe-sep) when present;
+        a film keeps the credit of its HOTTEST group. Read by ``watch_likelihood`` so BOTH the
+        space-pressure passes (untagged saga movies, via plan_movie_downgrades / plan_movie_upgrades)
+        AND the universe manager (keep-tagged) elevate a single-watch member of a hot saga, and let it
+        fall again as the saga's last watch recedes. 0 everywhere with no franchise heat → byte-identical."""
+        has_coll = "collection_name" in df.columns
+        has_uni  = "universe_name" in df.columns
+        if "movie_id" not in df.columns or not (has_coll or has_uni):
+            df["universe_credit"] = 0.0
+            return
+        _mid = pd.to_numeric(df["movie_id"], errors="coerce")
+        _wc  = pd.to_numeric(df["watch_count"], errors="coerce") if "watch_count" in df.columns else None
+        _lw  = pd.to_datetime(df["last_watched_at"], utc=True, errors="coerce") \
+            if "last_watched_at" in df.columns else None
+        now = pd.Timestamp.now(tz="UTC")
+        universe_map: dict = {}
+        stats: dict = {}
+        for pos, idx in enumerate(df.index):
+            m = _mid.iat[pos]
+            if pd.isna(m):
+                continue
+            mid = int(m)
+            labels: list[str] = []
+            if has_coll:
+                c = df.at[idx, "collection_name"]
+                if c is not None and pd.notna(c) and str(c).strip():
+                    labels.append(str(c).strip())
+            if has_uni:
+                u = df.at[idx, "universe_name"]
+                if u is not None and pd.notna(u) and str(u).strip():
+                    labels.append(str(u).strip())
+            if labels:
+                universe_map[mid] = "|".join(labels)
+            wc = float(_wc.iat[pos]) if (_wc is not None and pd.notna(_wc.iat[pos])) else 0.0
+            ds = (now - _lw.iat[pos]).days if (_lw is not None and pd.notna(_lw.iat[pos])) else 1e9
+            stats[mid] = {"watch_count": wc, "days_since": ds}
+        # Drop the junk placeholder group names ("universe"/"franchise"/"standalone"/…) — keep_policy
+        # stamps bare-universe films with universe_name="universe", which must NOT fuse unrelated films.
+        credits = movie_universe_credits(universe_map, stats, config=self.config,
+                                         drop_labels=PLACEHOLDER_AFFINITY)
+        df["universe_credit"] = _mid.map(lambda m: credits.get(int(m), 0.0) if pd.notna(m) else 0.0)
+        if credits:
+            self.logger.log_info(
+                f"[Universe] '{instance}': lent franchise/collection credit to {len(credits)} movies "
+                f"(max {max(credits.values()):.2f} watch-counts)."
+            )
 
     @timeit("report_size_anomalies")
     def report_size_anomalies(self, instance: str, df=None) -> list:

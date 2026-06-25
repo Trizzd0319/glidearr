@@ -2,6 +2,10 @@ from datetime import datetime, timedelta, timezone
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
+from scripts.managers.machine_learning.likelihood.watch_likelihood import (
+    resolution_cap_for_likelihood,
+    watch_likelihood,
+)
 from scripts.managers.machine_learning.space.upgrade_planner import (
     active_series_candidates,
     aggregate_series_signals,
@@ -38,26 +42,44 @@ def _is_anime_profile(profile: dict) -> bool:
     return (profile.get("name") or "").strip().lower().startswith("[anime]")
 
 
+_CODEC_VARIANT_SUFFIXES = (" (h264)", " (hevc)", " (hevc-dv)", " (av1)")
+
+
+def _codec_variant(profile: dict) -> bool:
+    """A device-audience codec variant, e.g. ``WEB-2160p (Combined) (AV1)``. NEVER an auto-upgrade
+    target: the RESOLUTION ladder picks the agnostic tier; the device→codec stage assigns the codec."""
+    return (profile.get("name") or "").strip().lower().endswith(_CODEC_VARIANT_SUFFIXES)
+
+
 def select_upgrade_targets(profiles: list[dict]) -> tuple[dict | None, dict | None]:
-    """Highest-resolution upgrade target *within each seriesType family*.
+    """Highest-resolution AGNOSTIC upgrade target *within each seriesType family* — codec variants
+    excluded (they're device picks, not ladder rungs, so 'best by resolution' must never land on one).
 
-    Returns ``(best_standard, best_anime)``. A series is only ever upgraded inside
-    its own family: standard/daily series take the best non-anime profile, anime
-    series take the best anime profile. Each family falls back to the other only
-    when it has no profiles of its own, so a target is always returned whenever at
-    least one profile exists.
+    Returns ``(best_standard, best_anime)``; each family falls back to the other so a target exists
+    whenever any agnostic profile does. (The per-series likelihood CAP is applied separately via
+    ``capped_target`` — this is just the family ceiling.)"""
+    pool = [p for p in profiles if not _codec_variant(p)]
 
-    Without the split, a single global ``max(resolution)`` pick tie-breaks onto
-    whichever 2160p profile sorts last — the anime one — and routes every
-    actively-watched series onto the anime profile regardless of type.
-    """
-    def _best(pool: list[dict]) -> dict | None:
-        ranked = sorted(pool, key=_profile_max_resolution)
+    def _best(sub: list[dict]) -> dict | None:
+        ranked = sorted(sub, key=_profile_max_resolution)
         return ranked[-1] if ranked else None
 
-    best_standard = _best([p for p in profiles if not _is_anime_profile(p)])
-    best_anime    = _best([p for p in profiles if _is_anime_profile(p)])
+    best_standard = _best([p for p in pool if not _is_anime_profile(p)])
+    best_anime    = _best([p for p in pool if _is_anime_profile(p)])
     return (best_standard or best_anime), (best_anime or best_standard)
+
+
+def capped_target(profiles: list[dict], *, is_anime: bool, max_res: int) -> dict | None:
+    """The agnostic upgrade target for a series given its likelihood resolution CAP ``max_res``:
+    the highest-resolution agnostic profile in its family whose max resolution ≤ the cap. So a
+    single-watch series caps at 1080p; a regularly-rewatched / universe-elevated one reaches 2160p.
+    Codec variants excluded. Falls back to the lowest in-family profile when none sit at/under the cap."""
+    agn = [p for p in profiles if not _codec_variant(p)]
+    fam = [p for p in agn if _is_anime_profile(p) == is_anime] or agn
+    if not fam:
+        return None
+    le = [p for p in fam if _profile_max_resolution(p) <= max_res]
+    return max(le, key=_profile_max_resolution) if le else min(fam, key=_profile_max_resolution)
 
 
 class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
@@ -260,14 +282,32 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
                 stats["skipped_fully_downloaded"] += 1
                 continue
 
-            # Per-family upgrade target (Sonarr seriesType): anime series upgrade to
-            # the anime profile, standard/daily to the best non-anime profile.
+            # Per-family target, CAPPED by the recalibrated likelihood curve. A single watch caps at
+            # 1080p; only a regularly-rewatched (or hot-universe-credited) series reaches 2160p. The
+            # agnostic tier is chosen here — the device→codec stage assigns the codec variant, never
+            # this upgrade pass (so 'best by resolution' can't land on a `(AV1)` profile any more).
             is_anime_series = (series.get("seriesType") or "").strip().lower() == "anime"
-            best      = best_anime if is_anime_series else best_standard
-            _aw_mbpm  = _aw_mbpm_anime if is_anime_series else _aw_mbpm_standard
+            cur_profile = next((p for p in raw_profiles if p.get("id") == series.get("qualityProfileId")), None)
+            cur_res     = _profile_max_resolution(cur_profile) if cur_profile else 0
+            likelihood  = watch_likelihood({
+                "watch_count":        info.get("watch_count", 0),
+                "watchability_score": info.get("watchability_score", 0),
+                "universe_credit":    info.get("universe_credit", 0),
+            }, config=self.config)
+            cap_res = resolution_cap_for_likelihood(likelihood, config=self.config)
+            best    = capped_target(raw_profiles, is_anime=is_anime_series, max_res=cap_res)
+            if best is None:
+                stats["already_best"] += 1
+                continue
             best_id   = best["id"]
             best_name = best.get("name", str(best_id))
             best_res  = _profile_max_resolution(best)
+            _aw_mbpm  = _target_mbpm(best)
+            # Upgrade-only: a likelihood-capped target at/under the current tier → leave the series be
+            # (this pass never downgrades — that's the space-pressure path).
+            if best_res <= cur_res:
+                stats["already_best"] += 1
+                continue
 
             # Resolve the series' tag labels (cache → API) for the freeze-tag guard —
             # only for series that survived the fully-downloaded skip.
@@ -326,7 +366,7 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
                 if days_ago is not None else f"last watched {str(latest)[:10]}"
             )
 
-            why_bits = [recency]
+            why_bits = [recency, f"likelihood {likelihood:.0f} → cap ≤{cap_res}p"]
             if watched_eps:
                 hh = f", {household_eps} by full household" if household_eps else ""
                 why_bits.append(f"{watched_eps} ep watched{hh}")
