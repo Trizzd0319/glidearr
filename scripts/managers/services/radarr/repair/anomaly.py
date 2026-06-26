@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.classification.keep_policy import resolve_keep_policy
+from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
 from scripts.managers.machine_learning.lifecycle.monitor_policy import (
     release_available,
     triage_action,
@@ -689,7 +690,8 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         """
         instance = self._resolve_instance(instance)
         stats = {"checked": 0, "below_floor": 0, "aging": 0, "unmonitored": 0,
-                 "deleted": 0, "guarded": 0, "deferred": 0, "recovered": 0, "failed": 0}
+                 "deleted": 0, "guarded": 0, "deferred": 0, "recovered": 0, "failed": 0,
+                 "skipped_universe": 0}
 
         if not bool(self.config.get("owned_demote_enabled", True) if self.config else True):
             return stats
@@ -758,6 +760,27 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         if not owned:
             return stats
 
+        # Borrowed franchise/universe credit (per-tmdb, recency-decayed by refresh_scores): an
+        # UNTAGGED hot-saga member resists this stale-prune DELETE just as it resists the space-
+        # pressure delete/downgrade — deletion must not be more aggressive than the step-down it
+        # already survives. This path scores RAW Radarr dicts, which don't carry the column, so
+        # source it from the movie_files parquet. Empty (no guard) when the credit pass hasn't run
+        # or the column is cold -> byte-identical.
+        credit_by_tmdb: dict[int, float] = {}
+        try:
+            _mfm = self.registry.get("manager", "RadarrCacheMovieFilesManager") if self.registry else None
+            _mdf = _mfm.load(instance) if _mfm is not None else None
+            if _mdf is not None and not _mdf.empty \
+                    and "universe_credit" in _mdf.columns and "tmdb_id" in _mdf.columns:
+                import pandas as pd
+                _t = pd.to_numeric(_mdf["tmdb_id"], errors="coerce")
+                _c = pd.to_numeric(_mdf["universe_credit"], errors="coerce")
+                for _ti, _ci in zip(_t, _c):
+                    if pd.notna(_ti) and pd.notna(_ci):
+                        credit_by_tmdb[int(_ti)] = float(_ci)
+        except Exception:
+            credit_by_tmdb = {}
+
         clock_key = self._DELETE_CLOCK_KEY.format(inst=instance)
         clock = self.global_cache.get(clock_key)
         clock = clock if isinstance(clock, dict) else {}
@@ -823,7 +846,13 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                 watched_tmdb_ids=ctx["watched_tmdb_ids"], movie_tmdb_id=tmdb_id,
                 threshold=_franchise_threshold, enabled=_franchise_exempt_enabled,
             )
-            _has_fid_delete = bool(fid) and not _exempt
+            # Hot franchise/universe credit spares the DELETE branch (still eligible to
+            # unmonitor/age, exactly like the franchise exemption) — the recency decay lets a
+            # stale saga member become deletable again once its credit drops below the floor.
+            _credit_protected = credit_by_tmdb.get(tmdb_id, 0.0) >= UNIVERSE_PROTECT_MIN
+            if _credit_protected and bool(fid) and not _exempt:
+                stats["skipped_universe"] += 1
+            _has_fid_delete = bool(fid) and not _exempt and not _credit_protected
             # ── Dwell decision (pure: delete / unmonitor / age) ────────────────
             action = prune_below_floor_action(
                 age_days=age_days, delete_enabled=delete_enabled, delete_active=delete_active,

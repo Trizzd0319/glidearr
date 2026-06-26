@@ -939,6 +939,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             if "marked_for_deletion" in df.columns else pd.Series(False, index=df.index)
         )
         _univ_age = self._universe_delete_age_days()   # bare-universe ageing (default None = off)
+        _held_universe = 0   # hot-saga rows the credit guard spared from the pool (observability)
 
         for idx in df.index:
             fid = df.at[idx, "movie_file_id"]
@@ -968,6 +969,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 _uc = df.at[idx, "universe_credit"]
                 try:
                     if _uc is not None and pd.notna(_uc) and float(_uc) >= UNIVERSE_PROTECT_MIN:
+                        _held_universe += 1
                         continue
                 except (TypeError, ValueError):
                     pass
@@ -1010,6 +1012,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 "resolution": int(_res) if (_res is not None and pd.notna(_res)) else None,
                 "title": (df.at[idx, "title"] if "title" in df.columns else None) or f"movie {fid}",
             })
+        if _held_universe:
+            self.logger.log_info(
+                f"[SpacePressure] '{instance}': {_held_universe} title(s) held by hot-universe credit "
+                f"(coordinator delete pool)."
+            )
         return out
 
     @timeit("delete_selected_movie_files")
