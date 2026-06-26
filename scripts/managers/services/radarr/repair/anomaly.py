@@ -25,6 +25,7 @@ from scripts.managers.machine_learning.lifecycle.stale_prune_policy import (
     franchise_delete_exempt,
     prune_below_floor_action,
     prune_score_gate,
+    restore_cooldown_active,
 )
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
@@ -1043,7 +1044,8 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         movie regains a file by other means, or when it leaves Radarr.
         """
         instance = self._resolve_instance(instance)
-        stats = {"tracked": 0, "restored": 0, "still_low": 0, "dropped": 0, "deferred": 0, "failed": 0}
+        stats = {"tracked": 0, "restored": 0, "still_low": 0, "cooling": 0,
+                 "dropped": 0, "deferred": 0, "failed": 0}
         if self.radarr_api is None or self.global_cache is None:
             return stats
         dkey = self._DELETED_SET_KEY.format(inst=instance)
@@ -1052,10 +1054,15 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         if not dset:
             return stats
 
+        now = datetime.now(timezone.utc)
         try:
             restore_floor = int(self.config.get("owned_restore_score_threshold", 20) if self.config else 20)
         except (TypeError, ValueError):
             restore_floor = 20
+        try:
+            restore_min_age = int(self.config.get("owned_restore_min_age_days", 0) if self.config else 0)
+        except (TypeError, ValueError):
+            restore_min_age = 0
 
         from scripts.managers.services.trakt.movies.scorer import score_movie
         ctx = self._build_scoring_context(instance)
@@ -1082,6 +1089,13 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                 stats["deferred"] += 1
                 continue
             if score > restore_floor:
+                if restore_cooldown_active(iso, now, restore_min_age):
+                    # Score recovered but the re-grab cooldown hasn't elapsed since
+                    # deletion — hold off so a title hovering at the floor can't be
+                    # deleted one run and restored the next, repeatedly.
+                    keep[k] = iso
+                    stats["cooling"] += 1
+                    continue
                 mid = movie.get("id")
                 if mid is not None:
                     restore.append((k, mid, movie.get("title", str(mid))))
@@ -1136,22 +1150,25 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             pass
 
         prefix = "[dry_run] " if self.dry_run else ""
+        cooldown = f", cooldown>={restore_min_age}d" if restore_min_age > 0 else ""
         self.logger.log_table(
             ["Outcome", "Count"],
             [
                 ["tracked",   stats["tracked"]],
                 ["restored",  stats["restored"]],
                 ["still_low", stats["still_low"]],
+                ["cooling",   stats["cooling"]],
                 ["deferred",  stats["deferred"]],
                 ["dropped",   stats["dropped"]],
                 ["failed",    stats["failed"]],
             ],
-            title=f"[Anomaly] {prefix}Deletion-restore - '{instance}' (score>{restore_floor})",
+            title=f"[Anomaly] {prefix}Deletion-restore - '{instance}' (score>{restore_floor}{cooldown})",
             caption="Re-acquires previously pruned movies whose watchability score recovered.",
             descriptions=[
                 "previously deleted movies still being tracked",
                 "movies re-monitored and re-searched this pass",
                 "movies still scoring at or below the floor",
+                "recovered but held: re-grab cooldown not yet elapsed",
                 "deferred: Trakt credits not cached yet",
                 "entries dropped: gone or re-acquired otherwise",
                 "movies whose restore call errored",

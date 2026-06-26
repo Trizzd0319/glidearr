@@ -38,14 +38,26 @@ def test_owned_freebies_uncapped_but_net_new_is_capped():
     assert [n["tmdb_id"] for n in net_new] == [1, 2]            # net-new capped at 2
 
 
-def test_on_this_day_leads_its_tier_over_higher_watchability():
-    # Within a tier, a title whose anniversary is EXACTLY today leads even with a lower watchability.
+def test_on_this_day_leads_net_new_over_higher_watchability():
+    # NET-NEW (grab) picks: a title whose anniversary is EXACTLY today leads its group even with a lower
+    # watchability — the "on this very day" hook is what justifies spending a grab on it.
+    today = {"media": "movie", "tmdb_id": 1, "owned": False, "score": 70, "on_this_day": True, "title": "Today"}
+    week = {"media": "movie", "tmdb_id": 2, "owned": False, "score": 90, "on_this_day": False, "title": "ThisWeek"}
+    _, net_new = gated_plan([week, today], level=ADULT, cap=5, resolve=movie_resolver(_MOVIE_INV))
+    assert [n["tmdb_id"] for n in net_new] == [1, 2]              # today first despite lower score
+    assert [n["on_this_day"] for n in net_new] == [True, False]
+
+
+def test_owned_tiers_sort_by_score_not_on_this_day():
+    # OWNED tiers sort by per-user watchability ALONE: a higher-score title leads even when a lower-score
+    # one falls on today (on_this_day is retained as a display flag but never forces the top), so the
+    # owned shelf stays personalized — contrast the net-new today-first behavior above.
     today = {"media": "movie", "tmdb_id": 1, "owned": True, "score": 70, "on_this_day": True, "title": "Today"}
     week = {"media": "movie", "tmdb_id": 2, "owned": True, "score": 90, "on_this_day": False, "title": "ThisWeek"}
     inv = {"1": {"rating_key": "rkToday"}, "2": {"rating_key": "rkWeek"}}
-    items, _ = gated_plan([week, today], level=ADULT, cap=5, resolve=movie_resolver(inv))
-    assert [i["rating_key"] for i in items] == ["rkToday", "rkWeek"]   # today first despite lower score
-    assert [i["on_this_day"] for i in items] == [True, False]
+    items, _ = gated_plan([today, week], level=ADULT, cap=5, resolve=movie_resolver(inv))
+    assert [i["rating_key"] for i in items] == ["rkWeek", "rkToday"]   # higher score first; today not forced up
+    assert [i["on_this_day"] for i in items] == [False, True]         # flag still carried for a badge
 
 
 def test_seen_owned_demoted_to_the_bottom_tier():

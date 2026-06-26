@@ -133,10 +133,16 @@ def gated_plan(scored, *, level, cap, resolve, seen=None):
                 # genres/votes and silently degrades to score order).
                 "genres": list(c.get("genres") or []), "votes": c.get("votes"),
             })
-    # WITHIN each group, a title whose anniversary is EXACTLY today leads ("on this very day"), then
-    # watchability. The net-new cap is applied AFTER this sort so today's finds make the cut.
-    for grp in (unwatched, seen_items, net_new):
-        grp.sort(key=_today_then_score, reverse=True)
+    # The NET-NEW (grab) picks lead with a title whose anniversary is EXACTLY today ("on this very day"),
+    # then watchability — that calendar hook is what justifies spending a grab on it; the cap is applied
+    # AFTER so today's finds make the cut. The OWNED tiers sort by per-user watchability ALONE: each row
+    # keeps its on_this_day flag (for an "anniversary today" badge) but it no longer forces the top, so a
+    # viewer's strong-affinity owned pick outranks a low-affinity title that merely falls on today — the
+    # owned shelf stays personalized even on a week with many on-this-day owned titles (a hard today-first
+    # tier would otherwise freeze an identical top slice for every user).
+    net_new.sort(key=_today_then_score, reverse=True)
+    for grp in (unwatched, seen_items):
+        grp.sort(key=_score_only, reverse=True)
     net_new = net_new[:cap]
     owned_items = unwatched + seen_items                # already-seen anniversary titles sit at the BOTTOM
     for i, item in enumerate(owned_items):
@@ -144,5 +150,9 @@ def gated_plan(scored, *, level, cap, resolve, seen=None):
     return owned_items, net_new
 
 
+def _score_only(item):
+    return item.get("score") if item.get("score") is not None else 0.0
+
+
 def _today_then_score(item):
-    return (1 if item.get("on_this_day") else 0, item.get("score") if item.get("score") is not None else 0.0)
+    return (1 if item.get("on_this_day") else 0, _score_only(item))

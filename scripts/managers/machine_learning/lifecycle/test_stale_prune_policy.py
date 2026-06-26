@@ -14,6 +14,7 @@ from scripts.managers.machine_learning.lifecycle.stale_prune_policy import (
     franchise_delete_exempt,
     prune_below_floor_action,
     prune_score_gate,
+    restore_cooldown_active,
 )
 
 _NOW = datetime(2026, 6, 10, tzinfo=timezone.utc)
@@ -51,6 +52,33 @@ def test_clock_age_parses_and_resets_on_garbage():
     # garbage resets to now (age 0, since reflects the reset)
     iso3, age3 = clock_age("nonsense", _NOW)
     assert iso3 == _NOW.isoformat() and age3 == 0
+
+
+# ── restore_cooldown_active ───────────────────────────────────────────────────────
+def test_restore_cooldown_off_is_byte_identical():
+    # min_age_days <= 0 / None / unparseable -> never blocks, regardless of timestamp
+    just_deleted = _NOW.isoformat()
+    for bad in (0, -5, None, "x"):
+        assert restore_cooldown_active(just_deleted, _NOW, bad) is False
+
+
+def test_restore_cooldown_boundary():
+    # deleted exactly 7 days ago: cooldown of 7d has elapsed -> NOT active (restorable)
+    deleted = datetime(2026, 6, 3, tzinfo=timezone.utc).isoformat()   # _NOW is 2026-06-10
+    assert restore_cooldown_active(deleted, _NOW, 7) is False
+    # one day short of 7 -> still active (blocked)
+    deleted6 = datetime(2026, 6, 4, tzinfo=timezone.utc).isoformat()
+    assert restore_cooldown_active(deleted6, _NOW, 7) is True
+    # just deleted -> blocked
+    assert restore_cooldown_active(_NOW.isoformat(), _NOW, 7) is True
+
+
+def test_restore_cooldown_naive_and_garbage():
+    # naive timestamp treated as UTC (5 days < 7 -> active)
+    assert restore_cooldown_active("2026-06-05T00:00:00", _NOW, 7) is True
+    # garbage / blank -> fail-open (not active, restore allowed) even with cooldown on
+    for bad in ("nonsense", "", None):
+        assert restore_cooldown_active(bad, _NOW, 7) is False
 
 
 # ── prune_score_gate ────────────────────────────────────────────────────────────

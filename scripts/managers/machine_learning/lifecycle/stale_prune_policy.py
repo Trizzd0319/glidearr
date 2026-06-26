@@ -16,6 +16,10 @@ Public API:
         space falls from U toward T; with no floor it's the legacy always-active dwell.
   * clock_age(since_iso, now) -> (since_iso, age_days)
         parse the per-movie "below-floor since" clock; a malformed value resets to now.
+  * restore_cooldown_active(deletion_iso, now, min_age_days) -> bool
+        whether a deleted title is still inside its re-grab cooldown (block restore until
+        min_age_days have elapsed since deletion, independent of score). Default-off
+        (<=0 -> never blocks); shared by the Radarr + Sonarr restore passes.
   * prune_score_gate(score, has_credits, floor) -> 'defer' | 'error' | 'recovered' | 'below_floor'
         the pre-dwell gate from the watchability score.
   * prune_below_floor_action(*, age_days, delete_enabled, delete_active, has_fid,
@@ -63,6 +67,37 @@ def clock_age(since_iso, now):
     except (ValueError, TypeError):
         since_dt, since_iso = now, now.isoformat()
     return since_iso, (now - since_dt).days
+
+
+def restore_cooldown_active(deletion_iso, now, min_age_days) -> bool:
+    """Whether a deleted title is still inside its re-grab cooldown — restore is
+    BLOCKED until ``min_age_days`` have elapsed since the deletion timestamp,
+    independent of how far its watchability score has recovered. Stops delete/
+    re-grab thrash when a title's score hovers right at the shared demote/restore
+    floor (deleted one run, restored the next, repeatedly).
+
+    DEFAULT (``min_age_days`` <= 0, None, or unparseable) -> False (never blocks), so
+    the restore pass stays byte-identical to the pure score gate. A naive
+    ``deletion_iso`` is treated as UTC; a blank / malformed timestamp -> False
+    (fail-open — restore rather than wedge an entry forever on a bad clock, mirroring
+    ``clock_age``'s reset-on-garbage). The boundary is inclusive of the cooldown end:
+    at exactly ``min_age_days`` elapsed the title is restorable (active iff
+    ``age_days < min_age_days``). Post-deletion counterpart to the below-floor clock
+    in :func:`clock_age`; shared by the Radarr (``restore_recovered_deletions``) and
+    Sonarr (``restore_recovered_episode_deletions``) restore passes."""
+    try:
+        days = int(min_age_days)
+    except (TypeError, ValueError):
+        return False
+    if days <= 0:
+        return False
+    try:
+        del_dt = datetime.fromisoformat(deletion_iso)
+        if del_dt.tzinfo is None:
+            del_dt = del_dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+    return (now - del_dt).days < days
 
 
 def prune_score_gate(score, has_credits, floor) -> str:
