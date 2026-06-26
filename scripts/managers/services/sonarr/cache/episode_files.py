@@ -843,6 +843,125 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         return (sub.groupby(["series_title", "resolution"], dropna=True)["video_codec"]
                 .agg(_dominant).reset_index())
 
+    @timeit("regrab_legacy_codecs")
+    def regrab_legacy_codecs(self, instance: str) -> dict:
+        """ACTUATION (gated, default-OFF): replace owned legacy-codec episode files (XviD / DivX /
+        MPEG-2 / WMV) with a modern-codec release so modern Plex clients stop transcoding them — the
+        curative twin of the AVC/x264 profile preference. Runs AFTER the transcode-decision reports
+        (report_codec_routing). For each legacy file — WATCHED first, a small per-run BUDGET, and a
+        cooldown so the same file isn't re-searched every run — ONE Sonarr interactive search confirms
+        a modern release at >= the current resolution; if found it grabs that release, and Sonarr
+        replaces the file on IMPORT (nothing is deleted first, so a file with no modern replacement is
+        left untouched and never lost). Honours dry_run (previews, grabs nothing). Off via
+        ``scoring.codec_profiles.legacy_regrab=false`` — the default, so the pass is fully inert."""
+        from datetime import datetime, timedelta, timezone
+
+        cp = (((self.config or {}).get("scoring") or {}).get("codec_profiles") or {})
+        if not cp.get("legacy_regrab", False):
+            return {}
+        instance = self._resolve_instance(instance)
+        df = self.load(instance)
+        if df is None or getattr(df, "empty", True):
+            return {}
+        from scripts.managers.machine_learning.quality_analytics.legacy_codec import (
+            best_modern_release, legacy_files_from_df, release_resolution,
+        )
+        legacy = legacy_files_from_df(df)
+        if not legacy:
+            return {}
+        budget = max(1, int(cp.get("legacy_regrab_budget", 10) or 10))
+        cooldown = timedelta(days=max(1, int(cp.get("legacy_regrab_cooldown_days", 14) or 14)))
+        now = datetime.now(tz=timezone.utc)
+        lkey = f"sonarr/legacy_regrab/{instance}"
+        ledger = dict((self.global_cache.get(lkey) if self.global_cache else None) or {})
+
+        def _recent(fid) -> bool:
+            ent = ledger.get(str(fid))
+            if not ent:
+                return False
+            try:
+                return (now - datetime.fromisoformat(ent.get("at"))) < cooldown
+            except Exception:
+                return False
+
+        queue = [r for r in legacy if not _recent(r["episode_file_id"])][:budget]
+        if not queue:
+            self.logger.log_info(
+                f"[LegacyRegrab] '{instance}': {len(legacy)} legacy-codec file(s), all within the "
+                f"re-try cooldown — nothing to do this run.")
+            return {"legacy": len(legacy), "checked": 0, "grabbed": 0}
+
+        ep_cache: dict = {}
+        grabbed = previewed = no_repl = failed = 0
+        table = []
+        for row in queue:
+            sid, fid = row["series_id"], row["episode_file_id"]
+            emap = ep_cache.get(sid)
+            if emap is None:
+                eps = self.sonarr_api._make_request(instance, f"episode?seriesId={sid}", fallback=[]) or []
+                emap = {}
+                for e in eps:
+                    f = e.get("episodeFileId")
+                    if f is not None:
+                        emap.setdefault(int(f), e)
+                ep_cache[sid] = emap
+            ep = emap.get(int(fid))
+            eid = ep.get("id") if ep else None
+            if not eid:
+                continue
+            releases = self.sonarr_api._make_request(instance, f"release?episodeId={eid}", fallback=None)
+            if releases is None:
+                continue   # transient search failure — DON'T record, re-try next run
+            best = best_modern_release(releases if isinstance(releases, list) else [], row.get("resolution") or 0)
+            sn, en = ep.get("seasonNumber"), ep.get("episodeNumber")
+            label = (f"{str(row.get('series_title') or '?')[:22]} S{sn:02d}E{en:02d}"
+                     if isinstance(sn, int) and isinstance(en, int)
+                     else str(row.get("series_title") or "?")[:28])
+            cur = f"{row.get('video_codec')}@{row.get('resolution') or '?'}"
+            if not best:
+                no_repl += 1
+                ledger[str(fid)] = {"at": now.isoformat(), "result": "no_release"}
+                continue
+            relt = (best.get("title") or "?")[:40]
+            rres = f"{release_resolution(best) or '?'}p"
+            if self.dry_run:
+                previewed += 1
+                table.append([label, cur, relt, rres, "would-grab"])
+                continue
+            ok = False
+            try:
+                res = self.sonarr_api._make_request(
+                    instance, "release", method="POST",
+                    payload={"guid": best.get("guid"), "indexerId": best.get("indexerId")}, fallback=None)
+                ok = res is not None
+            except Exception as e:
+                self.logger.log_warning(f"[LegacyRegrab] grab error for {label}: {e}")
+            if ok:
+                grabbed += 1
+                ledger[str(fid)] = {"at": now.isoformat(), "result": "grabbed"}
+                table.append([label, cur, relt, rres, "grabbed"])
+            else:
+                failed += 1
+
+        # Persist the cooldown ledger only on a REAL run — a dry-run preview must not burn cooldowns.
+        if not self.dry_run and self.global_cache:
+            try:
+                self.global_cache.set(lkey, ledger)
+            except Exception:
+                pass
+        prefix = "[dry_run] " if self.dry_run else ""
+        self.logger.log_info(
+            f"[LegacyRegrab] {prefix}'{instance}': {len(legacy)} legacy-codec file(s); checked "
+            f"{len(queue)} (budget {budget}) — {grabbed} grabbed, {previewed} would-grab, "
+            f"{no_repl} no modern release, {failed} failed.")
+        if table:
+            self.logger.log_grid(
+                ["Episode", "Current", "-> Modern release", "Res", "State"], table,
+                title=f"Legacy-codec re-grab - '{instance}'"
+                      + (" (dry-run preview)" if self.dry_run else ""), cap=24)
+        return {"legacy": len(legacy), "checked": len(queue), "grabbed": grabbed,
+                "previewed": previewed, "no_release": no_repl, "failed": failed}
+
     @timeit("refresh_enrichment")
     def refresh_enrichment(self, instance: str) -> int:
         """Broadcast per-SERIES enrichment (genres + cast/crew + Trakt rating) onto every

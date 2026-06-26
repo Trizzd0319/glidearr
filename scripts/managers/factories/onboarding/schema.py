@@ -231,7 +231,12 @@ def empty_config() -> dict:
             # direct-play matrix). enabled = the ADD-time codec re-pick (NOT wired yet → inert);
             # report = the read-only run-summary 'Codec routing preview' showing what each WATCHED
             # title's codec WOULD become vs its current codec (changes nothing). report:false hides it.
-            "codec_profiles": {"enabled": False, "report": True},
+            # legacy_regrab = the curative TV pass (Sonarr) that swaps owned XviD/DivX/MPEG-2 files —
+            # which always transcode on modern clients — for a modern-codec release; gated default-OFF,
+            # dry_run-aware, <=legacy_regrab_budget files/run, re-tried no sooner than
+            # legacy_regrab_cooldown_days (so a slow interactive search per file can't storm a run).
+            "codec_profiles": {"enabled": False, "report": True, "legacy_regrab": False,
+                               "legacy_regrab_budget": 10, "legacy_regrab_cooldown_days": 14},
         },
         # JIT next-episode quality: per_episode_tiers (default ON) lets each upcoming episode earn
         # its OWN best-that-fits tier, so one series can mix tiers (e.g. one 2160p next to four

@@ -163,6 +163,16 @@ class SonarrOrchestrationSeriesManager(BaseManager, ComponentManagerMixin):
             self.logger.log_warning(
                 f"[ShowEnrich] refresh_enrichment failed for '{resolved}': {e}"
             )
+        # Curative legacy-codec re-grab (gated, default-OFF): AFTER the transcode-decision reports
+        # (report_codec_routing runs inside refresh_scores above), swap owned XviD/DivX/MPEG-2 files
+        # — which always transcode on modern Plex clients — for a modern-codec release. Budget-capped
+        # + cooldown-laddered + dry_run-aware; inert unless scoring.codec_profiles.legacy_regrab=true.
+        try:
+            episode_files_mgr.regrab_legacy_codecs(resolved)
+        except Exception as e:
+            self.logger.log_warning(
+                f"[LegacyRegrab] regrab_legacy_codecs failed for '{resolved}': {e}"
+            )
 
     @LoggerManager().log_function_entry
     @timeit("run_full_series_enrichment")
