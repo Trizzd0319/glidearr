@@ -31,7 +31,6 @@ Exit codes: 0=ok, 1=connection/config error.
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 import time
 from collections import Counter
@@ -50,15 +49,12 @@ if str(_REPO_ROOT) not in sys.path:
 
 from scripts.managers.factories.config.config_loader import ConfigLoader   # noqa: E402
 from scripts.managers.factories.daemons.daemon_paths import CONFIG_PATH     # noqa: E402
-
-# Legacy video codecs modern Plex clients almost always transcode (MPEG-4 ASP / DivX / XviD,
-# MPEG-2, WMV/VC-1). Sonarr mediaInfo.videoCodec values seen on this library: "XviD", "MPEG2".
-_LEGACY_CODECS = {"xvid", "divx", "div3", "dx50", "mp42", "mp43", "mpeg4", "msmpeg4", "msmpeg4v3",
-                  "mpeg2", "mpeg2video", "mpeg1", "mpeg1video", "wmv", "wmv1", "wmv2", "wmv3",
-                  "vc1", "vc-1", "wvc1"}
-# Release-title tokens: MODERN = a release we'd swap TO; LEGACY = never swap to (it would re-transcode).
-_MODERN_RE = re.compile(r"(?i)\b([xh][\s._-]?26[45]|avc|hevc|av1|vp9)\b")
-_LEGACY_RE = re.compile(r"(?i)\b(xvid|divx|dx50|div3|wmv|vc-?1|mpeg-?[12]|msmpeg4)\b")
+from scripts.managers.machine_learning.quality_analytics.legacy_codec import (   # noqa: E402
+    best_modern_release,
+    is_legacy_codec as _is_legacy,
+    normalize_codec as _norm_codec,
+    release_resolution as _rel_res,
+)
 
 
 def _endpoint(icfg):
@@ -72,24 +68,11 @@ def _endpoint(icfg):
     return raw.rstrip("/"), (icfg.get("api") or "").strip()
 
 
-def _norm_codec(v):
-    return str(v or "").strip().lower().replace(" ", "").replace(".", "")
-
-
-def _is_legacy(codec):
-    c = _norm_codec(codec)
-    return c in _LEGACY_CODECS or c.startswith("msmpeg4")
-
-
 def _safe_int(v):
     try:
         return int(v)
     except (TypeError, ValueError):
         return None
-
-
-def _rel_res(rel):
-    return _safe_int(((rel.get("quality") or {}).get("quality") or {}).get("resolution")) or 0
 
 
 # ── Sonarr client ─────────────────────────────────────────────────────────────
@@ -210,27 +193,6 @@ def episode_map(client, sid, cache):
             m.setdefault(fid, e)
     cache[sid] = m
     return m
-
-
-def best_modern_release(releases, cur_res):
-    """The release to swap to: APPROVED, a modern codec in its title (and NOT a legacy one), at
-    resolution >= the current file's. Prefer the SMALLEST qualifying resolution (a codec-only swap,
-    not a resolution upgrade), then the highest custom-format score. None when nothing qualifies."""
-    cands = []
-    for r in (releases or []):
-        title = r.get("title") or ""
-        if r.get("rejected"):
-            continue
-        if _LEGACY_RE.search(title) or not _MODERN_RE.search(title):
-            continue
-        res = _rel_res(r)
-        if cur_res and res and res < cur_res:
-            continue
-        cands.append((res, -int(r.get("customFormatScore") or 0), r))
-    if not cands:
-        return None
-    cands.sort(key=lambda x: (x[0], x[1]))
-    return cands[0][2]
 
 
 def _ep_label(row):
