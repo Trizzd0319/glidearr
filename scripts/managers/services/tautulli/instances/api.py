@@ -165,6 +165,12 @@ class TautulliAPI:
     def get_metadata(self, rating_key):
         return self._request("get_metadata", {"rating_key": rating_key})
 
+    def get_stream_data(self, row_id):
+        """Per-stream playback details for one history row (``row_id``) — the per-stream transcode
+        decisions (video/audio/subtitle/container) + source-vs-stream codecs that ``get_history`` does
+        NOT carry. Used to attribute WHY a play transcoded."""
+        return self._request("get_stream_data", {"row_id": row_id})
+
     # ── Play statistics ───────────────────────────────────────────────────
 
     def get_home_stats(self, time_range: int = 30, stats_type: str = "plays",

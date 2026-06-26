@@ -247,6 +247,9 @@ class TautulliManager(BaseManager, ComponentManagerMixin):
         platform_stats   = self.devices.get_platform_usage(all_entries)
         device_codec_mtx = self.transcode.get_device_codec_matrix(all_entries)
         fingerprint_mtx  = self.transcode.get_transcode_fingerprint_matrix(all_entries)
+        # Per-row stream decisions (get_stream_data) — the per-stream transcode CAUSE detail that
+        # get_history omits; caches itself (tautulli/stream_decisions), incremental per row_id.
+        self.transcode.get_stream_decisions_cached(all_entries)
         series_stats     = self.series.get_series_completion_stats(all_entries)
         episode_stats    = self.episodes.get_episode_completion_stats(all_entries)
         # Persist the derived play-statistics signals the scorers consume:

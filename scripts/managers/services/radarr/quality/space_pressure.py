@@ -1529,10 +1529,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             return {}
         self._transcode_causes_logged = True
         metadata = (self.global_cache.get("tautulli/metadata/index") if self.global_cache else None) or {}
+        stream_decisions = (self.global_cache.get("tautulli/stream_decisions") if self.global_cache else None) or {}
         from scripts.managers.machine_learning.quality_analytics.transcode_causes import (
             transcode_cause_breakdown,
         )
-        breakdown = transcode_cause_breakdown(history, metadata)
+        breakdown = transcode_cause_breakdown(history, stream_decisions, metadata)
         rows = []
         for user, b in sorted(breakdown.items(), key=lambda kv: -kv[1]["transcodes"]):
             if b["transcodes"] <= 0:
