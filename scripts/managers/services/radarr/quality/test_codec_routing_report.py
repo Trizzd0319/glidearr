@@ -26,8 +26,9 @@ class _Api:
 
 
 class _Log:
-    def __init__(self): self.info = []
+    def __init__(self): self.info = []; self.grids = []
     def log_info(self, msg="", *a, **k): self.info.append(str(msg))
+    def log_grid(self, headers, rows, title="", cap=None): self.grids.append((title, headers, rows))
     def log_debug(self, *a, **k): pass
     def log_warning(self, *a, **k): pass
 
@@ -80,6 +81,8 @@ def test_preview_flags_transcoding_title_records_summary_and_logs():
     svc, concern, inst, headers, table, order = m._rs.calls[0]
     assert (svc, concern, inst, order) == ("radarr", "Codec routing preview", "standard", 37)
     assert table[0][-1] == "YES"
+    # table is ALSO logged directly (visible in the run log, not only the run-summary report)
+    assert m.logger.grids and m.logger.grids[0][1][0] == "Title"
     # transparency line always logged
     assert _has(m.logger.info, "[CodecRoute]", "evaluated 1 watched", "1 would change")
 

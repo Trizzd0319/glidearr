@@ -65,12 +65,27 @@ def test_report_flags_transcoding_title_and_skips_optimal_and_unwatched():
     rows = codec_report_rows(df, PROFS, MATRIX, PLATFORM, watchers)
     by_title = {r["title"]: r for r in rows}
     assert set(by_title) == {"The Bear", "Severance"}                       # unwatched dropped
-    assert by_title["The Bear"]["recommended_codec"] == "hevc"
-    assert by_title["The Bear"]["current_codec"] == "av1"
-    assert by_title["The Bear"]["change"] is True and by_title["The Bear"]["cost"] == 0.0
-    assert by_title["Severance"]["current_codec"] == "hevc"                 # x265 normalised to hevc
-    assert by_title["Severance"]["change"] is False
+    bear = by_title["The Bear"]
+    assert bear["current_codec"] == "av1" and bear["recommended_codec"] == "hevc"
+    assert bear["current_cost"] == 1.0 and bear["recommended_cost"] == 0.0  # av1 transcodes, hevc direct
+    assert bear["change"] is True                                          # real reduction -> flagged
+    sev = by_title["Severance"]
+    assert sev["current_codec"] == "hevc"                                  # x265 normalised to hevc
+    assert sev["current_cost"] == sev["recommended_cost"] and sev["change"] is False  # already optimal
     assert rows[0]["title"] == "The Bear"                                   # change-first sort
+
+
+def test_no_transcode_signal_does_not_flag_a_change():
+    # The 40/40 guard: with an EMPTY matrix every candidate ties at the neutral prior, so the size
+    # tie-break recommends AV1 — but current_cost == recommended_cost (both none_p), so gain is 0 and
+    # it is NOT flagged as a change. A recommendation needs real transcode evidence to count.
+    df = pd.DataFrame([{"title": "Cold Movie", "video_codec": "hevc", "resolution": 1080}])
+    rows = codec_report_rows(df, PROFS, {}, {}, {"cold movie": {"Z": 5}})  # user Z has no matrix data
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["recommended_codec"] == "av1"                                 # cold size default
+    assert r["current_cost"] == r["recommended_cost"]                      # both the neutral prior
+    assert r["change"] is False                                           # no evidence -> no change
 
 
 def test_report_skips_tier_with_fewer_than_two_variants():

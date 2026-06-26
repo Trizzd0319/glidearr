@@ -1490,16 +1490,22 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             f"({len(rows)} at a multi-codec tier); {n_changed} would change codec to reduce "
             f"transcoding (read-only preview; nothing applied)."
         )
-        _rs = getattr(self.global_cache, "run_summary", None) if (self.global_cache and rows) else None
-        if _rs is not None:
-            table = [[str(r["title"])[:30], ",".join(r["watchers"])[:18], r["current_codec"],
-                      r["recommended_codec"], f"{(r['cost'] or 0.0):.2f}", "YES" if r["change"] else "-"]
-                     for r in rows[:40]]
-            _rs.add_rows(
-                "radarr", "Codec routing preview", instance,
-                ["Title", "Viewers", "Current", "Recommend", "TranscodeCost", "Change"],
-                table, order=37,
+        if rows:
+            headers = ["Title", "Viewers", "Current", "Recommend", "CurCost", "RecCost", "Change"]
+            table = [[str(r["title"])[:28], ",".join(r["watchers"])[:16],
+                      r["current_codec"], r["recommended_codec"],
+                      f"{r['current_cost']:.2f}", f"{r['recommended_cost']:.2f}",
+                      "YES" if r["change"] else "-"] for r in rows[:25]]
+            # Log the table DIRECTLY so it's visible in the run log, not only the (mode-dependent)
+            # end-of-run summary. CurCost/RecCost = the viewers' predicted P(transcode) for the current
+            # vs recommended codec; a change is flagged only when RecCost is materially lower.
+            self.logger.log_grid(
+                headers, table,
+                title=f"Codec routing preview - '{instance}' (read-only; cost = P(transcode))", cap=24,
             )
+            _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
+            if _rs is not None:
+                _rs.add_rows("radarr", "Codec routing preview", instance, headers, table, order=37)
         return rows
 
     @timeit("remediate_size_anomalies")

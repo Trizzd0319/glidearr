@@ -27,8 +27,10 @@ from scripts.managers.machine_learning.quality_analytics.likely_viewers import (
     platform_weights_for_viewers,
 )
 from scripts.managers.machine_learning.quality_analytics.profile_selector import (
+    candidate_fingerprint,
     choose_codec_profile,
     classify_profile_axes,
+    viewer_transcode_cost,
 )
 from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint import _norm_video
 
@@ -78,12 +80,18 @@ def _to_int(v):
 def codec_report_rows(df, candidate_profiles, per_user_matrix, per_user_platform_usage,
                       per_title_watchers, *, title_col="title", codec_col="video_codec",
                       res_col="resolution", none_p: float = 0.5, min_n: int = 3,
-                      threshold: float = 0.15) -> list:
+                      threshold: float = 0.15, gain_threshold: float = 0.1) -> list:
     """Per-title codec recommendations for owned, WATCHED titles. Returns a list of dicts sorted
-    change-first then by transcode cost::
+    change-first then by predicted transcode reduction::
 
         {title, watchers: [user...], current_codec, resolution, recommended_codec,
-         cost, recommended_pid, change: bool}
+         current_cost, recommended_cost, gain, recommended_pid, change: bool}
+
+    ``current_cost``/``recommended_cost`` are the watch-share-weighted P(transcode) for the file's
+    CURRENT codec vs the recommended one. ``change`` is True only when a DIFFERENT codec is predicted
+    to REDUCE transcoding by more than ``gain_threshold`` — so a tie with no transcode evidence (cold
+    matrix → both costs hit the neutral prior) never reads as a recommended change, and the size
+    tie-break's cold default (AV1) doesn't masquerade as a real recommendation.
 
     ``df`` rows expose ``title_col``/``codec_col``/``res_col``; ``per_title_watchers`` is keyed by
     :func:`normalize_title`. Only titles whose resolution tier has >= 2 codec-variant candidate
@@ -116,15 +124,26 @@ def codec_report_rows(df, candidate_profiles, per_user_matrix, per_user_platform
             continue
         cur_codec = _norm_video(r.get(codec_col))
         rec_codec = reason.get("codec")
+        rec_cost = float(reason.get("cost") or 0.0)
+        # The file's CURRENT codec's predicted transcode cost for these viewers — the baseline the
+        # recommendation must actually beat for a 'change' to be meaningful (vs. a no-evidence tie).
+        cur_cost = viewer_transcode_cost(
+            candidate_fingerprint({"codec": cur_codec, "res_tier": res}),
+            likely, per_user_matrix, weights, none_p=none_p, min_n=min_n,
+        )
+        gain = cur_cost - rec_cost
         rows.append({
             "title": str(title),
             "watchers": sorted(watchers),
             "current_codec": cur_codec,
             "resolution": res,
             "recommended_codec": rec_codec,
-            "cost": reason.get("cost"),
+            "current_cost": round(cur_cost, 3),
+            "recommended_cost": round(rec_cost, 3),
+            "gain": round(gain, 3),
             "recommended_pid": rec_pid,
-            "change": bool(rec_codec and rec_codec != "unknown" and rec_codec != cur_codec),
+            "change": bool(rec_codec and rec_codec != "unknown"
+                           and rec_codec != cur_codec and gain > gain_threshold),
         })
-    rows.sort(key=lambda x: (not x["change"], -(x["cost"] or 0.0)))
+    rows.sort(key=lambda x: (not x["change"], -x["gain"]))
     return rows
