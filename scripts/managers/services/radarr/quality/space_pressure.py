@@ -1335,6 +1335,10 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             self.remediate_size_anomalies(instance, _rows)
         except Exception as e:
             self.logger.log_debug(f"[SizeAnomaly] report/remediate failed for '{instance}': {e}")
+        try:
+            self.report_codec_routing(instance, df)   # read-only preview; changes nothing
+        except Exception as e:
+            self.logger.log_debug(f"[CodecRoute] preview failed for '{instance}': {e}")
         return len(score_map)
 
     def _apply_universe_credit(self, instance: str, df) -> None:
@@ -1429,6 +1433,63 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 "radarr", "Size anomalies", instance,
                 ["Title", "Graded", "Looks like", "Size", "Expected", "Ratio", "Reclaim", "Verdict"],
                 table, order=35,
+            )
+        return rows
+
+    def report_codec_routing(self, instance: str, df=None) -> list:
+        """READ-ONLY codec-routing preview. For each owned, WATCHED movie, show the codec the
+        transcode-minimising policy WOULD pick for its actual viewers (profile_selector.
+        choose_codec_profile over the per-user device→transcode matrix) vs the file's CURRENT
+        codec. Changes NOTHING — logs a count and records a 'Codec routing preview' table in the
+        end-of-run summary so the codec-aware-routing decisions are visible before any actuation
+        is wired. Cheap no-op when there are no codec-variant profiles or no watch history.
+        Off via ``scoring.codec_profiles.report=false``. (v1 covers WATCHED titles; extending the
+        compute to all owned titles via affinity-predicted viewers is the Phase-2 follow-up.)"""
+        if not (((self.config or {}).get("scoring") or {}).get("codec_profiles") or {}).get("report", True):
+            return []
+        instance = self._resolve_instance(instance)
+        if df is None:
+            mfm = self._get_movie_files_manager()
+            df = mfm.load(instance) if mfm is not None else None
+        if df is None or getattr(df, "empty", True):
+            return []
+        history = (self.global_cache.get("tautulli/history/all") if self.global_cache else None) or []
+        if not history:
+            return []
+        try:
+            profiles = self.radarr_api._make_request(instance, "qualityprofile", fallback=[]) or []
+        except Exception:
+            profiles = []
+        if not profiles:
+            return []
+        from scripts.managers.machine_learning.quality_analytics.codec_report import (
+            build_per_title_watchers, codec_report_rows, per_user_platform_usage_from_history,
+        )
+        from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint import (
+            per_user_transcode_fingerprint_matrix,
+        )
+        rows = codec_report_rows(
+            df, profiles,
+            per_user_transcode_fingerprint_matrix(history),
+            per_user_platform_usage_from_history(history),
+            build_per_title_watchers(history),
+        )
+        if not rows:
+            return []
+        changed = [r for r in rows if r["change"]]
+        self.logger.log_info(
+            f"[CodecRoute] '{instance}': {len(changed)} of {len(rows)} watched title(s) would "
+            f"change codec to reduce transcoding for their viewers (read-only preview; nothing applied)."
+        )
+        _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
+        if _rs is not None:
+            table = [[str(r["title"])[:30], ",".join(r["watchers"])[:18], r["current_codec"],
+                      r["recommended_codec"], f"{(r['cost'] or 0.0):.2f}", "YES" if r["change"] else "-"]
+                     for r in rows[:40]]
+            _rs.add_rows(
+                "radarr", "Codec routing preview", instance,
+                ["Title", "Viewers", "Current", "Recommend", "TranscodeCost", "Change"],
+                table, order=37,
             )
         return rows
 

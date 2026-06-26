@@ -226,6 +226,12 @@ def empty_config() -> dict:
             # household favours. cap = max points (mirrors C2's ratios). enabled toggles the
             # term; it stays inert (byte-identical) until the people_matrix has been built.
             "person_affinity": {"enabled": True, "cap": 8.0},
+            # Codec-aware transcode reduction: among same-resolution codec-variant profiles, pick the
+            # one that minimises Plex transcoding for a title's likely viewers (their device→codec
+            # direct-play matrix). enabled = the ADD-time codec re-pick (NOT wired yet → inert);
+            # report = the read-only run-summary 'Codec routing preview' showing what each WATCHED
+            # title's codec WOULD become vs its current codec (changes nothing). report:false hides it.
+            "codec_profiles": {"enabled": False, "report": True},
         },
         # JIT next-episode quality: per_episode_tiers (default ON) lets each upcoming episode earn
         # its OWN best-that-fits tier, so one series can mix tiers (e.g. one 2160p next to four
