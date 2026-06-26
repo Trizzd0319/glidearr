@@ -33,6 +33,8 @@ Safety rails, all P0 (see the PR brief):
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.machine_learning.playlists.cert_gate import tier_level
 from scripts.managers.services.plex._common import anon_label, metadata_items, parse_item
@@ -67,6 +69,33 @@ _MOVIE_INVENTORY_KEY = "plex/movies/owned_inventory"
 # safe_user → our playlist ratingKey (the managed ANCHOR). Persisted so find-or-create
 # resolves by ratingKey first and we never delete a playlist we don't own.
 _ANCHOR_KEY = "plex/playlists/managed_anchor"          # + /{safe_user}
+
+# Per-family poster art (uploaded to each managed playlist when ``plex.playlists.branding.enabled``).
+# suffix → asset slug under support/assets/playlists/; MUST stay in lock-step with the generator
+# scripts/support/tools/generate_playlist_logos.py. The upload is version-gated (see _apply_branding)
+# so it happens once per playlist and re-fires only when the PNG itself changes.
+# Managed playlist titles carry NO username — each list lives on that member's OWN account, so the
+# owner is unambiguous (and the title stays non-identifying). The DISPLAY title is the bare suffix
+# ("Up Next"); the front-pinning '!' lives ONLY in the Plex titleSort key, so the visible name stays
+# clean while the list still sorts to the FRONT. '!' (ASCII 0x21) sorts ahead of every digit/letter
+# (verified live — '_' would sort AFTER capitals, so it would NOT pin to the front).
+_SORT_PREFIX = "!"
+_TITLE_KEY = "plex/playlists/titled"                   # + /{anchor_id} → last-set titleSort (edit gate)
+
+_BRAND_KEY = "plex/playlists/branded"                  # + /{anchor_id} → last-uploaded asset version
+# Bump when the upload CONTRACT changes (endpoint, format) so persisted version tokens from an older,
+# broken scheme no longer match and every poster re-uploads once. v1 used the wrong /playlists/{rk}/
+# posters endpoint (404, silently cached as done); v2 is /library/metadata/{rk}/posters + 2xx-verified.
+_BRAND_SCHEME = "2"
+_BRAND_ASSETS = {
+    _UP_NEXT_SUFFIX: "up_next",
+    "The Long Glide": "the_long_glide",
+    "Touch & Go": "touch_and_go",
+    "Fresh Arrivals": "fresh_arrivals",
+    "Anniversary Picks": "anniversary_picks",
+    "On This Week": "on_this_week",
+}
+_ASSETS_DIR = Path(__file__).resolve().parents[4] / "support" / "assets" / "playlists"
 
 # Drift fraction above which a user is skipped (the plan is too stale to write safely; a
 # re-run after the next inventory scan resolves it).
@@ -137,7 +166,7 @@ class PlaylistWritebackManager(BaseManager):
         excluded = self._excluded_users()
         valid_rks = self._valid_rating_keys(tv_inv, movie_inv)
         stats = {"armed": armed, "created": 0, "updated": 0, "deleted": 0,
-                 "skipped": 0, "users": len(tracked), "orphans": 0}
+                 "skipped": 0, "users": len(tracked), "orphans": 0, "branded": 0, "retitled": 0}
         # safe_user → de-identified handle, so run-log lines below never print the real profile
         # name (the dedicated playlists.log preview keeps it). Built once from the tracked order.
         self._anon_by_safe = {u.get("safe_user"): self._anon(u, i)
@@ -206,20 +235,32 @@ class PlaylistWritebackManager(BaseManager):
             # Not armed (no real create happened) — we've already counted a would-create and
             # logged the preview; nothing more to do this run.
             return
+
+        # Branding is applied ONCE per path, on the ratingKey that actually survives this run
+        # (version-gated, so it uploads once and no-ops thereafter; default-off, so byte-identical
+        # when branding is off). We deliberately do NOT brand up front: the recreate path mints a
+        # fresh ratingKey and brands THAT, so an early brand on the doomed old list was a wasted
+        # second upload.
+        rk = anchor["rating_key"]
+        # Clean display title + '!' titleSort (front-pin), set once, gated. Runs for fresh creates
+        # (the POST can't set titleSort) AND migrates older '{name} {suffix}' / '!{suffix}' titles.
+        self._ensure_title(safe, suffix, rk, token, armed, stats)
         if anchor.get("created"):
+            self._apply_branding(safe, suffix, rk, token, armed, stats)   # fresh list → brand it
             return                       # freshly created with the desired items, in order
 
-        rk = anchor["rating_key"]
         current = self._current_items(rk, token)
         desired_rks = [it["rating_key"] for it in desired]
         if [c["rating_key"] for c in current] == desired_rks:
-            self.logger.log_debug(f"[Writeback] '{title}' already in steady state — no write.")
-            return                       # P0 #5: current == desired → skip entirely
+            self.logger.log_debug(f"[Writeback] '{title}' already in steady state — no item write.")
+            self._apply_branding(safe, suffix, rk, token, armed, stats)   # ensure the poster (gated)
+            return                       # P0 #5: current == desired → no item write
 
         plan = self._diff(current, desired_rks)
         n_changes = len(plan["add"]) + len(plan["remove"]) + len(plan["move"])
         if n_changes > max(len(desired_rks), 1) * _RECREATE_RATIO:
-            # Diff exceeds the whole list → cheaper + safer to recreate (new-then-old).
+            # Diff exceeds the whole list → cheaper + safer to recreate (new-then-old). _recreate
+            # force-brands the NEW ratingKey, so we don't brand the about-to-be-deleted old one here.
             self._recreate(user, safe, title, rk, desired_rks, token, armed, stats, suffix)
             return
 
@@ -227,12 +268,14 @@ class PlaylistWritebackManager(BaseManager):
             self._detail(
                 f"[Writeback] [disarmed] '{title}' would update "
                 f"(+{len(plan['add'])}/-{len(plan['remove'])}/~{len(plan['move'])}).")
+            self._apply_branding(safe, suffix, rk, token, armed, stats)   # disarmed → preview only
             stats["updated"] += 1
             return
 
         self._apply_diff(rk, current, desired_rks, plan, token)
         stats["updated"] += 1
         self._audit(user, "replace", rk, len(desired_rks))
+        self._apply_branding(safe, suffix, rk, token, armed, stats)       # in-place update → brand
 
     def _find_or_create_anchor(self, safe, title, token, armed, desired, stats, suffix="Up Next") -> dict | None:
         """Resolve OUR managed playlist for this user (P0 #3). Cached ratingKey FIRST; on a
@@ -281,6 +324,8 @@ class PlaylistWritebackManager(BaseManager):
             return
         self._anchor_set(safe, new_rk, suffix)    # repoint the anchor BEFORE deleting the old one
         self.plex_api.delete_playlist(old_rk, token=token)
+        # The new list is a fresh ratingKey with no poster — force a re-brand past the version gate.
+        self._apply_branding(safe, suffix, new_rk, token, armed, stats, force=True)
         stats["updated"] += 1
         self._audit(user, "replace", new_rk, len(desired_rks))
 
@@ -544,12 +589,14 @@ class PlaylistWritebackManager(BaseManager):
             return None
         return users_mgr.server_write_token(user)
 
-    def _playlist_title(self, user, suffix="Up Next") -> str:
-        return self._title_for(user.get("title") or user.get("safe_user") or "User", suffix)
+    def _playlist_title(self, user, suffix=_UP_NEXT_SUFFIX) -> str:
+        # The CLEAN display title — bare suffix, no username, no sort prefix. The front-pinning
+        # prefix lives only in _sort_title (the Plex titleSort key).
+        return suffix
 
     @staticmethod
-    def _title_for(display, suffix="Up Next") -> str:
-        return f"{display} {suffix}"
+    def _sort_title(suffix=_UP_NEXT_SUFFIX) -> str:
+        return f"{_SORT_PREFIX}{suffix}"
 
     def _excluded_users(self) -> set:
         raw = self._pl_cfg().get("exclude_users")
@@ -627,9 +674,123 @@ class PlaylistWritebackManager(BaseManager):
         state = "ARMED" if stats["armed"] else "disarmed (dry-run/disabled — no Plex writes)"
         self.logger.log_info(
             f"[Writeback] {state}: {stats['created']} create / {stats['updated']} update / "
-            f"{stats['deleted']} delete / {stats['skipped']} skipped "
+            f"{stats['deleted']} delete / {stats['skipped']} skipped / {stats.get('branded', 0)} branded "
+            f"/ {stats.get('retitled', 0)} retitled "
             f"(over {stats['users']} user(s), {stats['orphans']} orphan(s)) "
             f"— per-playlist detail in support/logs/playlists.log.")
+
+    # ── title (rename) gate ──────────────────────────────────────────────────────
+    def _ensure_title(self, safe, suffix, rk, token, armed, stats):
+        """Give a managed playlist its CLEAN display title (bare suffix, no username) and a
+        ``!``-prefixed titleSort (front-pin) ONCE. Gated on the persisted last-set titleSort so a
+        steady run edits nothing; a fresh create gets the titleSort its POST can't set, and a list
+        carrying an old ``'{name} {suffix}'`` / ``'!{suffix}'`` title is migrated on the first armed
+        run. Honors the arm gate (disarmed only previews) and the per-user ``token``."""
+        title = self._playlist_title({}, suffix)         # clean: just the suffix
+        sort = self._sort_title(suffix)                  # '!{suffix}'
+        key = f"{_TITLE_KEY}/{self._anchor_id(safe, suffix)}"
+        if self._cache_get(key, None) == sort:
+            return
+        if not armed:
+            self._detail(f"[Writeback] [disarmed] '{suffix}' would be titled '{title}' (sort '{sort}').")
+            return
+        if rk is None or token is None:
+            return
+        if not self.plex_api.edit_playlist(rk, title=title, title_sort=sort, token=token):
+            self.logger.log_warning(
+                f"[Writeback] retitle of '{title}' failed (rk {rk}) — not cached, will retry next run.")
+            return
+        self._title_set(safe, suffix, sort)
+        stats["retitled"] = stats.get("retitled", 0) + 1
+        self._detail(f"[Writeback] titled '{title}' (sort '{sort}').")
+
+    def _title_set(self, safe, suffix, sort):
+        if not self.global_cache:
+            return
+        try:
+            self.global_cache.set(f"{_TITLE_KEY}/{self._anchor_id(safe, suffix)}", sort)
+        except Exception:
+            pass
+
+    # ── poster branding (default-off, version-gated) ─────────────────────────────
+    def _branding_cfg(self) -> dict:
+        return (self._pl_cfg().get("branding", {}) or {})
+
+    def _branding_enabled(self) -> bool:
+        """The opt-in gate for uploading per-family poster art. Default False, so with it unset the
+        whole branding path is inert and the write-back is byte-identical to before."""
+        return bool(self._branding_cfg().get("enabled", False))
+
+    def _assets_dir(self) -> Path:
+        """Where the poster PNGs live — the bundled support/assets/playlists/ dir, overridable via
+        ``plex.playlists.branding.assets_dir`` (an operator who keeps custom art elsewhere)."""
+        override = self._branding_cfg().get("assets_dir")
+        return Path(override) if override else _ASSETS_DIR
+
+    def _branding_asset(self, suffix) -> Path | None:
+        """The poster Path for a family ``suffix``, or None when there's no mapping or no file on disk
+        (a missing asset is skipped quietly — branding is best-effort, never a write-back blocker)."""
+        slug = _BRAND_ASSETS.get(suffix)
+        if not slug:
+            return None
+        path = self._assets_dir() / f"{slug}.png"
+        try:
+            return path if path.is_file() else None
+        except OSError:
+            return None
+
+    @staticmethod
+    def _asset_version(path: Path) -> str | None:
+        """A cheap content-change token (size + mtime) so a re-themed PNG re-uploads but an unchanged
+        one never does. None on a stat failure → the caller treats it as 'no asset' and skips."""
+        try:
+            st = path.stat()
+            return f"{_BRAND_SCHEME}:{st.st_size}-{st.st_mtime_ns}"
+        except OSError:
+            return None
+
+    def _apply_branding(self, safe, suffix, rk, token, armed, stats, force=False):
+        """Upload a family's poster to ITS managed playlist, once. Version-gated against
+        ``_BRAND_KEY/{anchor_id}`` so a steady-state run re-uploads nothing; ``force`` bypasses the
+        gate after a recreate (the new ratingKey has no poster yet). Honors the same arm gate as the
+        item writes — disarmed only previews — and the same per-user ``token`` so the poster lands on
+        the member's own list, never the owner's."""
+        if not self._branding_enabled():
+            return
+        asset = self._branding_asset(suffix)
+        if asset is None:
+            return
+        version = self._asset_version(asset)
+        if version is None:
+            return
+        key = f"{_BRAND_KEY}/{self._anchor_id(safe, suffix)}"
+        if not force and self._cache_get(key, None) == version:
+            return                       # already branded with this exact art → no re-upload
+        if not armed:
+            self._detail(f"[Writeback] [disarmed] '{suffix}' poster would be set.")
+            return
+        if rk is None or token is None:
+            return
+        try:
+            data = asset.read_bytes()
+        except OSError:
+            self.logger.log_warning(f"[Writeback] could not read poster '{asset.name}' — skipped.")
+            return
+        if not data:
+            return
+        # Only cache the version on a VERIFIED 2xx — a silent 404/401 must NOT mark the list branded
+        # (else it never retries). upload_playlist_poster reads the real HTTP status for us.
+        if not self.plex_api.upload_playlist_poster(rk, data, token=token):
+            self.logger.log_warning(
+                f"[Writeback] poster upload failed for '{suffix}' (rk {rk}) — not cached, will retry next run.")
+            return
+        if self.global_cache:
+            try:
+                self.global_cache.set(key, version)
+            except Exception:
+                pass
+        stats["branded"] = stats.get("branded", 0) + 1
+        self._detail(f"[Writeback] '{suffix}' poster set ({len(data)} bytes).")
 
     def _cache_get(self, key, default):
         if not self.global_cache:

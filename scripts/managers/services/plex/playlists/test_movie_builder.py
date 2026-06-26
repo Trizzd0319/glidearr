@@ -618,3 +618,33 @@ def test_fresh_arrivals_picks_join_the_delete_shield():
     cfg = {"plex": {"playlists": {"fresh_arrivals": {"enabled": True}}}}
     _mgr(cache, config=cfg)._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
     assert cache.get(_PROTECTED_KEY) == {"tmdbs": [7]}        # recommended in fresh → shielded too
+
+
+# ── recency_boost wiring (plex.playlists.recency_boost → the Up Next ordering) ──
+def test_recency_cfg_reads_and_validates():
+    assert _mgr()._recency_cfg() == (False, 30)               # absent → off, default 30-day window
+    on = _mgr(config={"plex": {"playlists": {"recency_boost": {"enabled": True, "window_days": 14}}}})
+    assert on._recency_cfg() == (True, 14)
+    bad = _mgr(config={"plex": {"playlists": {"recency_boost": {"enabled": True, "window_days": "x"}}}})
+    assert bad._recency_cfg() == (True, 30)                   # non-numeric window → default
+    neg = _mgr(config={"plex": {"playlists": {"recency_boost": {"enabled": True, "window_days": -5}}}})
+    assert neg._recency_cfg() == (True, 0)                    # negative window clamped to 0
+
+
+def test_recency_boost_lifts_freshly_acquired_movie_in_up_next():
+    # The config must reach order_items via the builder: a freshly-ACQUIRED movie (modest score) jumps
+    # to the top of Up Next when recency_boost is on; the long-owned higher-score one leads when off.
+    recent = (date.today() - timedelta(days=5)).isoformat()
+    old = (date.today() - timedelta(days=1000)).isoformat()
+    owned = [_movie_added(1, "FreshAcq", 2000, 40, recent),
+             _movie_added(2, "OldFav", 2010, 90, old)]
+    inv = {"1": {"rating_key": "fr"}, "2": {"rating_key": "ol"}}
+
+    c_off = _Cache()
+    _mgr(c_off)._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
+    assert _items(c_off, "rob") == ["ol", "fr"]              # watchability rules when off
+
+    c_on = _Cache()
+    cfg = {"plex": {"playlists": {"recency_boost": {"enabled": True, "window_days": 30}}}}
+    _mgr(c_on, config=cfg)._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
+    assert _items(c_on, "rob") == ["fr", "ol"]              # recency boost lifts the fresh acquisition

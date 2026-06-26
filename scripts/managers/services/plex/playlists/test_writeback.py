@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from scripts.managers.services.plex.playlists.writeback import (
     _ANCHOR_KEY,
+    _BRAND_KEY,
+    _TITLE_KEY,
     PlaylistWritebackManager,
 )
 
@@ -49,12 +51,14 @@ class _Cache:
 
 class _FakeAPI:
     """Captures every write verb; reads (get_playlist_items/get_playlists) come from a script."""
-    def __init__(self, token="OWNER", items_by_rk=None, playlists=None):
+    def __init__(self, token="OWNER", items_by_rk=None, playlists=None, poster_ok=True, edit_ok=True):
         self.token = token
         self.writes: list = []                # (verb, rk, extra, token)
         self._items_by_rk = items_by_rk or {}  # rk -> [{ratingKey, playlistItemID}]
         self._playlists = playlists or []      # [{ratingKey, title, playlistType}]
         self._next_rk = 9000
+        self._poster_ok = poster_ok            # the verified 2xx/failure the poster verb returns
+        self._edit_ok = edit_ok                # the verified 2xx/failure the edit verb returns
 
     # reads (token-scoped, matching the real api — captured so a test can assert per-user scope)
     def get_playlist_items(self, rating_key, token=None, fallback=None):
@@ -88,6 +92,15 @@ class _FakeAPI:
 
     def delete_playlist(self, playlist_rk, token=None, fallback=None):
         self.writes.append(("delete", playlist_rk, None, token))
+
+    def upload_playlist_poster(self, playlist_rk, image_bytes, *, content_type="image/png",
+                               token=None):
+        self.writes.append(("poster", playlist_rk, len(image_bytes), token))
+        return self._poster_ok
+
+    def edit_playlist(self, playlist_rk, *, title=None, title_sort=None, token=None):
+        self.writes.append(("edit", playlist_rk, {"title": title, "title_sort": title_sort}, token))
+        return self._edit_ok
 
 
 class _Users:
@@ -240,6 +253,7 @@ def test_find_or_create_resolves_via_cached_anchor_no_create():
     cache = _Cache({
         "plex/playlists/tv_plan/rob": _plan("a", "b"),
         f"{_ANCHOR_KEY}/rob": "555",
+        f"{_TITLE_KEY}/rob": "!Up Next",          # already migrated → title is part of steady state
     })
     api = _FakeAPI(token="OWNER", items_by_rk={"555": [
         {"ratingKey": "a", "playlistItemID": "p1"}, {"ratingKey": "b", "playlistItemID": "p2"}]})
@@ -255,7 +269,7 @@ def test_never_deletes_a_non_anchor_title_match():
     cache = _Cache({"plex/playlists/tv_plan/rob": _plan("a", "b")})
     api = _FakeAPI(token="OWNER",
                    items_by_rk={"777": [{"ratingKey": "a", "playlistItemID": "p1"}]},
-                   playlists=[{"ratingKey": "777", "title": "Rob Up Next", "playlistType": "video"}])
+                   playlists=[{"ratingKey": "777", "title": "Up Next", "playlistType": "video"}])
     m = _mgr(cache, api)
     users = _Users({"rob": "OWNER"}); users.tracked_users = [_OWNER_USER]
     m._writeback([_OWNER_USER], [{"uuid": "u-rob"}], users, _TV_INV, {})
@@ -292,6 +306,7 @@ def test_steady_state_is_a_noop():
     cache = _Cache({
         "plex/playlists/tv_plan/rob": _plan("a", "b"),
         f"{_ANCHOR_KEY}/rob": "555",
+        f"{_TITLE_KEY}/rob": "!Up Next",          # already migrated → title is part of steady state
     })
     api = _FakeAPI(token="OWNER", items_by_rk={"555": [
         {"ratingKey": "a", "playlistItemID": "p1"}, {"ratingKey": "b", "playlistItemID": "p2"}]})
@@ -307,6 +322,7 @@ def test_in_place_diff_adds_missing_item_without_recreating():
     cache = _Cache({
         "plex/playlists/tv_plan/rob": _plan("a", "b"),
         f"{_ANCHOR_KEY}/rob": "555",
+        f"{_TITLE_KEY}/rob": "!Up Next",          # already migrated → title is part of steady state
     })
     api = _FakeAPI(token="OWNER", items_by_rk={"555": [{"ratingKey": "a", "playlistItemID": "p1"}]})
     m = _mgr(cache, api)
@@ -401,7 +417,7 @@ def test_writes_one_playlist_per_enabled_family():
     users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
     stats = m._writeback([_KID_USER], [], users, _TV_INV, {})
     titles = {w[2]["title"] for w in api.writes if w[0] == "create"}
-    assert titles == {"Kid Up Next", "Kid The Long Glide", "Kid Touch & Go"}
+    assert titles == {"Up Next", "The Long Glide", "Touch & Go"}     # clean display names
     assert stats["created"] == 3
     assert cache.get(f"{_ANCHOR_KEY}/kid") is not None                     # Up Next at the LEGACY key
     assert cache.get(f"{_ANCHOR_KEY}/kid::The Long Glide") is not None     # extra family namespaced
@@ -416,7 +432,7 @@ def test_extra_family_not_written_when_flag_off():
     m = _mgr(cache, api)                                        # default config: mood_lists absent → off
     users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
     stats = m._writeback([_KID_USER], [], users, _TV_INV, {})
-    assert {w[2]["title"] for w in api.writes if w[0] == "create"} == {"Kid Up Next"}
+    assert {w[2]["title"] for w in api.writes if w[0] == "create"} == {"Up Next"}
     assert stats["created"] == 1                               # only Up Next
 
 
@@ -433,7 +449,7 @@ def test_twih_families_written_when_enabled():
     users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
     m._writeback([_KID_USER], [], users, _TV_INV, {})
     titles = {w[2]["title"] for w in api.writes if w[0] == "create"}
-    assert titles == {"Kid Anniversary Picks", "Kid On This Week"}
+    assert titles == {"Anniversary Picks", "On This Week"}
     assert cache.get(f"{_ANCHOR_KEY}/kid::Anniversary Picks") is not None
     assert cache.get(f"{_ANCHOR_KEY}/kid::On This Week") is not None
 
@@ -451,6 +467,167 @@ def test_twih_family_torn_down_when_flag_off():
     m._writeback([_KID_USER], [{"uuid": "u-kid"}], users, _TV_INV, {})
     assert ("delete", "777", None, "KIDTOK") in api.writes
     assert cache.get(f"{_ANCHOR_KEY}/kid::Anniversary Picks") is None
+
+
+# ── poster branding (default-off, version-gated) ───────────────────────────────
+def _branding_cfg(tmp_path):
+    """An armed config that points the branding path at a throwaway PNG, so the test never
+    depends on the real bundled assets (or their mtimes)."""
+    (tmp_path / "up_next.png").write_bytes(b"PNG-bytes")
+    return {"plex": {"playlists": {"writeback": {"enabled": True},
+                                   "branding": {"enabled": True, "assets_dir": str(tmp_path)}}}}
+
+
+def test_branding_off_by_default_uploads_no_poster():
+    # The default config has no branding block → the poster path is inert (byte-identical).
+    cache = _Cache({"plex/playlists/tv_plan/kid": _plan("a", "b")})
+    api = _FakeAPI(token="OWNER")
+    m = _mgr(cache, api)                                  # armed, but branding absent → off
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    stats = m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert [w for w in api.writes if w[0] == "create"]    # the list IS created…
+    assert not any(w[0] == "poster" for w in api.writes)  # …but no poster is uploaded
+    assert stats["branded"] == 0
+
+
+def test_branding_uploads_poster_once_then_version_gated(tmp_path):
+    cfg = _branding_cfg(tmp_path)
+    cache = _Cache({"plex/playlists/tv_plan/kid": _plan("a", "b")})
+    api = _FakeAPI(token="OWNER")
+    m = _mgr(cache, api, config=cfg)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    stats = m._writeback([_KID_USER], [], users, _TV_INV, {})
+    posters = [w for w in api.writes if w[0] == "poster"]
+    assert len(posters) == 1
+    assert posters[0][3] == "KIDTOK"                      # uploaded on the member's account, not owner
+    assert stats["branded"] == 1
+    # Second run: anchor + poster-version both cached → steady state, NO re-upload.
+    api.writes.clear()
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert not any(w[0] == "poster" for w in api.writes)
+
+
+def test_branding_disarmed_previews_without_uploading(tmp_path):
+    # Disarmed (dry-run) with an EXISTING playlist → preview line in the dedicated file, no upload.
+    cfg = _branding_cfg(tmp_path)
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan("a", "b"),
+        f"{_ANCHOR_KEY}/kid": "555",
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [
+        {"ratingKey": "a", "playlistItemID": "p1"}, {"ratingKey": "b", "playlistItemID": "p2"}]})
+    m = _mgr(cache, api, config=cfg, dry_run=True)        # disarmed
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert not any(w[0] == "poster" for w in api.writes)
+    assert any("poster would be set" in ln for ln in m.logger.files.get("playlists", []))
+
+
+def test_branding_reapplies_to_recreated_playlist(tmp_path):
+    # A recreate mints a fresh ratingKey with no poster → branding must re-fire past the version gate.
+    cfg = _branding_cfg(tmp_path)
+    # Pre-brand the OLD rk at the CURRENT art version so the pre-diff branding is a no-op — this
+    # isolates the recreate's FORCED re-brand (otherwise an art-change run brands old + new).
+    ver = PlaylistWritebackManager._asset_version(tmp_path / "up_next.png")
+    # Anchor [a,b,c] live; desired [c] → a 2-remove diff that exceeds the list size → recreate path.
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan("c"),
+        f"{_ANCHOR_KEY}/kid": "555",
+        f"{_BRAND_KEY}/kid": ver,
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [
+        {"ratingKey": "a", "playlistItemID": "p1"},
+        {"ratingKey": "b", "playlistItemID": "p2"},
+        {"ratingKey": "c", "playlistItemID": "p3"}]})
+    m = _mgr(cache, api, config=cfg)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    creates = [w for w in api.writes if w[0] == "create"]
+    posters = [w for w in api.writes if w[0] == "poster"]
+    assert len(creates) == 1                              # recreate happened
+    assert len(posters) == 1                              # exactly one re-brand, on the new list
+    assert posters[0][1] == creates[0][1] or posters[0][1] is not None  # targets the recreated rk
+    assert posters[0][3] == "KIDTOK"                      # still the member's account
+
+
+# ── title: clean display name (no username/'!'), '!' lives in the titleSort, set once ──────────
+def test_created_playlist_has_clean_title_and_sort_pin():
+    cache = _Cache({"plex/playlists/tv_plan/kid": _plan("a", "b")})
+    api = _FakeAPI(token="OWNER")
+    m = _mgr(cache, api)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    created = [w for w in api.writes if w[0] == "create"][0]
+    assert created[2]["title"] == "Up Next"                       # clean display name, no '!' / username
+    edit = [w for w in api.writes if w[0] == "edit"][0]
+    assert edit[2] == {"title": "Up Next", "title_sort": "!Up Next"}   # '!' only in the sort key
+    assert edit[3] == "KIDTOK"                                    # on the member's own list
+    assert cache.get(f"{_TITLE_KEY}/kid") == "!Up Next"          # gated on the titleSort
+
+
+def test_existing_playlist_retitled_once_then_gated():
+    # A playlist created under an older title (cached anchor, no titleSort key) gets the clean title
+    # + '!' titleSort once, on the MEMBER's token; the next run is gated (no edit).
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan("a", "b"),
+        f"{_ANCHOR_KEY}/kid": "555",
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [
+        {"ratingKey": "a", "playlistItemID": "p1"}, {"ratingKey": "b", "playlistItemID": "p2"}]})
+    m = _mgr(cache, api)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    stats = m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert ("edit", "555", {"title": "Up Next", "title_sort": "!Up Next"}, "KIDTOK") in api.writes
+    assert stats["retitled"] == 1
+    assert cache.get(f"{_TITLE_KEY}/kid") == "!Up Next"
+    api.writes.clear()
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert not any(w[0] == "edit" for w in api.writes)           # gated → no churn
+
+
+def test_failed_retitle_not_cached_so_it_retries():
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan("a", "b"),
+        f"{_ANCHOR_KEY}/kid": "555",
+    })
+    api = _FakeAPI(token="OWNER", edit_ok=False, items_by_rk={"555": [
+        {"ratingKey": "a", "playlistItemID": "p1"}, {"ratingKey": "b", "playlistItemID": "p2"}]})
+    m = _mgr(cache, api)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert any(w[0] == "edit" for w in api.writes)               # attempted
+    assert cache.get(f"{_TITLE_KEY}/kid") is None                # not cached → retries next run
+    assert any("retitle of 'Up Next' failed" in w for w in m.logger.warns)
+
+
+def test_branding_failed_upload_not_cached_so_it_retries(tmp_path):
+    # REGRESSION (the live bug): the old endpoint 404'd but was silently cached as branded, so it
+    # never retried. A non-2xx upload must NOT cache the version and MUST log a retry-able warning.
+    cfg = _branding_cfg(tmp_path)
+    cache = _Cache({"plex/playlists/tv_plan/kid": _plan("a", "b")})
+    api = _FakeAPI(token="OWNER", poster_ok=False)        # Plex rejects the poster (e.g. 404/401)
+    m = _mgr(cache, api, config=cfg)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    stats = m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert any(w[0] == "poster" for w in api.writes)       # the upload WAS attempted
+    assert stats["branded"] == 0                           # ...but never counted as branded
+    assert cache.get(f"{_BRAND_KEY}/kid") is None          # ...and NOT cached → next run retries
+    assert any("poster upload failed" in w for w in m.logger.warns)
+
+
+def test_branding_no_double_upload_on_in_place_update(tmp_path):
+    # The recreate double-upload is gone: an in-place item update brands the surviving rk exactly once.
+    cfg = _branding_cfg(tmp_path)
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan("a", "b"),     # desired [a,b]
+        f"{_ANCHOR_KEY}/kid": "555",
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [{"ratingKey": "a", "playlistItemID": "p1"}]})
+    m = _mgr(cache, api, config=cfg)                        # current [a] → one add, in-place
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert len([w for w in api.writes if w[0] == "add"]) == 1
+    assert len([w for w in api.writes if w[0] == "poster"]) == 1   # branded exactly once
 
 
 def test_orphan_sweep_deletes_namespaced_extra_family_anchor():

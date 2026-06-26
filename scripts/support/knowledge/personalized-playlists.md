@@ -302,6 +302,7 @@ Everything below lives under the `plex.playlists` section of your config, plus a
 | Setting | What it does | Default |
 |---|---|---|
 | `plex.playlists.writeback.enabled` | Actually write playlists to Plex (still needs `dry_run = false`) | `false` |
+| `plex.playlists.branding.enabled` | Upload Glidearr poster art to each managed playlist (Up Next, Touch & Go, …); needs write-back armed | `false` |
 | `plex.playlists.recency_boost.enabled` | Turn on the "new season of a show you finished" lift | `false` |
 | `plex.playlists.cold_start_kids_prior` | Seed a no-history kid profile from the household's kid taste | `false` |
 | `plex.playlists.exclude_users` | Profiles (by name) to leave completely untouched | empty |

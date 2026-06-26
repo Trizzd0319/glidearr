@@ -144,11 +144,17 @@ class PlexAPI:
     # ── core request ────────────────────────────────────────────────────────
     def _request(self, method: str, url: str, token: str | None = None,
                  params: dict | None = None, headers: dict | None = None,
-                 external: bool = False, fallback=None, _retry: bool = True):
+                 external: bool = False, fallback=None, _retry: bool = True,
+                 data: bytes | None = None, return_response: bool = False):
         """One Plex HTTP call. Returns parsed JSON (dict) or ``fallback``.
 
         TLS verification is left at the requests default (ON). The URL is scrubbed
-        of its query string in every log line.
+        of its query string in every log line. ``data`` is an optional raw request
+        BODY (e.g. a poster's image bytes); it is only sent when present, so the
+        query-param-only writes stay body-free. ``return_response`` returns the raw
+        ``requests.Response`` on a 2xx (and ``fallback`` on any failure) — needed by
+        write verbs whose SUCCESS is an empty 200 body, which is otherwise
+        indistinguishable from a silently-swallowed 404.
         """
         hdrs = self._headers(token)
         if headers:
@@ -162,10 +168,11 @@ class PlexAPI:
         for attempt in range(self._MAX_RETRIES):
             try:
                 self.calls_made += 1
-                resp = self._session.request(
-                    method=method, url=url, params=params, headers=hdrs,
-                    timeout=(self._CONNECT_TIMEOUT, self._READ_TIMEOUT),
-                )
+                req_kwargs = dict(method=method, url=url, params=params, headers=hdrs,
+                                  timeout=(self._CONNECT_TIMEOUT, self._READ_TIMEOUT))
+                if data is not None:
+                    req_kwargs["data"] = data
+                resp = self._session.request(**req_kwargs)
 
                 if resp.status_code == 429:
                     wait = int(resp.headers.get("Retry-After", 10) or 10)
@@ -182,7 +189,8 @@ class PlexAPI:
                     # already charged on this entry, and the Retry-After sleep above
                     # already enforced the backoff — re-throttling would double-count.
                     return self._request(method, url, token, params, headers,
-                                         external=False, fallback=fallback, _retry=False)
+                                         external=False, fallback=fallback, _retry=False,
+                                         data=data, return_response=return_response)
 
                 if resp.status_code in (401, 403):
                     # Scope/token failure — caller decides how to degrade. Do NOT retry
@@ -195,6 +203,8 @@ class PlexAPI:
                     return fallback
 
                 resp.raise_for_status()
+                if return_response:
+                    return resp                       # 2xx: hand back the raw response (status known)
                 if not resp.content:
                     return fallback
                 try:
@@ -360,6 +370,43 @@ class PlexAPI:
         write strategy, since the cached plan is already fully ranked)."""
         return self._request("DELETE", f"{self.base_url}/playlists/{playlist_rk}",
                              token=token, fallback=fallback)
+
+    def upload_playlist_poster(self, playlist_rk, image_bytes, *, content_type: str = "image/png",
+                               token: str | None = None) -> bool:
+        """Set a playlist's poster from raw image BYTES; returns True only on a real 2xx.
+
+        The endpoint is ``POST /library/metadata/{ratingKey}/posters`` — a playlist's ratingKey
+        resolves under ``/library/metadata`` (verified live: ``/playlists/{rk}/posters`` 404s). The
+        bytes ride the request BODY, not a ``uri``/``url`` param. ``token`` scopes the write to the
+        playlist's OWNER (a managed member's per-server accessToken) so the poster lands on that
+        member's own list. We read the HTTP STATUS (``return_response``) rather than trust the
+        empty-200 body, so a silent 404/401 is reported as failure and the caller can retry."""
+        if not image_bytes:
+            return False
+        resp = self._request("POST", f"{self.base_url}/library/metadata/{playlist_rk}/posters",
+                             token=token, data=image_bytes,
+                             headers={"Content-Type": content_type}, return_response=True)
+        return bool(resp is not None and 200 <= getattr(resp, "status_code", 0) < 300)
+
+    def edit_playlist(self, playlist_rk, *, title: str | None = None, title_sort: str | None = None,
+                      token: str | None = None) -> bool:
+        """Edit a playlist's display ``title`` and/or its ``title_sort`` — ``PUT /playlists/{rk}`` —
+        returning True only on a 2xx. The sort key uses the LOCKED-field form
+        (``titleSort.value`` + ``titleSort.locked=1``); the plain ``titleSort`` param is silently
+        ignored by PMS (verified live). This lets the visible title stay clean while a ``!``-prefixed
+        sort key pins the playlist to the FRONT of the list. ``token`` scopes the edit to the
+        playlist's OWNER (a managed member's per-server token) so it lands on that member's own list."""
+        params: dict = {}
+        if title is not None:
+            params["title"] = title
+        if title_sort is not None:
+            params["titleSort.value"] = title_sort
+            params["titleSort.locked"] = 1
+        if not params:
+            return False
+        resp = self._request("PUT", f"{self.base_url}/playlists/{playlist_rk}",
+                             token=token, params=params, return_response=True)
+        return bool(resp is not None and 200 <= getattr(resp, "status_code", 0) < 300)
 
     # ── library COLLECTIONS: write + Home promotion (owner-token; the managed-hub API) ──
     # Mirrors python-plexapi's Collection.create + ManagedHub.updateVisibility (the proven path):

@@ -201,13 +201,17 @@ def tv_inputs(owned_eps: list, owned_inventory: dict, watched, series_scores: di
 def build_tv_plan(owned_eps: list, owned_inventory: dict, watched, series_scores: dict,
                   *, family: str = "up_next", episode_cap: int = 25, max_items: int = 300,
                   mode: str = NEXT_UNWATCHED, franchise_by_series: dict | None = None,
-                  series_timeline: dict | None = None):
+                  series_timeline: dict | None = None,
+                  recency_boost: bool = False, window_days: int = 30):
     """Resolve + expand owned episodes (:func:`tv_inputs`) then hand them to the brain to
-    order. Returns ``(PlaylistPlan, stats)``."""
+    order. Returns ``(PlaylistPlan, stats)``. ``recency_boost`` lifts a series you're caught up
+    on the moment its freshest next-unwatched episode aired within ``window_days`` (see
+    :func:`order_items`); OFF (default) → byte-identical."""
     expanded, stats = tv_inputs(owned_eps, owned_inventory, watched, series_scores,
                                 episode_cap=episode_cap, mode=mode,
                                 franchise_by_series=franchise_by_series,
                                 series_timeline=series_timeline)
-    plan = order_items(expanded, family=family, max_items=max_items)
+    plan = order_items(expanded, family=family, max_items=max_items,
+                       recency_boost=recency_boost, window_days=window_days)
     stats["in_plan"] = len(plan.items)
     return plan, stats

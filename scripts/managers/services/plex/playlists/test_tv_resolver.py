@@ -94,6 +94,23 @@ def test_episode_cap_limits_per_series():
     assert [i.rating_key for i in plan.items] == ["r1", "r2"]   # earliest 2 unwatched
 
 
+def test_recency_boost_lifts_a_freshly_aired_caught_up_series():
+    # The intended use: a series you're caught up on whose next-unwatched episode just aired (within
+    # window_days) jumps to the top of Up Next when recency_boost is on; the higher-watchability but
+    # stale series leads when off. Proves build_tv_plan threads the flag into order_items.
+    from datetime import date, timedelta
+    fresh = (date.today() - timedelta(days=5)).isoformat()
+    owned = [{"series_id": 1, "season_number": 1, "episode_number": 1, "tvdb_join_key": "s1",
+              "title": "Fresh", "air_date_utc": fresh, "is_special": False},
+             {"series_id": 2, "season_number": 1, "episode_number": 1, "tvdb_join_key": "s2",
+              "title": "Old", "air_date_utc": "2005-01-01", "is_special": False}]
+    inv = {"s1": {"rating_key": "fresh"}, "s2": {"rating_key": "stale"}}
+    off, _ = build_tv_plan(owned, inv, set(), {1: 40, 2: 90})
+    on, _ = build_tv_plan(owned, inv, set(), {1: 40, 2: 90}, recency_boost=True, window_days=30)
+    assert [i.rating_key for i in off.items] == ["stale", "fresh"]   # watchability rules off
+    assert [i.rating_key for i in on.items] == ["fresh", "stale"]    # fresh caught-up series lifted
+
+
 def test_series_ordered_by_watchability():
     owned = [_owned(1, 1, 1, "a1"), _owned(2, 1, 1, "b1")]
     inv = {"a1": {"rating_key": "a"}, "b1": {"rating_key": "b"}}

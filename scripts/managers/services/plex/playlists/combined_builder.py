@@ -146,10 +146,12 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                                        universe_membership=universe_membership,
                                        watch_recency=(movie_recency or {}).get(u["safe_user"], {}))
 
+            recency_on, recency_window = self._recency_cfg()
             plan, stats = build_combined_plan([tv_items, mv_items], family="up_next",
                                               max_items=self._max_items(),
                                               resume_boost=resume_boost, resume_order=resume_order,
                                               resume_weight=resume_weight,
+                                              recency_boost=recency_on, window_days=recency_window,
                                               series_recency=series_recency)   # lift in-progress TV too
             if self.global_cache:
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))

@@ -155,12 +155,14 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
             movie_scores = self._per_user_movie_scores(user_owned, user_aff, hh_max, (aff_w, hh_w, jit_w),
                                                        self._genre_match_opts())
 
+            recency_on, recency_window = self._recency_cfg()
             plan, stats = build_movie_plan(user_owned, inventory, watched, movie_scores,
                                            family="up_next", max_items=self._max_items(),
                                            universe_order=universe_order,
                                            universe_membership=universe_membership,
                                            resume_boost=resume_boost, resume_order=resume_order,
                                            resume_weight=resume_weight,
+                                           recency_boost=recency_on, window_days=recency_window,
                                            watch_recency=(recency_by_user or {}).get(u["safe_user"], {}))
             if self.global_cache:
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))

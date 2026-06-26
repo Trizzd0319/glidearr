@@ -1,6 +1,8 @@
 """Tests for combined_resolver.build_combined_plan — cross-medium merge + per-medium order."""
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from scripts.managers.machine_learning.playlists.models import PlaylistInput
 from scripts.managers.services.plex.playlists.combined_resolver import build_combined_plan
 
@@ -27,3 +29,16 @@ def test_watched_dropped_across_mediums():
 def test_empty_inputs_safe():
     plan, stats = build_combined_plan([[], []])
     assert plan.items == () and stats["in_plan"] == 0
+
+
+def test_recency_boost_threads_through_and_lifts_a_caught_up_fresh_item():
+    # build_combined_plan must pass recency_boost/window_days into order_items: a caught-up, freshly
+    # acquired item (modest score) leads when on; the higher-watchability stale one leads when off.
+    fresh = (date.today() - timedelta(days=5)).isoformat()          # within the 30-day window
+    items = [PlaylistInput(rating_key="fresh", medium="movie", title="Fresh", score=30, added_at=fresh),
+             PlaylistInput(rating_key="stale_hi", medium="movie", title="StaleHi", score=95,
+                           release_date="2001-01-01")]
+    off, _ = build_combined_plan([items])
+    on, _ = build_combined_plan([items], recency_boost=True, window_days=30)
+    assert [i.rating_key for i in off.items] == ["stale_hi", "fresh"]   # watchability rules off
+    assert [i.rating_key for i in on.items] == ["fresh", "stale_hi"]    # recency boost flips it

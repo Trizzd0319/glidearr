@@ -165,6 +165,53 @@ def test_delete_playlist():
     assert call["method"] == "DELETE" and call["url"].endswith("/playlists/777")
 
 
+def test_upload_playlist_poster_posts_bytes_to_library_metadata():
+    a = _cap_api([_Resp(200, {})])
+    ok = a.upload_playlist_poster("777", b"\x89PNG-data", token="UT")
+    assert ok is True                                      # 2xx → verified success
+    call = a._session.calls[0]
+    # The playlist ratingKey resolves under /library/metadata (the /playlists/{rk}/posters path 404s).
+    assert call["method"] == "POST" and call["url"].endswith("/library/metadata/777/posters")
+    assert call["data"] == b"\x89PNG-data"                # bytes ride the BODY, not a uri param
+    assert "params" not in call or call["params"] is None  # no query items on a poster upload
+    assert call["headers"]["Content-Type"] == "image/png"
+    assert call["headers"]["X-Plex-Token"] == "UT"        # per-user scope → member's own list
+
+
+def test_upload_playlist_poster_false_on_404():
+    # The 404 the OLD endpoint returned must surface as failure, not a silent success.
+    a = _cap_api([_Resp(404, {})])
+    assert a.upload_playlist_poster("777", b"\x89PNG-data", token="UT") is False
+
+
+def test_upload_playlist_poster_skips_empty_bytes():
+    a = _cap_api([])                                       # no scripted response → must not call out
+    assert a.upload_playlist_poster("777", b"", token="UT") is False
+    assert a._session.calls == []
+
+
+def test_edit_playlist_sets_title_and_locked_titlesort():
+    a = _cap_api([_Resp(200, {})])
+    ok = a.edit_playlist("777", title="Up Next", title_sort="!Up Next", token="UT")
+    assert ok is True
+    call = a._session.calls[0]
+    assert call["method"] == "PUT" and call["url"].endswith("/playlists/777")
+    # The plain titleSort param is ignored by PMS — the LOCKED field form is required.
+    assert call["params"] == {"title": "Up Next", "titleSort.value": "!Up Next", "titleSort.locked": 1}
+    assert call["headers"]["X-Plex-Token"] == "UT"        # per-user scope → member's own list
+
+
+def test_edit_playlist_false_on_404():
+    a = _cap_api([_Resp(404, {})])
+    assert a.edit_playlist("777", title="Up Next", title_sort="!Up Next", token="UT") is False
+
+
+def test_edit_playlist_noop_when_nothing_to_set():
+    a = _cap_api([])
+    assert a.edit_playlist("777", token="UT") is False
+    assert a._session.calls == []
+
+
 # ── library COLLECTIONS write + Home promotion (managed-hub API) ──────────────
 def test_create_collection_section_scoped_items_in_uri_query():
     a = _cap_api([_Resp(200, {})])

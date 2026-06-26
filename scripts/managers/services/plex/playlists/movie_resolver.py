@@ -235,17 +235,21 @@ def build_movie_plan(owned_movies: list, owned_inventory: dict, watched, movie_s
                      universe_order: dict | None = None, universe_membership: dict | None = None,
                      watch_recency: dict | None = None,
                      resume_boost: bool = False, resume_order: str = "recency",
-                     resume_weight: float = 0.0):
+                     resume_weight: float = 0.0,
+                     recency_boost: bool = False, window_days: int = 30):
     """Build movie candidates (:func:`movie_inputs`) then hand them to the brain to order.
     Returns ``(PlaylistPlan, stats)``. ``resume_boost`` lifts an in-progress movie saga (see
-    :func:`order_items`); ``watch_recency`` stamps ``last_watched`` for its recency key."""
+    :func:`order_items`); ``watch_recency`` stamps ``last_watched`` for its recency key.
+    ``recency_boost`` lifts a caught-up saga whose freshest member landed within ``window_days``
+    (it takes precedence over ``resume_boost``); OFF (default) → byte-identical."""
     inputs, stats = movie_inputs(owned_movies, owned_inventory, watched, movie_scores,
                                  universe_order=universe_order,
                                  universe_membership=universe_membership,
                                  watch_recency=watch_recency)
     plan = order_items(inputs, family=family, max_items=max_items,
                        resume_boost=resume_boost, resume_order=resume_order,
-                       resume_weight=resume_weight)
+                       resume_weight=resume_weight,
+                       recency_boost=recency_boost, window_days=window_days)
     stats["in_plan"] = len(plan.items)
     return plan, stats
 

@@ -226,10 +226,12 @@ class PlexPlaylistBuilderManager(BaseManager):
             user_scores = self._per_user_series_scores(
                 series_scores, series_genres, user_aff, user_jit, hh_max, (aff_w, hh_w, jit_w),
                 self._genre_match_opts())
+            recency_on, recency_window = self._recency_cfg()
             plan, stats = build_tv_plan(
                 user_owned, inventory, watched, user_scores, family="up_next",
                 episode_cap=self._episode_cap(), max_items=self._max_items(),
-                franchise_by_series=franchise_by_series, series_timeline=series_timeline)
+                franchise_by_series=franchise_by_series, series_timeline=series_timeline,
+                recency_boost=recency_on, window_days=recency_window)
             if self.global_cache:
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))
             reasons = self._tv_reasons(user_owned, inventory, series_genres, user_aff, user_jit)
@@ -848,6 +850,18 @@ class PlexPlaylistBuilderManager(BaseManager):
             return int(self._pl_cfg().get("max_items", 100))
         except (TypeError, ValueError):
             return 100
+
+    def _recency_cfg(self):
+        """(enabled, window_days) from plex.playlists.recency_boost — lift a group the viewer is
+        CAUGHT UP on the instant its freshest member lands within window_days (e.g. a show you've
+        finished whose new episode just aired). order_items gives this precedence over resume_boost.
+        OFF (default) → byte-identical. Shared by the TV, movie, and combined Up Next builders."""
+        rc = self._pl_cfg().get("recency_boost", {}) or {}
+        try:
+            window = int(rc.get("window_days", 30))
+        except (TypeError, ValueError):
+            window = 30
+        return bool(rc.get("enabled", False)), max(0, window)
 
     def _genre_match_opts(self) -> dict:
         """genre_match shape knobs (plex.playlists.*) — passed into every per-user score so the
