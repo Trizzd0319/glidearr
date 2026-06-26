@@ -652,6 +652,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             self.report_size_anomalies(instance, df)
         except Exception as e:
             self.logger.log_debug(f"[SizeAnomaly] report failed for '{instance}': {e}")
+        try:
+            self.report_codec_routing(instance, df)   # read-only codec preview; changes nothing
+        except Exception as e:
+            self.logger.log_debug(f"[CodecRoute] report failed for '{instance}': {e}")
         return len(score_by_series)
 
     def _apply_universe_credit(self, instance: str, df) -> None:
@@ -739,6 +743,105 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return f"{title} S{sn:02d}E{en:02d}"
         except (TypeError, ValueError):
             return title
+
+    @timeit("report_codec_routing")
+    def report_codec_routing(self, instance: str, df=None) -> list:
+        """READ-ONLY codec-routing preview for SERIES — the TV twin of
+        ``RadarrSpacePressureManager.report_codec_routing``. For each owned, WATCHED series at a
+        resolution tier that has >= 2 codec-variant quality profiles, show the codec the
+        transcode-minimising policy WOULD pick for its actual viewers (profile_selector.
+        choose_codec_profile over the per-user device->transcode matrix) vs the files' current
+        (dominant) codec. Changes NOTHING — logs a count and records a 'Codec routing preview'
+        table in the end-of-run summary. Per-episode-file rows are reduced to one (series,
+        resolution) row at the dominant codec, so a series with mixed-codec tiers surfaces each
+        tier. Off via ``scoring.codec_profiles.report=false``."""
+        if not (((self.config or {}).get("scoring") or {}).get("codec_profiles") or {}).get("report", True):
+            return []
+        instance = self._resolve_instance(instance)
+        if df is None:
+            df = self.load(instance)
+        if df is None or getattr(df, "empty", True):
+            return []
+        history = (self.global_cache.get("tautulli/history/all") if self.global_cache else None) or []
+        if not history:
+            self.logger.log_info(
+                f"[CodecRoute] '{instance}': no Tautulli watch history cached yet — nothing to evaluate.")
+            return []
+        try:
+            profiles = self.sonarr_api._make_request(instance, "qualityProfile", fallback=[]) or []
+        except Exception:
+            profiles = []
+        if not profiles:
+            self.logger.log_info(f"[CodecRoute] '{instance}': no quality profiles available — skipped.")
+            return []
+        series_df = self._series_codec_frame(df)
+        if series_df is None or getattr(series_df, "empty", True):
+            return []
+        from scripts.managers.machine_learning.quality_analytics.codec_report import (
+            build_per_title_watchers, codec_report_rows, normalize_title,
+            per_user_platform_usage_from_history,
+        )
+        from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint import (
+            per_user_source_fingerprint_matrix, per_user_transcode_fingerprint_matrix,
+        )
+        # Source-codec matrix (keyed by the FILE's codec via the metadata index, NOT Plex's streamed /
+        # transcode-target codec) so the prediction is codec-aware; falls back to the streamed matrix
+        # only when no metadata index is cached yet. Identical to the Radarr movie preview.
+        metadata = (self.global_cache.get("tautulli/metadata/index") if self.global_cache else None) or {}
+        matrix = (per_user_source_fingerprint_matrix(history, metadata) if metadata
+                  else per_user_transcode_fingerprint_matrix(history))
+        watchers = build_per_title_watchers(history)
+        rows = codec_report_rows(
+            series_df, profiles, matrix,
+            per_user_platform_usage_from_history(history),
+            watchers, title_col="series_title",
+        )
+        # TRANSPARENCY: always report what the pass evaluated. ``n_watched`` is owned series that appear
+        # in the watch history; ``len(rows)`` is the subset at a multi-codec tier (the only place a codec
+        # CAN be re-picked). Mirrors the Radarr movie preview's transparency line.
+        n_watched = sum(1 for t in series_df["series_title"] if normalize_title(t) in watchers)
+        n_changed = sum(1 for r in rows if r["change"])
+        self.logger.log_info(
+            f"[CodecRoute] '{instance}': evaluated {n_watched} watched series "
+            f"({len(rows)} at a multi-codec tier); {n_changed} would change codec to reduce "
+            f"transcoding (read-only preview; nothing applied)."
+        )
+        if rows:
+            headers = ["Series", "Viewers", "Current", "Recommend", "CurCost", "RecCost", "Change"]
+            table = [[str(r["title"])[:28], ",".join(r["watchers"])[:16],
+                      r["current_codec"], r["recommended_codec"],
+                      f"{r['current_cost']:.2f}", f"{r['recommended_cost']:.2f}",
+                      "YES" if r["change"] else "-"] for r in rows[:25]]
+            self.logger.log_grid(
+                headers, table,
+                title=f"Codec routing preview (TV) - '{instance}' (read-only; cost = P(transcode))", cap=24,
+            )
+            _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
+            if _rs is not None:
+                _rs.add_rows("sonarr", "Codec routing preview", instance, headers, table, order=37)
+        return rows
+
+    @staticmethod
+    def _series_codec_frame(df):
+        """Reduce per-episode-file rows to one row per (series_title, resolution) at the DOMINANT
+        (most common) ``video_codec`` — the movie codec preview is 1 file = 1 title, but a series has
+        many files at possibly mixed codecs/tiers, so each (series, tier) is summarised to the codec
+        that dominates it (a series mostly h264@720 + some XviD@480 surfaces BOTH tiers). Returns a
+        DataFrame with series_title/resolution/video_codec; empty frame when those columns are absent.
+        Pure DataFrame reshape."""
+        need = ["series_title", "resolution", "video_codec"]
+        if df is None or not set(need) <= set(getattr(df, "columns", [])):
+            return pd.DataFrame(columns=need)
+        sub = df[need].dropna(subset=["series_title", "resolution"])
+        if sub.empty:
+            return pd.DataFrame(columns=need)
+
+        def _dominant(s):
+            vc = s.dropna().value_counts()
+            return vc.index[0] if len(vc) else None
+
+        return (sub.groupby(["series_title", "resolution"], dropna=True)["video_codec"]
+                .agg(_dominant).reset_index())
 
     @timeit("refresh_enrichment")
     def refresh_enrichment(self, instance: str) -> int:
