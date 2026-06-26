@@ -68,6 +68,7 @@ _DOC_LEAVES = [
     ("owned_delete_enabled", "true", "DELETE the file after a longer sustained low-watchability window"),
     ("owned_delete_dwell_days", "90", "Days below the floor before deleting the file (restorable)"),
     ("owned_restore_score_threshold", "20", "Re-acquire a deleted movie if its score recovers above this"),
+    ("owned_restore_min_age_days", "0", "Min days since deletion before a recovered title may be re-acquired (0 = off; stops delete/re-grab thrash)"),
     ("owned_delete_min_dwell_days", "7", "Most-expedited delete dwell when free space is at the floor"),
     ("space_pressure_headroom_ratio", "0.10", "Pressure band above free_space_limit (0.10 = up to +10%)"),
     ("space_pressure_delete_enabled", "true", "Delete lowest-rated movies to free space below free_space_limit"),
@@ -90,6 +91,9 @@ _DOC_LEAVES = [
     ("pilot_interactive.enabled", "true", "Pilot search via ONE Sonarr interactive search per stub (grab the lowest available resolution in one shot, flag UNACQUIRABLE when nothing is found) instead of the blind tier-by-tier climb. false = legacy climb"),
     ("pilot_interactive.recheck_days", "7", "How long an UNACQUIRABLE pilot stays blocked before re-searching (it also re-checks immediately when a new indexer is added). Days"),
     ("pilot_interactive.floor_res", "0", "Minimum resolution (px height) a pilot grab will consider; 0 = grab the lowest available at any resolution"),
+    ("pilot_interactive.search_no_resolution", "true", "When releases exist but report NO resolution (likely SD-only), search at the floor tier so Sonarr can grab them; false = flag UNACQUIRABLE"),
+    ("pilot_interactive.skip_hard_rejects", "true", "Skip + flag a pilot when EVERY release is rejected for a profile-independent reason (size/blocklist/incomplete) a profile flip can't fix; false = search anyway"),
+    ("pilot_interactive.anime_ladder", "true", "Route anime (seriesType=anime) stubs onto the [Anime] quality-profile ladder so they're never flipped onto an x265-penalising live-action profile; false = use the regular ladder"),
     ("acquisition.next_episode.mode", "recommended", "Next-episode prefetch tuning: recommended | customize | off (set =off to keep it disabled headlessly)"),
     ("acquisition.universe.enabled", "false", "Hybrid universe acquisition: once the household watches part of a saga (MCU, Star Trek, Arrowverse, One Chicago…), grab its remaining films (Radarr) + shows (Sonarr) in timeline order — START-first. Default off; honours dry_run + free-space band. Needs plex.playlists.universe_timeline on"),
     ("acquisition.universe.max_per_run", "5", "Per-run cap on universe backfill grabs (bypasses acquisition.max_adds_per_run / min_score — explicit intent, own budget)"),
@@ -153,7 +157,7 @@ _DOC_LEAVES = [
     ("plex.playlists.writeback.enabled", "false", "WRITES per-user playlists into Plex (create/update real playlists). Off until you opt in; ALSO requires dry_run=false"),
     ("plex.playlists.max_items", "100", "Max items per per-user playlist"),
     ("plex.playlists.exclude_users", "", "Comma-separated profile titles / safe_users to skip when building playlists"),
-    ("plex.playlists.recency_boost.enabled", "false", "Lift recently-aired/added items in the per-user ordering (inert until enabled)"),
+    ("plex.playlists.recency_boost.enabled", "false", "Lift a show/saga you're caught up on to the top of Up Next the moment its freshest item lands within window_days (e.g. a finished show whose new episode just aired); applies to the TV, movie, and combined per-user ordering"),
     ("plex.playlists.fresh_arrivals.enabled", "false", "Build a per-profile 'Fresh Arrivals' playlist of genuinely-new movie acquisitions (churn-immune; off until enabled)"),
     ("plex.playlists.fresh_arrivals.acquired_window_days", "45", "How many days back counts as a 'fresh arrival' for that playlist"),
     ("plex.playlists.home_collections.enabled", "false", "Build the age-tiered 'Up Next - <Tier>' collections and pin them to Home (REAL Plex writes; off until enabled, also needs dry_run=false)"),
@@ -178,6 +182,8 @@ _DOC_LEAVES = [
     ("daemons.enrich.enabled", "false", "Run the background Trakt enrichment daemon; main runs go cache-only"),
     ("daemons.enrich.owned_first", "true", "Enrich in-library (owned) movies before unowned"),
     ("daemons.enrich.scope", "summary,people,ratings,related,aliases,studios", "Comma-separated Trakt buckets per movie"),
+    ("daemons.pilot_search.enabled", "true", "Spill large Sonarr pilot interactive-search batches to a background daemon so big sprees never hang the run"),
+    ("daemons.pilot_search.threshold", "10", "Batches LARGER than this many stub pilots go to the daemon; <= stay in-process"),
 ]
 
 # Fields templated once per Sonarr/Radarr session.

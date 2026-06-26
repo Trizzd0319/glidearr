@@ -90,6 +90,37 @@ DEFAULT_SCOPE: list[str] = ["summary", "people", "ratings", "related", "aliases"
 # them cheap once warm; each adds at most one endpoint-call per show per TTL.
 SHOW_SCOPE:    list[str] = ["summary", "people", "ratings", "related"]
 
+# ── Pilot-search daemon ─────────────────────────────────────────────────────────
+# A SECOND, independent daemon (scripts/support/daemons/pilot_search_daemon.py) that
+# drains Sonarr pilot interactive-search jobs out of the main run process. ``run_pilot_search``
+# hands a large batch (> threshold stubs) to this daemon via a JSON job file instead of the
+# in-process NON-daemon worker thread — that thread blocks interpreter exit, so a 9k-stub
+# spree would hang the whole run until every indexer search finished. Small batches still run
+# in-process. Its files live in their OWN directory (not the Trakt cache) so the two daemons
+# never collide on pid / stop / log.
+PILOT_DAEMON_SCRIPT   = SUPPORT_DIR / "daemons" / "pilot_search_daemon.py"
+PILOT_CACHE_DIR       = SUPPORT_DIR / "cache" / "pilot_search"
+PILOT_QUEUE_DIR       = PILOT_CACHE_DIR / "queue"        # <instance>.json — newest enqueue wins (overwrite)
+PILOT_PROCESSING_DIR  = PILOT_CACHE_DIR / "processing"   # claimed jobs; orphans are re-queued on daemon start
+PILOT_PID_PATH        = PILOT_CACHE_DIR / "pilot_search_daemon.pid"
+PILOT_STOP_SENTINEL   = PILOT_CACHE_DIR / "pilot_search_daemon.stop"
+PILOT_LOG_PATH        = SUPPORT_DIR / "logs" / "pilot_search_daemon.log"
+PILOT_POLL_INTERVAL_S = 2.0      # how often the idle daemon re-checks the queue / stop sentinel
+PILOT_IDLE_EXIT_S     = 1_800    # exit after this long with no work, so an idle daemon never lingers
+                                 # forever; the supervisor re-spawns it the next time a batch is enqueued
+PILOT_SEARCH_WORKERS  = 6        # parallel JIT step-down workers (mirrors JIT_SEARCH_MAX_WORKERS)
+PILOT_INTERACTIVE_WORKERS = 3    # parallel interactive (release?episodeId=) searches — LOWER than the
+                                 # JIT workers on purpose: a live interactive search hits the indexer
+                                 # synchronously, and 6-at-once over a big batch makes a single indexer
+                                 # (e.g. NZBgeek) time out / rate-limit → false 'no_results'. Tunable via
+                                 # pilot_interactive.search_workers.
+PILOT_SPILL_THRESHOLD = 10       # batches LARGER than this spill to the daemon; <= stay in-process
+PILOT_SEARCH_BATCH    = 100      # EpisodeSearch grab-triggers are fired in chunks of this many episodeIds
+                                 # (Sonarr's command takes a list) so a 9k-stub spree posts ~91 commands
+                                 # to Sonarr's task queue instead of 9k — the profile of each series is
+                                 # still set individually first, so each grab honours its own tier
+
+
 # ── Rate / timing tuning ──────────────────────────────────────────────────────
 CACHE_TTL_S    = 604_800     # 7 days — matches TraktMovieCacheManager
 RATE_WINDOW_S  = 300         # Trakt's 5-minute rate window

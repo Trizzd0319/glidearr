@@ -313,7 +313,7 @@ def test_interactive_default_spawns_interactive_worker():
     m._get_episode_id = lambda *a, **k: 999
 
     spawned: dict = {}
-    m._spawn_pilot_interactive_worker = lambda inst, items, ladder, meta, idx, floor, cd: spawned.update(
+    m._spawn_pilot_interactive_worker = lambda inst, items, ladder, meta, idx, floor, cd, **k: spawned.update(
         instance=inst, items=list(items), ladder=list(ladder), meta=dict(meta)
     )
 
@@ -324,6 +324,76 @@ def test_interactive_default_spawns_interactive_worker():
     assert spawned["meta"][1]["title"] == "S"                   # title threaded for label + ledger
     assert api.puts == []                                       # main thread flips NO profiles
     assert stats["searched"] == 1
+
+
+def test_removes_stub_with_committed_grab():
+    """A pilot whose S01E01 is already in the download queue (grab committed) is REMOVED from the df:
+    the one queue/details fetch surfaces episodeId 999, the stub row is dropped + the trimmed frame
+    saved, and the interactive worker is never handed it. The pilot cache rebuild re-creates the stub
+    if the download later fails (still file-less), so removal is safe."""
+    df = _stub_df()
+
+    class _DlApi(_FakeApi):
+        def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+            if endpoint == "queue/details":
+                return [{"episodeId": 999}]           # S01E01 (id 999) is mid-download
+            return _FakeApi._make_request(self, instance, endpoint, method, payload, fallback)
+
+    api = _DlApi(series_qp=99)
+    saved: dict = {}
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = api
+    m.sonarr_cache = None
+    m.global_cache = None
+    m.config = {"free_space_limit": 100}              # default interactive
+    m.dry_run = False
+    m._resolve_instance = lambda inst: inst
+    m.load = lambda inst: df
+    m.save = lambda inst, d: saved.update(df=d)
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_episode_id = lambda *a, **k: 999           # resolves to the downloading episode
+
+    spawned: dict = {"n": 0}
+    m._spawn_pilot_interactive_worker = lambda *a, **k: spawned.__setitem__("n", spawned["n"] + 1)
+
+    stats = m.run_pilot_search("inst")
+
+    assert stats["removed_grabbing"] == 1             # surfaced from the queue
+    assert spawned["n"] == 0                           # worker never spawned — nothing to search
+    assert stats["searched"] == 0
+    assert len(saved["df"]) == 0                       # the committed-grab stub was dropped + persisted
+
+
+def test_dry_run_does_not_remove_committed_grab():
+    """Dry-run counts the committed-grab stub but never drops the row or saves."""
+    df = _stub_df()
+
+    class _DlApi(_FakeApi):
+        def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+            if endpoint == "queue/details":
+                return [{"episodeId": 999}]
+            return _FakeApi._make_request(self, instance, endpoint, method, payload, fallback)
+
+    saved: list = []
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.sonarr_api = _DlApi(series_qp=99)
+    m.sonarr_cache = None
+    m.global_cache = None
+    m.config = {"free_space_limit": 100}
+    m.dry_run = True
+    m._resolve_instance = lambda inst: inst
+    m.load = lambda inst: df
+    m.save = lambda inst, d: saved.append(True)
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_episode_id = lambda *a, **k: 999
+
+    stats = m.run_pilot_search("inst")
+
+    assert stats["removed_grabbing"] == 1             # planned…
+    assert saved == []                                 # …but never persisted in dry-run
+    assert len(df) == 1                                # row left intact
 
 
 def test_climb_default_collects_items_and_spawns_worker():

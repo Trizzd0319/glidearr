@@ -819,6 +819,22 @@ if __name__ == "__main__":
             except Exception as e:
                 logger.log_warning(f"[Main] enrich daemon supervisor failed: {e}")
 
+        # If the pilot-search daemon is enabled and a prior run left queued / orphaned search
+        # batches behind, make sure it's running so those searches RESUME (it idle-exits when the
+        # queue drains, and fresh spillover during THIS run is spawned by run_pilot_search itself,
+        # so we only ensure-running here when there's actually leftover work to pick up).
+        try:
+            _pilot_cfg = (config_manager.get("daemons", {}) or {}).get("pilot_search") or {}
+            if _pilot_cfg.get("enabled", True):
+                from scripts.managers.factories.daemons import pilot_jobs as _pilot_jobs
+                if _pilot_jobs.pending_count() > 0:
+                    from scripts.managers.factories.daemons.supervisor import (
+                        PilotSearchDaemonSupervisor,
+                    )
+                    PilotSearchDaemonSupervisor(logger=logger).ensure_running()
+        except Exception as e:
+            logger.log_warning(f"[Main] pilot-search daemon resume check failed: {e}")
+
         global_cache = GlobalCacheManager(logger=logger, config=config_manager)
 
         # ════════════════════════════════════════════════════════════════════════

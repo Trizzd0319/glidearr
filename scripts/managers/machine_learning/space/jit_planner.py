@@ -34,6 +34,11 @@ Public API:
         the chosen profile's max-resolution int — the per-(series, tier) group key used to
         bucket episodes that share a target tier into ONE series-QP-flip search (so the
         background worker never over-grabs a lower-target episode at a higher tier).
+  * pilot_floor_hold(cap, *, is_pilot, likelihood, upgrade_cutoff, floor_res, is_acquire,
+                     current_res) -> (cap, settled)
+        hold an UNWATCHED pilot at ``floor_res`` unless its (affinity-only) likelihood clears
+        ``upgrade_cutoff``; ``settled`` flags an on-disk pilot already at/below the floor so the
+        caller leaves it untouched (no no-op grab, still upgradeable after a real watch).
 """
 from __future__ import annotations
 
@@ -116,17 +121,35 @@ def choose_jit_profile(best_first, *, cap, projected_free, reserve_gb, runtime_m
     """Best profile for a series' next-up grab: the highest-resolution profile whose max
     resolution is <= the effective cap AND whose estimated grab keeps ``projected_free``
     at/above ``reserve_gb``. ``best_first`` is the profile list ordered highest-resolution
-    first. None when even the lowest profile would breach the reserve.
+    first.
+
+    FLOOR FALLBACK: when NO profile sits at/below the cap, falls back to the lowest-resolution
+    profile that still fits the reserve and grabs at the floor — so a too-low earned cap (e.g. a
+    720p-earned episode on an instance whose profiles all floor at 1080p) never SILENTLY STRANDS the
+    grab. Returns None ONLY when even the lowest-resolution profile would breach the reserve (a
+    genuine space problem, not a tier mismatch); the caller can detect a floor grab via chosen
+    resolution > cap and log it distinctly.
 
     The effective cap is the likelihood ``cap`` lowered to ``pressure_cap`` when the drive
     is in the lower part of the pressure band (so a near-floor disk grabs 1080p/720p instead
     of 4K even for a hot series). DEFAULT ``pressure_cap=None`` -> the effective cap is the
     bare likelihood ``cap`` and the choice is byte-identical."""
     eff_cap = cap if pressure_cap is None else min(cap, pressure_cap)
+
+    def _fits(prof):
+        return projected_free - estimate_gb_for_profile(prof, runtime_min, 1, measured) >= reserve_gb
+
+    # Best (highest) profile within the earned tier that still fits the reserve.
     for prof in best_first:
         if profile_max_quality(prof)[0] > eff_cap:
             continue   # exceeds the earned tier (or the pressure ceiling)
-        if projected_free - estimate_gb_for_profile(prof, runtime_min, 1, measured) >= reserve_gb:
+        if _fits(prof):
+            return prof
+    # No profile at/below the cap fits → grab the LOWEST-resolution profile that fits rather than
+    # strand the episode. (Only meaningfully fires when no profile is <= cap; if cap-fitting profiles
+    # exist but all breach, the lowest is among them and also breaches → None below.)
+    for prof in reversed(best_first):          # lowest-resolution first
+        if _fits(prof):
             return prof
     return None
 
@@ -154,3 +177,31 @@ def target_tier_key(chosen) -> int:
     resolution, their :func:`jit_step_down_pids` ladders are identical, so the group's whole
     step-down stays at or below that tier. Pure (size_model only)."""
     return profile_max_quality(chosen)[0]
+
+
+def pilot_floor_hold(cap, *, is_pilot, likelihood, upgrade_cutoff, floor_res, is_acquire,
+                     current_res):
+    """Hold an UNWATCHED pilot at the resolution floor in the JIT next-up upgrade pass.
+
+    A pilot (S01E01) of a never-watched series is the next-up episode with an AFFINITY-ONLY
+    watch-likelihood (no real viewing yet), so taste alone would otherwise let the pass lift it to
+    1080p whenever the disk has room. This clamps the pilot's earned ``cap`` down to ``floor_res``
+    UNLESS its ``likelihood`` clears ``upgrade_cutoff`` (very strong affinity) — and once the pilot
+    is actually watched the engagement floor raises the likelihood, so the hold no longer fires and
+    the normal earned tier applies ("upgrade only when watchability is high enough").
+
+    Returns ``(new_cap, settled)``:
+      * new_cap — ``cap`` clamped to ``floor_res`` for a held pilot, else ``cap`` unchanged.
+      * settled — True ONLY for an on-disk pilot ALREADY at/below the floor: the caller should
+        leave it untouched (fire no no-op search and DON'T mark it upgraded, so a genuine
+        post-watch upgrade stays possible). A MISSING pilot (``is_acquire``) is never settled — it
+        still ACQUIREs at the floor; an ABOVE-floor pilot (e.g. an existing 1080p) is never settled
+        — it still DOWNGRADEs toward the floor where a release exists.
+
+    Non-pilots, and pilots whose likelihood clears ``upgrade_cutoff``, pass through unchanged as
+    ``(cap, False)``. Pure: stdlib only."""
+    if not is_pilot or likelihood >= upgrade_cutoff:
+        return cap, False
+    new_cap = min(cap, floor_res)
+    settled = (not is_acquire) and (current_res is not None) and (current_res <= floor_res)
+    return new_cap, settled

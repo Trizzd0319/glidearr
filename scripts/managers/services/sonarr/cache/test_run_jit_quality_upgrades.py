@@ -350,6 +350,89 @@ def test_jit_plan_routes_into_run_summary():
     assert rows and all(r[0] == "sonarr" for r in rows)
 
 
+# ── pilot floor-hold (pilot_hold_at_floor) ────────────────────────────────────────────────────
+# Production-faithful cutoffs: affinity_cap (75) < uhd_cutoff (77) so affinity-only titles top out
+# at 1080p. untouched_base 12 + score → likelihood; score 40 → 52 (earns 1080), score 60 → 72
+# (earns 1080 and clears the 65 hold cutoff).
+_WL_PILOT = dict(_WL, uhd_cutoff=77, fhd_cutoff=40, hd_cutoff=20, affinity_cap=75,
+                 untouched_base=12, untouched_score_gain=1.0)
+
+
+def _pilot_row(sid, fid, *, resolution, score):
+    r = _row(sid, 1, 1, fid)
+    r["is_pilot"] = True
+    r["resolution"] = resolution
+    r["quality_name"] = f"Bluray-{resolution}p"
+    r["watchability_score"] = score
+    return r
+
+
+def _pilot_manager(df, captured, *, hold_enabled=True):
+    class _Api:
+        def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+            return list(_PROFILES) if endpoint == "qualityprofile" else fallback
+    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m.logger = _StubLogger()
+    m.config = {"free_space_limit": 100, "watch_likelihood": _WL_PILOT,
+                "jit_per_episode_tiers": {"enabled": True},
+                "pilot_hold_at_floor": {"enabled": hold_enabled, "upgrade_cutoff": 65}}
+    m.dry_run = False
+    m.global_cache = None
+    m.sonarr_api = _Api()
+    m.load = lambda inst: df
+    m.save = lambda inst, d: None
+    m._measured_mb_per_min = lambda d: dict(_MEASURED)
+    m._get_free_space_gb = lambda inst: 5000.0           # ample → space never the limiter
+    m._get_total_space_gb = lambda inst: 1000.0
+    m._get_episode_id = lambda inst, sid, sn, en: 9000 + en
+    m._spawn_jit_search_worker = lambda inst, work: captured.update(work)
+    return m
+
+
+def test_pilot_held_at_floor_existing_1080_downgrades():
+    """An unwatched pilot on disk at 1080p whose affinity-only likelihood (52) earns 1080p is
+    DOWNGRADED to the 720p floor — taste alone must not keep a never-watched pilot at 1080p."""
+    df = pd.DataFrame([_pilot_row(10, 1001, resolution=1080, score=40)])
+    captured = {}
+    stats = _pilot_manager(df, captured).run_jit_quality_upgrades("inst")
+    assert stats["upgraded"] == 1
+    assert set(captured[10].keys()) == {720}             # re-qualitied DOWN to the 720 floor, not held at 1080
+
+
+def test_pilot_already_at_floor_is_settled_and_left_alone():
+    """An unwatched pilot already on disk at 720p is 'settled': no no-op grab is queued and it is NOT
+    marked upgraded_for_watching, so a genuine post-watch upgrade stays possible."""
+    df = pd.DataFrame([_pilot_row(10, 1001, resolution=720, score=40)])
+    captured = {}
+    stats = _pilot_manager(df, captured).run_jit_quality_upgrades("inst")
+    assert stats["held_pilot"] == 1
+    assert stats["upgraded"] == 0 and stats["acquired"] == 0
+    assert captured == {}                                 # nothing queued
+    assert bool(df.iloc[0]["upgraded_for_watching"]) is False   # still upgradeable after a real watch
+
+
+def test_very_high_affinity_pilot_is_not_held():
+    """A pilot whose likelihood (72) clears the upgrade_cutoff (65) is NOT held — very strong affinity
+    earns it 1080p before any watch (the 'also if affinity is very high' allowance)."""
+    df = pd.DataFrame([_pilot_row(10, 1001, resolution=720, score=60)])
+    captured = {}
+    stats = _pilot_manager(df, captured).run_jit_quality_upgrades("inst")
+    assert stats["held_pilot"] == 0
+    assert stats["upgraded"] == 1
+    assert set(captured[10].keys()) == {1080}            # climbs to the earned 1080 tier
+
+
+def test_pilot_hold_disabled_is_byte_identical():
+    """With pilot_hold_at_floor OFF the same low-affinity 720p pilot is upgraded to its bare earned
+    1080 tier — i.e. the flag-off path is the pre-feature behavior."""
+    df = pd.DataFrame([_pilot_row(10, 1001, resolution=720, score=40)])
+    captured = {}
+    stats = _pilot_manager(df, captured, hold_enabled=False).run_jit_quality_upgrades("inst")
+    assert stats["held_pilot"] == 0
+    assert stats["upgraded"] == 1
+    assert set(captured[10].keys()) == {1080}            # unheld → earns 1080 off affinity alone
+
+
 class _Cache:
     def __init__(self): self.d = {}
     def get(self, k): return self.d.get(k)

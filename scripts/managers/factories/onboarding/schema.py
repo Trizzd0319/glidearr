@@ -117,7 +117,9 @@ def empty_config() -> dict:
         # Two-stage prune of owned movies that stay below the demote floor (20):
         #   unmonitor after owned_demote_dwell_days (30), DELETE FILE after
         #   owned_delete_dwell_days (90). Deletions are restored (re-monitor + search)
-        #   if the score later recovers above owned_restore_score_threshold.
+        #   if the score later recovers above owned_restore_score_threshold — but no
+        #   sooner than owned_restore_min_age_days (0 = off) after the deletion, a
+        #   time floor that stops delete/re-grab thrash when a score hovers at the floor.
         #   keep/universe-tagged or ever-watched movies are never touched; movies
         #   without cached Trakt credits are deferred (never deleted on missing data).
         "owned_demote_enabled": True,
@@ -126,6 +128,7 @@ def empty_config() -> dict:
         "owned_delete_enabled": True,
         "owned_delete_dwell_days": 90,
         "owned_restore_score_threshold": 20,
+        "owned_restore_min_age_days": 0,
         "owned_delete_min_dwell_days": 7,
         # Space-pressure deletion: free_space_limit (T) is the floor to keep. As free
         # space falls into the band [T, U=T*(1+headroom)] the time-based delete dwell
@@ -244,13 +247,25 @@ def empty_config() -> dict:
         # is added OR recheck_days elapses (the only two ways an empty search can newly succeed; the
         # clock also self-heals a flag set during a transient indexer outage). floor_res = optional
         # minimum resolution to consider (0 = any). enabled:false falls back to the blind climb.
-        "pilot_interactive": {"enabled": True, "recheck_days": 7, "floor_res": 0},
+        "pilot_interactive": {"enabled": True, "recheck_days": 7, "floor_res": 0,
+                              "search_no_resolution": True, "skip_hard_rejects": True,
+                              "anime_ladder": True},
         # Legacy escape hatch (only used when pilot_floor_climb is OFF). best_tier_first ON makes a
         # stub pilot target the HIGHEST tier whose grab keeps the space reserve, diverting DOWN one
         # rung per empty run (never likelihood-gated). OFF = legacy floor-first/step-up across runs.
         # force_floor (default FALSE): when even the floor would breach the reserve, grab at the floor
         # anyway vs skip + re-probe next run. A pilot is NEVER deleted. Default OFF — superseded.
         "pilot_best_tier_first": {"enabled": False, "force_floor": False},
+        # Pilot floor-hold (default ON): keep an UNWATCHED pilot (S01E01) at the 720p floor in the
+        # JIT next-up upgrade pass. A pilot's next-up watch-likelihood is AFFINITY-ONLY (no real
+        # viewing yet), so taste alone would otherwise let JIT lift it to 1080p whenever the disk has
+        # room — the "pilots auto-pushed to 1080p" complaint. It climbs above the floor only once its
+        # likelihood clears upgrade_cutoff (very strong affinity) or, post-watch, the engagement floor
+        # earns it. An existing ABOVE-floor pilot is DOWNGRADED to 720p where a release exists; one
+        # already at/below the floor is left untouched (still upgradeable after a real watch). The
+        # floor follows watch_likelihood.floor_res (720). enabled:false → byte-identical (a pilot is
+        # treated like any other next-up episode).
+        "pilot_hold_at_floor": {"enabled": True, "upgrade_cutoff": 65},
         "large_file_gb": 30,
         "firstRunCompleted": False,
         "radarr_instances": {"default_instance": {"name": ""}},
@@ -288,8 +303,9 @@ def empty_config() -> dict:
                  # (services/plex/playlists/builder.py: _max_items / _episode_cap /
                  # _genre_match_opts / _priority_weights / _personal_tilt / _profile_ages),
                  # so deep_merge over an existing config is a NO-OP and behaviour is
-                 # byte-identical until the user edits a knob. ``writeback`` and
-                 # ``recency_boost`` are NEW and currently UNREAD — purely inert placeholders.
+                 # byte-identical until the user edits a knob. ``writeback`` gates the real
+                 # Plex write (below); ``recency_boost`` lifts a caught-up group on a fresh
+                 # drop — both are READ (recency_boost is wired into the Up Next builders).
                  #   writeback.enabled: WRITE the per-user plans into Plex (create/update the
                  #     real playlists). OFF by default; also requires dry_run=false to actuate.
                  #   max_items / episode_cap: playlist length + per-series episode cap.
@@ -300,7 +316,10 @@ def empty_config() -> dict:
                  #     0-100 alias for affinity_weight = tilt/100).
                  #   exclude_users: profile titles / safe_users to skip entirely.
                  #   profile_ages: operator override of a profile's age tier (parental gate).
-                 #   recency_boost: lift recently-aired/added items (window_days) — UNREAD, inert.
+                 #   recency_boost: lift a group you're caught up on the instant its freshest
+                 #     member landed within window_days (a finished show whose new episode just
+                 #     aired) — applied to the per-user Up Next ordering (TV, movie, and combined),
+                 #     precedence over resume_boost; OFF by default → byte-identical.
                  #   fresh_arrivals: a per-profile "Fresh Arrivals" playlist of GENUINELY-new
                  #     acquisitions (movies) added within acquired_window_days — keyed on Radarr's
                  #     churn-immune movie.added (NOT the file date, which upgrades/re-grabs bump).
@@ -453,8 +472,15 @@ def empty_config() -> dict:
         "calendar": {"enabled": False, "ensure_monitored": True, "search": False,
                      "mal": True, "mal_min_watchability": 20},
         # Background workers — the Trakt enrichment daemon is OFF by default. When
-        # enabled, main.py (re)spawns it and runs become cache-only.
-        "daemons": {"enrich": {"enabled": False, "scope": [], "owned_first": True}},
+        # enabled, main.py (re)spawns it and runs become cache-only. The pilot-search
+        # daemon is ON by default: it drains LARGE Sonarr pilot interactive-search batches
+        # (> threshold stubs) out of the run process so a massive search spree can't hang
+        # the run; smaller batches still run in-process. Set enabled=false to keep every
+        # batch in-process (the legacy behaviour).
+        "daemons": {
+            "enrich": {"enabled": False, "scope": [], "owned_first": True},
+            "pilot_search": {"enabled": True, "threshold": 10},
+        },
         # English-audio (dub) prioritization — all five pieces ON by default ("recommended";
         # absent/{} also reads as recommended). Normalized into the skeleton so a step-free
         # headless overlay yields a complete config (the EnglishDubStep otherwise creates it

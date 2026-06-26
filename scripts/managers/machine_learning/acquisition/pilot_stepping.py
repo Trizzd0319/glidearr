@@ -66,6 +66,8 @@ probing. The pure slices for that model:
 """
 from __future__ import annotations
 
+from collections import Counter
+
 import pandas as pd
 
 from scripts.managers.machine_learning.sizing.size_model import estimate_gb_for_profile
@@ -253,6 +255,143 @@ def choose_lowest_available_tier(releases, ladder, *, floor_res: int = 0):
     res = avail[0]
     pid = next((p for p, r in ladder if r >= res), (ladder[-1][0] if ladder else None))
     return res, pid
+
+
+# Rejection reasons a quality-PROFILE change cannot clear — they're about the release itself or a
+# GLOBAL setting, so flipping the series to a permissive tier won't make them grab. Size limits live
+# on the Quality Definition (global), the blocklist is global, and incomplete/sample are release
+# properties. Quality-not-wanted and custom-format-score rejections are deliberately NOT here — those
+# are profile-dependent and clear after the flip, so such stubs are still searched. Conservative:
+# anything unrecognised is treated as profile-DEPENDENT (still searched), so we never skip a stub a
+# flip might rescue.
+_PROFILE_INDEPENDENT_REJECTIONS = (
+    "larger than maximum allowed",
+    "smaller than minimum allowed",
+    "blocklist",
+    "not a complete release",
+    "sample",
+)
+
+
+def _is_profile_independent_rejection(reason: str) -> bool:
+    """True when ``reason`` is a rejection a profile flip cannot clear (size / blocklist /
+    incomplete / sample). See ``_PROFILE_INDEPENDENT_REJECTIONS``."""
+    s = (reason or "").lower()
+    return any(k in s for k in _PROFILE_INDEPENDENT_REJECTIONS)
+
+
+# Sonarr rejects a SEASON PACK against a single-episode (S01E01) search with "Episode wasn't
+# requested: 1xNN" — the release is fine, it just carries episodes the single-ep search didn't ask
+# for. A SeasonSearch (which requests the whole season) clears this; a profile flip does NOT. So this
+# is its OWN category: request-scope, not profile-(in)dependent. It's the signal that an anime is only
+# available as a batch, which the season-pack fallback acts on.
+_REQUEST_SCOPED_REJECTIONS = ("wasn't requested", "wasnt requested", "not requested")
+
+
+def _is_request_scoped_rejection(reason: str) -> bool:
+    """True when ``reason`` is a single-vs-pack scope rejection (a SeasonSearch would clear it)."""
+    s = (reason or "").lower()
+    return any(k in s for k in _REQUEST_SCOPED_REJECTIONS)
+
+
+def _rejection_strings(release) -> list:
+    """Normalize a release's ``rejections`` (Sonarr returns a list of strings OR of
+    ``{reason/message, type}`` dicts) to a flat list of human reason strings."""
+    out = []
+    for rej in ((release or {}).get("rejections") or []):
+        if isinstance(rej, str):
+            if rej.strip():
+                out.append(rej.strip())
+        elif isinstance(rej, dict):
+            msg = rej.get("reason") or rej.get("message") or rej.get("Reason")
+            if msg:
+                out.append(str(msg).strip())
+    return out
+
+
+def classify_release_outcome(releases, *, floor_res: int = 0) -> dict:
+    """Diagnose WHY a stub pilot will or won't acquire from its interactive-search results — the
+    operator-facing 'no results vs incomplete blocks vs rejected vs available' breakdown.
+
+    The interactive search (GET /release?episodeId=) returns every candidate the indexers found,
+    each with ``quality.quality.resolution`` and Sonarr's per-release ``rejected``/``rejections``
+    (computed against the series' CURRENT profile). Returns::
+
+        {reason, total, resolutions, accepted, rejected, rejection_reasons: [(reason, count), ...]}
+
+    ``reason`` is one of:
+      * 'no_results'    — the indexers returned NOTHING (→ UNACQUIRABLE).
+      * 'no_resolution' — releases exist but NONE report a resolution (likely SD-only / odd
+        releases that can't be mapped to a quality tier → UNACQUIRABLE under the current model).
+      * 'below_floor'   — releases with a resolution exist but every one is below ``floor_res``
+        (none usable → UNACQUIRABLE).
+      * 'rejected'      — a usable resolution exists, every release at/above the floor is rejected,
+        but at least ONE of them is rejected ONLY for profile-DEPENDENT reasons (quality-not-wanted /
+        custom-format score) that clear once the pilot flips the series to a permissive tier. STILL
+        searched (the flip may rescue it; Sonarr picks the release).
+      * 'rejected_hard' — same, but EVERY usable release carries a profile-INDEPENDENT rejection
+        (size / blocklist / incomplete / sample) that a flip can't clear → Sonarr would grab nothing,
+        so the service can skip the futile search and flag it instead.
+      * 'available'     — at least one NON-rejected release at/above the floor.
+
+    Pure: stdlib only. ``rejection_reasons`` is the top-5 reason strings across all rejected releases.
+    ``rescuable`` is True when something could grab now or after a profile flip (available / rejected),
+    False for the hard cases (no_results / no_resolution / below_floor / rejected_hard)."""
+    releases = releases or []
+    total = len(releases)
+    resolutions: set = set()
+    rej_counter: Counter = Counter()
+    usable_total = usable_accepted = usable_rescuable = usable_season_pack = 0
+    rejected_total = 0
+    for r in releases:
+        r = r or {}
+        raw = (((r.get("quality") or {}).get("quality") or {}).get("resolution"))
+        res = int(raw) if isinstance(raw, (int, float)) and int(raw) > 0 else 0
+        if res > 0:
+            resolutions.add(res)
+        rejected = bool(r.get("rejected"))
+        rej_strs = _rejection_strings(r)
+        if rejected:
+            rejected_total += 1
+            for msg in rej_strs:
+                rej_counter[msg] += 1
+        if res >= floor_res and res > 0:
+            usable_total += 1
+            if not rejected:
+                usable_accepted += 1
+            else:
+                hard = any(_is_profile_independent_rejection(m) for m in rej_strs)
+                if not hard:
+                    usable_rescuable += 1     # all this release's rejections could clear after a flip
+                # SEASON PACK: blocked only by the single-vs-pack request scope (+ flip-clearable
+                # quality), never by a hard size/blocklist reason — i.e. a SeasonSearch would grab it.
+                if not hard and any(_is_request_scoped_rejection(m) for m in rej_strs):
+                    usable_season_pack += 1
+
+    if total == 0:
+        reason = "no_results"
+    elif not resolutions:
+        reason = "no_resolution"      # releases exist but none report a resolution (likely SD-only)
+    elif usable_total == 0:
+        reason = "below_floor"        # resolutions present but all below floor_res
+    elif usable_accepted > 0:
+        reason = "available"
+    elif usable_rescuable > 0:
+        reason = "rejected"           # usable but rejected; a flip MIGHT clear at least one
+    else:
+        reason = "rejected_hard"      # usable but rejected for reasons a flip can't fix
+    return {
+        "reason": reason,
+        "total": total,
+        "resolutions": sorted(resolutions),
+        "accepted": usable_accepted,
+        "rejected": rejected_total,
+        "rescuable": usable_accepted > 0 or usable_rescuable > 0,
+        # True when the ONLY thing blocking is the single-episode search scope (season packs present)
+        # → a SeasonSearch would grab it. Drives the anime season-pack fallback.
+        "batch_only": usable_accepted == 0 and usable_season_pack > 0,
+        "rejection_reasons": rej_counter.most_common(5),
+    }
 
 
 def indexer_fingerprint(indexers) -> list:

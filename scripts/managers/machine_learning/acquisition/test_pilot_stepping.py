@@ -10,6 +10,7 @@ import pandas as pd
 
 from scripts.managers.machine_learning.acquisition.pilot_stepping import (
     choose_pilot_profile,
+    classify_release_outcome,
     next_pilot_profile,
     next_pilot_profile_descend,
     pilot_backoff_interval,
@@ -17,6 +18,80 @@ from scripts.managers.machine_learning.acquisition.pilot_stepping import (
     profile_max_resolution,
     rank_pilot_profiles,
 )
+
+
+# ── classify_release_outcome (why a pilot acquires or not) ──────────────────────────
+def _rel(res, *, rejected=False, rejections=None):
+    return {"quality": {"quality": {"resolution": res}}, "rejected": rejected,
+            "rejections": rejections or []}
+
+
+def test_classify_no_results():
+    d = classify_release_outcome([], floor_res=0)
+    assert d["reason"] == "no_results" and d["total"] == 0 and d["rejection_reasons"] == []
+
+
+def test_classify_below_floor():
+    d = classify_release_outcome([_rel(480), _rel(576)], floor_res=720)
+    assert d["reason"] == "below_floor"
+    assert d["resolutions"] == [480, 576] and d["accepted"] == 0
+
+
+def test_classify_no_resolution():
+    # releases exist but none report a resolution (SD-only / odd) → distinct from below_floor.
+    d = classify_release_outcome([_rel(0), {"quality": {}}], floor_res=0)
+    assert d["reason"] == "no_resolution" and d["total"] == 2 and d["resolutions"] == []
+
+
+def test_classify_available_when_one_release_not_rejected():
+    d = classify_release_outcome(
+        [_rel(1080), _rel(1080, rejected=True, rejections=["Sample"])], floor_res=0)
+    assert d["reason"] == "available" and d["accepted"] == 1 and d["rejected"] == 1
+
+
+def test_classify_rejected_hard_when_all_profile_independent():
+    # size + blocklist + incomplete = a flip can't fix → rejected_hard (skippable).
+    rels = [_rel(1080, rejected=True, rejections=["1.8 GB is larger than maximum allowed 910.0 MB"]),
+            _rel(720, rejected=True, rejections=[{"reason": "Release is blocklisted"}]),
+            _rel(480, rejected=True, rejections=["Not a Complete Release"])]
+    d = classify_release_outcome(rels, floor_res=0)
+    assert d["reason"] == "rejected_hard" and d["rescuable"] is False
+    assert dict(d["rejection_reasons"])["Not a Complete Release"] == 1
+
+
+def test_classify_rejected_rescuable_when_profile_dependent():
+    # quality-not-wanted + CF score below minimum = clears after the profile flip → still searched.
+    rels = [_rel(1080, rejected=True, rejections=["WEBDL-1080p is not wanted in profile"]),
+            _rel(720, rejected=True, rejections=["Custom Formats X have score -28000 below minimum 0"])]
+    d = classify_release_outcome(rels, floor_res=0)
+    assert d["reason"] == "rejected" and d["rescuable"] is True
+
+
+def test_classify_rejected_mixed_one_rescuable_searches():
+    # one release hard (size), one rescuable (quality) → overall rescuable → "rejected".
+    rels = [_rel(1080, rejected=True, rejections=["larger than maximum allowed"]),
+            _rel(720, rejected=True, rejections=["WEBDL-720p is not wanted in profile"])]
+    assert classify_release_outcome(rels, floor_res=0)["reason"] == "rejected"
+
+
+def test_classify_batch_only_season_pack():
+    # season pack: rejected ONLY for single-vs-pack scope (+ flip-clearable quality) → batch_only.
+    rels = [_rel(720, rejected=True,
+                 rejections=["Episode wasn't requested: 1x12", "WEBDL-720p is not wanted in profile"])]
+    d = classify_release_outcome(rels, floor_res=0)
+    assert d["reason"] == "rejected" and d["batch_only"] is True
+
+
+def test_classify_not_batch_only_when_a_hard_reason_also_blocks():
+    # wasn't-requested AND a hard size rejection → a SeasonSearch can't help → NOT batch_only.
+    rels = [_rel(720, rejected=True,
+                 rejections=["Episode wasn't requested: 1x12", "larger than maximum allowed"])]
+    assert classify_release_outcome(rels, floor_res=0)["batch_only"] is False
+
+
+def test_classify_not_batch_only_when_something_accepted():
+    d = classify_release_outcome([_rel(1080)], floor_res=0)
+    assert d["reason"] == "available" and d["batch_only"] is False
 
 
 # ── profile_max_resolution ──────────────────────────────────────────────────────

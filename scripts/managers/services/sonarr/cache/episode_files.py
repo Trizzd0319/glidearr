@@ -79,12 +79,16 @@ from scripts.managers.machine_learning.lifecycle.grace_policy import (
 from scripts.managers.machine_learning.lifecycle.household_watch import (
     resolve_household_watch,
 )
+from scripts.managers.machine_learning.lifecycle.stale_prune_policy import (
+    restore_cooldown_active,
+)
 from scripts.managers.machine_learning.space.jit_planner import (
     choose_jit_profile,
     jit_reserve_gb,
     jit_row_skip,
     jit_step_down_pids,
     next_up_grab_candidates,
+    pilot_floor_hold,
     target_tier_key,
 )
 from scripts.support.utilities.watch_likelihood import (
@@ -1255,7 +1259,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         re-monitor the episodes + trigger EpisodeSearch. Mirrors Radarr's
         restore_recovered_deletions. Tracked in ``sonarr/{inst}/deleted_episodes``."""
         instance = self._resolve_instance(instance)
-        stats = {"tracked": 0, "restored": 0, "still_low": 0, "dropped": 0, "deferred": 0, "failed": 0}
+        stats = {"tracked": 0, "restored": 0, "still_low": 0, "cooling": 0,
+                 "dropped": 0, "deferred": 0, "failed": 0}
         if self.sonarr_api is None or self.global_cache is None:
             return stats
         now = datetime.now(tz=timezone.utc)
@@ -1268,6 +1273,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             restore_floor = int(self.config.get("owned_restore_score_threshold", 20) if self.config else 20)
         except (TypeError, ValueError):
             restore_floor = 20
+        try:
+            restore_min_age = int(self.config.get("owned_restore_min_age_days", 0) if self.config else 0)
+        except (TypeError, ValueError):
+            restore_min_age = 0
 
         # Per-series current watchability_score (from the parquet column).
         df = self.load(instance)
@@ -1296,6 +1305,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             if score is None or score <= restore_floor:
                 keep[sk] = ent
                 stats["still_low"] += 1
+                continue
+            if restore_cooldown_active(ent.get("ts"), now, restore_min_age):
+                # Score recovered but the re-grab cooldown hasn't elapsed since
+                # deletion — hold off (no API call) so a series hovering at the floor
+                # can't be deleted one run and restored the next, repeatedly.
+                keep[sk] = ent
+                stats["cooling"] += 1
                 continue
             # Resolve episode ids for the recovered coords.
             eps = self.sonarr_api._make_request(instance, f"episode?seriesId={sid}", fallback=[]) or []
@@ -3902,7 +3918,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         stats = {
             "checked": 0, "searched": 0, "stepped_down": 0,
             "at_floor": 0, "skipped_recent": 0, "skipped_space": 0, "failed": 0,
-            "skipped_unacquirable": 0,
+            "skipped_unacquirable": 0, "offloaded": 0, "removed_grabbing": 0,
         }
 
         df = self.load(instance)
@@ -3943,21 +3959,56 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # best-tier-first, which pinned every never-watched pilot to the highest tier space allowed.
         _climb_cfg  = (self.config or {}).get("pilot_floor_climb", {}) or {}
         pilot_climb = bool(_climb_cfg.get("enabled", True))
-        # Ascending ladder: one rung per resolution tier (dedupe profiles sharing a max resolution),
-        # dropping profiles that allow nothing. ladder[0] = floor (lowest res), ladder[-1] = widest.
-        _climb_ladder: list = []
-        _seen_res: set = set()
-        for _p in ranked:
-            _r = profile_max_resolution(_p)
-            if _r <= 0 or _r in _seen_res or _p.get("id") is None:
-                continue
-            _seen_res.add(_r)
-            _climb_ladder.append((int(_p["id"]), int(_r)))
+
+        def _is_anime_profile(p):
+            return str(p.get("name") or "").strip().lower().startswith("[anime]")
+
+        def _build_climb_ladder(profiles):
+            """Ascending floor→widest ladder: one rung per resolution tier (dedupe profiles sharing a
+            max resolution), dropping profiles that allow nothing."""
+            ladder, seen = [], set()
+            for _p in profiles:
+                _r = profile_max_resolution(_p)
+                if _r <= 0 or _r in seen or _p.get("id") is None:
+                    continue
+                seen.add(_r)
+                ladder.append((int(_p["id"]), int(_r)))
+            return ladder
+
+        # The NON-anime ladder EXCLUDES the [Anime] profiles so a live-action stub is never flipped onto
+        # an anime profile; anime stubs get their OWN ladder so they never land on an x265-penalising
+        # live-action profile (the root cause of anime never grabbing — see the [Anime] tier profiles).
+        _climb_ladder = _build_climb_ladder([p for p in ranked if not _is_anime_profile(p)])
         if not _climb_ladder:   # degenerate profile set → fall back to every usable ranked id, ascending
             _climb_ladder = [(int(p["id"]), int(profile_max_resolution(p)))
                              for p in ranked
                              if p.get("id") is not None and profile_max_resolution(p) > 0]
         _floor_pid = _climb_ladder[0][0] if _climb_ladder else None
+
+        # Anime ladder (default ON; self-degrades to the regular ladder when no [Anime] profiles exist,
+        # so no behaviour change until those profiles are created). Anime STUBS are collected in the
+        # loop below by seriesType and routed onto this ladder.
+        _anime_on = bool(((self.config or {}).get("pilot_interactive") or {}).get("anime_ladder", True))
+        _anime_ladder = _build_climb_ladder([p for p in ranked if _is_anime_profile(p)]) if _anime_on else []
+        _anime_sids: set = set()
+
+        # Stubs whose S01E01 is ALREADY downloading (a committed grab from a prior pass) are dropped
+        # from the df below rather than re-searched — a committed grab needs no pilot search. One queue
+        # fetch per run. When the file imports it becomes a real (non-stub) pilot row; a download that
+        # fails leaves the series file-less, so the pilot cache rebuild re-creates the stub to re-probe.
+        _downloading_eids: set = set()
+        try:
+            _q = self.sonarr_api._make_request(instance, "queue/details", fallback=[]) or []
+            for _rec in _q:
+                if not isinstance(_rec, dict):
+                    continue
+                _e = _rec.get("episodeId")
+                if _e is None:
+                    _e = (_rec.get("episode") or {}).get("id")
+                if _e is not None:
+                    _downloading_eids.add(int(_e))
+        except Exception:
+            _downloading_eids = set()
         if pilot_climb and not _climb_ladder:
             self.logger.log_warning(
                 f"[PilotSearch] No usable quality profiles for '{instance}' — cannot climb; "
@@ -4064,6 +4115,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # id can't be resolved (rare cache miss) falls back to a single floor SeriesSearch.
         climb_items: list     = []   # (sid, episode_id) → background floor-first climb
         series_fallback: list = []   # (idx, sid, title) → floor SeriesSearch fallback
+        drop_idxs: list       = []   # stub rows whose grab is already committed (in the download queue) → remove from the df
 
         def _mark_searched(idx: int, pid) -> None:
             prev = df.at[idx, "pilot_search_attempts"]
@@ -4184,12 +4236,29 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             # ascending ladder and grabs at the lowest tier with a release. Mark the stub searched
             # (at the floor, for the 24 h interval guard) whether or not the id resolves.
             if pilot_climb:
+                # Anime stubs route onto the [Anime] ladder so they're never flipped to an
+                # x265-penalising live-action profile (which is why anime never grabbed).
+                _is_anime = str((series or {}).get("seriesType") or "").lower() == "anime"
+                _stub_floor = _floor_pid
+                if _is_anime and _anime_ladder:
+                    _anime_sids.add(sid)
+                    _stub_floor = _anime_ladder[0][0]
                 ep_id = self._get_episode_id(
                     instance, sid, 1, 1, series_ep_cache=_ep_cache,
                     log_cache_miss=not use_tqdm, log_expired=not use_tqdm,
                     allow_live=(not self.dry_run) and not use_tqdm,
                 )
-                _mark_searched(idx, _floor_pid)
+                # Grab already committed (S01E01 is in the download queue) → drop the stub from the
+                # df. A committed grab needs no further pilot search, and removing it shrinks every
+                # subsequent run + daemon batch. Safe to remove: the pilot cache rebuild re-creates the
+                # stub for any series still file-less (so a failed/abandoned download re-probes), and an
+                # imported file becomes a real (non-stub) pilot row directly.
+                if ep_id and int(ep_id) in _downloading_eids:
+                    drop_idxs.append(idx)
+                    stats["removed_grabbing"] += 1
+                    changed = True
+                    continue
+                _mark_searched(idx, _stub_floor)
                 changed = True
                 if ep_id:
                     climb_items.append((sid, int(ep_id)))
@@ -4432,12 +4501,33 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                         _meta = {sid: {"title": (series_by_id.get(sid) or {}).get("title"),
                                        "tvdb": (series_by_id.get(sid) or {}).get("tvdbId")}
                                  for sid, _ in climb_items}
-                        self._spawn_pilot_interactive_worker(
+                        # LARGE batches (> threshold) spill to the standalone pilot-search daemon so
+                        # the run process never blocks: the in-process worker is a NON-daemon thread,
+                        # so a massive spree (thousands of stubs) would stall interpreter exit until
+                        # every indexer search finished. Small batches stay in-process (no point
+                        # spawning a process for a handful). A disabled daemon or any spawn failure
+                        # falls back to the in-process thread, so searches are never dropped.
+                        # Only the sids actually in this batch (anime stubs route onto the [Anime] ladder).
+                        _batch_anime = {sid for sid, _ in climb_items if sid in _anime_sids}
+                        if self._maybe_offload_pilot_search(
                             instance, climb_items, _climb_ladder, _meta,
-                            current_indexers, pilot_floor_res, recheck_cooldown)
+                            current_indexers, pilot_floor_res, recheck_cooldown,
+                            anime_ladder=_anime_ladder, anime_sids=sorted(_batch_anime),
+                        ):
+                            stats["offloaded"] = len(climb_items)
+                        else:
+                            self._spawn_pilot_interactive_worker(
+                                instance, climb_items, _climb_ladder, _meta,
+                                current_indexers, pilot_floor_res, recheck_cooldown,
+                                anime_ladder=_anime_ladder, anime_sids=sorted(_batch_anime))
                     else:
                         self._spawn_pilot_climb_worker(instance, climb_items, _climb_ladder)
                 stats["searched"] = len(climb_items)
+            # Drop the committed-grab stubs in one shot, AFTER every idx-based write (mark_searched /
+            # series_fallback) so positional indices stay valid through the loop. reset_index keeps the
+            # saved frame contiguous. Dry-run plans the removal in the stats table but never persists.
+            if drop_idxs and not self.dry_run:
+                df = df.drop(index=drop_idxs).reset_index(drop=True)
             if changed and not self.dry_run:
                 self.save(instance, df)
             _prefix = "[dry_run] " if self.dry_run else ""
@@ -4446,6 +4536,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 ["Outcome", "Count"],
                 [
                     ["searched",            stats["searched"]],
+                    ["offloaded to daemon", stats["offloaded"]],
+                    ["removed (grab in flight)", stats["removed_grabbing"]],
                     ["id unresolved",       _unresolved],
                     ["skipped recent",      stats["skipped_recent"]],
                     ["skipped unacquirable", stats["skipped_unacquirable"]],
@@ -4461,6 +4553,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                         "be resolved are deferred (never whole-series searched).",
                 descriptions=[
                     "pilots handed to the background search worker (grab at lowest available tier)",
+                    "of those, spilled to the standalone pilot-search daemon (batch > threshold) so the run never blocks",
+                    "stubs skipped: S01E01 already downloading (committed grab in flight) — re-probes when it leaves the queue",
                     "stubs whose S01E01 id stayed unresolved (cache + live miss) → deferred to next run",
                     f"stubs skipped: searched within last {PILOT_SEARCH_INTERVAL_H}h",
                     "stubs skipped: flagged UNACQUIRABLE (no releases) — re-checks on new-indexer or cooldown",
@@ -4747,16 +4841,19 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     @staticmethod
     def _pilot_unacq_key(instance: str) -> str:
         """global_cache key for the per-instance UNACQUIRABLE ledger (the background interactive
-        worker writes it; run_pilot_search reads it to gate re-searches)."""
-        return f"sonarr/pilot/unacquirable/{instance}"
+        worker / daemon writes it; run_pilot_search reads it to gate re-searches). Delegates to
+        the shared single source of truth so the in-process worker, the daemon, and the reader
+        can never disagree about the key."""
+        from scripts.managers.services.sonarr.cache.pilot_interactive import unacquirable_key
+        return unacquirable_key(instance)
 
     def _spawn_pilot_interactive_worker(self, instance: str, items: list, ladder: list,
                                         meta: dict, current_indexers: list, floor_res: int,
-                                        recheck_cooldown) -> None:
+                                        recheck_cooldown, anime_ladder=None, anime_sids=None) -> None:
         """Spawn the interactive-search pilot worker on a NON-daemon background thread (mirrors
         :meth:`_spawn_pilot_climb_worker`): it never blocks the pipeline, but the interpreter waits
         for it on exit so every grab/flag lands. One manual search per stub — far lighter than the
-        tier-by-tier climb it replaces."""
+        tier-by-tier climb it replaces. ``anime_sids`` route onto ``anime_ladder``."""
         import threading
         items  = [(int(s), int(e)) for s, e in items if s is not None and e is not None]
         ladder = [(int(p), int(r)) for p, r in ladder if p is not None]
@@ -4766,6 +4863,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             target=self._pilot_interactive_worker,
             args=(instance, items, ladder, meta, list(current_indexers), int(floor_res),
                   recheck_cooldown),
+            kwargs={"anime_ladder": anime_ladder, "anime_sids": anime_sids},
             name="pilot-interactive-search", daemon=False,
         ).start()
         self.logger.log_info(
@@ -4774,106 +4872,108 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             f"each: grab the lowest available resolution, or flag UNACQUIRABLE if nothing is found."
         )
 
-    def _pilot_interactive_worker(self, instance: str, items: list, ladder: list, meta: dict,
-                                  current_indexers: list, floor_res: int, recheck_cooldown) -> None:
-        """Per stub pilot: ONE Sonarr interactive search (``GET /release?episodeId=``) returns every
-        candidate release with its resolution, so a single call shows BOTH whether anything exists
-        and every resolution that does. The search is used ONLY for availability discovery — set the
-        series to the LOWEST tier that has results (jumping straight past tiers with none — "no SD,
-        no 720, but 1080 → search 1080"; seed low, the watch-based upgrade path raises it later) and
-        fire an ``EpisodeSearch`` so SONARR'S OWN quality + custom-format scoring picks the actual
-        release. We never pick a release ourselves. When the search comes back EMPTY the stub has no
-        release at any resolution → recorded UNACQUIRABLE in the ledger, which stays dead until a new
-        indexer is added or ``recheck_cooldown`` elapses. Replaces the blind climb: one interactive
-        search + one EpisodeSearch at the resolved tier.
+    def _maybe_offload_pilot_search(self, instance: str, items: list, ladder: list, meta: dict,
+                                    current_indexers: list, floor_res: int, recheck_cooldown,
+                                    anime_ladder=None, anime_sids=None) -> bool:
+        """Spill a LARGE interactive-search batch to the standalone pilot-search daemon instead of
+        the in-process NON-daemon worker thread, so the run process exits immediately rather than
+        waiting out a thousands-of-stubs indexer spree (the thread blocks interpreter exit).
 
-        Concurrency mirrors :meth:`_pilot_climb_worker`; outcomes are collected under a lock and the
-        ledger is MERGED once at the end so flags for stubs outside this run are preserved."""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import threading as _threading
-        lock     = _threading.Lock()
-        flagged: dict = {}     # sid → ledger entry (UNACQUIRABLE this run)
-        searched: set = set()  # sid had results + a search was fired → clear any prior flag
-        now_iso = datetime.now(tz=timezone.utc).isoformat()
-
-        def _label(sid):
-            m = meta.get(sid) or {}
-            title = (m.get("title") or "").strip()
-            return (f"sonarr/{instance} '{title}' (tvdb-{m.get('tvdb')})"
-                    if title else f"sonarr/{instance} series {sid}")
-
-        def _one(sid, ep_id):
-            label = _label(sid)
+        Returns True when the batch was enqueued AND the daemon is running, so the caller skips the
+        in-process worker. Returns False — caller falls back to the in-process thread — when:
+          * the daemon is disabled (``daemons.pilot_search.enabled=false``),
+          * the batch is at/below the spill threshold (``daemons.pilot_search.threshold``, default 10),
+          * dry-run (never spawn / write in dry-run), or
+          * anything goes wrong enqueueing / spawning (searches are NEVER silently dropped)."""
+        if self.dry_run:
+            return False
+        try:
+            import os
+            from scripts.managers.factories.daemons.daemon_paths import PILOT_SPILL_THRESHOLD
+            cfg = ((self.config or {}).get("daemons", {}) or {}).get("pilot_search", {}) or {}
+            if not cfg.get("enabled", True):
+                return False
             try:
-                releases = self.sonarr_api._make_request(
-                    instance, f"release?episodeId={ep_id}", fallback=[]) or []
-                pick = choose_lowest_available_tier(releases, ladder, floor_res=floor_res)
-                if pick is None:
-                    m = meta.get(sid) or {}
-                    with lock:
-                        flagged[sid] = {"flagged_at": now_iso, "indexers": list(current_indexers),
-                                        "title": m.get("title"), "tvdb": m.get("tvdb")}
-                    self.logger.log_info(
-                        f"  🚫 Pilot UNACQUIRABLE: {label} — no S01E01 release at ANY resolution "
-                        f"across {len(current_indexers)} indexer(s); blocked until an indexer is "
-                        f"added or the re-check cooldown elapses")
-                    return
-                res, pid = pick
-                # Set the series to the lowest tier with results, then fire an EpisodeSearch — Sonarr's
-                # own quality + custom-format scoring then selects the actual release at that tier. We do
-                # NOT pick a release ourselves; the interactive search is only used to find which
-                # resolution has results (and to jump straight past tiers that have none).
-                if not self._pilot_set_profile(instance, sid, pid):
-                    self.logger.log_warning(
-                        f"  ⚠️ Pilot: {label} profile flip to tier ≤{res}p failed — skipping search")
-                    return
-                cmd = self.sonarr_api._make_request(
-                    instance, "command", method="POST",
-                    payload={"name": "EpisodeSearch", "episodeIds": [ep_id]})
-                if cmd is None:
-                    self.logger.log_warning(f"  ⚠️ Pilot EpisodeSearch POST failed for {label} at ≤{res}p")
-                    return
-                with lock:
-                    searched.add(sid)
-                self.logger.log_info(
-                    f"  🔎 Pilot search: {label} at ≤{res}p (profile {pid}) — lowest resolution with "
-                    f"results; Sonarr's quality + custom-format scoring grabs the best release there")
-            except Exception as e:
-                self.logger.log_warning(f"[PilotSearch] interactive search failed for {label}: {e}")
+                threshold = int(cfg.get("threshold", PILOT_SPILL_THRESHOLD))
+            except (TypeError, ValueError):
+                threshold = PILOT_SPILL_THRESHOLD
+            if len(items) <= max(0, threshold):
+                return False
 
-        if len(items) <= 1:
-            for sid, ep_id in items:
-                _one(sid, ep_id)
-        else:
-            with ThreadPoolExecutor(
-                max_workers=min(self.JIT_SEARCH_MAX_WORKERS, len(items)),
-                thread_name_prefix="pilot-interactive",
-            ) as ex:
-                futures = [ex.submit(_one, sid, ep_id) for sid, ep_id in items]
-                for fut in as_completed(futures):
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        self.logger.log_warning(f"[PilotSearch] interactive task crashed: {e}")
+            from scripts.managers.factories.daemons import pilot_jobs
+            from scripts.managers.factories.daemons.supervisor import PilotSearchDaemonSupervisor
 
-        # Merge outcomes into the UNACQUIRABLE ledger (preserve entries for stubs not in this run):
-        # drop the ones that had results (search fired), (re)flag the ones that came up empty.
-        if self.global_cache is not None and (flagged or searched):
             try:
-                key = self._pilot_unacq_key(instance)
-                ledger = dict(self.global_cache.get(key) or {})
-                for sid in searched:
-                    ledger.pop(str(sid), None)
-                for sid, entry in flagged.items():
-                    ledger[str(sid)] = entry
-                self.global_cache.set(key, ledger)
-            except Exception as e:
-                self.logger.log_debug(f"[PilotSearch] unacquirable ledger update skipped: {e}")
-        if flagged or searched:
+                recheck_days = float(recheck_cooldown.total_seconds()) / 86_400.0
+            except Exception:
+                recheck_days = 7.0
+            _pi = ((self.config or {}).get("pilot_interactive") or {})
+            job = {
+                "version":          1,
+                "mode":             "interactive",
+                "instance":         instance,
+                "items":            [[int(s), int(e)] for s, e in items],
+                "ladder":           [[int(p), int(r)] for p, r in ladder],
+                "meta":             {str(s): (meta.get(s) or {}) for s, _ in items},
+                "current_indexers": list(current_indexers),
+                "floor_res":        int(floor_res),
+                "recheck_days":     recheck_days,
+                "search_no_resolution": bool(_pi.get("search_no_resolution", True)),
+                "skip_hard_rejects":    bool(_pi.get("skip_hard_rejects", True)),
+                "anime_ladder":     [[int(p), int(r)] for p, r in (anime_ladder or [])],
+                "anime_sids":       [int(s) for s in (anime_sids or [])],
+                "run_pid":          os.getpid(),
+            }
+            path = pilot_jobs.enqueue(instance, job)
+            try:
+                PilotSearchDaemonSupervisor(logger=self.logger).ensure_running()
+            except Exception:
+                # Roll back the just-enqueued job so we don't BOTH leave an orphan AND run the
+                # batch in-process (a double-search + dual ledger writer). The in-process fallback
+                # then owns the batch.
+                pilot_jobs.remove(path)
+                raise
             self.logger.log_info(
-                f"[PilotSearch] interactive pass: {len(searched)} searched at the lowest available "
-                f"tier (Sonarr CF picks the release), {len(flagged)} flagged UNACQUIRABLE "
-                f"(no releases at any resolution).")
+                f"[PilotSearch] 🛰️ Spilled {len(items)} pilot(s) to the background search daemon "
+                f"(batch > {threshold}); the run will NOT block on the search spree. "
+                f"Job: {path.name}; daemon log: pilot_search_daemon.log."
+            )
+            return True
+        except Exception as e:
+            self.logger.log_warning(
+                f"[PilotSearch] Could not offload to the search daemon ({e}); "
+                f"falling back to the in-process worker for {len(items)} pilot(s)."
+            )
+            return False
+
+    def _pilot_interactive_worker(self, instance: str, items: list, ladder: list, meta: dict,
+                                  current_indexers: list, floor_res: int, recheck_cooldown,
+                                  anime_ladder=None, anime_sids=None) -> None:
+        """In-process (SMALL-batch) interactive pilot search: thin wrapper over the shared core
+        :func:`pilot_interactive.interactive_pilot_search`, which both this worker and the
+        out-of-process pilot-search daemon call so the two can never drift. ONE Sonarr interactive
+        search per stub reveals all availability; set the series to the LOWEST tier with results +
+        fire an ``EpisodeSearch`` (Sonarr's quality + custom-format scoring grabs the release), or
+        flag UNACQUIRABLE when nothing is found.
+
+        ``recheck_cooldown`` is accepted for signature parity with the spawn/daemon path but is
+        unused here — the cooldown GATE lives in ``run_pilot_search`` (it reads the ledger this
+        writes); the worker only records flags."""
+        from scripts.managers.services.sonarr.cache.pilot_interactive import (
+            interactive_pilot_search,
+        )
+        _pi = (getattr(self, "config", None) or {}).get("pilot_interactive") or {}
+        interactive_pilot_search(
+            make_request=self.sonarr_api._make_request,
+            logger=self.logger,
+            global_cache=self.global_cache,
+            instance=instance, items=items, ladder=ladder, meta=meta,
+            current_indexers=current_indexers, floor_res=floor_res,
+            max_workers=self.JIT_SEARCH_MAX_WORKERS,
+            search_no_resolution=bool(_pi.get("search_no_resolution", True)),
+            skip_hard_rejects=bool(_pi.get("skip_hard_rejects", True)),
+            anime_ladder=anime_ladder, anime_sids=anime_sids,
+        )
 
     def _get_total_space_gb(self, instance: str) -> float:
         """
@@ -5071,6 +5171,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             "checked": 0, "acquired": 0, "upgraded": 0, "already_upgraded": 0,
             "skipped_kids": 0, "skipped_keep": 0, "skipped_space": 0, "failed": 0,
             "skipped_active_downgrade": 0,   # downgrades suppressed because the series is actively watched
+            "held_pilot": 0,                 # unwatched pilots left at the floor (pilot_hold_at_floor)
         }
 
         # ── Space reserve: JIT upgrades must keep free space above the configured
@@ -5190,6 +5291,24 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         per_episode_tiers = bool(
             ((self.config or {}).get("jit_per_episode_tiers") or {}).get("enabled", True)
         )
+        # PILOT FLOOR-HOLD (default ON): an UNWATCHED pilot (S01E01) is held at the resolution floor
+        # — its next-up watch-likelihood is AFFINITY-ONLY, so taste alone must NOT lift a never-watched
+        # pilot to 1080p just because the disk has room. It climbs only once its likelihood clears
+        # ``upgrade_cutoff`` (very strong affinity) or, post-watch, the engagement floor earns it. The
+        # floor follows the watch_likelihood floor_res (720). OFF → byte-identical (a pilot is treated
+        # like any other next-up episode).
+        _phf = (self.config or {}).get("pilot_hold_at_floor", {}) or {}
+        pilot_hold_on = bool(_phf.get("enabled", True))
+        try:
+            pilot_upgrade_cutoff = float(_phf.get("upgrade_cutoff", 65) or 65)
+        except (TypeError, ValueError):
+            pilot_upgrade_cutoff = 65.0
+        try:
+            pilot_floor_res = int(
+                ((self.config or {}).get("watch_likelihood") or {}).get("floor_res", 720) or 720
+            )
+        except (TypeError, ValueError):
+            pilot_floor_res = 720
         series_choice: dict = {}      # legacy memo (per_episode_tiers OFF): series_id → chosen
         # series_id → {tier_res(int): {"eps": [...], "step_pids": [...], "chosen": profile}}
         series_work: dict = {}
@@ -5255,10 +5374,32 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             # PER-EPISODE (default): recompute per row against the LIVE projected_free, so later
             # episodes of a series may earn a lower tier as the reserve shrinks. LEGACY (flag OFF):
             # decide ONCE per series and reuse it (byte-identical to the pre-per-episode behavior).
-            if per_episode_tiers:
-                _cap = resolution_cap_for_likelihood(
-                    watch_likelihood(row, config=self.config), config=self.config
+            _ll  = watch_likelihood(row, config=self.config)
+            _cap = resolution_cap_for_likelihood(_ll, config=self.config)
+            # PILOT FLOOR-HOLD: clamp an unwatched pilot to the floor unless its (affinity-only)
+            # likelihood clears the high bar. A pilot already on disk at/below the floor is left
+            # untouched (no no-op grab, not marked upgraded → still upgradeable once watched); a
+            # missing pilot still ACQUIREs at the floor and an existing 1080p pilot DOWNGRADEs to it.
+            if pilot_hold_on:
+                _cur_res = row.get("resolution")
+                try:
+                    _cur_res = int(_cur_res) if (_cur_res is not None and pd.notna(_cur_res)) else None
+                except (TypeError, ValueError):
+                    _cur_res = None
+                _cap, _pilot_settled = pilot_floor_hold(
+                    _cap, is_pilot=bool(row.get("is_pilot")), likelihood=_ll,
+                    upgrade_cutoff=pilot_upgrade_cutoff, floor_res=pilot_floor_res,
+                    is_acquire=is_acquire, current_res=_cur_res,
                 )
+                if _pilot_settled:
+                    stats["held_pilot"] += 1
+                    self.logger.log_debug(
+                        f"  🎚️  JIT hold pilot '{title}' S{sn:02d}E{en:02d}: at/below the "
+                        f"{pilot_floor_res}p floor (likelihood {_ll:.0f} < {pilot_upgrade_cutoff:.0f}) "
+                        f"— left as-is until watched."
+                    )
+                    continue
+            if per_episode_tiers:
                 chosen = choose_jit_profile(
                     best_first, cap=_cap, projected_free=projected_free,
                     reserve_gb=reserve_gb, runtime_min=runtime_min, measured=measured,
@@ -5266,9 +5407,6 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 )
             else:
                 if sid not in series_choice:
-                    _cap = resolution_cap_for_likelihood(
-                        watch_likelihood(row, config=self.config), config=self.config
-                    )
                     # Best profile that fits the reserve within the earned tier (brain).
                     series_choice[sid] = choose_jit_profile(
                         best_first, cap=_cap, projected_free=projected_free,
@@ -5277,10 +5415,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     )
                 chosen = series_choice[sid]
 
+            # None now means ONLY a genuine reserve breach (choose_jit_profile floor-falls-back when
+            # no profile is <= the earned cap), so the skip message is accurate.
             if chosen is None:
                 stats["skipped_space"] += 1
                 self.logger.log_info(
-                    f"  ⏭️  JIT skip '{title}' S{sn:02d}E{en:02d}: even the lowest "
+                    f"  ⏭️  JIT skip '{title}' S{sn:02d}E{en:02d}: even the lowest-resolution "
                     f"profile would drop below the {reserve_gb:.0f} GB reserve"
                 )
                 continue
@@ -5296,6 +5436,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 continue
 
             target_res, target_q = self._profile_max_quality(chosen)
+            # FLOOR FALLBACK: no profile sits at/below the earned cap (e.g. a 720p-earned episode on
+            # an instance whose profiles floor at 1080p). choose_jit_profile grabbed the lowest
+            # available instead of stranding it — log it distinctly from a true reserve skip.
+            if target_res > _cap:
+                self.logger.log_info(
+                    f"  ⤵️  JIT '{title}' S{sn:02d}E{en:02d}: no profile at/below the earned "
+                    f"{_cap}p cap — grabbing at the floor profile "
+                    f"'{chosen.get('name', chosen.get('id'))}' ({target_res}p)"
+                )
             cur_q = row.get("quality_name") or f"{row.get('resolution') or '?'}p"
 
             # ACQUIRE (no file yet) vs on-disk re-quality (UPGRADE / DOWNGRADE by resolution).
@@ -5425,7 +5574,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     )
                 except Exception as e:
                     self.logger.log_warning(f"[JIT] acquire monitor PUT failed: {e}")
-            self._spawn_jit_search_worker(instance, queued)
+            # LARGE batches spill to the daemon (the run won't block on per-search 180s polls);
+            # small batches stay in-process. A disabled daemon / spawn failure falls back to the
+            # in-process worker, so searches are never dropped.
+            if not self._maybe_offload_jit_search(instance, queued):
+                self._spawn_jit_search_worker(instance, queued)
 
         _group_count = sum(len(tiers) for tiers in queued.values())
 
@@ -5457,6 +5610,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 ["acquired",               stats["acquired"]],
                 ["re-quality",             stats["upgraded"]],
                 ["active-watch protected", stats["skipped_active_downgrade"]],
+                ["held-pilot (floor)",     stats["held_pilot"]],
                 ["no-space",               stats["skipped_space"]],
                 ["kids",                   stats["skipped_kids"]],
                 ["keep-tagged",            stats["skipped_keep"]],
@@ -5472,6 +5626,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 "missing next-up episodes grabbed fresh",
                 "owned next-up episodes re-grabbed at the calibrated tier",
                 "downgrades skipped: series watched within the active window",
+                "unwatched pilots already at/below the 720p floor — held until watched",
                 "skipped: grab would breach the disk reserve",
                 "skipped: kids-cert series",
                 "skipped: keep_series / keep_season tagged",
@@ -5577,6 +5732,67 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             f"{min(self.JIT_SEARCH_MAX_WORKERS, len(items))} parallel worker(s)."
         )
 
+    def _maybe_offload_jit_search(self, instance: str, work: dict) -> bool:
+        """Spill a LARGE JIT step-down batch to the standalone pilot-search daemon (mode='jit')
+        instead of the in-process NON-daemon thread, so the run exits immediately rather than
+        waiting out per-search 180s command polls across many series. Mirrors
+        :meth:`_maybe_offload_pilot_search` (same ``daemons.pilot_search`` gate + enqueue rollback);
+        threshold here counts SERIES. The daemon reverts a crash-stranded bumped profile on start
+        (the inflight-QP store), preserving the QP-restore guarantee the in-process thread gets for
+        free. Returns True when offloaded (caller skips the in-process worker)."""
+        if self.dry_run:
+            return False
+        try:
+            import os
+            from scripts.managers.factories.daemons.daemon_paths import PILOT_SPILL_THRESHOLD
+            cfg = ((self.config or {}).get("daemons", {}) or {}).get("pilot_search", {}) or {}
+            if not cfg.get("enabled", True):
+                return False
+            try:
+                threshold = int(cfg.get("threshold", PILOT_SPILL_THRESHOLD))
+            except (TypeError, ValueError):
+                threshold = PILOT_SPILL_THRESHOLD
+
+            # Flatten {sid: {tier_res: {eps, step_pids}}} → JSON items [[sid, [[tier_res, eps, step_pids]]]].
+            items = []
+            for sid, tiers in (work or {}).items():
+                groups = []
+                for tier_res, g in (tiers or {}).items():
+                    eps = [[int(e[0]), int(e[1]), int(e[2])]
+                           for e in (g.get("eps") or []) if e and e[0]]
+                    step_pids = [int(p) for p in (g.get("step_pids") or [])]
+                    if eps and step_pids:
+                        groups.append([int(tier_res), eps, step_pids])
+                if groups:
+                    items.append([int(sid), groups])
+            if len(items) <= max(0, threshold):
+                return False
+
+            from scripts.managers.factories.daemons import pilot_jobs
+            from scripts.managers.factories.daemons.supervisor import PilotSearchDaemonSupervisor
+
+            job = {"version": 1, "mode": "jit", "instance": instance,
+                   "items": items, "run_pid": os.getpid()}
+            path = pilot_jobs.enqueue(instance, job)
+            try:
+                PilotSearchDaemonSupervisor(logger=self.logger).ensure_running()
+            except Exception:
+                pilot_jobs.remove(path)
+                raise
+            _grp = sum(len(g) for _s, g in items)
+            self.logger.log_info(
+                f"[JIT] 🛰️ Spilled {len(items)} series ({_grp} tier-group(s)) to the background "
+                f"search daemon (batch > {threshold}); the run will NOT block on the step-down polls. "
+                f"Job: {path.name}; daemon log: pilot_search_daemon.log."
+            )
+            return True
+        except Exception as e:
+            self.logger.log_warning(
+                f"[JIT] Could not offload to the search daemon ({e}); "
+                f"falling back to the in-process worker."
+            )
+            return False
+
     def _jit_search_worker(self, instance: str, items: list) -> None:
         """
         Per series, per target-tier GROUP: search that group's step-down ladder
@@ -5592,157 +5808,19 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         is NEVER searched while the series profile is flipped to a higher tier —
         the group-by-tier invariant that prevents over-grab.
         """
-        POLL_INTERVAL_S = 3.0
-        CMD_TIMEOUT_S   = 180.0
-        DONE_STATES     = ("completed", "failed", "aborted", "cancelled")
-
-        def _label(sid, info=None):
-            """Readable series id for the log: ``sonarr/<instance> '<title>' (tvdb-<id>)``.
-            ``info`` is any series dict already fetched (it carries title + tvdbId), so this
-            costs no extra request; falls back to the raw id when the title is unknown."""
-            if isinstance(info, dict):
-                title = (info.get("title") or "").strip()
-                if title:
-                    tvdb = info.get("tvdbId")
-                    tvdb_s = f"tvdb-{tvdb}" if tvdb else f"sid-{sid}"
-                    return f"sonarr/{instance} '{title}' ({tvdb_s})"
-            return f"sonarr/{instance} series {sid}"
-
-        def _wait_command(cid):
-            if not cid:
-                return
-            start = time.time()
-            while time.time() - start < CMD_TIMEOUT_S:
-                cmd = self.sonarr_api._make_request(instance, f"command/{cid}", fallback=None)
-                if (cmd or {}).get("status") in DONE_STATES:
-                    return
-                time.sleep(POLL_INTERVAL_S)
-
-        def _revert(sid, original_pid):
-            if original_pid is None:
-                return
-            fresh = self.sonarr_api._make_request(instance, f"series/{sid}", fallback=None)
-            if (fresh and isinstance(fresh, dict)
-                    and fresh.get("qualityProfileId") != original_pid):
-                fresh["qualityProfileId"] = original_pid
-                self.sonarr_api._make_request(
-                    instance, f"series/{sid}", method="PUT", payload=fresh
-                )
-                self.logger.log_info(
-                    f"  ↩️ JIT QP revert: {_label(sid, fresh)} → profile {original_pid}"
-                )
-
-        def _process_series(sid, groups) -> list:
-            """Run ONE series' step-down ladder and return its not-grabbed episodes.
-
-            Every series owns its own profile (flip + revert) and its own
-            episodeIds, so series are independent and run concurrently. The
-            ladder WITHIN a series stays strictly sequential — that is what
-            preserves the group-by-tier invariant (a lower-target episode is
-            never searched while the profile is flipped to a higher tier).
-            """
-            failed: list = []
-            original_pid = None
-            label = _label(sid)
-            try:
-                base = self.sonarr_api._make_request(instance, f"series/{sid}", fallback=None)
-                if not (base and isinstance(base, dict)):
-                    return failed
-                label = _label(sid, base)
-                # Capture the pre-flip profile ONCE, before any group bumps the QP, so the
-                # end-of-series revert always restores the true original (never an intermediate
-                # group's tier).
-                original_pid = base.get("qualityProfileId")
-
-                for tier_res, eps, step_pids in groups:
-                    ep_meta   = {int(e[0]): (int(e[1]), int(e[2])) for e in eps if e and e[0]}
-                    remaining = set(ep_meta.keys())
-
-                    for pid in step_pids:
-                        if not remaining:
-                            break
-                        s = self.sonarr_api._make_request(instance, f"series/{sid}", fallback=None)
-                        if not (s and isinstance(s, dict)):
-                            break
-                        if s.get("qualityProfileId") != pid:
-                            s["qualityProfileId"] = pid
-                            self.sonarr_api._make_request(
-                                instance, f"series/{sid}", method="PUT", payload=s
-                            )
-                        # EpisodeSearch carries ONLY this group's remaining episodeIds, so it can
-                        # never grab a higher tier for a lower-target episode of another group.
-                        _cmd = self.sonarr_api._make_request(
-                            instance, "command", method="POST",
-                            payload={"name": "EpisodeSearch", "episodeIds": list(remaining)},
-                        )
-                        _wait_command(_cmd.get("id") if isinstance(_cmd, dict) else None)
-                        grabbed_now = self._episodes_in_queue(instance, list(remaining))
-                        if grabbed_now:
-                            remaining -= grabbed_now
-                            self.logger.log_info(
-                                f"  ✅ JIT grab: {label} grabbed {len(grabbed_now)} ep(s) "
-                                f"at profile {pid} (≤{tier_res}p tier, {len(remaining)} still searching)"
-                            )
-                        else:
-                            self.logger.log_info(
-                                f"  ⏬ JIT step-down: {label} found nothing at profile {pid}"
-                            )
-
-                    if remaining:
-                        self.logger.log_info(
-                            f"  ∅ JIT: {label} — {len(remaining)} ep(s) in the ≤{tier_res}p "
-                            f"tier found no release across {len(step_pids)} profile(s); "
-                            f"queued for retry next run"
-                        )
-                        for _eid in remaining:
-                            _sn, _en = ep_meta[_eid]
-                            failed.append({"series_id": sid, "season": _sn, "episode": _en})
-
-                # Revert ONCE per series, after the last group, to the captured pre-flip profile.
-                _revert(sid, original_pid)
-            except Exception as e:
-                self.logger.log_warning(
-                    f"[JIT] Background step-down search failed for {label}: {e}"
-                )
-                try:  # best-effort revert on error — original_pid was captured before any flip
-                    _revert(sid, original_pid)
-                except Exception:
-                    pass
-            return failed
-
-        # Run the series ladders CONCURRENTLY. Each ladder is independent (its own
-        # profile + episodeIds); writes to the one Sonarr instance still serialize on
-        # the per-instance write lock, but the long command/queue waits now overlap
-        # instead of one series blocking the next. Each _process_series swallows its
-        # own errors and returns its failed list, so a single bad series can't sink
-        # the pool, and the QP is reverted on every path.
-        failed_all: list = []
-        if len(items) <= 1:
-            for sid, groups in items:
-                failed_all.extend(_process_series(sid, groups))
-        else:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-            max_workers = min(self.JIT_SEARCH_MAX_WORKERS, len(items))
-            with ThreadPoolExecutor(
-                max_workers=max_workers, thread_name_prefix="jit-search"
-            ) as ex:
-                futures = [ex.submit(_process_series, sid, groups) for sid, groups in items]
-                for fut in as_completed(futures):
-                    try:
-                        failed_all.extend(fut.result() or [])
-                    except Exception as e:  # _process_series shouldn't raise, but stay defensive
-                        self.logger.log_warning(f"[JIT] step-down series task crashed: {e}")
-
-        # Persist not-grabbed episodes so the next run re-enables them.
-        if failed_all and self.global_cache:
-            try:
-                key = f"sonarr/{instance}/jit/failed_upgrades"
-                existing = self.global_cache.get(key) or []
-                self.global_cache.set(key, list(existing) + failed_all)
-            except Exception as e:
-                self.logger.log_warning(
-                    f"[JIT] Could not persist failed upgrades for retry: {e}"
-                )
+        # Thin wrapper over the shared core (which both this in-process worker and the out-of-process
+        # pilot-search daemon's "jit" mode call, so the two can never drift). ``_episodes_in_queue``
+        # is injected as the grabbed-episode probe; the core records each series' pre-flip profile in
+        # a durable inflight store and reverts it, so a detached crash never strands a bumped tier.
+        from scripts.managers.services.sonarr.cache.jit_search import jit_step_down_search
+        jit_step_down_search(
+            make_request=self.sonarr_api._make_request,
+            in_queue=self._episodes_in_queue,
+            logger=self.logger,
+            global_cache=self.global_cache,
+            instance=instance, items=items,
+            max_workers=self.JIT_SEARCH_MAX_WORKERS,
+        )
 
     def _episodes_in_queue(self, instance: str, ep_ids: list,
                            attempts: int = 3, delay_s: float = 2.0) -> set:

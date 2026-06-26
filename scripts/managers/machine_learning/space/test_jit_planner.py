@@ -13,6 +13,7 @@ from scripts.managers.machine_learning.space.jit_planner import (
     jit_row_skip,
     jit_step_down_pids,
     next_up_grab_candidates,
+    pilot_floor_hold,
     target_tier_key,
 )
 
@@ -104,6 +105,16 @@ def test_choose_jit_profile_none_when_nothing_fits():
                               runtime_min=100, measured=_MEASURED) is None
 
 
+def test_choose_jit_profile_floor_fallback_when_cap_below_all():
+    # cap 480 is below EVERY profile (lowest is 720) -> no profile <= cap. With room, fall back to
+    # the lowest-resolution profile (720, id 11) and grab at the floor rather than strand the episode.
+    assert choose_jit_profile(_BEST_FIRST, cap=480, projected_free=30.0, reserve_gb=5.0,
+                              runtime_min=100, measured=_MEASURED)["id"] == 11
+    # but if even that floor profile breaches the reserve -> None (a genuine space problem).
+    assert choose_jit_profile(_BEST_FIRST, cap=480, projected_free=5.0, reserve_gb=5.0,
+                              runtime_min=100, measured=_MEASURED) is None
+
+
 def test_choose_jit_profile_pressure_cap_default_is_byte_identical():
     # pressure_cap=None (default) -> the bare likelihood cap; same pick as without it.
     assert choose_jit_profile(_BEST_FIRST, cap=2160, projected_free=30.0, reserve_gb=5.0,
@@ -139,3 +150,67 @@ def test_target_tier_key_groups_same_resolution_different_ids_together():
     # invariant that makes the grouped per-episode search free of over-grab.
     assert target_tier_key(_p(99, 1080)) == target_tier_key(_p(12, 1080)) == 1080
     assert jit_step_down_pids(_BEST_FIRST, _p(99, 1080)) == jit_step_down_pids(_BEST_FIRST, _p(12, 1080))
+
+
+# ── pilot floor-hold ─────────────────────────────────────────────────────────────────
+def test_pilot_floor_hold_clamps_low_affinity_unwatched_pilot():
+    # An unwatched pilot whose affinity-only likelihood (30) is below the cutoff (65) is clamped to
+    # the 720 floor even though the bare cap earned 1080 — taste alone can't lift it.
+    cap, settled = pilot_floor_hold(
+        1080, is_pilot=True, likelihood=30.0, upgrade_cutoff=65.0, floor_res=720,
+        is_acquire=False, current_res=720,
+    )
+    assert cap == 720
+    # already on disk AT the floor → settled (leave it; no no-op grab, stays upgradeable post-watch).
+    assert settled is True
+
+
+def test_pilot_floor_hold_existing_1080_pilot_downgrades_not_settled():
+    # An existing ABOVE-floor pilot (1080 on disk) is clamped to 720 but NOT settled → the caller
+    # proceeds with the DOWNGRADE toward the floor where a 720 release exists.
+    cap, settled = pilot_floor_hold(
+        1080, is_pilot=True, likelihood=20.0, upgrade_cutoff=65.0, floor_res=720,
+        is_acquire=False, current_res=1080,
+    )
+    assert cap == 720
+    assert settled is False
+
+
+def test_pilot_floor_hold_missing_pilot_acquires_at_floor_not_settled():
+    # A MISSING pilot (acquire) is clamped to the floor but never settled — it still ACQUIREs at 720.
+    cap, settled = pilot_floor_hold(
+        1080, is_pilot=True, likelihood=10.0, upgrade_cutoff=65.0, floor_res=720,
+        is_acquire=True, current_res=None,
+    )
+    assert cap == 720
+    assert settled is False
+
+
+def test_pilot_floor_hold_very_high_affinity_pilot_passes_through():
+    # Affinity clears the high bar (70 >= 65) → the pilot keeps its earned 1080 cap, untouched.
+    cap, settled = pilot_floor_hold(
+        1080, is_pilot=True, likelihood=70.0, upgrade_cutoff=65.0, floor_res=720,
+        is_acquire=False, current_res=720,
+    )
+    assert cap == 1080
+    assert settled is False
+
+
+def test_pilot_floor_hold_non_pilot_unaffected():
+    # A non-pilot next-up episode is never clamped, regardless of likelihood.
+    cap, settled = pilot_floor_hold(
+        1080, is_pilot=False, likelihood=10.0, upgrade_cutoff=65.0, floor_res=720,
+        is_acquire=False, current_res=1080,
+    )
+    assert cap == 1080
+    assert settled is False
+
+
+def test_pilot_floor_hold_never_raises_cap():
+    # The clamp only ever LOWERS: a pilot earning below the floor (e.g. cap 480) is left at 480,
+    # never pulled up to the floor.
+    cap, _ = pilot_floor_hold(
+        480, is_pilot=True, likelihood=10.0, upgrade_cutoff=65.0, floor_res=720,
+        is_acquire=True, current_res=None,
+    )
+    assert cap == 480
