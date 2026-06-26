@@ -130,6 +130,23 @@ def test_preview_logs_when_nothing_changes_and_still_shows_table():
     assert _has(m.logger.info, "evaluated 1 watched", "0 would change")
 
 
+def test_transcode_causes_breakdown_logs_once():
+    history = (
+        [{"user": "A", "transcode_decision": "transcode", "video_decision": "transcode",
+          "stream_video_codec": "h264", "rating_key": "1", "location": "lan"}] * 3 +     # video: codec x3
+        [{"user": "A", "transcode_decision": "direct play"}] * 2 +
+        [{"user": "B", "transcode_decision": "transcode", "audio_decision": "transcode",
+          "stream_video_codec": "h264", "location": "lan"}]                              # audio
+    )
+    m = _mgr(history, _PROFS, metadata={"1": {"video_codec": "hevc"}})
+    bd = m.report_transcode_causes()
+    assert bd["A"]["causes"] == {"video: codec": 3} and bd["A"]["transcodes"] == 3
+    assert bd["B"]["causes"] == {"audio": 1}
+    assert m.logger.grids and m.logger.grids[0][1][0] == "Viewer"                        # grid logged
+    assert _has(m.logger.info, "transcode causes household-wide", "video-codec")
+    assert m.report_transcode_causes() == {}                                            # once per run
+
+
 def test_preview_off_by_flag():
     df = pd.DataFrame([{"title": "The Bear", "video_codec": "av1", "resolution": 1080}])
     m = _mgr(_HISTORY, _PROFS, config={"scoring": {"codec_profiles": {"report": False}}})

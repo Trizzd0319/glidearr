@@ -59,6 +59,12 @@ _CACHED_HISTORY_FIELDS = (
     "transcode_decision",
     "stream_video_codec",
     "stream_audio_codec",
+    # Per-stream transcode decisions (Plex ground truth: directplay/copy/transcode) — let the
+    # transcode-cause breakdown attribute a transcode to the VIDEO vs AUDIO stream rather than
+    # guessing. Media/playback properties, not PII. Absent on older cached rows (the projection
+    # drops a missing key) → the breakdown falls back to a source-vs-streamed-codec heuristic.
+    "video_decision",
+    "audio_decision",
     # Transcode-capability fingerprint axes (Stage-C remote-play gate). See the PII
     # rationale block above — these are media/playback properties, and location is a
     # coarse lan/wan bit, not an IP.

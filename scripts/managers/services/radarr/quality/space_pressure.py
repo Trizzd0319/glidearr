@@ -1337,6 +1337,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             self.logger.log_debug(f"[SizeAnomaly] report/remediate failed for '{instance}': {e}")
         try:
             self.report_codec_routing(instance, df)   # read-only preview; changes nothing
+            self.report_transcode_causes()            # household-wide cause breakdown; logs once per run
         except Exception as e:
             self.logger.log_debug(f"[CodecRoute] preview failed for '{instance}': {e}")
         return len(score_map)
@@ -1512,6 +1513,48 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             if _rs is not None:
                 _rs.add_rows("radarr", "Codec routing preview", instance, headers, table, order=37)
         return rows
+
+    def report_transcode_causes(self) -> dict:
+        """READ-ONLY household transcode-CAUSE breakdown: per viewer, WHY their plays transcode
+        (subtitle / video codec / video bitrate-res / audio / remote bandwidth). Codec routing only
+        fixes the 'video: codec' slice, so this answers whether it's worth pursuing for the household.
+        Household-wide, so it logs ONCE per run (later per-instance calls are no-ops). Changes nothing.
+        Off via ``scoring.codec_profiles.report=false``."""
+        if getattr(self, "_transcode_causes_logged", False):
+            return {}
+        if not (((self.config or {}).get("scoring") or {}).get("codec_profiles") or {}).get("report", True):
+            return {}
+        history = (self.global_cache.get("tautulli/history/all") if self.global_cache else None) or []
+        if not history:
+            return {}
+        self._transcode_causes_logged = True
+        metadata = (self.global_cache.get("tautulli/metadata/index") if self.global_cache else None) or {}
+        from scripts.managers.machine_learning.quality_analytics.transcode_causes import (
+            transcode_cause_breakdown,
+        )
+        breakdown = transcode_cause_breakdown(history, metadata)
+        rows = []
+        for user, b in sorted(breakdown.items(), key=lambda kv: -kv[1]["transcodes"]):
+            if b["transcodes"] <= 0:
+                continue
+            top = ", ".join(f"{c}:{n}" for c, n in list(b["causes"].items())[:3])
+            rows.append([str(user)[:18], str(b["transcodes"] + b["directs"]), str(b["transcodes"]),
+                         f"{b['rate'] * 100:.0f}%", "y" if b["ground_truth"] else "~", top[:42]])
+        if not rows:
+            return breakdown
+        self.logger.log_grid(
+            ["Viewer", "Plays", "Transc", "Rate", "GT", "Top causes"], rows,
+            title="Transcode causes by viewer (read-only; codec routing only fixes 'video: codec')",
+            cap=20,
+        )
+        total_t = sum(b["transcodes"] for b in breakdown.values())
+        codec_t = sum(b["causes"].get("video: codec", 0) for b in breakdown.values())
+        self.logger.log_info(
+            f"[CodecRoute] transcode causes household-wide: {total_t} transcode(s), of which "
+            f"{codec_t} ({(codec_t / total_t * 100 if total_t else 0):.0f}%) are video-codec — the only "
+            f"slice codec routing can fix; the rest are bitrate/audio/subtitle/remote-bandwidth."
+        )
+        return breakdown
 
     @timeit("remediate_size_anomalies")
     def remediate_size_anomalies(self, instance: str, rows: "list | None") -> dict:
