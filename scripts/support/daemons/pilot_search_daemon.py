@@ -293,6 +293,8 @@ def process_job(cfg: dict, job: dict, ledger: LedgerCache, dry_run: bool) -> dic
     if not instance:
         log.warning("Malformed job (no instance) — dropping.")
         return {"searched": [], "flagged": {}}
+    if mode == "legacy_regrab":
+        return _process_legacy_regrab_job(cfg, job, ledger, dry_run)
     if mode == "jit":
         return _process_jit_job(cfg, job, ledger, dry_run)
     items    = [(int(s), int(e)) for s, e in (job.get("items") or [])
@@ -422,6 +424,39 @@ def _process_jit_job(cfg: dict, job: dict, ledger, dry_run: bool) -> dict:
     return result
 
 
+def _process_legacy_regrab_job(cfg: dict, job: dict, ledger, dry_run: bool) -> dict:
+    """Run one queued legacy-codec re-grab batch through the shared ``run_legacy_regrab`` core: one
+    interactive search per owned XviD/DivX/MPEG-2 file, grab the confirmed modern release (Sonarr
+    replaces the file on import — nothing deleted). The cooldown/resume ledger is the same global-
+    cache key the run reads, written incrementally so an interrupted drain resumes without re-grabbing."""
+    instance = job.get("instance")
+    items = [i for i in (job.get("items") or [])
+             if isinstance(i, dict) and i.get("series_id") is not None and i.get("episode_file_id") is not None]
+    if not instance or not items:
+        log.warning(f"Malformed legacy_regrab job (instance={instance!r}, items={len(items)}) — dropping.")
+        return {}
+    try:
+        workers = int(((cfg.get("pilot_interactive", {}) or {}).get("search_workers", PILOT_INTERACTIVE_WORKERS)))
+    except (TypeError, ValueError):
+        workers = PILOT_INTERACTIVE_WORKERS
+    workers = max(1, workers)
+    log.info(f"Processing legacy re-grab: '{instance}' — {len(items)} legacy-codec file(s), "
+             f"{workers} concurrent search(es).")
+    if dry_run:
+        log.info(f"[dry-run] would interactive-search + re-grab {len(items)} legacy file(s) for "
+                 f"'{instance}' — no writes.")
+        return {}
+
+    from scripts.managers.services.sonarr.cache.legacy_regrab import run_legacy_regrab
+    client = SonarrClient(cfg)
+    result = run_legacy_regrab(make_request=client._make_request, logger=_LOG, global_cache=ledger,
+                               instance=instance, items=items, max_workers=workers, dry_run=False)
+    log.info(f"Legacy re-grab done for '{instance}': {result.get('grabbed', 0)} grabbed, "
+             f"{result.get('no_release', 0)} no modern release, {result.get('failed', 0)} failed "
+             f"(of {result.get('checked', 0)} checked).")
+    return result
+
+
 def _revert_stranded_jit_qp() -> None:
     """On daemon start, revert any series a crashed JIT job left at a bumped quality profile,
     restoring the pre-flip profile recorded in the inflight-QP store. The single-instance pid guard
@@ -522,7 +557,7 @@ def _report_dir(label: str, directory: Path, with_progress: bool = False) -> int
                         + (f", {_fmt_age(time.time() - _parse_iso(pdata.get('updated_at')))} since last"
                            if _parse_iso(pdata.get("updated_at")) else "") + "]")
         flag = "" if job else "  ⚠️ unreadable/corrupt"
-        unit = "series" if mode == "jit" else "stub(s)"
+        unit = {"jit": "series", "legacy_regrab": "file(s)"}.get(mode, "stub(s)")
         print(f"    {inst:<18} {len(items):>7,} {unit:<7}  mode={mode}{age}{prog}{flag}")
     return total
 

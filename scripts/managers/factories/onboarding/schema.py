@@ -233,8 +233,11 @@ def empty_config() -> dict:
             # title's codec WOULD become vs its current codec (changes nothing). report:false hides it.
             # legacy_regrab = the curative TV pass (Sonarr) that swaps owned XviD/DivX/MPEG-2 files —
             # which always transcode on modern clients — for a modern-codec release; gated default-OFF,
-            # dry_run-aware, <=legacy_regrab_budget files/run, re-tried no sooner than
-            # legacy_regrab_cooldown_days (so a slow interactive search per file can't storm a run).
+            # dry_run-aware. The WHOLE eligible backlog (round-robined across series) SPILLS to the
+            # pilot-search daemon (mode 'legacy_regrab', when it exceeds daemons.pilot_search.threshold)
+            # so the run never blocks on the slow per-file interactive searches; only a dry-run preview
+            # or a sub-threshold batch runs inline, capped at legacy_regrab_budget. A file is re-tried no
+            # sooner than legacy_regrab_cooldown_days (the cooldown ledger doubles as the resume checkpoint).
             "codec_profiles": {"enabled": False, "report": True, "legacy_regrab": False,
                                "legacy_regrab_budget": 10, "legacy_regrab_cooldown_days": 14},
         },

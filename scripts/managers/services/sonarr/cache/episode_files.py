@@ -848,11 +848,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         """ACTUATION (gated, default-OFF): replace owned legacy-codec episode files (XviD / DivX /
         MPEG-2 / WMV) with a modern-codec release so modern Plex clients stop transcoding them — the
         curative twin of the AVC/x264 profile preference. Runs AFTER the transcode-decision reports
-        (report_codec_routing). For each legacy file — WATCHED first, a small per-run BUDGET, and a
-        cooldown so the same file isn't re-searched every run — ONE Sonarr interactive search confirms
-        a modern release at >= the current resolution; if found it grabs that release, and Sonarr
-        replaces the file on IMPORT (nothing is deleted first, so a file with no modern replacement is
-        left untouched and never lost). Honours dry_run (previews, grabs nothing). Off via
+        (report_codec_routing). The WHOLE eligible backlog (cooldown-filtered + round-robined ACROSS
+        series so coverage spreads instead of finishing one binged show first) is processed: a LARGE
+        batch SPILLS to the standalone pilot-search daemon (mode 'legacy_regrab') so the run never
+        blocks on the slow per-file interactive searches; a small batch (or a dry-run preview) runs
+        inline, capped so it can't stall the run. Each grab is the specific modern release — Sonarr
+        replaces the file on IMPORT, nothing is deleted, so a file with no modern release is left
+        untouched. Honours dry_run (previews, grabs nothing). Off via
         ``scoring.codec_profiles.legacy_regrab=false`` — the default, so the pass is fully inert."""
         from datetime import datetime, timedelta, timezone
 
@@ -864,16 +866,17 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if df is None or getattr(df, "empty", True):
             return {}
         from scripts.managers.machine_learning.quality_analytics.legacy_codec import (
-            best_modern_release, legacy_files_from_df, release_resolution,
+            interleave_by_series, legacy_files_from_df,
         )
+        from scripts.managers.services.sonarr.cache.legacy_regrab import ledger_key, run_legacy_regrab
         legacy = legacy_files_from_df(df)
         if not legacy:
             return {}
-        budget = max(1, int(cp.get("legacy_regrab_budget", 10) or 10))
+        # Cooldown: skip files attempted within the window (esp. 'no_release'), so the daemon doesn't
+        # re-search the same files every run. The ledger doubles as the resume checkpoint.
         cooldown = timedelta(days=max(1, int(cp.get("legacy_regrab_cooldown_days", 14) or 14)))
         now = datetime.now(tz=timezone.utc)
-        lkey = f"sonarr/legacy_regrab/{instance}"
-        ledger = dict((self.global_cache.get(lkey) if self.global_cache else None) or {})
+        ledger = dict((self.global_cache.get(ledger_key(instance)) if self.global_cache else None) or {})
 
         def _recent(fid) -> bool:
             ent = ledger.get(str(fid))
@@ -884,83 +887,97 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             except Exception:
                 return False
 
-        queue = [r for r in legacy if not _recent(r["episode_file_id"])][:budget]
-        if not queue:
+        eligible = interleave_by_series([r for r in legacy if not _recent(r["episode_file_id"])])
+        if not eligible:
             self.logger.log_info(
                 f"[LegacyRegrab] '{instance}': {len(legacy)} legacy-codec file(s), all within the "
                 f"re-try cooldown — nothing to do this run.")
             return {"legacy": len(legacy), "checked": 0, "grabbed": 0}
 
-        ep_cache: dict = {}
-        grabbed = previewed = no_repl = failed = 0
-        table = []
-        for row in queue:
-            sid, fid = row["series_id"], row["episode_file_id"]
-            emap = ep_cache.get(sid)
-            if emap is None:
-                eps = self.sonarr_api._make_request(instance, f"episode?seriesId={sid}", fallback=[]) or []
-                emap = {}
-                for e in eps:
-                    f = e.get("episodeFileId")
-                    if f is not None:
-                        emap.setdefault(int(f), e)
-                ep_cache[sid] = emap
-            ep = emap.get(int(fid))
-            eid = ep.get("id") if ep else None
-            if not eid:
-                continue
-            releases = self.sonarr_api._make_request(instance, f"release?episodeId={eid}", fallback=None)
-            if releases is None:
-                continue   # transient search failure — DON'T record, re-try next run
-            best = best_modern_release(releases if isinstance(releases, list) else [], row.get("resolution") or 0)
-            sn, en = ep.get("seasonNumber"), ep.get("episodeNumber")
-            label = (f"{str(row.get('series_title') or '?')[:22]} S{sn:02d}E{en:02d}"
-                     if isinstance(sn, int) and isinstance(en, int)
-                     else str(row.get("series_title") or "?")[:28])
-            cur = f"{row.get('video_codec')}@{row.get('resolution') or '?'}"
-            if not best:
-                no_repl += 1
-                ledger[str(fid)] = {"at": now.isoformat(), "result": "no_release"}
-                continue
-            relt = (best.get("title") or "?")[:40]
-            rres = f"{release_resolution(best) or '?'}p"
-            if self.dry_run:
-                previewed += 1
-                table.append([label, cur, relt, rres, "would-grab"])
-                continue
-            ok = False
-            try:
-                res = self.sonarr_api._make_request(
-                    instance, "release", method="POST",
-                    payload={"guid": best.get("guid"), "indexerId": best.get("indexerId")}, fallback=None)
-                ok = res is not None
-            except Exception as e:
-                self.logger.log_warning(f"[LegacyRegrab] grab error for {label}: {e}")
-            if ok:
-                grabbed += 1
-                ledger[str(fid)] = {"at": now.isoformat(), "result": "grabbed"}
-                table.append([label, cur, relt, rres, "grabbed"])
-            else:
-                failed += 1
+        # LARGE backlog → spill the WHOLE set to the background daemon so the run never blocks on the
+        # slow per-file interactive searches (mirrors the pilot/JIT offload). Returns early.
+        if self._maybe_offload_legacy_regrab(instance, eligible):
+            return {"legacy": len(legacy), "queued": len(eligible), "offloaded": True}
 
-        # Persist the cooldown ledger only on a REAL run — a dry-run preview must not burn cooldowns.
-        if not self.dry_run and self.global_cache:
-            try:
-                self.global_cache.set(lkey, ledger)
-            except Exception:
-                pass
+        # Inline: a dry-run preview OR a batch at/below the spill threshold (or the daemon's disabled).
+        # Capped so a large set that couldn't be offloaded can't block the run — the cooldown ledger
+        # makes the next run pick up where this left off.
+        cap = max(1, int(cp.get("legacy_regrab_budget", 10) or 10))
+        batch = eligible[:cap]
+        result = run_legacy_regrab(
+            make_request=self.sonarr_api._make_request, logger=self.logger,
+            global_cache=self.global_cache, instance=instance, items=batch,
+            max_workers=1, dry_run=self.dry_run,
+        )
         prefix = "[dry_run] " if self.dry_run else ""
         self.logger.log_info(
             f"[LegacyRegrab] {prefix}'{instance}': {len(legacy)} legacy-codec file(s); checked "
-            f"{len(queue)} (budget {budget}) — {grabbed} grabbed, {previewed} would-grab, "
-            f"{no_repl} no modern release, {failed} failed.")
-        if table:
+            f"{result['checked']} (inline cap {cap}) — {result['grabbed']} grabbed, "
+            f"{result['previewed']} would-grab, {result['no_release']} no modern release, "
+            f"{result['failed']} failed"
+            + (f"; {len(eligible) - len(batch)} more need the daemon" if len(eligible) > len(batch) else "")
+            + ".")
+        if result["preview"]:
             self.logger.log_grid(
-                ["Episode", "Current", "-> Modern release", "Res", "State"], table,
-                title=f"Legacy-codec re-grab - '{instance}'"
-                      + (" (dry-run preview)" if self.dry_run else ""), cap=24)
-        return {"legacy": len(legacy), "checked": len(queue), "grabbed": grabbed,
-                "previewed": previewed, "no_release": no_repl, "failed": failed}
+                ["Episode", "Current", "-> Modern release", "Res", "State"],
+                [[*row, "would-grab"] for row in result["preview"]],
+                title=f"Legacy-codec re-grab - '{instance}' (dry-run preview)", cap=24)
+        return {"legacy": len(legacy), "checked": result["checked"], "grabbed": result["grabbed"],
+                "previewed": result["previewed"], "no_release": result["no_release"],
+                "failed": result["failed"]}
+
+    def _maybe_offload_legacy_regrab(self, instance: str, items: list) -> bool:
+        """Spill a LARGE legacy re-grab backlog to the standalone pilot-search daemon (mode
+        'legacy_regrab') so the run process exits immediately instead of waiting out a long per-file
+        interactive-search spree. Returns True when enqueued AND the daemon is running (caller skips
+        the inline path). False — caller falls back to the capped inline path — when dry-run, the
+        daemon is disabled, the batch is at/below the spill threshold, or anything fails (re-grabs are
+        never silently dropped; the inline cap + cooldown make the next run pick up the rest)."""
+        if self.dry_run:
+            return False
+        try:
+            import os
+            from scripts.managers.factories.daemons.daemon_paths import PILOT_SPILL_THRESHOLD
+            dcfg = ((self.config or {}).get("daemons", {}) or {}).get("pilot_search", {}) or {}
+            if not dcfg.get("enabled", True):
+                return False
+            try:
+                threshold = int(dcfg.get("threshold", PILOT_SPILL_THRESHOLD))
+            except (TypeError, ValueError):
+                threshold = PILOT_SPILL_THRESHOLD
+            if len(items) <= max(0, threshold):
+                return False
+            from scripts.managers.factories.daemons import pilot_jobs
+            from scripts.managers.factories.daemons.supervisor import PilotSearchDaemonSupervisor
+            cp = (((self.config or {}).get("scoring") or {}).get("codec_profiles") or {})
+            job = {
+                "version":       1,
+                "mode":          "legacy_regrab",
+                "instance":      instance,
+                "items":         [{
+                    "series_id": int(i["series_id"]), "episode_file_id": int(i["episode_file_id"]),
+                    "resolution": int(i.get("resolution") or 0),
+                    "series_title": i.get("series_title"), "video_codec": i.get("video_codec"),
+                    "season_number": i.get("season_number"), "episode_number": i.get("episode_number"),
+                } for i in items],
+                "cooldown_days": int(cp.get("legacy_regrab_cooldown_days", 14) or 14),
+                "run_pid":       os.getpid(),
+            }
+            path = pilot_jobs.enqueue(instance, job)
+            try:
+                PilotSearchDaemonSupervisor(logger=self.logger).ensure_running()
+            except Exception:
+                pilot_jobs.remove(path)   # don't orphan a job AND run inline (a double-search)
+                raise
+            self.logger.log_info(
+                f"[LegacyRegrab] 🛰️ Spilled {len(items)} legacy-codec file(s) to the background "
+                f"search daemon (batch > {threshold}); job {path.name}, log: pilot_search_daemon.log.")
+            return True
+        except Exception as e:
+            self.logger.log_warning(
+                f"[LegacyRegrab] Could not offload to the search daemon ({e}); "
+                f"falling back to the capped inline path for this run.")
+            return False
 
     @timeit("refresh_enrichment")
     def refresh_enrichment(self, instance: str) -> int:
