@@ -1,5 +1,6 @@
 """RadarrSpacePressureManager.report_codec_routing — read-only codec-routing preview that records
-the would-change decisions in the end-of-run summary (changes nothing)."""
+the would-change decisions in the end-of-run summary (changes nothing) and always logs what it
+evaluated for transparency."""
 from __future__ import annotations
 
 import pandas as pd
@@ -25,7 +26,8 @@ class _Api:
 
 
 class _Log:
-    def log_info(self, *a, **k): pass
+    def __init__(self): self.info = []
+    def log_info(self, msg="", *a, **k): self.info.append(str(msg))
     def log_debug(self, *a, **k): pass
     def log_warning(self, *a, **k): pass
 
@@ -62,32 +64,47 @@ def _mgr(history, profs, config=None):
     return m
 
 
-def test_preview_flags_transcoding_title_and_records_summary():
+def _has(log, *needles):
+    return any(all(n in s for n in needles) for s in log)
+
+
+def test_preview_flags_transcoding_title_records_summary_and_logs():
     # The owned file is AV1 (which A transcodes); the policy recommends HEVC (which A direct-plays).
     df = pd.DataFrame([{"title": "The Bear", "video_codec": "av1", "resolution": 1080}])
     m = _mgr(_HISTORY, _PROFS)
     rows = m.report_codec_routing("standard", df)
     assert len(rows) == 1
     r = rows[0]
-    assert r["title"] == "The Bear" and r["current_codec"] == "av1"
-    assert r["recommended_codec"] == "hevc" and r["change"] is True
+    assert r["current_codec"] == "av1" and r["recommended_codec"] == "hevc" and r["change"] is True
     # recorded in the end-of-run summary
-    assert m._rs.calls, "should record a run-summary table"
     svc, concern, inst, headers, table, order = m._rs.calls[0]
     assert (svc, concern, inst, order) == ("radarr", "Codec routing preview", "standard", 37)
-    assert headers[0] == "Title" and "Change" in headers
     assert table[0][-1] == "YES"
+    # transparency line always logged
+    assert _has(m.logger.info, "[CodecRoute]", "evaluated 1 watched", "1 would change")
+
+
+def test_preview_logs_when_nothing_changes_and_still_shows_table():
+    # Already on the direct-play codec (HEVC) -> a row with change=False; the table still shows and the
+    # transparency line reports 0 changes.
+    df = pd.DataFrame([{"title": "The Bear", "video_codec": "hevc", "resolution": 1080}])
+    m = _mgr(_HISTORY, _PROFS)
+    rows = m.report_codec_routing("standard", df)
+    assert len(rows) == 1 and rows[0]["change"] is False
+    assert m._rs.calls and m._rs.calls[0][4][0][-1] == "-"          # table shown, Change column "-"
+    assert _has(m.logger.info, "evaluated 1 watched", "0 would change")
 
 
 def test_preview_off_by_flag():
     df = pd.DataFrame([{"title": "The Bear", "video_codec": "av1", "resolution": 1080}])
     m = _mgr(_HISTORY, _PROFS, config={"scoring": {"codec_profiles": {"report": False}}})
     assert m.report_codec_routing("standard", df) == []
-    assert m._rs.calls == []
+    assert m._rs.calls == [] and m.logger.info == []
 
 
-def test_preview_noop_without_history():
+def test_preview_logs_transparency_without_history():
     df = pd.DataFrame([{"title": "The Bear", "video_codec": "av1", "resolution": 1080}])
     m = _mgr([], _PROFS)
     assert m.report_codec_routing("standard", df) == []
     assert m._rs.calls == []
+    assert _has(m.logger.info, "[CodecRoute]", "no Tautulli watch history")

@@ -1455,33 +1455,42 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             return []
         history = (self.global_cache.get("tautulli/history/all") if self.global_cache else None) or []
         if not history:
+            self.logger.log_info(
+                f"[CodecRoute] '{instance}': no Tautulli watch history cached yet — nothing to evaluate.")
             return []
         try:
             profiles = self.radarr_api._make_request(instance, "qualityprofile", fallback=[]) or []
         except Exception:
             profiles = []
         if not profiles:
+            self.logger.log_info(f"[CodecRoute] '{instance}': no quality profiles available — skipped.")
             return []
         from scripts.managers.machine_learning.quality_analytics.codec_report import (
-            build_per_title_watchers, codec_report_rows, per_user_platform_usage_from_history,
+            build_per_title_watchers, codec_report_rows, normalize_title,
+            per_user_platform_usage_from_history,
         )
         from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint import (
             per_user_transcode_fingerprint_matrix,
         )
+        watchers = build_per_title_watchers(history)
         rows = codec_report_rows(
             df, profiles,
             per_user_transcode_fingerprint_matrix(history),
             per_user_platform_usage_from_history(history),
-            build_per_title_watchers(history),
+            watchers,
         )
-        if not rows:
-            return []
-        changed = [r for r in rows if r["change"]]
+        # TRANSPARENCY: always report what the pass evaluated — even when nothing qualifies or nothing
+        # changes — so the run log shows it ran (vs. silently finding no rows). ``n_watched`` is owned
+        # movies that appear in the watch history; ``len(rows)`` is the subset at a multi-codec tier.
+        _titles = df["title"] if "title" in getattr(df, "columns", []) else []
+        n_watched = sum(1 for t in _titles if normalize_title(t) in watchers)
+        n_changed = sum(1 for r in rows if r["change"])
         self.logger.log_info(
-            f"[CodecRoute] '{instance}': {len(changed)} of {len(rows)} watched title(s) would "
-            f"change codec to reduce transcoding for their viewers (read-only preview; nothing applied)."
+            f"[CodecRoute] '{instance}': evaluated {n_watched} watched movie(s) "
+            f"({len(rows)} at a multi-codec tier); {n_changed} would change codec to reduce "
+            f"transcoding (read-only preview; nothing applied)."
         )
-        _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
+        _rs = getattr(self.global_cache, "run_summary", None) if (self.global_cache and rows) else None
         if _rs is not None:
             table = [[str(r["title"])[:30], ",".join(r["watchers"])[:18], r["current_codec"],
                       r["recommended_codec"], f"{(r['cost'] or 0.0):.2f}", "YES" if r["change"] else "-"]
