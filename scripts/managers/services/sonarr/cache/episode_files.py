@@ -4920,6 +4920,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 "recheck_days":     recheck_days,
                 "search_no_resolution": bool(_pi.get("search_no_resolution", True)),
                 "skip_hard_rejects":    bool(_pi.get("skip_hard_rejects", True)),
+                "soft_floor":           bool(_pi.get("soft_floor", True)),
                 "anime_ladder":     [[int(p), int(r)] for p, r in (anime_ladder or [])],
                 "anime_sids":       [int(s) for s in (anime_sids or [])],
                 "run_pid":          os.getpid(),
@@ -4972,6 +4973,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             max_workers=self.JIT_SEARCH_MAX_WORKERS,
             search_no_resolution=bool(_pi.get("search_no_resolution", True)),
             skip_hard_rejects=bool(_pi.get("skip_hard_rejects", True)),
+            soft_floor=bool(_pi.get("soft_floor", True)),
             anime_ladder=anime_ladder, anime_sids=anime_sids,
         )
 

@@ -83,6 +83,8 @@ def interactive_pilot_search(
     search_batch_size: int = 100,   # episodeIds per EpisodeSearch command (Sonarr accepts a list)
     search_no_resolution: bool = True,  # releases with no resolution (SD-only) → search at the floor tier
     skip_hard_rejects: bool = True,     # all releases rejected for profile-independent reasons → skip + flag
+    soft_floor: bool = True,            # nothing at/above floor_res but sub-floor releases exist → grab the
+                                        # best sub-floor (e.g. only 480 when floor is 720) instead of orphaning
     anime_ladder=None,              # [(profile_id, max_res)] ladder of [Anime] profiles
     anime_sids=None,                # series ids that should use anime_ladder (anime seriesType)
     job_id=None,                    # stable id of the offloaded job → enables per-stub resume
@@ -178,6 +180,13 @@ def interactive_pilot_search(
             # Releases exist but report NO resolution (SD-only / odd) → search at the FLOOR tier so
             # Sonarr can still grab them, rather than skipping as UNACQUIRABLE.
             if pick is None and diag["reason"] == "no_resolution" and search_no_resolution and lad:
+                pick = (lad[0][1], lad[0][0])
+            # SOFT FLOOR: releases exist but EVERY one is BELOW floor_res (e.g. only 480/SD when the
+            # floor is 720) → grab the best sub-floor release at the FLOOR tier rather than orphaning the
+            # pilot UNACQUIRABLE. Setting the series to the floor profile and searching lets Sonarr grab
+            # the best release that profile allows (the SD), so an SD-only show is still seeded; a show
+            # that DOES have ≥floor releases never reaches here (choose_lowest_available_tier picked one).
+            if pick is None and diag["reason"] == "below_floor" and soft_floor and lad:
                 pick = (lad[0][1], lad[0][0])
             # Every usable release is rejected for a PROFILE-INDEPENDENT reason (size / blocklist /
             # incomplete) a flip can't fix → Sonarr would grab nothing, so skip the futile search and

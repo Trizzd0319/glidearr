@@ -128,3 +128,42 @@ def test_concurrent_mixed_outcomes():
     _mk(api, gc)._pilot_interactive_worker("inst", [(1, 901), (2, 902)], LADDER, META, [1], 0, WEEK)
     assert api.searches == [901] and api.final_pid(1) == 11 and api.grabs == []
     assert set(gc.get("sonarr/pilot/unacquirable/inst")) == {"2"}     # only series 2 flagged
+
+
+# ── floor_res=720 + soft-floor (the "every pilot at 720p" behaviour) ──────────────────────────
+def test_floor_720_grabs_lowest_at_or_above_floor():
+    # floor_res=720 with 480/720/1080 available → grab the 720 tier (id 12): prefer the floor, never
+    # the cheaper 480 (the old lowest-of-everything bug) and not the higher 1080.
+    api = _FakeApi({901: [_rel(480, guid="g480"), _rel(720, guid="g720"), _rel(1080, guid="g1080")]})
+    gc = _GC()
+    _mk(api, gc)._pilot_interactive_worker("inst", [(1, 901)], LADDER, META, [1, 2], 720, WEEK)
+    assert api.final_pid(1) == 12 and api.searches == [901] and api.grabs == []
+    assert "1" not in gc.get("sonarr/pilot/unacquirable/inst", {})
+
+
+def test_floor_720_steps_up_when_no_720():
+    # floor_res=720, only 480/1080 available (no 720) → step UP to the 1080 tier (id 13), not down to 480.
+    api = _FakeApi({901: [_rel(480, guid="g480"), _rel(1080, guid="g1080")]})
+    gc = _GC()
+    _mk(api, gc)._pilot_interactive_worker("inst", [(1, 901)], LADDER, META, [1, 2], 720, WEEK)
+    assert api.final_pid(1) == 13 and api.searches == [901]
+
+
+def test_soft_floor_grabs_sub_floor_when_nothing_at_or_above():
+    # floor_res=720 but ONLY a 480 release exists → soft-floor (default ON) grabs at the floor tier
+    # (id 11) so the SD-only show is still seeded, instead of flagging UNACQUIRABLE.
+    api = _FakeApi({901: [_rel(480, guid="g480")]})
+    gc = _GC()
+    _mk(api, gc)._pilot_interactive_worker("inst", [(1, 901)], LADDER, META, [1, 2], 720, WEEK)
+    assert api.final_pid(1) == 11 and api.searches == [901]
+    assert "1" not in gc.get("sonarr/pilot/unacquirable/inst", {})
+
+
+def test_hard_floor_flags_unacquirable_when_soft_floor_off():
+    # soft_floor=False restores the hard floor: a 480-only show under a 720 floor is flagged UNACQUIRABLE.
+    api = _FakeApi({901: [_rel(480, guid="g480")]})
+    gc = _GC()
+    m = _mk(api, gc)
+    m.config = {"pilot_interactive": {"soft_floor": False}}
+    m._pilot_interactive_worker("inst", [(1, 901)], LADDER, META, [1], 720, WEEK)
+    assert api.searches == [] and "1" in gc.get("sonarr/pilot/unacquirable/inst")

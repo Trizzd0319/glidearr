@@ -364,6 +364,7 @@ def process_job(cfg: dict, job: dict, ledger: LedgerCache, dry_run: bool) -> dic
         search_batch_size=batch,
         search_no_resolution=bool(job.get("search_no_resolution", True)),
         skip_hard_rejects=bool(job.get("skip_hard_rejects", True)),
+        soft_floor=bool(job.get("soft_floor", True)),
         anime_ladder=anime_ladder, anime_sids=anime_sids,
         job_id=job_id, skip_sids=skip_sids,
     )

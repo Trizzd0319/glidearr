@@ -245,11 +245,17 @@ def empty_config() -> dict:
         # in one shot (jumping straight past tiers with no results) and, when NOTHING is found at any
         # resolution, flag the show UNACQUIRABLE. An unacquirable stub stays dead until a NEW indexer
         # is added OR recheck_days elapses (the only two ways an empty search can newly succeed; the
-        # clock also self-heals a flag set during a transient indexer outage). floor_res = optional
-        # minimum resolution to consider (0 = any). enabled:false falls back to the blind climb.
-        "pilot_interactive": {"enabled": True, "recheck_days": 7, "floor_res": 0,
+        # clock also self-heals a flag set during a transient indexer outage). floor_res = the
+        # PREFERRED minimum resolution (default 720): grab the lowest available resolution AT OR ABOVE it
+        # (so a pilot lands at 720p when a 720p release exists, stepping UP to 1080p only when none does),
+        # instead of taking the lowest-of-everything (which grabbed SD/480p even when 720p existed).
+        # soft_floor (default ON): when NOTHING at/above floor_res is available, grab the best SUB-floor
+        # release at the floor tier rather than flagging UNACQUIRABLE — so genuinely SD-only shows are
+        # still seeded. floor_res=0 (+ soft_floor) restores the old "lowest of everything" behavior.
+        # enabled:false falls back to the blind climb.
+        "pilot_interactive": {"enabled": True, "recheck_days": 7, "floor_res": 720,
                               "search_no_resolution": True, "skip_hard_rejects": True,
-                              "anime_ladder": True},
+                              "soft_floor": True, "anime_ladder": True},
         # Legacy escape hatch (only used when pilot_floor_climb is OFF). best_tier_first ON makes a
         # stub pilot target the HIGHEST tier whose grab keeps the space reserve, diverting DOWN one
         # rung per empty run (never likelihood-gated). OFF = legacy floor-first/step-up across runs.
