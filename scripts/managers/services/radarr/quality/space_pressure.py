@@ -1470,12 +1470,17 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             per_user_platform_usage_from_history,
         )
         from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint import (
-            per_user_transcode_fingerprint_matrix,
+            per_user_source_fingerprint_matrix, per_user_transcode_fingerprint_matrix,
         )
+        # Source-codec matrix (keyed by the FILE's codec via the metadata index, NOT Plex's streamed /
+        # transcode-target codec) — this is what makes the prediction codec-aware. Falls back to the
+        # streamed matrix (codec-blind) only when no metadata index is cached yet.
+        metadata = (self.global_cache.get("tautulli/metadata/index") if self.global_cache else None) or {}
+        matrix = (per_user_source_fingerprint_matrix(history, metadata) if metadata
+                  else per_user_transcode_fingerprint_matrix(history))
         watchers = build_per_title_watchers(history)
         rows = codec_report_rows(
-            df, profiles,
-            per_user_transcode_fingerprint_matrix(history),
+            df, profiles, matrix,
             per_user_platform_usage_from_history(history),
             watchers,
         )

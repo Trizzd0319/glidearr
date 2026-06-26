@@ -11,9 +11,29 @@ from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint i
     _norm_video, _norm_audio, _norm_subtitle, _norm_res_hdr, _norm_location,
     row_fingerprint, source_fingerprint,
     transcode_fingerprint_matrix, per_user_transcode_fingerprint_matrix,
+    per_user_source_fingerprint_matrix,
     serialize_fingerprint_matrix, deserialize_fingerprint_matrix,
     predict_transcode, choose_tier, can_remote_play,
 )
+
+
+def test_per_user_source_fingerprint_matrix_keys_by_source_not_streamed_codec():
+    # A transcodes an HEVC-source file (Plex streams the h264 transcode TARGET) and direct-plays an
+    # h264-source file. The source matrix must key the transcode under hevc (the FILE's codec), not
+    # h264 (the streamed target) — that's what makes a candidate codec's prediction meaningful.
+    history = [
+        {"user": "A", "platform": "TV", "rating_key": "1", "transcode_decision": "transcode",
+         "stream_video_codec": "h264", "stream_video_full_resolution": "1080", "date": 0},
+        {"user": "A", "platform": "TV", "rating_key": "2", "transcode_decision": "direct play",
+         "stream_video_codec": "h264", "stream_video_full_resolution": "1080", "date": 0},
+    ]
+    meta = {"1": {"video_codec": "hevc"}, "2": {"video_codec": "h264"}}
+    cells = per_user_source_fingerprint_matrix(history, meta)["A"]
+    codecs = {fp[0]: bucket for (dev, fp), bucket in cells.items()}
+    assert codecs["hevc"]["transcode"] == 1 and codecs["hevc"]["direct"] == 0   # hevc source transcoded
+    assert codecs["h264"]["direct"] == 1 and codecs["h264"]["transcode"] == 0   # h264 source direct-played
+    # plays with no source-codec metadata are skipped
+    assert per_user_source_fingerprint_matrix(history, {}) == {}
 
 
 def _row(platform="Chromecast", vc="hevc", ac="eac3", sub="none", res="4k",

@@ -15,8 +15,12 @@ class _RS:
 
 
 class _GC:
-    def __init__(self, rs, history): self.run_summary = rs; self._h = history
-    def get(self, k): return self._h if k == "tautulli/history/all" else None
+    def __init__(self, rs, history, metadata=None):
+        self.run_summary = rs; self._h = history; self._m = metadata or {}
+    def get(self, k):
+        if k == "tautulli/history/all": return self._h
+        if k == "tautulli/metadata/index": return self._m
+        return None
 
 
 class _Api:
@@ -54,15 +58,43 @@ _HISTORY = _plays("The Bear", "A", "PS5", "hevc", "direct play", 10) + \
            _plays("The Bear", "A", "PS5", "av1", "transcode", 10)
 
 
-def _mgr(history, profs, config=None):
+def _mgr(history, profs, config=None, metadata=None):
     m = object.__new__(RadarrSpacePressureManager)
     m.config = config or {}
     m._rs = _RS()
-    m.global_cache = _GC(m._rs, history)
+    m.global_cache = _GC(m._rs, history, metadata)
     m.radarr_api = _Api(profs)
     m.logger = _Log()
     m._resolve_instance = lambda i: i or "standard"
     return m
+
+
+def _src_play(title, rk, user, platform, source_codec, decision, n):
+    # The streamed codec for a TRANSCODE is Plex's target (h264), not the source; for a direct it IS
+    # the source. The source-keyed matrix must recover the source codec from the metadata index.
+    streamed = "h264" if decision == "transcode" else source_codec
+    return [{"title": title, "rating_key": rk, "user": user, "platform": platform,
+             "stream_video_codec": streamed, "transcode_decision": decision,
+             "stream_video_full_resolution": "1080", "stream_audio_codec": "eac3",
+             "subtitle_decision": "none", "location": "lan", "date": 0} for _ in range(n)]
+
+
+def test_source_codec_join_recommends_a_directplay_codec():
+    # A transcodes HEVC-source files but direct-plays h264-source files. 'Foo' is an HEVC file A
+    # watched -> the SOURCE-keyed matrix (via the metadata index) recommends h264 over its HEVC, where
+    # the codec-blind streamed matrix could not (this is the Phase-2 fix end to end).
+    history = (_src_play("Foo", "10", "A", "TV", "hevc", "transcode", 5) +
+               _src_play("Bar", "11", "A", "TV", "h264", "direct play", 5))
+    metadata = {"10": {"video_codec": "hevc"}, "11": {"video_codec": "h264"}}
+    df = pd.DataFrame([{"title": "Foo", "video_codec": "hevc", "resolution": 1080}])
+    m = _mgr(history, _PROFS, metadata=metadata)
+    rows = m.report_codec_routing("standard", df)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["current_codec"] == "hevc" and r["recommended_codec"] == "h264"
+    assert r["current_cost"] == 1.0 and r["recommended_cost"] == 0.0     # hevc transcodes, h264 direct
+    assert r["change"] is True
+    assert _has(m.logger.info, "1 would change")
 
 
 def _has(log, *needles):

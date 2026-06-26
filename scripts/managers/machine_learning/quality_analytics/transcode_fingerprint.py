@@ -158,6 +158,50 @@ def per_user_transcode_fingerprint_matrix(history_entries: list) -> dict:
     return {u: transcode_fingerprint_matrix(rows) for u, rows in by_user.items()}
 
 
+def _meta_video_codec(metadata_index, rating_key):
+    """Source video codec for a play's title from the metadata index, trying str/raw key forms."""
+    md = (metadata_index.get(str(rating_key)) if rating_key is not None else None) \
+        or (metadata_index.get(rating_key) if rating_key is not None else None) or {}
+    return md.get("video_codec")
+
+
+def per_user_source_fingerprint_matrix(history_entries: list, metadata_index: dict) -> dict:
+    """``{user: {(device, fingerprint): bucket}}`` keyed by the title's SOURCE video codec
+    (``metadata_index[rating_key].video_codec``) instead of the STREAMED codec.
+
+    THE FIX for codec-aware routing: when a file TRANSCODES, the streamed codec Tautulli records is
+    Plex's transcode TARGET (e.g. h264), not the file's actual codec — so the streamed-keyed matrix
+    attributes the transcode to the wrong codec and a candidate codec's prediction becomes codec-blind
+    (every codec reads the same per-device rate). Re-keying the video axis by the SOURCE codec makes
+    "would a file in codec X direct-play for this viewer?" answerable: a viewer who transcodes HEVC
+    sources but direct-plays H.264 now shows hevc→transcode vs h264→direct, so the selector can prefer
+    H.264. The other axes (audio/sub/res/location) stay from the play. Plays whose source codec is
+    unknown (title not in the index) are skipped — no usable source signal. Pure."""
+    by_user: dict = {}
+    for entry in history_entries:
+        decision = str(entry.get("transcode_decision") or "").strip().lower()
+        if not decision:
+            continue
+        src = _meta_video_codec(metadata_index or {}, entry.get("rating_key"))
+        if not src:
+            continue
+        u = entry.get("user") or entry.get("user_id") or "unknown"
+        fp = (
+            _norm_video(src),
+            _norm_audio(entry.get("stream_audio_codec")),
+            _norm_subtitle(entry.get("subtitle_decision")),
+            _norm_res_hdr(entry.get("stream_video_full_resolution")),
+            _norm_location(entry.get("location")),
+        )
+        key = (entry.get("platform") or "unknown", fp)
+        bucket = by_user.setdefault(u, {}).setdefault(
+            key, {"direct": 0, "transcode": 0, "last_seen": 0, "n": 0})
+        bucket["transcode" if decision == "transcode" else "direct"] += 1
+        bucket["n"] += 1
+        bucket["last_seen"] = max(bucket["last_seen"], _int(entry.get("date")))
+    return by_user
+
+
 # ── JSON round-trip (the matrix is tuple-keyed; the cache is JSON) ─────────────
 # The cache layer's make_json_safe stringifies dict keys with str(k) — IRREVERSIBLY for
 # a (device, fingerprint) tuple key (it becomes a Python-repr string with no inverse). So
