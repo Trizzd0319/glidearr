@@ -76,7 +76,47 @@ by many clients, so Plex **burns them in**, which forces a full video transcode.
 
 ---
 
-## 4. Quick reference: what each cause looks like in Tautulli
+## 4. Per-client step-by-step
+
+> Menu wording shifts between Plex app versions; the **path and the setting** are what matter.
+> Two settings fix almost everything: **streaming quality = Original/Maximum** (stops bitrate
+> transcodes) and **picking the standard audio track** (stops audio transcodes).
+
+### Samsung / LG TV (Tizen / webOS) — the biggest source of transcoding
+1. **Quality:** Plex app → **Settings (gear) → Video / Quality** → set **Home/Local** *and*
+   **Remote/Internet** streaming to **Maximum / Original**. (These TVs are often shipped capped, which
+   is why good 1080p was downscaling to SD.)
+2. **Audio (the important one):** start any movie → bring up the player bar → **Audio** icon →
+   choose the **"AC3 / Dolby Digital / 5.1"** (or Stereo) track, **not** the TrueHD/DTS/Atmos one.
+   Plex **remembers this per title and per user** — do it once on a show that defaults wrong.
+   *(Samsung/LG can't pass through DTS or TrueHD, so Plex transcodes them unless you pick the AC3 track.)*
+
+### PlayStation (PS4 / PS5)
+1. **Quality:** Plex app → **Settings → Video → Remote Quality** and **Local Quality** → **Original / Maximum**.
+2. **Audio:** **Settings → Audio** — match your TV/receiver setup, or pick the compatible track during
+   playback. (PS5 handles more codecs than a Samsung TV, so audio is less of an issue here; quality is.)
+
+### Windows
+- **Best fix: install the Plex desktop app** (Plex / Plex HTPC for Windows) instead of watching at
+  **app.plex.tv in a browser** — the browser transcodes all audio (see below).
+  - **Quality:** **Settings → Quality → Original / Maximum** (local and remote).
+  - **Audio:** **Settings → Audio** → enable **passthrough** if you have a receiver/soundbar; otherwise
+    select the AC3/stereo track. The desktop app *can* play DTS/TrueHD if your hardware does.
+
+### Chrome / Edge / any web browser
+- **No browser setting stops audio transcoding** — the web player re-encodes all multichannel/AC3/EAC3
+  audio to Opus. **Use a native app** (desktop, TV, mobile, Apple TV, Shield, Roku). If you truly can't,
+  at least set **Settings → Quality → Maximum** to avoid the bitrate transcode.
+
+### Android (phone / tablet / Android TV)
+1. **Quality:** Plex app → **Settings → Video → Remote/Local Quality → Original / Maximum**.
+2. **Audio:** **Settings → Audio → Audio Passthrough** (set to your device's capability) and
+   **Max audio channels** — on a phone, set **Stereo (2.0)** so it never grabs the 7.1 track; on Android
+   TV through a receiver, enable passthrough instead.
+
+---
+
+## 5. Quick reference: what each cause looks like in Tautulli
 
 Open **Tautulli → History → a play → "Stream Data"** (or the play details):
 
