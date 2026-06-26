@@ -6,6 +6,7 @@ import pandas as pd
 
 from scripts.managers.machine_learning.quality_analytics.legacy_codec import (
     best_modern_release,
+    interleave_by_series,
     is_legacy_codec,
     legacy_files_from_df,
 )
@@ -61,3 +62,20 @@ def test_legacy_files_from_df_drops_modern_and_sorts_watched_first():
 def test_legacy_files_from_df_missing_columns():
     assert legacy_files_from_df(pd.DataFrame([{"foo": 1}])) == []
     assert legacy_files_from_df(None) == []
+
+
+def test_interleave_by_series_round_robins_watched_first():
+    files = [
+        {"series_id": 1, "episode_file_id": 11, "watch_count": 9},   # series 1 (watched 9), 2 files
+        {"series_id": 1, "episode_file_id": 12, "watch_count": 9},
+        {"series_id": 2, "episode_file_id": 21, "watch_count": 0},   # series 2 (unwatched), 1 file
+        {"series_id": 3, "episode_file_id": 31, "watch_count": 3},   # series 3 (watched 3), 2 files
+        {"series_id": 3, "episode_file_id": 32, "watch_count": 3},
+    ]
+    out = [f["episode_file_id"] for f in interleave_by_series(files)]
+    # series order by max watch_count desc: 1(9), 3(3), 2(0); then one file per series each round.
+    assert out == [11, 31, 21, 12, 32]
+
+
+def test_interleave_by_series_empty():
+    assert interleave_by_series([]) == []

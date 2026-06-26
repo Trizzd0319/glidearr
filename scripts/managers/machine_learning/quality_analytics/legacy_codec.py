@@ -93,3 +93,33 @@ def legacy_files_from_df(df) -> list:
     # fixes the highest-impact ones before the long tail.
     out.sort(key=lambda d: -d["watch_count"])
     return out
+
+
+def interleave_by_series(files) -> list:
+    """Round-robin owned legacy files ACROSS series so a drain spreads coverage instead of finishing
+    one heavily-watched series (e.g. a 24-episode binge) before touching any other. Series are ordered
+    by their max watch_count (watched series first); within a series the input order is kept, then one
+    file per series is taken each round. Pure."""
+    groups: dict = {}
+    order: list = []
+    for f in (files or []):
+        sid = f.get("series_id")
+        if sid not in groups:
+            groups[sid] = []
+            order.append(sid)
+        groups[sid].append(f)
+    # Series priority: highest max watch_count first; ties keep first-seen order (stable).
+    order.sort(key=lambda s: -max((g.get("watch_count") or 0) for g in groups[s]))
+    out: list = []
+    i = 0
+    while True:
+        added = False
+        for sid in order:
+            grp = groups[sid]
+            if i < len(grp):
+                out.append(grp[i])
+                added = True
+        if not added:
+            break
+        i += 1
+    return out
