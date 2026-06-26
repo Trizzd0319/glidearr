@@ -41,10 +41,19 @@ if str(_REPO_ROOT) not in sys.path:
 from scripts.managers.factories.config.config_loader import ConfigLoader   # noqa: E402
 from scripts.managers.factories.daemons.daemon_paths import CONFIG_PATH     # noqa: E402
 
-# The resolution tiers to mirror → the anime profile name to create. Source profiles are matched by
-# name (case-insensitive) with a max-resolution fallback.
-_TIERS = [("SD", "[Anime] SD"), ("HD-720p", "[Anime] HD-720p"),
-          ("HD-1080p", "[Anime] HD-1080p"), ("Ultra-HD", "[Anime] Ultra-HD")]
+# (source_profile_name, new_anime_profile_name, cutoff_override_quality_name | None). Source profiles
+# are matched by name (case-insensitive) with a max-resolution fallback. Two deliberate choices for the
+# anime ladder:
+#   * the 720 FLOOR sources from SD-720p (the TRUE 720 cap) — NOT HD-720p, which also allows Raw-HD
+#     (1080) and would leak the anime floor up to 1080p, defeating "every anime pilot at 720p".
+#   * the 2160 tier targets a REMUX cutoff ("[Anime] Remux-2160p", the true-UHD-remux top, like the
+#     Radarr 'Remux 2160p (Combined)' ladder) — the remux quality is already allowed in Ultra-HD, so we
+#     only bump the cutoff. The bare-Bluray '[Anime] Ultra-HD' already exists and is left alone.
+_TIERS = [
+    ("SD-720p",  "[Anime] 720p",        None),
+    ("HD-1080p", "[Anime] HD-1080p",    None),
+    ("Ultra-HD", "[Anime] Remux-2160p", "Bluray-2160p Remux"),
+]
 
 
 def _endpoint(icfg):
@@ -86,6 +95,19 @@ def _has_x265_penalty(prof):
                for fi in (prof.get("formatItems") or []))
 
 
+def _cutoff_id_for(items, quality_name):
+    """The quality id of ``quality_name`` within a profile's allowed items — used to override the cutoff
+    to a specific quality (e.g. a remux tier). Returns None if that quality isn't present/allowed, so the
+    caller can fall back to the source profile's own cutoff rather than emit an invalid one."""
+    want = (quality_name or "").strip().lower()
+    for it in items or []:
+        for s in (it.get("items") or [it]):
+            q = s.get("quality") or {}
+            if (q.get("name") or "").strip().lower() == want and s.get("allowed") and q.get("id") is not None:
+                return q["id"]
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Derive per-tier anime quality profiles")
     ap.add_argument("--instance", default="standard")
@@ -120,10 +142,11 @@ def main() -> int:
           f"x265-penalty={_has_x265_penalty(anime_src)})\n")
 
     to_create = []
-    for src_name, new_name in _TIERS:
+    for src_name, new_name, cutoff_override in _TIERS:
         src = by_name.get(src_name.lower())
         if src is None:  # name miss → fall back to closest by max-resolution
-            target = {"sd": 576, "hd-720p": 720, "hd-1080p": 1080, "ultra-hd": 2160}[src_name.lower()]
+            target = {"sd-720p": 720, "hd-720p": 720, "hd-1080p": 1080,
+                      "ultra-hd": 2160}.get(src_name.lower(), 1080)
             src = min(profs, key=lambda p: abs(_max_res(p.get("items")) - target))
             print(f"  note: tier '{src_name}' not found by name — using '{src['name']}' (max {_max_res(src['items'])}p)")
         if new_name.lower() in by_name:
@@ -136,11 +159,22 @@ def main() -> int:
         payload.pop("id", None)
         payload["name"] = new_name
         payload["items"] = src.get("items")          # this tier's allowed qualities
-        payload["cutoff"] = src.get("cutoff")        # a cutoff valid within this tier's qualities
+        # Cutoff: a remux-tier override when requested (and the quality is allowed here), else this
+        # tier's own cutoff. The fallback keeps a valid cutoff even if the named remux quality is absent.
+        _cutoff = src.get("cutoff")
+        if cutoff_override:
+            _cid = _cutoff_id_for(src.get("items"), cutoff_override)
+            if _cid is not None:
+                _cutoff = _cid
+            else:
+                print(f"  ⚠ '{new_name}': cutoff '{cutoff_override}' not allowed in '{src['name']}' "
+                      f"— falling back to its default cutoff")
+        payload["cutoff"] = _cutoff
         to_create.append(payload)
         allowed = _allowed_names(src.get("items"))
+        _cut_note = f", cutoff→{cutoff_override}" if cutoff_override else ""
         print(f"  + '{new_name}'  (from '{src['name']}', {len(allowed)} qualities ≤{_max_res(src['items'])}p, "
-              f"minFormatScore={payload['minFormatScore']}, x265 NOT penalized)")
+              f"minFormatScore={payload['minFormatScore']}, x265 NOT penalized{_cut_note})")
 
     if not to_create:
         print("\nNothing to create.")
