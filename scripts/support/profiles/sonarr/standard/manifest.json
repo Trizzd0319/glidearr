@@ -1,0 +1,13 @@
+{
+  "service": "sonarr",
+  "instance": "standard",
+  "base_url": "http://192.168.1.110:8990",
+  "version": "4.0.17.2952",
+  "exported_at": "2026-06-24T17:40:56",
+  "counts": {
+    "qualityprofile": 13,
+    "customformat": 95,
+    "qualitydefinition": 22,
+    "language": 48
+  }
+}

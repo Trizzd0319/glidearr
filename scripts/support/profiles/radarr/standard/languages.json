@@ -1,0 +1,302 @@
+[
+  {
+    "id": -1,
+    "name": "Any",
+    "nameLower": "any"
+  },
+  {
+    "id": -2,
+    "name": "Original",
+    "nameLower": "original"
+  },
+  {
+    "id": 0,
+    "name": "Unknown",
+    "nameLower": "unknown"
+  },
+  {
+    "id": 51,
+    "name": "Afrikaans",
+    "nameLower": "afrikaans"
+  },
+  {
+    "id": 50,
+    "name": "Albanian",
+    "nameLower": "albanian"
+  },
+  {
+    "id": 31,
+    "name": "Arabic",
+    "nameLower": "arabic"
+  },
+  {
+    "id": 34,
+    "name": "Bengali",
+    "nameLower": "bengali"
+  },
+  {
+    "id": 41,
+    "name": "Bosnian",
+    "nameLower": "bosnian"
+  },
+  {
+    "id": 29,
+    "name": "Bulgarian",
+    "nameLower": "bulgarian"
+  },
+  {
+    "id": 38,
+    "name": "Catalan",
+    "nameLower": "catalan"
+  },
+  {
+    "id": 10,
+    "name": "Chinese",
+    "nameLower": "chinese"
+  },
+  {
+    "id": 39,
+    "name": "Croatian",
+    "nameLower": "croatian"
+  },
+  {
+    "id": 25,
+    "name": "Czech",
+    "nameLower": "czech"
+  },
+  {
+    "id": 6,
+    "name": "Danish",
+    "nameLower": "danish"
+  },
+  {
+    "id": 7,
+    "name": "Dutch",
+    "nameLower": "dutch"
+  },
+  {
+    "id": 1,
+    "name": "English",
+    "nameLower": "english"
+  },
+  {
+    "id": 42,
+    "name": "Estonian",
+    "nameLower": "estonian"
+  },
+  {
+    "id": 16,
+    "name": "Finnish",
+    "nameLower": "finnish"
+  },
+  {
+    "id": 19,
+    "name": "Flemish",
+    "nameLower": "flemish"
+  },
+  {
+    "id": 2,
+    "name": "French",
+    "nameLower": "french"
+  },
+  {
+    "id": 57,
+    "name": "Georgian",
+    "nameLower": "georgian"
+  },
+  {
+    "id": 4,
+    "name": "German",
+    "nameLower": "german"
+  },
+  {
+    "id": 20,
+    "name": "Greek",
+    "nameLower": "greek"
+  },
+  {
+    "id": 23,
+    "name": "Hebrew",
+    "nameLower": "hebrew"
+  },
+  {
+    "id": 26,
+    "name": "Hindi",
+    "nameLower": "hindi"
+  },
+  {
+    "id": 22,
+    "name": "Hungarian",
+    "nameLower": "hungarian"
+  },
+  {
+    "id": 9,
+    "name": "Icelandic",
+    "nameLower": "icelandic"
+  },
+  {
+    "id": 44,
+    "name": "Indonesian",
+    "nameLower": "indonesian"
+  },
+  {
+    "id": 5,
+    "name": "Italian",
+    "nameLower": "italian"
+  },
+  {
+    "id": 8,
+    "name": "Japanese",
+    "nameLower": "japanese"
+  },
+  {
+    "id": 49,
+    "name": "Kannada",
+    "nameLower": "kannada"
+  },
+  {
+    "id": 21,
+    "name": "Korean",
+    "nameLower": "korean"
+  },
+  {
+    "id": 36,
+    "name": "Latvian",
+    "nameLower": "latvian"
+  },
+  {
+    "id": 24,
+    "name": "Lithuanian",
+    "nameLower": "lithuanian"
+  },
+  {
+    "id": 46,
+    "name": "Macedonian",
+    "nameLower": "macedonian"
+  },
+  {
+    "id": 48,
+    "name": "Malayalam",
+    "nameLower": "malayalam"
+  },
+  {
+    "id": 52,
+    "name": "Marathi",
+    "nameLower": "marathi"
+  },
+  {
+    "id": 56,
+    "name": "Mongolian",
+    "nameLower": "mongolian"
+  },
+  {
+    "id": 15,
+    "name": "Norwegian",
+    "nameLower": "norwegian"
+  },
+  {
+    "id": 33,
+    "name": "Persian",
+    "nameLower": "persian"
+  },
+  {
+    "id": 12,
+    "name": "Polish",
+    "nameLower": "polish"
+  },
+  {
+    "id": 18,
+    "name": "Portuguese",
+    "nameLower": "portuguese"
+  },
+  {
+    "id": 30,
+    "name": "Portuguese (Brazil)",
+    "nameLower": "portuguese (brazil)"
+  },
+  {
+    "id": 27,
+    "name": "Romanian",
+    "nameLower": "romanian"
+  },
+  {
+    "id": 55,
+    "name": "Romansh",
+    "nameLower": "romansh"
+  },
+  {
+    "id": 11,
+    "name": "Russian",
+    "nameLower": "russian"
+  },
+  {
+    "id": 40,
+    "name": "Serbian",
+    "nameLower": "serbian"
+  },
+  {
+    "id": 35,
+    "name": "Slovak",
+    "nameLower": "slovak"
+  },
+  {
+    "id": 47,
+    "name": "Slovenian",
+    "nameLower": "slovenian"
+  },
+  {
+    "id": 3,
+    "name": "Spanish",
+    "nameLower": "spanish"
+  },
+  {
+    "id": 37,
+    "name": "Spanish (Latino)",
+    "nameLower": "spanish (latino)"
+  },
+  {
+    "id": 14,
+    "name": "Swedish",
+    "nameLower": "swedish"
+  },
+  {
+    "id": 53,
+    "name": "Tagalog",
+    "nameLower": "tagalog"
+  },
+  {
+    "id": 43,
+    "name": "Tamil",
+    "nameLower": "tamil"
+  },
+  {
+    "id": 45,
+    "name": "Telugu",
+    "nameLower": "telugu"
+  },
+  {
+    "id": 28,
+    "name": "Thai",
+    "nameLower": "thai"
+  },
+  {
+    "id": 17,
+    "name": "Turkish",
+    "nameLower": "turkish"
+  },
+  {
+    "id": 32,
+    "name": "Ukrainian",
+    "nameLower": "ukrainian"
+  },
+  {
+    "id": 54,
+    "name": "Urdu",
+    "nameLower": "urdu"
+  },
+  {
+    "id": 13,
+    "name": "Vietnamese",
+    "nameLower": "vietnamese"
+  }
+]

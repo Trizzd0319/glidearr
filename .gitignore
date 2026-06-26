@@ -62,3 +62,9 @@ scripts/managers/factories/cache/kometa-*/
 # the design says to prune in review — never auto-commit. Regenerate with
 # `python -m scripts.support.tools.generate_tv_franchises`; force-add a vetted copy when ready.
 scripts/managers/services/plex/playlists/tv_franchises.generated.json
+
+# Vendored TRaSH guide cache (re-fetched by arr_trash_fetch.py) — not source.
+scripts/support/profiles/trash/
+
+# Pre-apply profile snapshots (auto-backup written before a rebuild applies) — generated.
+scripts/support/profiles/**/_pre_apply_snapshot/

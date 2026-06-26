@@ -1,0 +1,104 @@
+{
+  "_note": "Codec-steering custom formats for the device/codec direct-play tiers (see ../DEVICE_CODEC_MATRIX.md). These ADD to what the primary already has (it already carries AV1, 10bit, x265 (HD), x265 (no HDR/DV)). Applied id-less — the target instance assigns ids. Shared by Radarr + Sonarr.",
+  "custom_formats": [
+    {
+      "name": "AVC/x264",
+      "includeCustomFormatWhenRenaming": false,
+      "specifications": [
+        {
+          "name": "AVC/x264",
+          "implementation": "ReleaseTitleSpecification",
+          "implementationName": "Release Title",
+          "infoLink": "https://wiki.servarr.com/radarr/settings#custom-formats-2",
+          "negate": false,
+          "required": true,
+          "fields": [
+            {"order": 0, "name": "value", "label": "Regular Expression",
+             "helpText": "Custom Format RegEx is Case Insensitive",
+             "value": "[xh][ ._-]?264|\\bAVC\\b", "type": "textbox",
+             "advanced": false, "privacy": "normal", "isFloat": false}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "HEVC",
+      "includeCustomFormatWhenRenaming": false,
+      "specifications": [
+        {
+          "name": "HEVC/x265",
+          "implementation": "ReleaseTitleSpecification",
+          "implementationName": "Release Title",
+          "infoLink": "https://wiki.servarr.com/radarr/settings#custom-formats-2",
+          "negate": false,
+          "required": true,
+          "fields": [
+            {"order": 0, "name": "value", "label": "Regular Expression",
+             "helpText": "Custom Format RegEx is Case Insensitive",
+             "value": "[xh][ ._-]?265|\\bHEVC(\\b|\\d)", "type": "textbox",
+             "advanced": false, "privacy": "normal", "isFloat": false}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "HDR or DV",
+      "includeCustomFormatWhenRenaming": false,
+      "specifications": [
+        {
+          "name": "HDR or DV",
+          "implementation": "ReleaseTitleSpecification",
+          "implementationName": "Release Title",
+          "infoLink": "https://wiki.servarr.com/radarr/settings#custom-formats-2",
+          "negate": false,
+          "required": true,
+          "fields": [
+            {"order": 0, "name": "value", "label": "Regular Expression",
+             "helpText": "Custom Format RegEx is Case Insensitive",
+             "value": "\\b(dv|dovi|dolby[ .]?v(ision)?|hdr(10(P(lus)?)?)?|pq)\\b", "type": "textbox",
+             "advanced": false, "privacy": "normal", "isFloat": false}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Language: Not Original",
+      "includeCustomFormatWhenRenaming": false,
+      "specifications": [
+        {
+          "name": "Not Original Language",
+          "implementation": "LanguageSpecification",
+          "implementationName": "Language",
+          "infoLink": "https://wiki.servarr.com/radarr/settings#custom-formats-2",
+          "negate": true,
+          "required": false,
+          "fields": [
+            {"order": 0, "name": "value", "value": -2},
+            {"order": 1, "name": "exceptLanguage", "value": false}
+          ]
+        }
+      ],
+      "_comment": "Mirrors the Sonarr CF Radarr lacks. Scored NEGATIVE → English/Dual outrank all other languages, but original-language (e.g. Japanese anime) is NOT penalized, so sub-only anime still grabs."
+    },
+    {
+      "name": "Dolby Vision (steer)",
+      "includeCustomFormatWhenRenaming": false,
+      "specifications": [
+        {
+          "name": "Dolby Vision",
+          "implementation": "ReleaseTitleSpecification",
+          "implementationName": "Release Title",
+          "infoLink": "https://wiki.servarr.com/radarr/settings#custom-formats-2",
+          "negate": false,
+          "required": true,
+          "fields": [
+            {"order": 0, "name": "value", "label": "Regular Expression",
+             "helpText": "Custom Format RegEx is Case Insensitive",
+             "value": "\\b(dv|dovi|dolby[ .]?v(ision)?)\\b", "type": "textbox",
+             "advanced": false, "privacy": "normal", "isFloat": false}
+          ]
+        }
+      ]
+    }
+  ]
+}
