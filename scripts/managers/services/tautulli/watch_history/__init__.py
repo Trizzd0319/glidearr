@@ -51,6 +51,11 @@ _CACHED_HISTORY_FIELDS = (
     "user_id",
     "rating_key",
     "grandparent_rating_key",
+    # Tautulli internal history-row id (NOT PII — an internal DB row id, not a person/device).
+    # Required to fetch a play's per-stream detail via get_stream_data for the transcode-cause
+    # breakdown (the per-stream decisions get_history itself omits).
+    "row_id",
+    "reference_id",
     "title",
     "grandparent_title",
     "media_type",
