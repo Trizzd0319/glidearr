@@ -40,11 +40,11 @@ def test_universe_action_band():
     assert universe_action(9900.0, 9000.0, 9900.0) is None
 
 
-# ── upgrade target (recalibrated default ladder: [0,3][40,4][45,7][55,8][77,5][85,9][90,10]) ──
+# ── upgrade target (recalibrated default ladder: [0,3][45,4][55,7][65,8][75,5][82,10][90,9]) ──
 def test_upgrade_target_steps_up_to_earned_tier():
     ranked = [{"id": 3}, {"id": 4}]
-    # likelihood 42 -> earned profile 4 (rank 1) > current 3 (rank 0) -> step to id 4 (1080p starts at 40 now).
-    assert upgrade_target(ranked, 3, 42, {})["id"] == 4
+    # likelihood 48 -> earned profile 4 (rank 1) > current 3 (rank 0) -> step to id 4 (1080p starts at 45 now).
+    assert upgrade_target(ranked, 3, 48, {})["id"] == 4
 
 
 def test_upgrade_target_none_when_at_or_above_tier():

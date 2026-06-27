@@ -200,7 +200,7 @@ def test_likelihood_map_reads_watchability_from_cache():
                        {"tmdb_id": 14160, "is_watched": False, "watchability_score": 10}])
     m = UhdReconcileManager(config={}, logger=None, registry=_Reg(_SP(df)))
     lk = m._likelihood_map("standard")
-    assert lk.get(862) == 75.0                         # watched + score 80 → likelihood 75
+    assert lk.get(862) == 74.0                         # watched + score 80 → likelihood 74
     assert 14160 in lk
 
 
@@ -219,7 +219,7 @@ def test_move_log_includes_watch_score(monkeypatch):
     log = _CapLog()
     UhdReconcileManager(config=_cfg(), logger=log, radarr=_Mgr(im), dry_run=False,
                         registry=_Reg(_SP(df))).run()
-    assert any("watch 75" in s for s in log.info)      # the per-title move log shows the score
+    assert any("watch 74" in s for s in log.info)      # the per-title move log shows the score
 
 
 # ── proactive 4K acquire (owned 1080p movie warranting 4K gets a 4K copy on the 4K instance) ──
@@ -261,7 +261,7 @@ def _proactive_run(monkeypatch, std, *, score=90, proactive=True, free=9999.0,
 
 
 def test_proactive_acquires_4k_for_high_watchability_1080p(monkeypatch):
-    im = _proactive_run(monkeypatch, [_M1080], score=90)   # likelihood 75 >= 70
+    im = _proactive_run(monkeypatch, [_M1080], score=90)   # likelihood 74 >= 70
     acq = [a for a in im.adds if a[0] == "ultra"]
     assert len(acq) == 1
     assert acq[0][1]["tmdbId"] == 14160
@@ -322,7 +322,7 @@ def _evict_cfg(*, evict=True, reorg="off"):
             "space_coordinator_enabled": True, "deletions_consent": True, "free_space_limit": 1000.0}
 
 
-def _downgrade_run(monkeypatch, *, std, ultra, score=5, free=500.0, evict=True):
+def _downgrade_run(monkeypatch, *, std, ultra, score=5, free=500.0, evict=True, wc=0):
     import pandas as pd
     for v in ("RECOMMENDARR_DELETIONS_CONSENT", "GLIDEARR_DELETIONS_CONSENT",
               "RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT"):
@@ -332,7 +332,8 @@ def _downgrade_run(monkeypatch, *, std, ultra, score=5, free=500.0, evict=True):
              roots={"ultra": [{"path": "/data/media/movies/4k"}],
                     "standard": [{"path": "/data/media/movies/standard"}]},
              free=free, total=10000.0)
-    df = pd.DataFrame([{"tmdb_id": 777, "is_watched": False, "watchability_score": score}])
+    df = pd.DataFrame([{"tmdb_id": 777, "is_watched": wc > 0, "watch_count": wc,
+                        "watchability_score": score}])
     UhdReconcileManager(config=_evict_cfg(evict=evict), logger=None, radarr=_Mgr(im), dry_run=False,
                         registry=_Reg(_SP(df))).run()
     return im
@@ -354,9 +355,18 @@ def test_no_downgrade_when_not_under_pressure(monkeypatch):
     assert im.adds == []                                   # free above the band → nothing
 
 
-def test_no_downgrade_for_high_watchability_orphan(monkeypatch):
-    im = _downgrade_run(monkeypatch, std=[], ultra=[_ORPHAN_4K], score=95, free=500.0)
-    assert im.adds == []                                   # warrants 4K → kept in 4K
+def test_no_downgrade_for_rewatched_orphan(monkeypatch):
+    # REWATCHED (engagement) → likelihood >= the 75 4K gate → genuinely warrants 4K → kept in 4K.
+    im = _downgrade_run(monkeypatch, std=[], ultra=[_ORPHAN_4K], score=50, free=500.0, wc=4)
+    assert im.adds == []                                   # warrants 4K by rewatch → kept in 4K
+
+
+def test_unwatched_high_affinity_orphan_is_downgraded(monkeypatch):
+    # UNWATCHED but high watchability_score: affinity caps at 74 (< the 75 4K gate) → taste alone no
+    # longer holds 4K, so under pressure it gets a 1080p baseline (the recalibrated 'taste never 4K').
+    im = _downgrade_run(monkeypatch, std=[], ultra=[_ORPHAN_4K], score=95, free=500.0, wc=0)
+    add = [a for a in im.adds if a[0] == "standard"]
+    assert len(add) == 1 and add[0][1]["tmdbId"] == 777    # demoted to a 1080p baseline
 
 
 def test_no_downgrade_when_baseline_already_present(monkeypatch):

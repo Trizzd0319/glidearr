@@ -28,8 +28,9 @@ from __future__ import annotations
 from scripts.support.utilities.size_model import profile_max_quality, target_resolution_for_score
 
 HD_MAX_RES = 1080            # the HD baseline never exceeds this (else it is just a second 4K copy)
-DEFAULT_UHD_SCORE = 70       # watchability at/above which a title warrants the 4K bonus (mirrors
-                             # watch_likelihood.uhd_cutoff); override per-deployment via config.
+DEFAULT_UHD_SCORE = 75       # watchability/likelihood at/above which a title warrants the 4K bonus —
+                             # tracks watch_likelihood.uhd_cutoff (75) and the ladder's first 4K rung
+                             # (Ultra-HD at 75); override per-deployment via 4k_dual_min_score / config.
 
 
 def hd_target_resolution(score) -> int:

@@ -181,7 +181,7 @@ def empty_config() -> dict:
         # likelihood onto radarr_quality_ladder (explicit profile ids, below); Sonarr
         # JIT uses the resolution cutoffs (uhd/fhd/hd -> 2160/1080/720).
         "watch_likelihood": {
-            "rewatch_floor": 90, "watched_floor": 50, "started_floor": 40,
+            "rewatch_floor": 90, "watched_floor": 50, "started_floor": 45,
             "abandoned_ceiling": 25,
             # untouched_mode: "percentile" ranks each title within the library so
             # affinity SPREADS across tiers (Option 1); "absolute" = base+score*gain.
@@ -190,16 +190,19 @@ def empty_config() -> dict:
             # "only the top X% upgrade" knob (raise it to upgrade fewer titles).
             "untouched_mode": "absolute", "untouched_pct_floor": 0,
             "untouched_base": 12, "untouched_score_gain": 1.0,
-            "affinity_cap": 75, "affinity_boost": 1.8,
-            "uhd_cutoff": 70, "fhd_cutoff": 40, "hd_cutoff": 20,
+            # affinity_cap (74) is kept just below uhd_cutoff (75) so taste alone reaches
+            # Remux-1080p but NEVER 4K (4K is earned by rewatch / saga caught-up engagement).
+            "affinity_cap": 74, "affinity_boost": 1.8,
+            "uhd_cutoff": 75, "fhd_cutoff": 45, "hd_cutoff": 20,
             "uhd_res": 2160, "fhd_res": 1080, "hd_res": 720, "floor_res": 720,
         },
-        # Radarr explicit profile ladder: ascending [min_likelihood%, profile_id].
-        # Distinguishes sub-tiers sharing a resolution (low/high-1080p, low/high-4K).
-        #  3=HD-720p 4=HD-1080p 6=HD-720p/1080p 7=HD Bluray+WEB 8=Remux+WEB-1080p
-        #  5=Ultra-HD(low-4K) 9=Remux 2160p(high-4K) 10=UHD Bluray+WEB(top-4K).
+        # Radarr explicit profile ladder: ascending [min_likelihood%, profile_id]. SYMMETRIC by
+        # quality CLASS — web → bluray → remux at each resolution, Remux the epitome of each. Must
+        # match watch_likelihood._DEFAULT_RADARR_LADDER.
+        #  3=HD-720p 4=HD-1080p(WEB) 7=HD Bluray+WEB 8=Remux+WEB-1080p
+        #  5=Ultra-HD(entry-4K) 10=UHD Bluray+WEB(Bluray-2160p) 9=Remux 2160p(epitome).
         "radarr_quality_ladder": [
-            [0, 3], [20, 4], [30, 6], [40, 7], [55, 8], [65, 5], [70, 9], [85, 10],
+            [0, 3], [45, 4], [55, 7], [65, 8], [75, 5], [82, 10], [90, 9],
         ],
         # Watchability-score (score_show / score_movie) tunables.
         #   show_user_rating: the Group-A4 declared-rating term for SHOWS only. A

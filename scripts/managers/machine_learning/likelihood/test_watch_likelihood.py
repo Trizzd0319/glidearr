@@ -4,6 +4,7 @@ from scripts.managers.machine_learning.likelihood.watch_likelihood import (
     movie_universe_credits,
     profile_id_for_likelihood,
     resolution_cap_for_likelihood,
+    saga_credit,
     series_universe_credits,
     universe_credit,
     watch_likelihood,
@@ -25,7 +26,7 @@ def test_engagement_floors_are_graded_by_watch_count():
 def test_single_watch_is_1080p_not_4k():
     one = _L(watch_count=1)
     assert resolution_cap_for_likelihood(one, config=None) == 1080
-    assert profile_id_for_likelihood(one, config=None) == 7     # HD Bluray + WEB (1080p), not a 4K id
+    assert profile_id_for_likelihood(one, config=None) == 4     # WEB-1080p, not a 4K id
 
 
 def test_twice_watched_still_1080p():
@@ -35,13 +36,26 @@ def test_twice_watched_still_1080p():
 def test_regular_rewatch_earns_4k():
     assert resolution_cap_for_likelihood(_L(watch_count=3), config=None) == 2160
     assert resolution_cap_for_likelihood(_L(watch_count=4), config=None) == 2160
-    assert profile_id_for_likelihood(_L(watch_count=4), config=None) == 10   # UHD Bluray + WEB (top 4K)
+    assert profile_id_for_likelihood(_L(watch_count=3), config=None) == 5    # entry-4K (Ultra-HD)
+    assert profile_id_for_likelihood(_L(watch_count=4), config=None) == 9    # Remux 2160p (the epitome)
+
+
+def test_symmetric_ladder_maps_each_band_to_its_class():
+    # web → bluray → remux at each resolution; Remux is the epitome of each tier.
+    pid = lambda L: profile_id_for_likelihood(L, config=None)
+    assert pid(30) == 3     # <45      720p (sticky cold floor)
+    assert pid(48) == 4     # 45–55    WEB-1080p
+    assert pid(60) == 7     # 55–65    Bluray-1080p
+    assert pid(70) == 8     # 65–75    Remux-1080p
+    assert pid(78) == 5     # 75–82    entry-4K (Ultra-HD)
+    assert pid(85) == 10    # 82–90    Bluray-2160p (UHD Bluray + WEB)
+    assert pid(95) == 9     # 90+      Remux-2160p (the epitome)
 
 
 def test_affinity_alone_never_reaches_4k():
     # A never-watched but highly-liked title tops out at 1080p — taste must not buy 4K.
     aff = _L(watch_count=0, watchability_score=80)
-    assert aff == 75                                            # capped at affinity_cap
+    assert aff == 74                                            # capped at affinity_cap
     assert resolution_cap_for_likelihood(aff, config=None) == 1080
     assert profile_id_for_likelihood(aff, config=None) == 8     # Remux + WEB 1080p — the ceiling for taste
 
@@ -53,9 +67,69 @@ def test_untouched_low_stays_720p():
 
 
 def test_started_and_abandoned_below_default():
-    assert _L(percent_complete=50) == 40                        # started_floor
+    assert _L(percent_complete=50) == 45                        # started_floor (entry 1080p)
     assert _L(percent_complete=10, watchability_score=80) == 25  # abandoned: CAPPED at the ceiling
     assert _L(percent_complete=10) == 12                         # low affinity → stays at affinity
+
+
+# ── saga caught-up / depth credit (household, cross-media, timeline) ───────────
+def _credit_to_pid(credit):
+    # what tier an UNWATCHED (own wc 0) member lands at, given a saga credit
+    L = watch_likelihood({"watch_count": 0, "universe_credit": credit}, config=None)
+    return profile_id_for_likelihood(L, config=None)
+
+
+def test_caught_up_unwatched_frontier_reaches_remux():
+    # Just released (age 0), you've watched everything before it (caught_up 1.0) → Remux-ready BEFORE
+    # you ever press play.
+    credit = saga_credit(caught_up_frac=1.0, days_since_available=0)
+    assert credit == 6.0                                   # full cap, within grace
+    assert _credit_to_pid(credit) == 9                     # Remux-2160p, unwatched
+
+
+def test_half_watched_saga_lifts_unwatched_member_to_remux():
+    # The looser ">50% of the saga watched" signal also reaches Remux.
+    assert _credit_to_pid(saga_credit(saga_watched_frac=0.5, days_since_available=0)) == 9
+
+
+def test_caught_up_beats_overall_depth():
+    # max(caught_up, overall): a frontier entry in a barely-started saga still gets the frontier boost.
+    assert saga_credit(caught_up_frac=1.0, saga_watched_frac=0.1) == \
+           saga_credit(caught_up_frac=1.0, saga_watched_frac=1.0)
+
+
+def test_within_grace_window_holds_remux_then_fades():
+    # Default 90-day window at reference household size: inside → Remux; long past it → faded out of 4K.
+    assert _credit_to_pid(saga_credit(caught_up_frac=1.0, days_since_available=80)) == 9    # in window
+    assert _credit_to_pid(saga_credit(caught_up_frac=1.0, days_since_available=200)) != 9   # past window, faded
+
+
+def test_solo_household_gets_a_longer_leash_than_a_big_one():
+    # Same age past the base window: a solo viewer still holds Remux; a 6-person house has dropped.
+    age = 150
+    solo = _credit_to_pid(saga_credit(caught_up_frac=1.0, days_since_available=age, household_members=1))
+    big  = _credit_to_pid(saga_credit(caught_up_frac=1.0, days_since_available=age, household_members=6))
+    assert solo == 9 and big != 9
+
+
+def test_freshly_released_entry_opens_a_new_window_regardless_of_age_of_saga():
+    # A dormant saga relights the moment its next entry drops: a NEW entry (age 0) is full even though
+    # an OLD unwatched one (age 1000) has long faded.
+    assert saga_credit(caught_up_frac=1.0, days_since_available=0) == 6.0
+    assert saga_credit(caught_up_frac=1.0, days_since_available=1000) < 1.0
+
+
+def test_shallow_saga_does_not_reach_remux():
+    # Only ~30% watched and not caught up → a partial lift, not Remux.
+    assert _credit_to_pid(saga_credit(saga_watched_frac=0.3, days_since_available=0)) != 9
+
+
+def test_cold_saga_lends_nothing():
+    assert saga_credit(caught_up_frac=0.0, saga_watched_frac=0.0) == 0.0
+
+
+def test_saga_credit_future_availability_does_not_overshoot_cap():
+    assert saga_credit(caught_up_frac=1.0, days_since_available=-30) <= 6.0
 
 
 # ── universe / franchise propagation ──────────────────────────────────────────

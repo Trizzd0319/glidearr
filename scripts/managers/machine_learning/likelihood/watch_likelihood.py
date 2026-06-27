@@ -16,10 +16,10 @@ Likelihood (0–100) = max(engagement floor, affinity propensity):
     → ~1080p, twice → high-1080p, but only REGULAR rewatches (≈3+) clear the 4K gate.
     Partial views: 20–90% → started_floor, abandoned (<20%) → ≤ abandoned_ceiling.
   * AFFINITY (cast/crew/studio/genre, via the watchability_score) raises it for
-    UNTOUCHED titles, but is CAPPED at ``affinity_cap`` (75) which is kept BELOW
-    ``uhd_cutoff`` (77) — so affinity alone reaches 1080p but NEVER 4K, which stays
-    reserved for rewatched content. A cold unwatched title with no affinity lands low
-    and stays at the 720p floor (the steep, sticky low end).
+    UNTOUCHED titles, but is CAPPED at ``affinity_cap`` (74) which is kept BELOW
+    ``uhd_cutoff`` (75) — so affinity alone reaches Remux-1080p but NEVER 4K, which
+    stays reserved for rewatched content. A cold unwatched title with no affinity lands
+    low and stays at the 720p floor (the steep, sticky low end).
 
 Two ladders:
   * RADARR — an EXPLICIT profile-id ladder (config ``radarr_quality_ladder``): an
@@ -40,8 +40,8 @@ _DEFAULTS = {
     # capped at rewatch_floor. So 1 watch → 50, 2 → 64, 3 → 78, 4+ → 90 (with rewatch_step 14).
     "rewatch_floor":        90.0,   # the cap a regularly-rewatched title reaches → top-4K
     "rewatch_step":         14.0,   # likelihood added per rewatch beyond the first
-    "watched_floor":        50.0,   # watched once / ≥90% done  → 1080p (+affinity may lift, never 4K)
-    "started_floor":        40.0,   # 20–90% complete           → high-1080
+    "watched_floor":        50.0,   # watched once / ≥90% done  → WEB-1080p (+affinity may lift, never 4K)
+    "started_floor":        45.0,   # 20–90% complete           → entry 1080p (WEB)
     "abandoned_ceiling":    25.0,   # 0–20% complete (tried, stopped)
     # Untouched / affinity propensity (capped below the top-4K band).
     # untouched_mode: "absolute" (DEFAULT — a real bar: base + score*gain, so a title
@@ -54,13 +54,13 @@ _DEFAULTS = {
     "untouched_pct_floor":  0.0,
     "untouched_base":       12.0,
     "untouched_score_gain": 1.0,
-    "affinity_cap":         75.0,   # < uhd_cutoff ⇒ affinity alone reaches 1080p but NEVER 4K
+    "affinity_cap":         74.0,   # < uhd_cutoff ⇒ affinity alone reaches Remux-1080p but NEVER 4K
     # Affinity weight multiplier applied to the scorer's cast/crew/studio/genre caps.
     "affinity_boost":       1.8,
     # Resolution cutoffs (Sonarr / fallback): likelihood → max resolution. uhd_cutoff is kept ABOVE
     # affinity_cap so only rewatch engagement (≈3+ watches) earns 4K — never taste alone.
-    "uhd_cutoff":           77.0,
-    "fhd_cutoff":           40.0,
+    "uhd_cutoff":           75.0,
+    "fhd_cutoff":           45.0,
     "hd_cutoff":            20.0,
     "uhd_res":              2160,
     "fhd_res":              1080,
@@ -72,22 +72,41 @@ _DEFAULTS = {
     "universe_credit_cap":            2.0,    # max watch-counts a hot universe lends a sibling
     "universe_heat_full":             0.30,   # rewatched-fraction of the group that earns FULL credit
     "universe_recency_halflife_days": 30.0,   # lent credit halves every N days since the group's last watch
+    # Saga CAUGHT-UP / DEPTH credit (household, cross-media, timeline-aware). Distinct from the
+    # rewatched-fraction credit above: lends borrowed watch-count from how CAUGHT-UP the household is on
+    # a saga's timeline (all priors watched) OR how DEEP into it overall, so even an UNWATCHED frontier
+    # entry (e.g. Eternals once you've seen everything before it) reaches Remux before first play. The
+    # LEASH is RELEASE-RELATIVE: full for a grace window after the entry becomes available, then fades —
+    # so being caught-up never expires (a dormant saga relights when its next entry drops), but an
+    # ignored new entry decays back to its own tier. The grace window scales by household size.
+    "saga_credit_cap":            6.0,    # max borrowed watch-counts from saga caught-up/depth
+    "saga_engagement_full":       0.5,    # caught-up OR overall-watched fraction at/above which FULL
+                                          # credit is lent (>50% of the saga, or ALL of an entry's priors)
+    "saga_grace_days":            90.0,   # a caught-up UNWATCHED new entry holds FULL Remux credit this
+                                          # long after it becomes available (release/acquisition), at the
+                                          # reference household size — the window to watch it in Remux
+    "saga_grace_ref_members":     4.0,    # reference household size; the grace window scales √(ref/N) so a
+                                          # solo viewer gets a longer leash, a big household a shorter one
+    "saga_postgrace_halflife_days": 30.0, # past the grace window the credit halves every N days (an
+                                          # unwatched entry fades back to its own tier)
 }
 
 # Radarr explicit profile ladder (ascending [min_likelihood, profile_id]). Profiles:
-#   3 HD-720p · 4 HD-1080p · 6 HD-720p/1080p · 7 HD Bluray+WEB · 8 Remux+WEB-1080p ·
-#   5 Ultra-HD(low-4K) · 9 Remux 2160p(high-4K) · 10 UHD Bluray+WEB(top-4K).
-# Recalibrated: 720p is the sticky low end (<40), 1080p is the broad default (40–77, incl. all
-# affinity-only titles), and the 4K trio (5/9/10) sits at ≥77 so ONLY rewatch engagement reaches it
-# (watched 3× → ~78 → Ultra-HD; 4×+ → 90 → UHD Bluray+WEB). Affinity (≤75) tops out at Remux+WEB 1080p.
+#   3 HD-720p · 4 HD-1080p(WEB) · 6 HD-720p/1080p · 7 HD Bluray+WEB · 8 Remux+WEB-1080p ·
+#   5 Ultra-HD(entry-4K) · 10 UHD Bluray+WEB(Bluray-2160p) · 9 Remux 2160p(epitome).
+# SYMMETRIC by quality CLASS — web → bluray → remux at BOTH resolutions, Remux the epitome of each:
+#   <45 720p (sticky cold floor) · 45 WEB-1080p · 55 Bluray-1080p · 65 Remux-1080p ·
+#   75 entry-4K · 82 Bluray-2160p · 90 Remux-2160p (top).
+# The 4K trio (5/10/9) sits at ≥75 so ONLY rewatch/universe engagement reaches it (watched 3× → ~78
+# → entry-4K; 4×+ → 90 → Remux-2160p). Affinity (≤74) tops out at Remux+WEB-1080p — taste never buys 4K.
 _DEFAULT_RADARR_LADDER = [
     [0,  3],
-    [40, 4],
-    [45, 7],
-    [55, 8],
-    [77, 5],
-    [85, 9],
-    [90, 10],
+    [45, 4],
+    [55, 7],
+    [65, 8],
+    [75, 5],
+    [82, 10],
+    [90, 9],
 ]
 
 
@@ -332,6 +351,52 @@ def universe_credit(rewatched_siblings, group_size, *, days_since_watch=0.0, con
     days = max(0.0, _num(days_since_watch))
     decay = 0.5 ** (days / hl) if hl > 0 else 1.0
     return round(cap * heat * decay, 3)
+
+
+def saga_credit(*, caught_up_frac=0.0, saga_watched_frac=0.0, days_since_available=0.0,
+                household_members=None, config=None) -> float:
+    """Borrowed effective-watch-count a saga member earns from how CAUGHT-UP / DEEP the HOUSEHOLD is —
+    the value a pre-pass writes into a member's ``universe_credit`` (combined via ``max`` with the
+    rewatched-fraction :func:`universe_credit`, so it only ever lifts).
+
+    ELIGIBILITY (never decays): ``engagement = max(caught_up_frac, saga_watched_frac)`` (both 0–1).
+    ``caught_up_frac`` = fraction of THIS entry's timeline-priors the household has watched (1.0 = you've
+    seen everything before it → you're at the frontier); ``saga_watched_frac`` = fraction of the WHOLE
+    saga watched (the looser ">50% of it" signal). FULL strength once engagement reaches
+    ``saga_engagement_full`` (0.5), scaling down linearly below.
+
+    LEASH (release-relative): full credit for a GRACE WINDOW after the entry became AVAILABLE
+    (``days_since_available`` = days since its release / acquisition), then halves every
+    ``saga_postgrace_halflife_days`` (30). So a caught-up household gets a window to watch a NEW entry in
+    Remux; ignore it past the window and it fades to its own tier — while a freshly-released entry always
+    opens a NEW window (a saga you finished years ago relights the moment its next entry drops). Being
+    caught-up never expires; only the unwatched entry's window does.
+
+    HOUSEHOLD SIZE: the window scales ``√(saga_grace_ref_members / household_members)`` — a solo viewer
+    gets a longer leash than a 6-person house, so per-person pressure to keep up is comparable
+    (``household_members`` None → reference size → the base window). Cap (6.0) sits well above the ~3.86
+    effective-watches the Remux gate needs. 0 when nothing of the saga is watched — purely additive."""
+    cap = _cfg(config, "saga_credit_cap")
+    full = max(1e-6, _cfg(config, "saga_engagement_full"))
+    base_window = _cfg(config, "saga_grace_days")
+    ref = max(1.0, _cfg(config, "saga_grace_ref_members"))
+    post_hl = _cfg(config, "saga_postgrace_halflife_days")
+    engagement = max(0.0, min(1.0, max(_num(caught_up_frac), _num(saga_watched_frac))))
+    if engagement <= 0.0:
+        return 0.0
+    frac = min(1.0, engagement / full)
+    # Size-normalised grace window: a solo household gets a longer leash (√-dampened); unknown → ref.
+    n = max(1.0, _num(household_members, ref))
+    window = base_window * (ref / n) ** 0.5
+    # Clamp age >= 0 so a future-dated availability (clock skew) is treated as just-released.
+    age = max(0.0, _num(days_since_available))
+    if age <= window:
+        decay = 1.0
+    elif post_hl > 0:
+        decay = 0.5 ** ((age - window) / post_hl)
+    else:
+        decay = 0.0
+    return round(cap * frac * decay, 3)
 
 
 def series_universe_credits(fran_map, series_stats, *, config=None, rewatch_min=2) -> dict:

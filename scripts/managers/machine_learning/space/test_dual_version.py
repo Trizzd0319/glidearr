@@ -42,7 +42,7 @@ def test_hd_cap_noop_when_proactive_off():
 
 
 def test_hd_cap_lowers_below_first_present_4k_rung(_proactive_cfg):
-    assert hd_capped_likelihood(90, _LADDER_PROFS, _proactive_cfg) == 84.0   # recalibrated: first present 4K rung now at 85 → 84
+    assert hd_capped_likelihood(90, _LADDER_PROFS, _proactive_cfg) == 89.0   # symmetric ladder: first present 4K rung (p9) now at 90 → 89
 
 
 def test_hd_cap_leaves_already_low_likelihood(_proactive_cfg):
