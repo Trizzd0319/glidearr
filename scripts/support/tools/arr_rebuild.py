@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 import requests
@@ -36,10 +37,31 @@ def _resolve(cfg, svc, instance="standard"):
     return inst.get("base_url") or "", inst.get("api") or ""
 
 
+def _request(method, base, key, path, *, json_body=None, timeout=300, retries=4):
+    """HTTP with a generous timeout + backoff retry on transient timeouts / conn errors. After a bulk
+    profile/CF upsert an *arr re-evaluates custom formats across the WHOLE library, so the next big call
+    (GET /movie or an editor PUT on a 24k library) can stall well past a short timeout — retrying lets a
+    busy instance settle instead of crashing the apply mid-flight. GET/PUT/DELETE here are idempotent
+    (read; profile-PUT-by-id; editor-PUT ids→profile; 404-tolerant delete) so a retry is safe."""
+    last = None
+    for attempt in range(retries):
+        try:
+            r = requests.request(method, f"{base}/api/v3/{path}",
+                                  headers={"X-Api-Key": key}, json=json_body, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            last = e
+            if attempt < retries - 1:
+                wait = 15 * (attempt + 1)
+                print(f"  … {method} {path} timed out (attempt {attempt + 1}/{retries}); "
+                      f"the *arr is busy re-scoring — retrying in {wait}s")
+                time.sleep(wait)
+    raise last
+
+
 def _get(base, key, path):
-    r = requests.get(f"{base}/api/v3/{path}", headers={"X-Api-Key": key}, timeout=60)
-    r.raise_for_status()
-    return r.json()
+    return _request("GET", base, key, path).json()
 
 
 def _strip_spec(s):
@@ -130,20 +152,18 @@ def dry_run(cfg, svc, instance="standard") -> bool:
 
 
 def _post(base, key, path, payload):
-    r = requests.post(f"{base}/api/v3/{path}", headers={"X-Api-Key": key}, json=payload, timeout=60)
-    r.raise_for_status()
+    # creation is NOT idempotent (a retry could duplicate a CF/profile) → single attempt, long timeout.
+    r = _request("POST", base, key, path, json_body=payload, retries=1)
     return r.json() if r.content else None
 
 
 def _put(base, key, path, payload):
-    r = requests.put(f"{base}/api/v3/{path}", headers={"X-Api-Key": key}, json=payload, timeout=120)
-    r.raise_for_status()
+    r = _request("PUT", base, key, path, json_body=payload)
     return r.json() if r.content else None
 
 
 def _delete(base, key, path):
-    r = requests.delete(f"{base}/api/v3/{path}", headers={"X-Api-Key": key}, timeout=60)
-    r.raise_for_status()
+    _request("DELETE", base, key, path)
 
 
 def _schema_quality_index(schema):
