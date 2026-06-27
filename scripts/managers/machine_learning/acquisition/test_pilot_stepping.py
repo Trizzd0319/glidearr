@@ -110,6 +110,31 @@ def test_profile_max_resolution_empty_is_zero():
     assert profile_max_resolution({"items": [{"allowed": True, "quality": {}}]}) == 0
 
 
+def test_profile_max_resolution_treats_raw_hd_as_720_not_1080():
+    # Raw-HD is resolution 1080 in Sonarr's quality definition but is a 720-tier passthrough; a profile
+    # that allows it (the 'HD-720p' profile) must still cap at 720 so it can act as a true 720 rung.
+    hd720 = {"items": [
+        {"allowed": True, "quality": {"name": "Bluray-720p", "resolution": 720}},
+        {"allowed": True, "quality": {"name": "Raw-HD", "source": "televisionRaw", "resolution": 1080}},
+        {"allowed": True, "quality": {"name": "WEBDL-480p", "resolution": 480}},
+    ]}
+    assert profile_max_resolution(hd720) == 720
+    # a REAL 1080p quality is NOT demoted (identity-based, not resolution-based)
+    hd1080 = {"items": [{"allowed": True, "quality": {"name": "Bluray-1080p", "resolution": 1080}}]}
+    assert profile_max_resolution(hd1080) == 1080
+
+
+def test_raw_hd_profile_and_1080_profile_are_distinct_ladder_rungs():
+    # With Raw-HD demoted, HD-720p (720) and HD-1080p (1080) no longer collapse into one rung — the
+    # climb ladder keeps a true 720 rung for the pilot floor to land on.
+    hd720 = {"id": 3, "items": [
+        {"allowed": True, "quality": {"name": "Bluray-720p", "resolution": 720}},
+        {"allowed": True, "quality": {"name": "Raw-HD", "source": "televisionRaw", "resolution": 1080}}]}
+    hd1080 = {"id": 4, "items": [{"allowed": True, "quality": {"name": "Bluray-1080p", "resolution": 1080}}]}
+    ranked = rank_pilot_profiles([hd1080, hd720])
+    assert [p["id"] for p in ranked] == [3, 4]            # 720 floor first, distinct rungs
+
+
 # ── rank_pilot_profiles ─────────────────────────────────────────────────────────
 def _p(pid, res):
     return {"id": pid, "items": [{"allowed": True, "quality": {"resolution": res}}]}

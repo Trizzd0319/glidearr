@@ -135,15 +135,20 @@ def interactive_pilot_search(
 
     def _set_profile(sid, pid) -> bool:
         """Re-fetch the series FRESH and PUT only its qualityProfileId, so the write lands
-        against current Sonarr state (mirrors ``_pilot_set_profile``). False if the fetch
-        came back empty (caller skips the search; the stub re-probes next run)."""
+        against current Sonarr state (mirrors ``_pilot_set_profile``). False if the fetch came back
+        empty OR the PUT failed (caller skips the search; the stub re-probes next run). Checking the
+        PUT result is essential: a silently-failed flip would otherwise leave the series on its
+        ORIGINAL (possibly 1080p-allowing) profile and the EpisodeSearch would over-grab above the
+        floor — the exact bug this floor logic exists to prevent."""
         fresh = make_request(instance, f"series/{sid}", fallback=None)
         if not fresh or not isinstance(fresh, dict):
             return False
+        if fresh.get("qualityProfileId") == pid:
+            return True                                   # already on the target tier — nothing to do
         fresh = dict(fresh)
         fresh["qualityProfileId"] = pid
-        make_request(instance, f"series/{sid}", method="PUT", payload=fresh)
-        return True
+        # A failed write returns the None fallback; a successful PUT returns the updated series dict.
+        return make_request(instance, f"series/{sid}", method="PUT", payload=fresh) is not None
 
     # ── Phase 1: discover availability + set each series' tier (concurrent) ──────────
     def _one(sid, ep_id):

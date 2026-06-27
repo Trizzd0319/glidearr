@@ -73,22 +73,34 @@ import pandas as pd
 from scripts.managers.machine_learning.sizing.size_model import estimate_gb_for_profile
 
 
+def _effective_resolution(quality) -> int:
+    """A quality's resolution for CAP/ladder purposes, treating Raw-HD as a 720-tier passthrough rather
+    than the 1080 Sonarr's quality definition labels it. Without this, a profile that allows Raw-HD (e.g.
+    the 'HD-720p' profile) reports max_resolution 1080, so it can never act as a true 720 rung — the
+    pilot's 720 floor then maps onto a 1080-allowing profile and Sonarr (quality-first) grabs 1080p.
+    Raw-HD is identified by IDENTITY (source 'televisionRaw' / name 'Raw-HD'), NOT by resolution — real
+    1080p qualities (HDTV/WEB/Bluray-1080p) share resolution 1080 and must keep it."""
+    if not isinstance(quality, dict):
+        return 0
+    if str(quality.get("source") or "").lower() == "televisionraw" or str(quality.get("name") or "") == "Raw-HD":
+        return 0
+    res = quality.get("resolution", 0)
+    return int(res) if isinstance(res, (int, float)) else 0
+
+
 def profile_max_resolution(profile) -> int:
-    """Highest allowed resolution in a Sonarr quality profile, including nested
-    grouped items — the key that ranks profiles from most-permissive (lowest) to
-    widest. 0 when nothing is allowed / no resolution is set."""
+    """Highest allowed resolution in a Sonarr quality profile, including nested grouped items — the key
+    that ranks profiles from most-permissive (lowest) to widest. Raw-HD is treated as 720 (see
+    :func:`_effective_resolution`) so a 720-capped profile is not mis-ranked as 1080. 0 when nothing is
+    allowed / no resolution is set."""
     best = 0
     for item in (profile.get("items") or []):
         if not item.get("allowed"):
             continue
-        res = (item.get("quality") or {}).get("resolution", 0)
-        if isinstance(res, (int, float)):
-            best = max(best, int(res))
+        best = max(best, _effective_resolution(item.get("quality")))
         for sub in (item.get("items") or []):
             if sub.get("allowed"):
-                sr = (sub.get("quality") or {}).get("resolution", 0)
-                if isinstance(sr, (int, float)):
-                    best = max(best, int(sr))
+                best = max(best, _effective_resolution(sub.get("quality")))
     return best
 
 
