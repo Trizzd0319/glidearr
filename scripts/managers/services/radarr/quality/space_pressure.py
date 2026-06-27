@@ -1386,12 +1386,71 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # stamps bare-universe films with universe_name="universe", which must NOT fuse unrelated films.
         credits = movie_universe_credits(universe_map, stats, config=self.config,
                                          drop_labels=PLACEHOLDER_AFFINITY)
-        df["universe_credit"] = _mid.map(lambda m: credits.get(int(m), 0.0) if pd.notna(m) else 0.0)
-        if credits:
+        # Saga CAUGHT-UP / DEPTH credit (household, cross-media, release-grace-decayed) — combined via
+        # max with the rewatched-fraction credit above. Default-off: returns {} (no change) when
+        # scoring.saga_credit.enabled is unset, so this is byte-identical inert until opted in.
+        saga_cr = self._saga_quality_credits(df, _mid, instance)
+        df["universe_credit"] = _mid.map(
+            lambda m: max(credits.get(int(m), 0.0), saga_cr.get(int(m), 0.0)) if pd.notna(m) else 0.0)
+        if credits or saga_cr:
+            _allc = dict(credits)
+            for _k, _v in saga_cr.items():
+                _allc[_k] = max(_allc.get(_k, 0.0), _v)
+            _saga_note = f"; {len(saga_cr)} via saga caught-up/depth" if saga_cr else ""
             self.logger.log_info(
-                f"[Universe] '{instance}': lent franchise/collection credit to {len(credits)} movies "
-                f"(max {max(credits.values()):.2f} watch-counts)."
+                f"[Universe] '{instance}': lent franchise/collection credit to {len(_allc)} movies "
+                f"(max {max(_allc.values()):.2f} watch-counts{_saga_note})."
             )
+
+    def _saga_quality_credits(self, df, _mid, instance) -> dict:
+        """``{movie_id: saga caught-up/depth credit}`` for the QUALITY pre-pass — household,
+        cross-media, release-grace-decayed (:func:`watch_likelihood.saga_credit`). Empty when
+        ``scoring.saga_credit.enabled`` is off or the universe source / ``tmdb_id``+``date_added``
+        columns are absent, so the caller's ``max`` is a no-op. ``_mid`` is the numeric ``movie_id``
+        series (position-aligned with ``df``). Also surfaces the per-title detail to the run log + a
+        global_cache snapshot (the GUI feed) via :func:`emit_saga_credit_preview`. Best-effort: logs +
+        returns ``{}`` on any failure."""
+        out: dict = {}
+        try:
+            from scripts.managers.machine_learning.likelihood.saga_engagement import (
+                emit_saga_credit_preview,
+                gather_saga_engagement,
+                household_member_count,
+            )
+            from scripts.managers.machine_learning.likelihood.watch_likelihood import saga_credit
+            from scripts.managers.services.plex.playlists.universe_order import saga_display_name
+            eng = gather_saga_engagement(self.global_cache, self.config)
+            if not eng or "tmdb_id" not in df.columns or "date_added" not in df.columns:
+                return out
+            members = household_member_count(self.config, self.global_cache) or None
+            now = pd.Timestamp.now(tz="UTC")
+            _tm = pd.to_numeric(df["tmdb_id"], errors="coerce")
+            _da = pd.to_datetime(df["date_added"], utc=True, errors="coerce")
+            _has_title = "title" in df.columns
+            items: list = []
+            for pos, _idx in enumerate(df.index):
+                m, tmdb = _mid.iat[pos], _tm.iat[pos]
+                if pd.isna(m) or pd.isna(tmdb) or pd.isna(_da.iat[pos]):
+                    continue
+                e = eng.get(("movie", int(tmdb)))
+                if not e:
+                    continue
+                days = max(0.0, float((now - _da.iat[pos]).days))
+                cr = saga_credit(caught_up_frac=e["caught_up_frac"],
+                                 saga_watched_frac=e["saga_watched_frac"],
+                                 days_since_available=days, household_members=members,
+                                 config=self.config)
+                if cr > 0:
+                    out[int(m)] = cr
+                    items.append({"id": int(m),
+                                  "title": (df.at[_idx, "title"] if _has_title else int(m)),
+                                  "saga": saga_display_name(e.get("saga", "")),
+                                  "caught_up": e["caught_up_frac"], "depth": e["saga_watched_frac"],
+                                  "days": days, "credit": cr})
+            emit_saga_credit_preview(self.global_cache, self.logger, self.config, "radarr", instance, items)
+        except Exception as e:
+            self.logger.log_debug(f"[Universe] saga quality credit skipped: {e}")
+        return out
 
     @timeit("report_size_anomalies")
     def report_size_anomalies(self, instance: str, df=None) -> list:
@@ -1563,17 +1622,22 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
           * MIS-GRADED (junk/SD grade, really HD) → ``RefreshMovie`` rescans mediainfo to fix the
             grade. Non-destructive.
-          * BLOATED (oversized at a real HD/UHD grade) → re-grab at the profile target: DELETE the
-            oversized file + ``MoviesSearch`` so Radarr re-acquires a properly-sized release.
-            DESTRUCTIVE — only for MONITORED movies (else the delete would orphan the slot), and
-            only when the backup gate is armed (``effective_dry_run`` False); otherwise logged as
-            'would …'. Honours the run's dry_run AND the degrade-to-dry-run backup gate."""
+          * BLOATED (oversized at a real HD/UHD grade) → ACQUIRE-then-replace, never delete-first:
+            an interactive search (``GET release?movieId=``) lists every candidate release with its
+            size, we pick a SAME-RESOLUTION, in-profile-size one and grab it by guid (``POST release``),
+            and Radarr's import removes the old bloated file on success. No window where the movie has
+            no file; if no acceptable smaller release exists the bloated file is LEFT AS-IS. A blind
+            ``MoviesSearch`` can't do this — the bloated file is already at the profile cutoff (Radarr
+            grabs nothing), and even forced it would re-grab the same top-scored remux. Only for
+            MONITORED movies, and the grab honours the run's dry_run AND the degrade-to-dry-run backup
+            gate (otherwise logged as 'would …')."""
         cfg = size_anomaly.config_for(self.config)
         if not cfg.get("remediate", False) or not rows:
             return {}
         instance = self._resolve_instance(instance)
         eff_dry = effective_dry_run(self.dry_run, self.global_cache)
-        stats = {"rescanned": 0, "regrabbed": 0, "skipped_unmonitored": 0, "failed": 0}
+        stats = {"rescanned": 0, "regrabbed": 0, "skipped_unmonitored": 0,
+                 "skipped_no_release": 0, "failed": 0}
 
         # ── rescan mis-graded (non-destructive) ──────────────────────────────────
         mids = [int(r["movie_id"]) for r in rows
@@ -1593,45 +1657,124 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     stats["failed"] += 1
                     self.logger.log_warning(f"[SizeAnomaly] rescan batch failed on '{instance}': {e}")
 
-        # ── re-grab bloated (destructive: delete + search) ───────────────────────
+        # ── re-grab bloated (acquire-then-replace: grab a right-sized release by guid) ─────
         for r in rows:
             if r.get("action") != "regrab":
                 continue
             mid, fid = r.get("movie_id"), r.get("movie_file_id")
             if mid is None or fid is None:
                 continue
-            # Only re-grab MONITORED movies — deleting an unmonitored movie's file leaves it gone
-            # with nothing to re-acquire it.
+            # Only re-grab MONITORED movies — replacing an unmonitored movie's file overrides a
+            # deliberate opt-out (and Radarr won't keep monitoring the result).
             mv = self.radarr_api._make_request(instance, f"movie/{int(mid)}", fallback=None)
             if not (isinstance(mv, dict) and mv.get("monitored")):
                 stats["skipped_unmonitored"] += 1
                 self.logger.log_info(f"[SizeAnomaly] skip re-grab '{r.get('title')}' — not monitored.")
                 continue
+            cur_res = (((mv.get("movieFile") or {}).get("quality") or {}).get("quality") or {}).get("resolution")
+            # No current resolution (the file was deleted/moved since the snapshot) → we can't keep the
+            # resolution we own; a resolution-blind grab could route a 4K release into a 1080p instance.
+            # Leave it for next run rather than risk a wrong-resolution pull.
+            if not cur_res:
+                stats["skipped_no_release"] += 1
+                self.logger.log_info(
+                    f"[SizeAnomaly] keep '{r.get('title')}' — current resolution unknown (no movie "
+                    f"file); won't risk a wrong-resolution grab.")
+                continue
+            expected_gb = float(r.get("expected_gb") or 0)
+            # ONE interactive search (read-only, but it does hit indexers) reveals every candidate
+            # release + size; pick a same-resolution, in-profile-size one. Done in dry-run too so the
+            # preview names the actual release that WOULD be grabbed.
+            releases = self.radarr_api._make_request(instance, f"release?movieId={int(mid)}", fallback=None) or []
+            pick = self._pick_replacement_release(
+                releases, expected_gb=expected_gb, resolution=cur_res,
+                under_ratio=cfg["under_ratio"], over_ratio=cfg["over_ratio"])
+            if not pick:
+                stats["skipped_no_release"] += 1
+                self.logger.log_info(
+                    f"[SizeAnomaly] keep '{r.get('title')}' — no in-profile same-resolution release "
+                    f"found to replace the {r.get('size_gb')} GB {r.get('quality_name')} file (left as-is).")
+                continue
+            pick_gb = float(pick.get("size") or 0) / (1024 ** 3)
             if eff_dry:
                 self.logger.log_info(
-                    f"[SizeAnomaly] [dry_run] would re-grab '{r.get('title')}' "
-                    f"({r.get('size_gb')} GB {r.get('quality_name')} -> profile target, "
-                    f"~{r.get('reclaim_gb')} GB reclaim): delete file {fid} + MoviesSearch.")
+                    f"[SizeAnomaly] [dry_run] would re-grab '{r.get('title')}': grab "
+                    f"'{pick.get('title')}' ({pick_gb:.1f} GB) to replace the {r.get('size_gb')} GB "
+                    f"{r.get('quality_name')} file — Radarr import removes the old file "
+                    f"(~{r.get('reclaim_gb')} GB reclaim). No file is deleted first.")
                 continue
             try:
-                self.radarr_api._make_request(instance, f"moviefile/{int(fid)}", method="DELETE")
-                self.radarr_api._make_request(instance, "command", method="POST",
-                                              payload={"name": "MoviesSearch", "movieIds": [int(mid)]})
+                # Confirm the grab was accepted — _make_request returns None on a soft rejection
+                # (release no longer grabbable / indexer down) WITHOUT raising, so don't count those as
+                # replaced (mirrors legacy_regrab). The old file is untouched, so it re-flags next run.
+                res = self.radarr_api._make_request(
+                    instance, "release", method="POST", fallback=None,
+                    payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId")})
+                if res is None:
+                    stats["failed"] += 1
+                    self.logger.log_warning(
+                        f"[SizeAnomaly] re-grab not accepted for '{r.get('title')}': grab of "
+                        f"'{pick.get('title')}' returned no result (left as-is, will re-flag next run).")
+                    continue
                 stats["regrabbed"] += 1
-                self.logger.log_info(f"[SizeAnomaly] re-grabbing '{r.get('title')}': deleted "
-                                     f"bloated file, searching at profile target.")
+                self.logger.log_info(
+                    f"[SizeAnomaly] re-grabbing '{r.get('title')}': grabbed '{pick.get('title')}' "
+                    f"({pick_gb:.1f} GB) — Radarr will import and replace the {r.get('size_gb')} GB file.")
             except Exception as e:
                 stats["failed"] += 1
                 self.logger.log_warning(f"[SizeAnomaly] re-grab failed for '{r.get('title')}': {e}")
 
         acted = stats["rescanned"] + stats["regrabbed"]
-        if acted or stats["skipped_unmonitored"]:
+        if acted or stats["skipped_unmonitored"] or stats["skipped_no_release"]:
             self.logger.log_info(
                 f"[SizeAnomaly] '{instance}' remediation: {stats['rescanned']} rescanned, "
                 f"{stats['regrabbed']} re-grabbed, {stats['skipped_unmonitored']} skipped "
-                f"(unmonitored), {stats['failed']} failed."
+                f"(unmonitored), {stats['skipped_no_release']} kept (no right-sized release), "
+                f"{stats['failed']} failed."
             )
         return stats
+
+    @staticmethod
+    def _pick_replacement_release(releases, *, expected_gb, resolution, under_ratio, over_ratio):
+        """Choose the release that should REPLACE a bloated file from Radarr interactive-search
+        results. Returns the chosen release dict (carrying ``guid`` + ``indexerId``) or None.
+
+        Eligibility: has a guid+indexerId, matches ``resolution`` (keep the resolution we own — when
+        ``resolution`` is falsy the filter is skipped), and its size falls in the SAME in-profile band
+        the detector uses (``under_ratio`` × expected < size < ``over_ratio`` × expected) so we skip
+        both fake/tiny releases and still-bloated ones. Hard rejections (sample/blocklist) and torrents
+        with no seeders are excluded; 'not an upgrade'/quality rejections are fine (a manual grab
+        overrides them). Among the eligible, the one CLOSEST to the expected size wins (tie-break: most
+        seeders) so the replacement lands at the profile target, not just under the bloat ceiling."""
+        if not releases or expected_gb <= 0:
+            return None
+        lo, hi = under_ratio * expected_gb, over_ratio * expected_gb
+        best, best_key = None, None
+        for rel in releases:
+            if not isinstance(rel, dict):
+                continue
+            guid, indexer = rel.get("guid"), rel.get("indexerId")
+            if not guid or indexer is None:
+                continue
+            res = (((rel.get("quality") or {}).get("quality") or {}).get("resolution"))
+            if resolution and res != resolution:
+                continue
+            try:
+                size_gb = float(rel.get("size") or 0) / (1024 ** 3)
+            except (TypeError, ValueError):
+                continue
+            if not (lo < size_gb < hi):                       # skip undersized/fake AND still-bloated
+                continue
+            rejections = [str(x).lower() for x in (rel.get("rejections") or [])]
+            if any(bad in rj for rj in rejections for bad in ("sample", "blocklist", "blacklist")):
+                continue
+            seeders = rel.get("seeders")
+            if seeders is not None and seeders <= 0:          # dead torrent; usenet has no seeders → allow
+                continue
+            key = (abs(size_gb - expected_gb), -(seeders or 0))
+            if best_key is None or key < best_key:
+                best, best_key = rel, key
+        return best
 
     @LoggerManager().log_function_entry
     @timeit("run_space_pressure")

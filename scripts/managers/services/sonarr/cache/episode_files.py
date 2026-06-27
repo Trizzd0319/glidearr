@@ -649,9 +649,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             f"(range: {min(vals)}-{max(vals)})"
         )
         try:
-            self.report_size_anomalies(instance, df)
+            _rows = self.report_size_anomalies(instance, df)
+            self.remediate_size_anomalies(instance, _rows)
         except Exception as e:
-            self.logger.log_debug(f"[SizeAnomaly] report failed for '{instance}': {e}")
+            self.logger.log_debug(f"[SizeAnomaly] report/remediate failed for '{instance}': {e}")
         try:
             self.report_codec_routing(instance, df)   # read-only codec preview; changes nothing
         except Exception as e:
@@ -683,11 +684,82 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             for sid, ts in _last.items():
                 stats.setdefault(int(sid), {})["days_since"] = (now - ts).days if pd.notna(ts) else 1e9
         credits = series_universe_credits(fran or {}, stats, config=self.config)
-        df["universe_credit"] = _sid.map(lambda s: credits.get(int(s), 0.0) if pd.notna(s) else 0.0)
-        if credits:
+        # Saga CAUGHT-UP / DEPTH credit (household, cross-media, release-grace-decayed) — combined via
+        # max with the rewatched-fraction credit above. Default-off: {} (no change) when
+        # scoring.saga_credit.enabled is unset, so this is byte-identical inert until opted in.
+        saga_cr = self._saga_quality_credits(df, rows, _sid, instance)
+        df["universe_credit"] = _sid.map(
+            lambda s: max(credits.get(int(s), 0.0), saga_cr.get(int(s), 0.0)) if pd.notna(s) else 0.0)
+        if credits or saga_cr:
+            _allc = dict(credits)
+            for _k, _v in saga_cr.items():
+                _allc[_k] = max(_allc.get(_k, 0.0), _v)
+            _saga_note = f"; {len(saga_cr)} via saga caught-up/depth" if saga_cr else ""
             self.logger.log_info(
-                f"[Universe] '{instance}': lent franchise credit to {len(credits)} series "
-                f"(max {max(credits.values()):.2f} watch-counts).")
+                f"[Universe] '{instance}': lent franchise credit to {len(_allc)} series "
+                f"(max {max(_allc.values()):.2f} watch-counts{_saga_note}).")
+
+    def _saga_quality_credits(self, df, rows, _sid, instance) -> dict:
+        """``{series_id: saga caught-up/depth credit}`` for the TV QUALITY pre-pass — household,
+        cross-media, release-grace-decayed (:func:`watch_likelihood.saga_credit`). Empty when
+        ``scoring.saga_credit.enabled`` is off, the universe source is absent, or the series tvdb /
+        ``date_added`` can't be resolved, so the caller's ``max`` is a no-op. ``rows`` are the series
+        cache dicts (for series_id→tvdb + title); ``_sid`` is the numeric series_id column. Availability
+        is the series' FRESHEST episode ``date_added`` (latest content arrival → the grace-window
+        anchor). Also surfaces the per-title detail to the run log + a global_cache snapshot (the GUI
+        feed) via :func:`emit_saga_credit_preview`. Best-effort: logs + returns ``{}`` on any failure."""
+        out: dict = {}
+        try:
+            from scripts.managers.machine_learning.likelihood.saga_engagement import (
+                emit_saga_credit_preview,
+                gather_saga_engagement,
+                household_member_count,
+            )
+            from scripts.managers.machine_learning.likelihood.watch_likelihood import saga_credit
+            from scripts.managers.services.plex.playlists.universe_order import saga_display_name
+            eng = gather_saga_engagement(self.global_cache, self.config)
+            if not eng or "date_added" not in df.columns:
+                return out
+            sid_to_tvdb: dict = {}
+            sid_to_title: dict = {}
+            for s in rows or []:
+                sid_i, tv = s.get("id"), s.get("tvdbId")
+                try:
+                    if sid_i is not None and tv is not None:
+                        sid_to_tvdb[int(sid_i)] = int(tv)
+                        sid_to_title[int(sid_i)] = s.get("title")
+                except (TypeError, ValueError):
+                    continue
+            if not sid_to_tvdb:
+                return out
+            members = household_member_count(self.config, self.global_cache) or None
+            now = pd.Timestamp.now(tz="UTC")
+            _da = pd.to_datetime(df["date_added"], utc=True, errors="coerce")
+            _added = pd.DataFrame({"_s": _sid, "_da": _da}).dropna(subset=["_s"]).groupby("_s")["_da"].max()
+            items: list = []
+            for sid, ts in _added.items():
+                sid = int(sid)
+                tvdb = sid_to_tvdb.get(sid)
+                if tvdb is None or pd.isna(ts):
+                    continue
+                e = eng.get(("show", tvdb))
+                if not e:
+                    continue
+                days = max(0.0, float((now - ts).days))
+                cr = saga_credit(caught_up_frac=e["caught_up_frac"],
+                                 saga_watched_frac=e["saga_watched_frac"],
+                                 days_since_available=days, household_members=members,
+                                 config=self.config)
+                if cr > 0:
+                    out[sid] = cr
+                    items.append({"id": sid, "title": sid_to_title.get(sid) or f"series {sid}",
+                                  "saga": saga_display_name(e.get("saga", "")),
+                                  "caught_up": e["caught_up_frac"], "depth": e["saga_watched_frac"],
+                                  "days": days, "credit": cr})
+            emit_saga_credit_preview(self.global_cache, self.logger, self.config, "sonarr", instance, items)
+        except Exception as e:
+            self.logger.log_debug(f"[Universe] saga quality credit skipped: {e}")
+        return out
 
     @timeit("report_size_anomalies")
     def report_size_anomalies(self, instance: str, df=None) -> list:
@@ -707,7 +779,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return []
 
         rows = size_anomaly.find_size_anomalies(
-            df, id_cols=("series_title", "season_number", "episode_number"),
+            df, id_cols=("series_title", "season_number", "episode_number",
+                         "series_id", "episode_file_id"),
             size_col="size_bytes", runtime_col="runtime_seconds", runtime_unit="seconds",
             quality_col="quality_name", resolution_col="resolution",
             over_ratio=cfg["over_ratio"], under_ratio=cfg["under_ratio"],
@@ -743,6 +816,155 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return f"{title} S{sn:02d}E{en:02d}"
         except (TypeError, ValueError):
             return title
+
+    @timeit("remediate_size_anomalies")
+    def remediate_size_anomalies(self, instance: str, rows: "list | None") -> dict:
+        """ACT on the size anomalies (opt-in: ``size_anomaly.remediate=true``) — the TV twin of
+        Radarr's remediation.
+
+          * MIS-GRADED (junk/SD grade, really HD) and UNDERSIZED (suspiciously small) → ``RefreshSeries``
+            re-reads the series' mediainfo to fix a wrong grade / re-verify the file. Non-destructive.
+          * BLOATED (oversized at a real HD/UHD grade) → re-grab at the profile target: DELETE the
+            oversized episode file + ``EpisodeSearch`` so Sonarr re-acquires a properly-sized release.
+            DESTRUCTIVE — only for MONITORED episodes (else the delete orphans the episode), only when
+            the file isn't whole-file-guarded (pilot / keep / recent-air / household), and only when
+            the backup gate is armed (``effective_dry_run`` False); otherwise logged as 'would …'.
+            Honours the run's dry_run AND the degrade-to-dry-run backup gate."""
+        from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
+
+        cfg = size_anomaly.config_for(self.config)
+        if not cfg.get("remediate", False) or not rows:
+            return {}
+        if self.sonarr_api is None:
+            return {}
+        instance = self._resolve_instance(instance)
+        eff_dry = effective_dry_run(self.dry_run, self.global_cache)
+        stats = {"rescanned": 0, "regrabbed": 0, "skipped_unmonitored": 0,
+                 "skipped_guard": 0, "failed": 0}
+
+        # ── rescan mis-graded + undersized (non-destructive: RefreshSeries) ──────
+        rescan_sids = sorted({int(r["series_id"]) for r in rows
+                              if r.get("action") == "rescan" and r.get("series_id") is not None})
+        if rescan_sids:
+            if eff_dry:
+                self.logger.log_info(f"[SizeAnomaly] [dry_run] would RefreshSeries (rescan) "
+                                     f"{len(rescan_sids)} series on '{instance}'.")
+            else:
+                for sid in rescan_sids:
+                    try:
+                        self.sonarr_api._make_request(instance, "command", method="POST",
+                                                      payload={"name": "RefreshSeries", "seriesId": sid})
+                        stats["rescanned"] += 1
+                    except Exception as e:
+                        stats["failed"] += 1
+                        self.logger.log_warning(f"[SizeAnomaly] RefreshSeries failed for series "
+                                                f"{sid} on '{instance}': {e}")
+                if stats["rescanned"]:
+                    self.logger.log_info(f"[SizeAnomaly] rescanned {stats['rescanned']} series on "
+                                         f"'{instance}' to fix mis-graded / verify undersized files.")
+
+        # ── re-grab bloated (destructive: delete + search) ───────────────────────
+        regrab = [r for r in rows if r.get("action") == "regrab"
+                  and r.get("series_id") is not None and r.get("episode_file_id") is not None]
+        if not regrab:
+            return stats
+
+        # Whole-file guard set (pilot / keep / recent-air / household): NEVER re-grab a protected
+        # episode file — a failed search would leave it gone. Fail safe: if the data or guard set
+        # can't be built, skip every re-grab this cycle (mirrors delete_selected_episode_files).
+        df = self.load(instance)
+        if df is None or getattr(df, "empty", True):
+            stats["skipped_guard"] += len(regrab)
+            self.logger.log_warning(f"[SizeAnomaly] no episode-file data to verify guards on "
+                                    f"'{instance}'; skipping {len(regrab)} re-grab(s) (fail-safe).")
+            return stats
+        now = datetime.now(tz=timezone.utc)
+        try:
+            protected = self._build_protected_file_ids(df, now)
+        except Exception as e:
+            stats["skipped_guard"] += len(regrab)
+            self.logger.log_error(
+                f"[SizeAnomaly] protected-file-id build failed for '{instance}'; skipping ALL "
+                f"{len(regrab)} re-grab(s) this cycle (fail-safe): {e}"
+            )
+            return stats
+
+        # Map every physical file id → ALL the episode coords it backs. A multi-episode file (one
+        # episodeFileId backing e.g. S01E02-E07) may be deleted ONLY when EVERY episode it backs is
+        # monitored + resolvable, else the delete would orphan an unmonitored sibling with nothing to
+        # re-grab it. Built from the FULL df (monitored-agnostic) so a sibling outside the anomaly set
+        # still protects the file.
+        fid_coords: dict[int, set] = {}
+        _cols_raw = getattr(df, "columns", None)
+        _cols = set(_cols_raw) if _cols_raw is not None else set()
+        if {"episode_file_id", "season_number", "episode_number"}.issubset(_cols):
+            _ff = pd.to_numeric(df["episode_file_id"], errors="coerce")
+            _sn = pd.to_numeric(df["season_number"], errors="coerce")
+            _en = pd.to_numeric(df["episode_number"], errors="coerce")
+            for pos in range(len(df)):
+                f, s, e = _ff.iat[pos], _sn.iat[pos], _en.iat[pos]
+                if pd.notna(f) and pd.notna(s) and pd.notna(e):
+                    fid_coords.setdefault(int(f), set()).add((int(s), int(e)))
+
+        # ONE decision per UNIQUE file id (a multi-episode omnibus yields several anomaly rows sharing
+        # one fid — dedup so we DELETE + search it once), grouped by series for the episode lookup.
+        by_series: dict[int, dict] = {}
+        for r in regrab:
+            by_series.setdefault(int(r["series_id"]), {}).setdefault(int(r["episode_file_id"]), r)
+        for sid, fid_rows in by_series.items():
+            eps = self.sonarr_api._make_request(instance, f"episode?seriesId={sid}", fallback=[]) or []
+            ep_by_coord = {(e.get("seasonNumber"), e.get("episodeNumber")): e
+                           for e in eps if isinstance(e, dict)}
+            for fid, r in fid_rows.items():
+                label = self._fmt_episode_label(r)
+                if fid in protected:
+                    stats["skipped_guard"] += 1
+                    self.logger.log_info(f"[SizeAnomaly] skip re-grab '{label}' — whole-file guarded.")
+                    continue
+                # EVERY episode this file backs (not just the anomaly row's) must be monitored AND
+                # resolvable, or deleting the file would orphan a sibling. Fall back to the row's own
+                # coord when the df lacks the columns to enumerate siblings.
+                coords = set(fid_coords.get(fid) or set())
+                if not coords:
+                    try:
+                        coords = {(int(r.get("season_number")), int(r.get("episode_number")))}
+                    except (TypeError, ValueError):
+                        coords = set()
+                backing = [ep_by_coord.get(c) for c in coords]
+                eids = [b["id"] for b in backing if isinstance(b, dict) and b.get("id")]
+                all_ok = bool(coords) and all(
+                    isinstance(b, dict) and b.get("monitored") and b.get("id") for b in backing)
+                if not all_ok:
+                    stats["skipped_unmonitored"] += 1
+                    self.logger.log_info(f"[SizeAnomaly] skip re-grab '{label}' — file backs an "
+                                         f"unmonitored or unresolved episode (would orphan it).")
+                    continue
+                if eff_dry:
+                    self.logger.log_info(
+                        f"[SizeAnomaly] [dry_run] would re-grab '{label}' "
+                        f"({r.get('size_gb')} GB {r.get('quality_name')} -> profile target, "
+                        f"~{r.get('reclaim_gb')} GB reclaim): delete file {fid} + EpisodeSearch "
+                        f"{len(eids)} ep(s).")
+                    continue
+                try:
+                    self.sonarr_api._make_request(instance, f"episodefile/{fid}", method="DELETE")
+                    self.sonarr_api._make_request(instance, "command", method="POST",
+                                                  payload={"name": "EpisodeSearch", "episodeIds": eids})
+                    stats["regrabbed"] += 1
+                    self.logger.log_info(f"[SizeAnomaly] re-grabbing '{label}': deleted bloated file, "
+                                         f"searching {len(eids)} ep(s) at profile target.")
+                except Exception as e:
+                    stats["failed"] += 1
+                    self.logger.log_warning(f"[SizeAnomaly] re-grab failed for '{label}': {e}")
+
+        acted = stats["rescanned"] + stats["regrabbed"]
+        if acted or stats["skipped_unmonitored"] or stats["skipped_guard"]:
+            self.logger.log_info(
+                f"[SizeAnomaly] '{instance}' remediation: {stats['rescanned']} rescanned, "
+                f"{stats['regrabbed']} re-grabbed, {stats['skipped_unmonitored']} skipped "
+                f"(unmonitored), {stats['skipped_guard']} skipped (guarded), {stats['failed']} failed."
+            )
+        return stats
 
     @timeit("report_codec_routing")
     def report_codec_routing(self, instance: str, df=None) -> list:
