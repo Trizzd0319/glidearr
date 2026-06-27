@@ -54,7 +54,7 @@
         },
         {
           "name": "Raw-HD",
-          "allowed": true
+          "allowed": false
         },
         {
           "group": "WEB 720p",

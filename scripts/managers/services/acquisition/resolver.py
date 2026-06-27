@@ -41,6 +41,15 @@ class Resolver:
         self._root_folders = config.get("rootFolders", {}) or {}
         self._movie_root_folders = config.get("movieRootFolders", {}) or {}
         self._acq = config.get("acquisition", {}) or {}
+        # Pilot/discovery floor: SHOW adds are capped to this resolution so the first (pilot) grab lands
+        # <= floor and the watch-based upgrade path raises it later — mirrors pilot_interactive.floor_res
+        # so add-time and the pilot search agree. 0 (default) disables the cap → byte-identical. Movies
+        # are unaffected. This keeps EVERY show-add path (universe walk, search-on-add) off a
+        # 1080p-allowing profile, which Sonarr (quality-first) would otherwise grab at 1080p.
+        try:
+            self._pilot_floor_res = max(0, int((config.get("pilot_interactive", {}) or {}).get("floor_res", 0) or 0))
+        except (TypeError, ValueError):
+            self._pilot_floor_res = 0
         # Operator routing preferences (the `routing` onboarding step). Honoured ONLY once
         # the step has run (the ``configured`` stamp), so a never-onboarded install routes
         # exactly as before — see _route_category.
@@ -156,7 +165,7 @@ class Resolver:
             out["skip_reason"] = "already in library"
             return out
 
-        profile = self._pick_profile(gw, inst)
+        profile = self._pick_profile(gw, inst, is_show=is_show, is_anime=is_anime)
         profile_reason = self._last_profile_reason
         root = self._pick_root_folder(gw, inst, is_show, route_category)
         size, unit = self._expected_size(profile, runtime, is_movie=not is_show)
@@ -234,7 +243,25 @@ class Resolver:
             return "?"
         return f"{res}p" if res > 480 else "SD"
 
-    def _pick_profile(self, gw, inst, score=None) -> dict:
+    def _show_floor_profile(self, profiles, is_anime):
+        """The floor profile a SHOW add lands on so its pilot grabs <= the pilot floor (the watch-based
+        upgrade path raises it later). Within the show's FAMILY (anime vs live-action — never put a
+        live-action stub on an [Anime] profile or vice-versa), pick the HIGHEST profile whose max allowed
+        resolution is <= the floor; fall back to the family's LOWEST profile when none is <= floor (e.g.
+        anime has no <=720 profile yet). None when there are no profiles."""
+        floor = self._pilot_floor_res
+
+        def _anime_p(p):
+            return str(p.get("name") or "").strip().lower().startswith("[anime]")
+
+        pool = [p for p in profiles if _anime_p(p) == bool(is_anime)] or list(profiles)
+        ranked = sorted(((profile_max_quality(p)[0] or 0, p) for p in pool), key=lambda t: t[0])
+        if not ranked:
+            return None
+        eligible = [p for (res, p) in ranked if res <= floor]
+        return eligible[-1] if eligible else ranked[0][1]
+
+    def _pick_profile(self, gw, inst, score=None, *, is_show=False, is_anime=False) -> dict:
         profiles = gw.quality_profiles(inst) or []
         want = (self._acq.get("quality_profile") or "").strip().lower()
         chosen, reason = None, ""
@@ -243,6 +270,16 @@ class Resolver:
             chosen = next((p for p in profiles if str(p.get("name", "")).lower() == want), None)
             if chosen is not None:
                 reason = f"pinned to '{chosen.get('name')}' by acquisition.quality_profile"
+        # SHOW adds are capped to the pilot floor (default-off via pilot_interactive.floor_res=0) so the
+        # first (pilot) grab lands <= floor REGARDLESS of score — the watch-based upgrade path raises it
+        # later. This keeps every show-add path (universe walk, search-on-add) off a 1080p-allowing
+        # profile, which Sonarr (quality-first ranking) would otherwise grab at 1080p before the pilot
+        # flip. Movies are unaffected.
+        if chosen is None and not want and is_show and self._pilot_floor_res > 0 and profiles:
+            chosen = self._show_floor_profile(profiles, is_anime)
+            if chosen is not None:
+                reason = (f"show add capped to the <={self._pilot_floor_res}p pilot floor "
+                          f"('{chosen.get('name')}'); quality climbs via the watch-based upgrade path")
         if chosen is None and not want and score is not None and profiles:
             # Matrix-driven: map the watchability/acquisition score to a target
             # resolution tier and pick the highest-quality profile at or under it,
@@ -310,7 +347,8 @@ class Resolver:
         gw = self.gw.get("sonarr" if is_show else "radarr")
         if not gw:
             return enriched
-        profile = self._pick_profile(gw, enriched["instance"], score=score)
+        profile = self._pick_profile(gw, enriched["instance"], score=score,
+                                     is_show=is_show, is_anime=bool(enriched.get("is_anime")))
         size, unit = self._expected_size(profile, int(enriched.get("runtime") or 0), is_movie=not is_show)
         enriched["quality_profile"]  = profile
         enriched["profile_reason"]   = self._last_profile_reason

@@ -1581,7 +1581,7 @@
           "resolution": 1080
         },
         "items": [],
-        "allowed": true
+        "allowed": false
       },
       {
         "name": "WEB 720p",
@@ -7483,7 +7483,7 @@
           "resolution": 1080
         },
         "items": [],
-        "allowed": true
+        "allowed": false
       },
       {
         "name": "WEB 720p",
