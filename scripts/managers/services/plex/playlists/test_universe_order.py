@@ -15,6 +15,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     movie_order_from_children,
     movie_universe_keys,
     saga_display_name,
+    saga_member_engagement,
     saga_member_sets,
     saga_membership_index,
     series_order_from_children,
@@ -310,6 +311,60 @@ def test_universe_acquire_plan_skips_unengaged_saga():
             {"media": "show", "tvdb": 500, "rank": 1}]}}},
         owned_movie_tmdbs=set(), owned_tvdb_to_sid={}, include_unowned=True)
     assert universe_acquire_plan(unified, set(), set()) == {}
+
+
+# ── saga member engagement (caught-up + depth, for the QUALITY credit) ──────────
+def test_saga_member_engagement_caught_up_and_depth():
+    # MCU-ish timeline: Iron Man (m10) → Loki (show 500) → Eternals (m11). Household watched the two
+    # priors but NOT Eternals → Eternals is fully caught-up (frontier).
+    unified = unified_universe_order(
+        {"universes": {"mcu": {"timeline": True, "items": [
+            {"media": "movie", "tmdb": 10, "rank": 0},
+            {"media": "show", "tvdb": 500, "rank": 1},
+            {"media": "movie", "tmdb": 11, "rank": 2}]}}},
+        owned_movie_tmdbs={10, 11}, owned_tvdb_to_sid={500: 9}, include_unowned=True)
+    eng = saga_member_engagement(unified, watched_movie_tmdbs={10}, watched_show_tvdbs={500})
+    assert eng[("movie", 11)]["caught_up_frac"] == 1.0             # all priors (movie + show) watched
+    assert eng[("movie", 11)]["saga_watched_frac"] == round(2 / 3, 4)
+    assert eng[("movie", 10)]["caught_up_frac"] == 0.0            # first entry, no priors
+    assert eng[("show", 500)]["caught_up_frac"] == 1.0            # its one prior (m10) watched
+
+
+def test_saga_member_engagement_partial_catch_up():
+    unified = unified_universe_order(
+        {"universes": {"x": {"timeline": True, "items": [
+            {"media": "movie", "tmdb": 1, "rank": 0},
+            {"media": "movie", "tmdb": 2, "rank": 1},
+            {"media": "movie", "tmdb": 3, "rank": 2},
+            {"media": "movie", "tmdb": 4, "rank": 3}]}}},
+        owned_movie_tmdbs={1, 2, 3, 4}, owned_tvdb_to_sid={}, include_unowned=True)
+    eng = saga_member_engagement(unified, watched_movie_tmdbs={1, 2}, watched_show_tvdbs=set())
+    assert eng[("movie", 3)]["caught_up_frac"] == 1.0             # priors 1,2 both watched
+    assert eng[("movie", 4)]["caught_up_frac"] == round(2 / 3, 4)  # of priors 1,2,3 → 2 watched
+    assert eng[("movie", 4)]["saga_watched_frac"] == 0.5          # 2 of 4 watched
+
+
+def test_saga_member_engagement_keeps_highest_across_sagas():
+    # Film 1 sits in two sagas: caught-up in 'a' (prior 9 watched), not in 'b' → keeps the higher.
+    unified = {
+        "a": [{"media": "movie", "id": 9, "rank": 0, "owned": True},
+              {"media": "movie", "id": 1, "rank": 1, "owned": True}],
+        "b": [{"media": "movie", "id": 8, "rank": 0, "owned": True},
+              {"media": "movie", "id": 7, "rank": 1, "owned": True},
+              {"media": "movie", "id": 1, "rank": 2, "owned": True}],
+    }
+    eng = saga_member_engagement(unified, watched_movie_tmdbs={9}, watched_show_tvdbs=set())
+    assert eng[("movie", 1)]["caught_up_frac"] == 1.0            # max across the two sagas
+
+
+def test_saga_member_engagement_cold_saga_is_zero():
+    unified = unified_universe_order(
+        {"universes": {"x": {"timeline": True, "items": [
+            {"media": "movie", "tmdb": 1, "rank": 0},
+            {"media": "movie", "tmdb": 2, "rank": 1}]}}},
+        owned_movie_tmdbs={1, 2}, owned_tvdb_to_sid={}, include_unowned=True)
+    eng = saga_member_engagement(unified, set(), set())
+    assert eng[("movie", 2)] == {"caught_up_frac": 0.0, "saga_watched_frac": 0.0, "saga": "x"}
 
 
 def test_is_stale_ttl_boundary():

@@ -520,6 +520,56 @@ def universe_acquire_plan(unified_order, watched_movie_tmdbs, watched_show_tvdbs
     return out
 
 
+def saga_member_engagement(unified_order, watched_movie_tmdbs, watched_show_tvdbs) -> dict:
+    """Per-member CAUGHT-UP + overall-DEPTH engagement for the saga QUALITY credit (consumed by
+    ``watch_likelihood.saga_credit``). The cross-media twin of :func:`universe_acquire_plan`, but for
+    ELEVATING THE QUALITY of OWNED members rather than acquiring unowned ones.
+
+    ``unified_order`` = :func:`unified_universe_order` (``include_unowned=True``):
+    ``{key: [{media,id,rank,owned}…]}`` in saga order — so the priors of a member include UNOWNED and
+    cross-media (movie+show) entries. ``watched_*`` = the HOUSEHOLD-watched ids keyed like the unified
+    items (movie→tmdb, show→tvdb).
+
+    Returns ``{(media, id): {"caught_up_frac": float, "saga_watched_frac": float, "saga": key}}``. A
+    member in several sagas keeps the record of the saga it's most STRONGLY engaged in (highest
+    ``max(caught_up, saga_watched)`` — which is exactly the engagement ``saga_credit`` keys off, so the
+    resulting credit is identical to a cross-saga max; ``saga`` just names the saga that earned it, for
+    the preview / GUI):
+      * ``caught_up_frac`` — fraction of the member's timeline-PRIORS (lower rank) the household has
+        watched (1.0 = you've seen everything before it → the frontier). 0.0 for a saga's FIRST entry
+        (no priors) — the depth signal covers that case.
+      * ``saga_watched_frac`` — fraction of the WHOLE saga the household has watched (same for every
+        member of the saga).
+      * ``saga`` — the universe key that earned the member its (winning) engagement.
+    PURE — no I/O, deterministic."""
+    wm = {t for t in (watched_movie_tmdbs or set()) if t is not None}
+    ws = {t for t in (watched_show_tvdbs or set()) if t is not None}
+
+    def _is_watched(media, mid):
+        return (media == "movie" and mid in wm) or (media == "show" and mid in ws)
+
+    out: dict = {}
+    for key, members in (unified_order or {}).items():
+        ordered = sorted(members, key=lambda m: m.get("rank", 0))
+        total = len(ordered)
+        n_watched = sum(1 for m in ordered if _is_watched(m["media"], m["id"]))
+        saga_frac = round((n_watched / total) if total else 0.0, 4)
+        priors_watched = 0
+        for i, m in enumerate(ordered):
+            caught = round((priors_watched / i) if i > 0 else 0.0, 4)
+            ident = (m["media"], m["id"])
+            strength = max(caught, saga_frac)
+            cur = out.get(ident)
+            if cur is None or strength > cur["_strength"]:    # keep the saga it's most engaged in
+                out[ident] = {"caught_up_frac": caught, "saga_watched_frac": saga_frac,
+                              "saga": key, "_strength": strength}
+            if _is_watched(m["media"], m["id"]):
+                priors_watched += 1
+    for rec in out.values():
+        rec.pop("_strength", None)
+    return out
+
+
 def saga_member_sets(source) -> dict:
     """The cached universe ``source`` → ``{key: {"movies": {tmdb: rank}, "shows": {tvdb: rank}}}`` —
     the FULL, OWNERSHIP-INDEPENDENT membership of every saga, each member carrying its saga RANK
