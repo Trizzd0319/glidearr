@@ -30,6 +30,7 @@ from scripts.managers.services.plex.playlists.universe_order import (
     saga_display_name,
     saga_membership_index,
 )
+from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.decorators.timing import timeit
 from datetime import datetime, timezone
 
@@ -458,6 +459,90 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                     })
             return {"action": "deferred", "title": title}
         return {"action": action, "title": title}
+
+    def rehome_to_standard(self, tmdb_id, *, std_inst, target_profile_id,
+                           gateways=None, band_cache=None) -> dict:
+        """FORK-D: add ONE film (by tmdbId) on the STANDARD instance at a specific,
+        watchability-matched, sub-4K ``target_profile_id`` and grab it NOW — the rehome half
+        of evicting a cold 4K-only film (the 4K copy is deleted later, only once this standard
+        copy imports). Differs from :meth:`ensure_owned_and_grab` in two deliberate ways:
+
+          1. Dedup is STANDARD-ONLY. ``ensure_owned_and_grab`` scans every instance
+             (_find_movie_record) and would find the 4K copy (hasFile=true) on the 4K instance
+             and return already-owned — defeating the rehome. Here we scan only ``std_inst``.
+          2. It SEARCHES immediately even under floor pressure (does NOT defer). Below-floor is a
+             RESERVE breach, not a full disk — there's ample absolute space for the small
+             standard copy, and deferring would deadlock (space only recovers once the 4K is
+             evicted, which needs this standard copy first). Net footprint drops after eviction.
+
+        Honours ``dry_run`` (Adder/_trigger_search no-op → would-add/would-search). Returns
+        ``{"action","title"?,"reason"?,"standard_id"?}`` with action ∈ {already-owned, searched,
+        search-failed, would-search, added, would-add, add-failed, skipped}."""
+        if tmdb_id is None:
+            return {"action": "skipped", "reason": "no tmdb"}
+        if target_profile_id is None:
+            return {"action": "skipped", "reason": "no target profile"}
+        if gateways is None:
+            gateways = {"radarr": ArrGateway(
+                "radarr", getattr(self.radarr, "instance_manager", None), self.config, self.logger)}
+        band_cache = band_cache if band_cache is not None else {}
+        gw = gateways.get("radarr")
+        if gw is None or not gw.available:
+            return {"action": "skipped", "reason": "no radarr instance"}
+        tmdb = int(tmdb_id)
+        # Honour the backup gate too: a real run whose backup pre-flight failed DEGRADES to
+        # dry-run, so a rehome must NOT POST adds/searches then (the bare self.dry_run would).
+        eff_dry = effective_dry_run(self.dry_run, self.global_cache)
+
+        # (1) STANDARD-ONLY dedup. A hit means the film is already on standard: grab it in place
+        # if it has no file (forcing the search — never defer, see the docstring), else owned.
+        rec = next((r for r in gw.library_items(std_inst)
+                    if isinstance(r, dict) and str(r.get("tmdbId")) == str(tmdb)), None)
+        if rec is not None:
+            if rec.get("hasFile"):
+                return {"action": "already-owned", "title": rec.get("title"), "standard_id": rec.get("id")}
+            title = rec.get("title") or str(tmdb)
+            if eff_dry:
+                return {"action": "would-search", "title": title, "standard_id": rec.get("id")}
+            if not rec.get("monitored"):
+                gw.put(std_inst, f"movie/{rec.get('id')}", {**rec, "monitored": True})
+            ok = self._trigger_search(gw, std_inst,
+                                      {"type": "movie", "arr_id": rec.get("id"), "title": title})
+            return {"action": "searched" if ok else "search-failed", "title": title,
+                    "standard_id": rec.get("id")}
+
+        # Not on standard → resolve lookup metadata, then FORCE the standard instance + the
+        # watchability-matched profile + a standard-instance root folder.
+        resolver = Resolver(gateways, self.config, self.logger)
+        adder = Adder(gateways, self.logger, dry_run=eff_dry, monitored=True, search=True)
+        enriched = resolver.prepare({"type": "movie", "ids": {"tmdb": tmdb}})
+        reason = enriched.get("skip_reason")
+        if reason == "already in library":
+            # prepare dedups its ROUTED instance (anime films route to the anime instance); our
+            # standard scan above already cleared standard, so this hit is on another instance and
+            # prepare returned without lookup metadata → can't build the add. Skip (4K stays).
+            return {"action": "skipped", "reason": "routed-instance dup", "title": enriched.get("title")}
+        if reason:
+            return {"action": "skipped", "reason": reason, "title": enriched.get("title")}
+        if str(enriched.get("ext_id")) != str(tmdb):
+            return {"action": "skipped", "reason": "tmdb mismatch", "title": enriched.get("title")}
+
+        enriched["instance"] = std_inst
+        qp = dict(enriched.get("quality_profile") or {})
+        qp["id"] = int(target_profile_id)
+        enriched["quality_profile"] = qp
+        # Root folder for the STANDARD instance's movie bucket (NOT the routed instance's — a
+        # 4K/anime route would otherwise point at the wrong folder). Fall back to prepare's
+        # value (already standard's for a default-routed non-anime film) when unconfigured.
+        _mrf = (self.config or {}).get("movieRootFolders", {}) or {}
+        enriched["root_folder"] = (_mrf.get(enriched.get("route_category"))
+                                   or _mrf.get("standard")
+                                   or enriched.get("root_folder"))
+        title = enriched.get("title") or enriched.get("ext_id")
+
+        res = adder.add(enriched, search=True)   # grab the small standard copy NOW (no defer)
+        aid = (res.get("result") or {}).get("id") if isinstance(res.get("result"), dict) else None
+        return {"action": res.get("action"), "title": title, "standard_id": aid}
 
     # ── show (Sonarr) twin of the movie grab — the hybrid universe walk's TV add-by-tvdb ──────
     def _find_series_record(self, gw, tvdb) -> "tuple[dict | None, str | None]":

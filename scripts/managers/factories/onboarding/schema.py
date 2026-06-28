@@ -83,6 +83,16 @@ def empty_config() -> dict:
                 "4k_dual_min_score": 0,
                 "proactive_4k": False,
                 "evict_uhd_first": False,
+                # FORK-D: when a 4K-ONLY film (2160p on the dedicated 4K instance with NO
+                # 1080p baseline on standard) is the coldest title under floor pressure,
+                # REHOME it — add a watchability-matched (≤1080p) copy on the standard
+                # instance, then evict the 4K copy ONLY after that copy actually imports
+                # (never a no-copy gap). Default OFF (existing installs unchanged).
+                "rehome_4k_only": False,
+                "rehome_floor_profile": "HD-720p",    # never rehome below this tier
+                "rehome_import_timeout_days": 7,      # abandon the evict (KEEP the 4K) if the standard copy never imports
+                "rehome_readd_margin": 0.25,          # re-add the 4K once free >= band-top U * (1 + this) — 25% above the ceiling
+
                 # Only acquire the 4K bonus copy when a likely household device can
                 # direct-play it (learned from Tautulli transcode history); else the
                 # 1080p baseline already covers playback. Default OFF → 4K added regardless.

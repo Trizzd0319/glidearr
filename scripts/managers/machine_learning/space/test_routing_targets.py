@@ -8,6 +8,7 @@ import pytest
 from scripts.managers.machine_learning.space.routing_targets import (
     evict_uhd_first,
     proactive_4k_enabled,
+    rehome_4k_only_enabled,
     relocation_consented,
     relocation_enabled,
     reorg_mode,
@@ -165,6 +166,41 @@ def test_evict_uhd_first_needs_deletion_ownership(_clear_delete_env):
 def test_evict_uhd_first_handles_malformed_config(_clear_delete_env):
     assert evict_uhd_first({"routing": "oops"}) is False
     assert evict_uhd_first({"routing": {"movies": "oops"}}) is False
+
+
+# ── rehome_4k_only (FORK-D gate — deletion ownership, NOT dual-version policy) ─
+def _rehome_cfg(*, flag=True, coordinator=True, consent=True, floor=2500, policy="highest_only"):
+    cfg = {"routing": {"movies": {"rehome_4k_only": flag, "4k_policy": policy}},
+           "free_space_limit": floor}
+    if coordinator:
+        cfg["space_coordinator_enabled"] = True
+    if consent:
+        cfg["deletions_consent"] = True
+    return cfg
+
+
+def test_rehome_4k_only_enabled_when_owned(_clear_delete_env):
+    # Enabled on the flag + deletion ownership; does NOT require 4k_policy=='both'
+    # (precondition is a split 4K instance, checked at runtime).
+    assert rehome_4k_only_enabled(_rehome_cfg()) is True
+    assert rehome_4k_only_enabled(_rehome_cfg(policy="both")) is True
+
+
+def test_rehome_4k_only_defaults_false(_clear_delete_env):
+    assert rehome_4k_only_enabled({}) is False
+    assert rehome_4k_only_enabled(None) is False
+    assert rehome_4k_only_enabled(_rehome_cfg(flag=False)) is False
+
+
+def test_rehome_4k_only_needs_deletion_ownership(_clear_delete_env):
+    assert rehome_4k_only_enabled(_rehome_cfg(coordinator=False)) is False
+    assert rehome_4k_only_enabled(_rehome_cfg(consent=False)) is False
+    assert rehome_4k_only_enabled(_rehome_cfg(floor=0)) is False
+
+
+def test_rehome_4k_only_handles_malformed_config(_clear_delete_env):
+    assert rehome_4k_only_enabled({"routing": "oops"}) is False
+    assert rehome_4k_only_enabled({"routing": {"movies": "oops"}}) is False
 
 
 # ── transcode_gate_enabled (transcode_gate AND 4k_policy==both; NO relocation/move dep) ───

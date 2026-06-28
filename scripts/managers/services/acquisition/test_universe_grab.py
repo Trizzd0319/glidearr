@@ -202,6 +202,60 @@ def test_deferred_under_pressure_when_deletions_armed(monkeypatch):
     assert q and q[0]["arr_id"] == 999 and q[0]["service"] == "radarr"
 
 
+# ── FORK-D: rehome_to_standard (add a sub-4K copy on standard, dedup STANDARD-only) ──
+def test_rehome_adds_on_standard_even_when_4k_copy_owned(monkeypatch):
+    # The SAME tmdb has a 4K copy (hasFile) on the uhd instance. ensure_owned_and_grab would
+    # find it (all-instance scan) and return already-owned; rehome_to_standard dedups STANDARD
+    # only, so it still adds on standard at the forced sub-4K profile.
+    adds = _patch(monkeypatch, {"skip_reason": None, "ext_id": 123, "instance": "standard",
+                                "title": "X", "route_category": "standard", "quality_profile": {}})
+    gw = _MultiGW({"standard": [], "uhd": [{"tmdbId": 123, "hasFile": True, "id": 7, "title": "X 4K"}]})
+    out = _mgr(_TWO_INSTANCES, cache=_Cache()).rehome_to_standard(
+        123, std_inst="standard", target_profile_id=8, gateways={"radarr": gw})
+    assert out["action"] == "added"               # 4K copy did NOT short-circuit the add
+    assert adds and adds[0][1] is True            # searches immediately (no defer → no deadlock)
+    enriched = adds[0][0]
+    assert enriched["instance"] == "standard"
+    assert enriched["quality_profile"]["id"] == 8  # watchability-matched sub-4K profile forced
+
+
+def test_rehome_dry_run_would_add(monkeypatch):
+    _patch(monkeypatch, {"skip_reason": None, "ext_id": 123, "instance": "standard", "title": "X",
+                         "route_category": "standard", "quality_profile": {}},
+           add_result={"action": "would-add", "ok": True})
+    gw = _MultiGW({"standard": [], "uhd": []})
+    out = _mgr(_TWO_INSTANCES, dry_run=True, cache=_Cache()).rehome_to_standard(
+        123, std_inst="standard", target_profile_id=8, gateways={"radarr": gw})
+    assert out["action"] == "would-add"
+
+
+def test_rehome_already_on_standard_is_owned(monkeypatch):
+    adds = _patch(monkeypatch, {"skip_reason": None, "ext_id": 123})   # prepare must NOT be reached
+    gw = _MultiGW({"standard": [{"tmdbId": 123, "hasFile": True, "id": 5, "title": "X"}]})
+    out = _mgr(_TWO_INSTANCES, cache=_Cache()).rehome_to_standard(
+        123, std_inst="standard", target_profile_id=8, gateways={"radarr": gw})
+    assert out["action"] == "already-owned" and not adds
+
+
+def test_rehome_owned_no_file_on_standard_searches_now(monkeypatch):
+    # Already added on standard (prior run) but no file → search NOW (forced, never defers).
+    _patch(monkeypatch, {"skip_reason": None, "ext_id": 123})
+    gw = _MultiGW({"standard": [{"tmdbId": 123, "hasFile": False, "monitored": True, "id": 5, "title": "X"}]})
+    out = _mgr(_TWO_INSTANCES).rehome_to_standard(
+        123, std_inst="standard", target_profile_id=8, gateways={"radarr": gw})
+    assert out["action"] == "searched"
+    assert gw.commands and gw.commands[0][1] == {"name": "MoviesSearch", "movieIds": [5]}
+
+
+def test_rehome_tmdb_mismatch_skips(monkeypatch):
+    _patch(monkeypatch, {"skip_reason": None, "ext_id": 999, "instance": "standard", "title": "Wrong",
+                         "route_category": "standard", "quality_profile": {}})
+    gw = _MultiGW({"standard": [], "uhd": []})
+    out = _mgr(_TWO_INSTANCES).rehome_to_standard(
+        123, std_inst="standard", target_profile_id=8, gateways={"radarr": gw})
+    assert out["action"] == "skipped" and out["reason"] == "tmdb mismatch"
+
+
 # ── show (Sonarr) twin: ensure_show_owned_and_grab ──────────────────────────────
 _TWO_SONARR = {"sonarr_instances": {"default_instance": "standard", "standard": {}, "uhd": {}}}
 

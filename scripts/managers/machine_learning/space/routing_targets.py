@@ -156,3 +156,23 @@ def evict_uhd_first(config) -> bool:
     if not isinstance(mv, dict) or not mv.get("evict_uhd_first") or mv.get("4k_policy") != "both":
         return False
     return coordinator_owns_deletion(config)
+
+
+def rehome_4k_only_enabled(config) -> bool:
+    """Gate for FORK-D: rehome a cold 4K-ONLY film (2160p on the dedicated 4K instance with
+    NO 1080p baseline on standard) down to a watchability-matched (≤1080p) copy on the
+    standard instance, then defer-evict the 4K copy only AFTER the standard copy imports.
+    Requires ``routing.movies.rehome_4k_only`` AND the cross-service coordinator owning
+    deletion (``coordinator_owns_deletion`` — space_coordinator_enabled + consent +
+    free_space_limit). Unlike :func:`evict_uhd_first` it does NOT require dual-version
+    ``4k_policy == "both"``: its precondition is a SPLIT 4K instance, checked at runtime via
+    ``_uhd_instance``. This is an acquisition+deletion path governed by the space-floor
+    consent, NOT a file move — independent of relocation consent. Default OFF."""
+    from scripts.managers.machine_learning.space.space_targets import coordinator_owns_deletion
+    routing = _cfg_get(config, "routing", None) or {}
+    if not isinstance(routing, dict):
+        return False
+    mv = routing.get("movies", {}) or {}
+    if not isinstance(mv, dict) or not mv.get("rehome_4k_only"):
+        return False
+    return coordinator_owns_deletion(config)
