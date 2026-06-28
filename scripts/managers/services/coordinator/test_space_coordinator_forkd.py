@@ -155,6 +155,23 @@ def test_run1_rehomes_and_does_not_touch_4k():
     assert led and led["9"]["uhd_movie_id"] == 900 and led["9"]["uhd_file_id"] == 99
 
 
+def test_keep_universe_is_rehomeable_but_hard_pins_spared():
+    # keep_universe 4K-only film IS rehomed (rehome preserves the title → keep_universe satisfied);
+    # a keep_forever / keep_movie hard pin is spared.
+    cache = _Cache()
+    uhd = pd.DataFrame([
+        {"tmdb_id": 9, "movie_id": 900, "movie_file_id": 99, "watchability_score": 5,
+         "resolution": 2160, "size_bytes": 70 * _GB, "title": "Universe 4K", "keep_policy": "keep_universe"},
+        {"tmdb_id": 8, "movie_id": 800, "movie_file_id": 88, "watchability_score": 4,
+         "resolution": 2160, "size_bytes": 60 * _GB, "title": "Pinned 4K", "keep_policy": "keep_forever"},
+    ])
+    c, sp, acq = _coord({"standard": _std_df(), "uhd": uhd}, cache=cache)
+    c.run()
+    tmdbs = [t for (t, _s, _p) in acq.calls]
+    assert 9 in tmdbs           # keep_universe → rehomed (the fix)
+    assert 8 not in tmdbs       # keep_forever → spared
+
+
 def test_4k_evicted_to_space_ledger_only_after_import():
     cache = _Cache()
     dfs = {"standard": _std_df(with9=False), "uhd": _uhd_df()}

@@ -343,39 +343,53 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                         self.logger.log_warning(f"[SpaceCoordinator] FORK-D 4K load failed for '{_ruhd}': {e}")
                         _rdf = None
                     instance_dfs[_ruhd] = _rdf
+                # Detect 4K-only films DIRECTLY from the 4K instance df — NOT via
+                # build_delete_candidates, whose keep/universe DELETION guards exclude them. A
+                # rehome PRESERVES the title (adds a <=1080p baseline BEFORE the 4K is evicted), so
+                # keep_universe — "never lose the final copy without first replacing it with a
+                # lower-quality one" — is satisfied by construction. Spare only hard manual pins
+                # (keep_forever / keep_movie).
+                _spared = {"keep_forever", "keep_movie"}
+                only4k: list = []
                 if _rdf is not None and not _rdf.empty:
-                    try:
-                        _cands = radarr_sp.build_delete_candidates(_ruhd, _rdf, ignore_score_ceiling=True)
-                    except Exception as e:
-                        self.logger.log_warning(f"[SpaceCoordinator] FORK-D candidate build failed: {e}")
-                        _cands = []
-                    only4k = [c for c in _cands
-                              if c.get("resolution") and int(c["resolution"]) > 1080
-                              and c.get("tmdb_id") not in survivors]
+                    for _idx in _rdf.index:
+                        _row = _rdf.loc[_idx]
+                        _fid = _row.get("movie_file_id")
+                        _res = pd.to_numeric(_row.get("resolution"), errors="coerce")
+                        _tmdb = _row.get("tmdb_id")
+                        if (_fid is None or not pd.notna(_fid)               # no 4K file on disk
+                                or not (pd.notna(_res) and _res > 1080)      # not a 2160p copy
+                                or pd.isna(_tmdb) or int(_tmdb) in survivors  # has a standard baseline
+                                or str(_row.get("keep_policy") or "").strip().lower() in _spared):
+                            continue
+                        only4k.append((_idx, _row))
                     # coldest first (lowest watchability), then biggest file, up to the reclaim target.
-                    only4k.sort(key=lambda c: ((c.get("score") if c.get("score") is not None else 0),
-                                               -float(c.get("size_bytes") or 0.0)))
+                    only4k.sort(key=lambda t: ((float(t[1].get("watchability_score"))
+                                                if pd.notna(t[1].get("watchability_score")) else 0.0),
+                                               -float(t[1].get("size_bytes") or 0.0)))
                     _budget_gb = max(0.0, U - free)   # GB to reclaim (sizes below are BYTES)
                     _acc_gb = 0.0
-                    for c in only4k:
+                    for _idx, _row in only4k:
                         if _acc_gb >= _budget_gb:
                             break
                         try:
-                            _mid = int(_rdf.at[c["idx"], "movie_id"])
+                            _mid = int(_row.get("movie_id"))
+                            _fidv = int(_row.get("movie_file_id"))
                         except Exception:
-                            continue                  # can't identify the 4K movie record → skip (never guess)
-                        _sz = float(c.get("size_bytes") or 0.0)
+                            continue                  # can't identify the 4K record/file → skip (never guess)
+                        _sz = float(_row.get("size_bytes") or 0.0)
                         rehome_queue.append({
-                            "tmdb_id": c.get("tmdb_id"), "uhd_inst": _ruhd,
-                            "uhd_movie_id": _mid, "uhd_file_id": c.get("fid"),
-                            "size_bytes": _sz, "title": c.get("title"),
-                            "row": _rdf.loc[c["idx"]].to_dict(),
+                            "tmdb_id": int(_row.get("tmdb_id")), "uhd_inst": _ruhd,
+                            "uhd_movie_id": _mid, "uhd_file_id": _fidv,
+                            "size_bytes": _sz, "title": _row.get("title"),
+                            "row": _row.to_dict(),
                         })
                         _acc_gb += _sz / (1024 ** 3)
-                    if rehome_queue:
-                        self.logger.log_info(
-                            f"[SpaceCoordinator] FORK-D queued {len(rehome_queue)} cold 4K-only "
-                            f"film(s) on '{_ruhd}' to rehome → standard (evicted once the copy imports).")
+                # Always log the count when FORK-D is active, so an empty result is visible (not silent).
+                _msg = (f"{len(rehome_queue)} cold 4K-only film(s) on '{_ruhd}' to rehome → standard "
+                        f"(evicted once the copy imports)." if rehome_queue
+                        else f"no 4K-only films on '{_ruhd}' to rehome.")
+                self.logger.log_info(f"[SpaceCoordinator] FORK-D: {_msg}")
 
         # ── Pass 3: pool the REMAINING Radarr instances (not the default, not the
         # config-labeled 4K instance) as whole-title candidates. They share the one mount,
