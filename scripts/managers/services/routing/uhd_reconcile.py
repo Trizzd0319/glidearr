@@ -189,9 +189,10 @@ class UhdReconcileManager:
         # The two are mutually exclusive (reorg_mode is single-valued).
         move_cross_armed = cross_instance_move_enabled(self.config)
         move_legacy_armed = relocation_enabled(self.config)
-        # Proactive 4K ACQUIRE (a NEW copy on the 4K instance; the source is untouched) is NOT a
-        # cross-instance move, so it keeps the existing same-instance dual-version consent gate.
-        acquire_actuate = move_legacy_armed and not eff_dry
+        # Proactive 4K ACQUIRE (a NEW copy on the 4K instance; the source is untouched, no shared
+        # storage needed) actuates under EITHER move gate — same_instance (legacy) or cross_instance
+        # — so it stays coupled to the standard upgrade cap (proactive_4k_enabled) in both modes.
+        acquire_actuate = (move_legacy_armed or move_cross_armed) and not eff_dry
         acq_mover = CrossInstanceMove(gw, self.logger, dry_run=not acquire_actuate)
 
         ultra = gw.library_items(fourk) or []

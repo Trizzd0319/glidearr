@@ -519,6 +519,25 @@ def test_cross_instance_dedup_blocked_by_disarmed_backup(monkeypatch):
     assert im.deletes == []                                    # dedup not actuated (gate down)
 
 
+def test_proactive_acquire_actuates_under_cross_instance(monkeypatch):
+    # proactive 4K acquire must FIRE under cross_instance mode (not just same_instance): an owned
+    # 1080p film warranting 4K with no 4K anywhere → add a 4K copy on ultra, search ON.
+    import pandas as pd
+    _clear_x_env(monkeypatch)
+    im = _Im({"standard": [_M1080], "ultra": []},
+             profiles={"standard": _STD_PROFILES, "ultra": _UHD_PROFILES},
+             roots=_SHARED_ROOTS, free=9999.0)
+    cfg = _xcfg()
+    cfg["routing"]["movies"]["proactive_4k"] = True
+    cfg["routing"]["movies"]["4k_dual_min_score"] = 70
+    df = pd.DataFrame([{"tmdb_id": 14160, "is_watched": True, "watchability_score": 90}])
+    UhdReconcileManager(config=cfg, logger=None, radarr=_Mgr(im), dry_run=False,
+                        registry=_Reg(_SP(df)), global_cache=_XCache()).run()
+    acq = [a for a in im.adds if a[0] == "ultra"]
+    assert len(acq) == 1 and acq[0][1]["tmdbId"] == 14160
+    assert acq[0][1]["addOptions"] == {"searchForMovie": True}   # actuates (not would-acquire)
+
+
 def test_cross_instance_dedup_off_move_on(monkeypatch):
     other = {"id": 2, "tmdbId": 999, "title": "Other", "monitored": True, "qualityProfileId": 9,
              "hasFile": True,

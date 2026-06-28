@@ -135,6 +135,21 @@ def test_proactive_4k_handles_malformed_config():
     assert proactive_4k_enabled({"routing": {"movies": "oops"}}) is False      # movies not a dict
 
 
+def test_proactive_4k_enabled_under_cross_instance():
+    # cross_instance mode + move consent is ALSO a valid actuation gate (couples with the cross
+    # mode's acquire), so proactive 4K works without same_instance.
+    cfg = {"routing": {"reorg_mode": "cross_instance",
+                       "movies": {"proactive_4k": True, "4k_policy": "both"}},
+           "cross_instance_move_consent": True}
+    assert proactive_4k_enabled(cfg) is True
+
+
+def test_proactive_4k_false_cross_instance_without_move_consent():
+    cfg = {"routing": {"reorg_mode": "cross_instance",
+                       "movies": {"proactive_4k": True, "4k_policy": "both"}}}
+    assert proactive_4k_enabled(cfg) is False              # cross mode but no move consent
+
+
 # ── evict_uhd_first (deletion gate, INDEPENDENT of relocation consent) ────────
 @pytest.fixture
 def _clear_delete_env(monkeypatch):
