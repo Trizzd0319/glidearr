@@ -385,6 +385,27 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                             "row": _row.to_dict(),
                         })
                         _acc_gb += _sz / (1024 ** 3)
+                # Per-film audit so the operator can confirm each queued title is GENUINELY 4K-only
+                # before any live eviction. A tmdb with a standard RECORD but no file (not a survivor)
+                # is a pending baseline, not truly 4K-only — flag it so a duplicate baseline add is
+                # visible rather than silent.
+                _std_records: set = set()
+                try:
+                    for _t in radarr_df.get("tmdb_id", []):
+                        if pd.notna(_t):
+                            _std_records.add(int(_t))
+                except Exception:
+                    pass
+                for _e in rehome_queue:
+                    _t = _e.get("tmdb_id")
+                    _ws = _e["row"].get("watchability_score")
+                    _wtxt = f"{float(_ws):.0f}" if (_ws is not None and pd.notna(_ws)) else "n/a"
+                    _gb = (_e.get("size_bytes") or 0.0) / (1024 ** 3)
+                    _flag = (" [WARN: a standard record exists WITHOUT a file — pending baseline, not "
+                             "truly 4K-only; rehome would add a duplicate baseline]"
+                             if (_t in _std_records and _t not in survivors) else "")
+                    self.logger.log_info(f"[SpaceCoordinator] FORK-D candidate: '{_e.get('title')}' "
+                                         f"(tmdb {_t}, watch {_wtxt}, {_gb:.1f} GB){_flag}")
                 # Always log the count when FORK-D is active, so an empty result is visible (not silent).
                 _msg = (f"{len(rehome_queue)} cold 4K-only film(s) on '{_ruhd}' to rehome → standard "
                         f"(evicted once the copy imports)." if rehome_queue
