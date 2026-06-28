@@ -121,3 +121,8 @@ class ArrGateway:
 
     def command(self, inst, payload):
         return self._req(self.resolve(inst), "command", method="POST", payload=payload)
+
+    def delete(self, inst, endpoint):
+        """DELETE an endpoint on the instance (e.g. ``moviefile/{id}`` to remove a FILE while keeping
+        the Radarr record). Mirrors :meth:`put`/:meth:`command`; the caller owns gating."""
+        return self._req(self.resolve(inst), endpoint, method="DELETE")
