@@ -200,14 +200,18 @@ class UhdReconcileManager:
                    if isinstance(m, dict) and m.get("tmdbId") is not None and m.get("hasFile")}
         # Per-tmdb 4K-side file path → lets the move SKIP same-path duplicates (two records, one
         # physical file): retuning/searching/Move-scanning such a title could destroy the shared file
-        # the 4K record depends on (Invariant 4). Detected + flagged, never actuated.
-        uhd_paths = {}
+        # the 4K record depends on (Invariant 4). Detected + flagged, never actuated. Also per-tmdb
+        # 4K-side file RESOLUTION → so FINALIZE never downgrades a standard file to 1080p unless the
+        # 4K instance genuinely holds an equal-or-higher-res copy (else the high-res standard file
+        # would be the only one, and retune+search could destroy it).
+        uhd_paths, uhd_res = {}, {}
         for m in ultra:
             if not isinstance(m, dict) or m.get("tmdbId") is None:
                 continue
             p = str(((m.get("movieFile") or {}).get("path")) or "").replace("\\", "/").strip().rstrip("/")
             if p:
                 uhd_paths[m.get("tmdbId")] = p
+            uhd_res[m.get("tmdbId")] = self._res(m)
 
         # Stage-C remote-play gate (household-global) — computed once for the whole sweep.
         crp = self._remote_play_ok()
@@ -225,7 +229,7 @@ class UhdReconcileManager:
                     move_actuate = True
             move_mover = CrossInstanceMove(gw, self.logger, dry_run=not move_actuate)
             self._reconcile_instance(gw, move_mover, acq_mover, name, fourk, dest_root, dest_pid,
-                                     present, hasfile, uhd_paths, crp)
+                                     present, hasfile, uhd_paths, uhd_res, crp)
 
     def _source_instances(self, gw, fourk) -> list:
         """The HD/standard-tier instances to scan as MOVE SOURCES — where the 1080p baseline lives.
@@ -397,8 +401,9 @@ class UhdReconcileManager:
 
     # ── per standard instance ──────────────────────────────────────────────────
     def _reconcile_instance(self, gw, move_mover, acq_mover, std_inst, fourk, dest_root, dest_pid,
-                            present, hasfile, uhd_paths=None, can_remote_play=True):
+                            present, hasfile, uhd_paths=None, uhd_res=None, can_remote_play=True):
         uhd_paths = uhd_paths or {}
+        uhd_res = uhd_res or {}
         try:
             movies = gw.library_items(std_inst) or []
         except Exception as e:
@@ -458,6 +463,16 @@ class UhdReconcileManager:
             already_baseline = (mv.get("qualityProfileId") == hd_pid) or (mv.get("hasFile") and 0 < res <= 1080)
             is_finalize = dest_hasfile and not already_baseline
             is_movein = (not dest_hasfile) and res >= _UHD_RES
+            # SAFETY: never retune the source down to 1080p unless the 4K instance genuinely holds an
+            # equal-or-higher-res copy. If the 4K side is LOWER res than the source's current file,
+            # the source is the better copy — finalize would search+replace it down to 1080p and the
+            # high-res original would be lost. Hold it for dedup/move instead.
+            if is_finalize and res > 0 and uhd_res.get(tmdb, 0) < res:
+                self._log("log_warning", f"[UHD] {std_inst}: '{mv.get('title')}' held — {fourk} copy "
+                                         f"({uhd_res.get(tmdb, 0)}p) is lower-res than standard ({res}p); "
+                                         f"not downgrading the better copy.")
+                self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "move", "held-uhd-lower-res")
+                continue
             if not (is_finalize or is_movein):
                 continue
             st = move_mover.relocate(mv, from_inst=std_inst, to_inst=fourk, dest_root=dest_root,

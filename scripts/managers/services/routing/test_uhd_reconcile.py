@@ -23,7 +23,9 @@ _M4K = {"id": 1, "title": "Toy Story", "tmdbId": 862, "year": 1995, "monitored":
                       "quality": {"quality": {"resolution": 2160}}}}
 _M1080 = {"id": 2, "title": "Up", "tmdbId": 14160, "monitored": True, "qualityProfileId": 3,
           "movieFile": {"id": 51, "path": "/x/Up/up.mkv", "quality": {"quality": {"resolution": 1080}}}}
-_U_HASFILE = {"id": 5, "tmdbId": 862, "hasFile": True}
+# a 4K-instance record that HAS a 2160p file (the legit finalize precondition — ultra holds the 4K)
+_U_HASFILE = {"id": 5, "tmdbId": 862, "hasFile": True,
+              "movieFile": {"id": 55, "quality": {"quality": {"resolution": 2160}}}}
 _U_NOFILE = {"id": 5, "tmdbId": 862, "hasFile": False}
 
 
@@ -130,6 +132,15 @@ def test_finalize_retunes_standard_in_place(monkeypatch):
     assert ("standard", {"movieIds": [1], "qualityProfileId": 3, "monitored": True}) in im.puts
     assert ("standard", {"name": "RescanMovie", "movieIds": [1]}) in im.commands
     assert ("standard", {"name": "MoviesSearch", "movieIds": [1]}) in im.commands
+
+
+def test_finalize_held_when_ultra_copy_is_lower_res(monkeypatch):
+    # standard holds 2160p but the 4K instance only has 1080p → standard is the BETTER copy;
+    # finalize must NOT downgrade+search it away (data-loss guard).
+    u_1080 = {"id": 5, "tmdbId": 862, "hasFile": True,
+              "movieFile": {"id": 55, "quality": {"quality": {"resolution": 1080}}}}
+    im = _run(_cfg(), [_M4K], [u_1080], monkeypatch=monkeypatch)
+    assert im.puts == [] and im.commands == [] and im.adds == []   # standard untouched
 
 
 def test_steady_baseline_title_is_noop(monkeypatch):
