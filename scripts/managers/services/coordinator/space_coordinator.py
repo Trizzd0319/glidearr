@@ -385,15 +385,18 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                             "row": _row.to_dict(),
                         })
                         _acc_gb += _sz / (1024 ** 3)
-                # Per-film audit so the operator can confirm each queued title is GENUINELY 4K-only
-                # before any live eviction. A tmdb with a standard RECORD but no file (not a survivor)
-                # is a pending baseline, not truly 4K-only — flag it so a duplicate baseline add is
-                # visible rather than silent.
+                # Per-film audit so the operator can review each queued title before any live
+                # eviction. Query the FULL standard library (incl. FILELESS records, which
+                # load_movie_files / survivors omit) so the note distinguishes a TRULY 4K-only film
+                # (no standard record) from a dual-version-INCOMPLETE one (a fileless standard record
+                # — the 4K is on ultra, the 1080p baseline just hasn't landed). Both are handled
+                # safely (the rehome dedups + retunes to <=1080; the 4K is evicted only AFTER a
+                # baseline imports), so this is informational, not a warning.
                 _std_records: set = set()
                 try:
-                    for _t in radarr_df.get("tmdb_id", []):
-                        if pd.notna(_t):
-                            _std_records.add(int(_t))
+                    for _m in (radarr_sp.radarr_api._make_request(radarr_inst, "movie", fallback=[]) or []):
+                        if isinstance(_m, dict) and _m.get("tmdbId") is not None:
+                            _std_records.add(int(_m.get("tmdbId")))
                 except Exception:
                     pass
                 for _e in rehome_queue:
@@ -401,11 +404,11 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                     _ws = _e["row"].get("watchability_score")
                     _wtxt = f"{float(_ws):.0f}" if (_ws is not None and pd.notna(_ws)) else "n/a"
                     _gb = (_e.get("size_bytes") or 0.0) / (1024 ** 3)
-                    _flag = (" [WARN: a standard record exists WITHOUT a file — pending baseline, not "
-                             "truly 4K-only; rehome would add a duplicate baseline]"
-                             if (_t in _std_records and _t not in survivors) else "")
+                    _note = (" - has a standard baseline record (fileless; baseline grabbed before the "
+                             "4K is evicted)" if _t in _std_records
+                             else " - no standard record (truly 4K-only)")
                     self.logger.log_info(f"[SpaceCoordinator] FORK-D candidate: '{_e.get('title')}' "
-                                         f"(tmdb {_t}, watch {_wtxt}, {_gb:.1f} GB){_flag}")
+                                         f"(tmdb {_t}, watch {_wtxt}, {_gb:.1f} GB){_note}")
                 # Always log the count when FORK-D is active, so an empty result is visible (not silent).
                 _msg = (f"{len(rehome_queue)} cold 4K-only film(s) on '{_ruhd}' to rehome → standard "
                         f"(evicted once the copy imports)." if rehome_queue
