@@ -238,13 +238,16 @@ def test_rehome_already_on_standard_is_owned(monkeypatch):
 
 
 def test_rehome_owned_no_file_on_standard_searches_now(monkeypatch):
-    # Already added on standard (prior run) but no file → search NOW (forced, never defers).
+    # Already added on standard (prior run) but no file → retune to the sub-4K target + search NOW.
     _patch(monkeypatch, {"skip_reason": None, "ext_id": 123})
-    gw = _MultiGW({"standard": [{"tmdbId": 123, "hasFile": False, "monitored": True, "id": 5, "title": "X"}]})
+    gw = _MultiGW({"standard": [{"tmdbId": 123, "hasFile": False, "monitored": True, "id": 5,
+                                 "title": "X", "qualityProfileId": 9}]})   # sat at a 4K profile
     out = _mgr(_TWO_INSTANCES).rehome_to_standard(
         123, std_inst="standard", target_profile_id=8, gateways={"radarr": gw})
     assert out["action"] == "searched"
     assert gw.commands and gw.commands[0][1] == {"name": "MoviesSearch", "movieIds": [5]}
+    # the existing fileless record is retuned to the <=1080 target (8) so it can't re-grab a 4K
+    assert any(p[1] == "movie/5" and p[2].get("qualityProfileId") == 8 for p in gw.puts)
 
 
 def test_rehome_tmdb_mismatch_skips(monkeypatch):

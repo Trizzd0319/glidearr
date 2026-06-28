@@ -504,8 +504,11 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             title = rec.get("title") or str(tmdb)
             if eff_dry:
                 return {"action": "would-search", "title": title, "standard_id": rec.get("id")}
-            if not rec.get("monitored"):
-                gw.put(std_inst, f"movie/{rec.get('id')}", {**rec, "monitored": True})
+            # Retune the EXISTING fileless record to the watchability-matched sub-4K target + monitor
+            # BEFORE searching, so the rehome grabs a <=1080 baseline even if the record sat at a
+            # 4K-capable profile — otherwise a 4K would land on standard and the eviction frees nothing.
+            gw.put(std_inst, f"movie/{rec.get('id')}",
+                   {**rec, "monitored": True, "qualityProfileId": int(target_profile_id)})
             ok = self._trigger_search(gw, std_inst,
                                       {"type": "movie", "arr_id": rec.get("id"), "title": title})
             return {"action": "searched" if ok else "search-failed", "title": title,
