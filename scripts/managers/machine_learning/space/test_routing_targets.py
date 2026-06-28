@@ -6,6 +6,10 @@ from __future__ import annotations
 import pytest
 
 from scripts.managers.machine_learning.space.routing_targets import (
+    cross_instance_dedup_consented,
+    cross_instance_dedup_enabled,
+    cross_instance_move_consented,
+    cross_instance_move_enabled,
     evict_uhd_first,
     proactive_4k_enabled,
     rehome_4k_only_enabled,
@@ -16,12 +20,14 @@ from scripts.managers.machine_learning.space.routing_targets import (
     uhd_remote_play_ok,
 )
 
-_ENV = ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT")
+_ENV = ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT",
+        "RECOMMENDARR_CROSS_INSTANCE_MOVE_CONSENT", "GLIDEARR_CROSS_INSTANCE_MOVE_CONSENT",
+        "RECOMMENDARR_CROSS_INSTANCE_DEDUP_CONSENT", "GLIDEARR_CROSS_INSTANCE_DEDUP_CONSENT")
 
 
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch):
-    # Every test starts with no relocation-consent env override.
+    # Every test starts with no relocation/cross-instance consent env override.
     for v in _ENV:
         monkeypatch.delenv(v, raising=False)
 
@@ -58,6 +64,8 @@ def test_reorg_mode_defaults_log_only():
 
 def test_reorg_mode_reads_and_normalises():
     assert reorg_mode({"routing": {"reorg_mode": "same_instance"}}) == "same_instance"
+    assert reorg_mode({"routing": {"reorg_mode": "cross_instance"}}) == "cross_instance"
+    assert reorg_mode({"routing": {"reorg_mode": "CROSS_INSTANCE"}}) == "cross_instance"  # case-normalised
     assert reorg_mode({"routing": {"reorg_mode": "off"}}) == "off"
     assert reorg_mode({"routing": {"reorg_mode": "OFF"}}) == "off"        # case-normalised
 
@@ -265,3 +273,73 @@ def test_uhd_remote_play_ok_true_on_no_data_even_with_gate_on():
     cfg = _transcode_cfg()
     assert uhd_remote_play_ok(cfg, None, None) is True
     assert uhd_remote_play_ok(cfg, [], {"Chromecast": 1}) is True
+
+
+# ── cross-instance move / dedup gates (FORK 1 + FORK 4 — un-conflated, default OFF) ──
+def _move_cfg(*, mode="cross_instance", consent=True):
+    cfg = {"routing": {"reorg_mode": mode}}
+    if consent:
+        cfg["cross_instance_move_consent"] = True
+    return cfg
+
+
+def _dedup_cfg(*, mode="cross_instance", consent=True):
+    cfg = {"routing": {"reorg_mode": mode}}
+    if consent:
+        cfg["cross_instance_dedup_consent"] = True
+    return cfg
+
+
+def test_cross_instance_consents_default_false():
+    assert cross_instance_move_consented({}) is False
+    assert cross_instance_move_consented(None) is False
+    assert cross_instance_dedup_consented({}) is False
+    assert cross_instance_dedup_consented(None) is False
+
+
+def test_cross_instance_consents_from_config():
+    assert cross_instance_move_consented({"cross_instance_move_consent": True}) is True
+    assert cross_instance_dedup_consented({"cross_instance_dedup_consent": True}) is True
+
+
+def test_cross_instance_move_consent_env_overrides_config(monkeypatch):
+    monkeypatch.setenv("GLIDEARR_CROSS_INSTANCE_MOVE_CONSENT", "true")
+    assert cross_instance_move_consented({"cross_instance_move_consent": False}) is True
+    monkeypatch.setenv("GLIDEARR_CROSS_INSTANCE_MOVE_CONSENT", "false")
+    assert cross_instance_move_consented({"cross_instance_move_consent": True}) is False
+
+
+def test_cross_instance_dedup_consent_env_overrides_config(monkeypatch):
+    monkeypatch.setenv("RECOMMENDARR_CROSS_INSTANCE_DEDUP_CONSENT", "yes")
+    assert cross_instance_dedup_consented({"cross_instance_dedup_consent": False}) is True
+
+
+def test_cross_instance_move_enabled_requires_mode_and_consent():
+    assert cross_instance_move_enabled(_move_cfg()) is True
+    assert cross_instance_move_enabled(_move_cfg(consent=False)) is False          # no consent
+    assert cross_instance_move_enabled(_move_cfg(mode="same_instance")) is False   # wrong mode
+    assert cross_instance_move_enabled(_move_cfg(mode="log_only")) is False
+    assert cross_instance_move_enabled(_move_cfg(mode="off")) is False
+
+
+def test_cross_instance_dedup_enabled_requires_mode_and_consent():
+    assert cross_instance_dedup_enabled(_dedup_cfg()) is True
+    assert cross_instance_dedup_enabled(_dedup_cfg(consent=False)) is False
+    assert cross_instance_dedup_enabled(_dedup_cfg(mode="same_instance")) is False
+    assert cross_instance_dedup_enabled(_dedup_cfg(mode="log_only")) is False
+
+
+def test_cross_instance_gates_are_independent():
+    # move consent alone does not arm dedup, and vice-versa (FORK 4 — separate opt-ins).
+    move_only = {"routing": {"reorg_mode": "cross_instance"}, "cross_instance_move_consent": True}
+    assert cross_instance_move_enabled(move_only) is True
+    assert cross_instance_dedup_enabled(move_only) is False
+    dedup_only = {"routing": {"reorg_mode": "cross_instance"}, "cross_instance_dedup_consent": True}
+    assert cross_instance_dedup_enabled(dedup_only) is True
+    assert cross_instance_move_enabled(dedup_only) is False
+
+
+def test_cross_instance_move_does_not_arm_same_instance_relocation():
+    # un-conflation: arming the cross-instance move must NOT enable same-instance folder moves.
+    cfg = _move_cfg()
+    assert relocation_enabled(cfg) is False

@@ -27,10 +27,30 @@ import os
 
 # Mirror the deletions consent env-var pattern (space_targets._CONSENT_ENV_VARS).
 _CONSENT_ENV_VARS = ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT")
+# Cross-instance reconcile carries TWO further, independent consents (FORK 1 + FORK 4): physically
+# relocating a 2160p file standard→4K (a MOVE), and reclaiming the worse copy when both instances own
+# the same title (a DELETE). Each is its own informed opt-in, separate from the same-instance
+# folder-move consent above, so an operator can arm one cross-instance behaviour without the other.
+_MOVE_CONSENT_ENV_VARS = ("RECOMMENDARR_CROSS_INSTANCE_MOVE_CONSENT", "GLIDEARR_CROSS_INSTANCE_MOVE_CONSENT")
+_DEDUP_CONSENT_ENV_VARS = ("RECOMMENDARR_CROSS_INSTANCE_DEDUP_CONSENT", "GLIDEARR_CROSS_INSTANCE_DEDUP_CONSENT")
 _CONSENT_TRUTHY = {"1", "true", "yes", "on", "y"}
 
-_REORG_MODES = ("off", "log_only", "same_instance")
+# "cross_instance" is a PEER mode to "same_instance" (FORK 1A): it un-conflates moving a file BETWEEN
+# *arr instances from moving a file between root folders on ONE instance. reorg_mode is single-valued,
+# so an install actuates EITHER same-instance folder moves OR the cross-instance reconcile — not both
+# at once (a future "all" mode could lift that if ever needed).
+_REORG_MODES = ("off", "log_only", "same_instance", "cross_instance")
 DEFAULT_REORG_MODE = "log_only"
+
+
+def _env_consent(env_vars, config, config_key) -> bool:
+    """Shared consent reader: a non-empty env var (truthy/falsey) overrides config; otherwise the
+    config flag, default False. Mirrors :func:`relocation_consented` for the cross-instance consents."""
+    for var in env_vars:
+        raw = os.environ.get(var)
+        if raw is not None and raw.strip() != "":
+            return raw.strip().lower() in _CONSENT_TRUTHY
+    return bool(_cfg_get(config, config_key, False))
 
 
 def _cfg_get(config, key, default):
@@ -79,6 +99,44 @@ def relocation_enabled(config) -> bool:
     With either missing, the re-organizer may still classify and LOG misplacements
     (``log_only``) but must never move a file."""
     return reorg_mode(config) == "same_instance" and relocation_consented(config)
+
+
+def cross_instance_move_consented(config) -> bool:
+    """Explicit operator consent to physically MOVE a movie's file from one *arr instance to another
+    (e.g. relocate a 2160p file off the standard instance onto the dedicated 4K instance). Separate
+    from :func:`relocation_consented` (same-instance folder moves) so the two can be armed apart.
+    Captured during onboarding (the routing step) or the
+    ``RECOMMENDARR_/GLIDEARR_CROSS_INSTANCE_MOVE_CONSENT`` env var (headless). Default False."""
+    return _env_consent(_MOVE_CONSENT_ENV_VARS, config, "cross_instance_move_consent")
+
+
+def cross_instance_dedup_consented(config) -> bool:
+    """Explicit operator consent to RECLAIM the redundant copy when BOTH instances own the same title
+    — the lower-quality copy's FILE is deleted (its Radarr record is kept). This is a DELETION, so it
+    carries its own consent on top of the move consent. Captured during onboarding or the
+    ``RECOMMENDARR_/GLIDEARR_CROSS_INSTANCE_DEDUP_CONSENT`` env var. Default False."""
+    return _env_consent(_DEDUP_CONSENT_ENV_VARS, config, "cross_instance_dedup_consent")
+
+
+def cross_instance_move_enabled(config) -> bool:
+    """HARD GATE for actuating a cross-instance FILE MOVE. BOTH required:
+      1. ``reorg_mode == "cross_instance"`` (the operator armed the cross-instance reconcile), AND
+      2. :func:`cross_instance_move_consented` (explicit move opt-in).
+    With either missing the reconcile may still classify + LOG move candidates, but moves nothing.
+    The backup gate (degrade-to-dry-run) and a shared-storage pre-flight are enforced separately at
+    actuation time. Default False — existing installs unchanged."""
+    return reorg_mode(config) == "cross_instance" and cross_instance_move_consented(config)
+
+
+def cross_instance_dedup_enabled(config) -> bool:
+    """HARD GATE for actuating cross-instance DEDUP (reclaim the worse of two copies). BOTH required:
+      1. ``reorg_mode == "cross_instance"`` (the cross-instance reconcile is armed), AND
+      2. :func:`cross_instance_dedup_consented` (explicit dedup/delete opt-in).
+    Because dedup deletes a file, the actuator additionally honours the backup gate
+    (``effective_dry_run``) — a real run whose backup pre-flight failed reclaims nothing. Same-path
+    duplicates (two records, one physical file) are NEVER auto-acted regardless of this gate. Default
+    False — existing installs unchanged."""
+    return reorg_mode(config) == "cross_instance" and cross_instance_dedup_consented(config)
 
 
 def proactive_4k_enabled(config) -> bool:

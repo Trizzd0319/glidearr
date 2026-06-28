@@ -75,8 +75,10 @@ def empty_config() -> dict:
         #     "dedicated_plus_standard" keeps an extra standard copy; "standard_only" ignores the split.
         #   tv.anime_policy: "series_type_plus_folder" (anime FOLDER + seriesType) | "series_type".
         #   reorg_mode: "off" (no re-org) | "log_only" (classify owned + LOG misplacements, move
-        #     nothing) | "same_instance" (actuate same-instance root-folder moves; cross-instance
-        #     migration stays log-only). Actuation also requires relocation_consent (below).
+        #     nothing) | "same_instance" (actuate same-instance root-folder moves) | "cross_instance"
+        #     (actuate cross-instance file moves + dedup between *arr instances sharing a mount).
+        #     same_instance needs relocation_consent; cross_instance needs cross_instance_move_consent
+        #     for moves and cross_instance_dedup_consent for reclaiming a redundant copy (both below).
         "routing": {
             "movies": {
                 "4k_policy": "highest_only",
@@ -114,6 +116,15 @@ def empty_config() -> dict:
         # GLIDEARR_RELOCATION_CONSENT env override. Read by routing_targets.relocation_enabled;
         # log_only / off never move files so never need consent.
         "relocation_consent": False,
+        # Cross-instance reconcile (reorg_mode == "cross_instance"): TWO further, independent
+        # consents. move = physically relocate a file from one *arr instance to another (e.g. a 2160p
+        # off standard onto the 4K instance); dedup = when both instances own a title, DELETE the
+        # worse copy's file (the better copy is kept). Both off by default; env overrides
+        # RECOMMENDARR_/GLIDEARR_CROSS_INSTANCE_MOVE_CONSENT and *_DEDUP_CONSENT. Read by
+        # routing_targets.cross_instance_move_enabled / cross_instance_dedup_enabled. The move also
+        # requires a shared-storage pre-flight; dedup also honours the pre-destructive backup gate.
+        "cross_instance_move_consent": False,
+        "cross_instance_dedup_consent": False,
         "animeGenres": [],
         "documentaryGenres": [],
         "realityGenres": [],
