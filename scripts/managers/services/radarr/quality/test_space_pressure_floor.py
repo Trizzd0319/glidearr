@@ -57,3 +57,50 @@ def test_no_instance_skips_total_fetch():
     # instance=None -> total is never fetched -> last-resort constant.
     T, U = _mk({}, total_gb=8000.0)._space_targets(None)
     assert (T, U) == (RadarrSpacePressureManager.PRESSURE_THRESHOLD_GB,) * 2
+
+
+# ── run(): downgrade deferral to the coordinator (single shared-mount pass) ────
+def _mk_run(coordinator_owns, *, free=100.0, T=1000.0, U=1100.0):
+    """A manager whose run() pipeline is fully stubbed except the deferral branch.
+    The default instance is 'standard' (what _resolve_instance(None) returns)."""
+    m = object.__new__(RadarrSpacePressureManager)
+    m.config = {}
+    m.logger = _Logger()
+    m.calls = {"upgrades": 0, "downgrades": 0, "deletions": 0}
+    m._resolve_instance = lambda inst: inst if inst is not None else "standard"
+    m._get_free_space_gb = lambda inst: free
+    m._space_targets = lambda inst: (T, U)
+    m._coordinator_owns_deletion = lambda: coordinator_owns
+
+    def _up(inst, fg): m.calls["upgrades"] += 1; return {}
+    def _dn(inst, fg): m.calls["downgrades"] += 1; return {"downgraded": 1}
+    def _del(inst, fg): m.calls["deletions"] += 1; return {}
+    m.run_active_watcher_upgrades = _up
+    m.run_downgrades = _dn
+    m.run_deletions = _del
+    return m
+
+
+def test_run_defers_default_instance_downgrade_to_coordinator():
+    # Coordinator owns AND this is the default instance -> downgrade NOT run here.
+    m = _mk_run(coordinator_owns=True)
+    out = m.run("standard")
+    assert m.calls["downgrades"] == 0
+    assert out["downgrades"] == {"deferred_to_coordinator": True}
+    assert m.calls["deletions"] == 1   # run_deletions still invoked (it defers internally)
+
+
+def test_run_defers_nondefault_instance_downgrade_to_coordinator():
+    # Coordinator owns: EVERY instance (incl. non-default ultra/test) now defers its
+    # downgrade to the coordinator, which downgrades all instances on the shared mount.
+    m = _mk_run(coordinator_owns=True)
+    out = m.run("ultra")
+    assert m.calls["downgrades"] == 0
+    assert out["downgrades"] == {"deferred_to_coordinator": True}
+
+
+def test_run_downgrades_when_coordinator_disabled():
+    # Coordinator not owning -> downgrade runs here regardless of instance.
+    m = _mk_run(coordinator_owns=False)
+    m.run("standard")
+    assert m.calls["downgrades"] == 1

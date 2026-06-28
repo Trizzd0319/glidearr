@@ -2,6 +2,7 @@ from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
+from scripts.support.utilities.space_targets import coordinator_owns_deletion
 
 
 class SonarrOrchestrationSeriesManager(BaseManager, ComponentManagerMixin):
@@ -241,6 +242,13 @@ class SonarrOrchestrationSeriesManager(BaseManager, ComponentManagerMixin):
                     "[Orchestration] TV downgrades skipped — series.space_pressure manager unavailable."
                 )
                 return {}
+            # When the cross-service space coordinator owns reclamation, defer the TV
+            # downgrade to its single shared-mount Stage-1 pass so it never runs twice.
+            if coordinator_owns_deletion(self.config):
+                self.logger.log_info(
+                    f"[Orchestration] TV downgrades for '{resolved}' delegated to the space coordinator."
+                )
+                return {"action": "deferred_to_coordinator"}
             free_gb = sp.get_free_space_gb(resolved)
             # Delegate to the manager's total-aware helper so the floor derives from
             # free_space_limit, else 25% of the total drive (disk_total_gb) — never a

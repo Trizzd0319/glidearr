@@ -1783,8 +1783,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         Full pipeline:
           1. Check free space — bail if above threshold.
           2. Stage 1: downgrade low-score movies to HD-720p + trigger search.
+             (Deferred to the cross-service coordinator for the instance it owns,
+             so the downgrade pass never runs twice on the shared mount.)
           3. Re-read free space.
-          4. Stage 2: delete watched + grace-expired + already-720p if still tight.
+          4. Stage 2: delete watched + grace-expired + already-720p if still tight
+             (always deferred to the coordinator when it owns deletion).
         """
         instance = self._resolve_instance(instance)
         free_gb  = self._get_free_space_gb(instance)
@@ -1804,7 +1807,20 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
         # Stage 0: upgrade actively-watched movies when space is plentiful
         upgrade_stats   = self.run_active_watcher_upgrades(instance, free_gb)
-        downgrade_stats = self.run_downgrades(instance, free_gb)
+
+        # Stage 1: downgrade low-score movies to HD-720p. When the cross-service space
+        # coordinator owns reclamation, defer the downgrade to it for EVERY instance —
+        # the coordinator now runs the downgrade pass for all Radarr instances on the
+        # shared mount, so running it here too would double-process and double-log.
+        if self._coordinator_owns_deletion():
+            downgrade_stats = {"deferred_to_coordinator": True}
+            self.logger.log_info(
+                f"[SpacePressure] '{instance}': downgrades delegated to the space "
+                f"coordinator (single shared-mount reclamation pass)."
+            )
+        else:
+            downgrade_stats = self.run_downgrades(instance, free_gb)
+
         free_gb_after   = self._get_free_space_gb(instance)
         deletion_stats  = self.run_deletions(instance, free_gb_after)
 
