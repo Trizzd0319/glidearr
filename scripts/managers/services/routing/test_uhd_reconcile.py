@@ -402,3 +402,117 @@ def test_only_scans_hd_tier_sources_not_a_real_4k_library(monkeypatch):
     assert any(a[1].get("tmdbId") == 862 for a in adds_to_target)        # standard's title moved in
     assert not any(a[1].get("tmdbId") == 999 for a in adds_to_target)    # real ultra library untouched
     assert not any(p[0] == "ultra" for p in im.puts)                     # ultra never written to
+
+
+# ══ cross_instance mode: hardened move (shared-storage probe + backup gate) + DEDUP ══
+from scripts.managers.services.backup import GATE_KEY                    # noqa: E402
+
+_SHARED_ROOTS = {"standard": [{"path": "/data/media/movies/standard"}],
+                 "ultra": [{"path": "/data/media/movies/4k"}]}
+# a redundant 2160p copy of _M4K (tmdb 862) on ultra, DISTINCT path → a true cross-instance duplicate
+_U_DUP_2160 = {"id": 5, "tmdbId": 862, "hasFile": True,
+               "movieFile": {"id": 71, "path": "/data/media/movies/4k/Toy Story (1995)/ts.mkv",
+                             "quality": {"quality": {"resolution": 2160}}}}
+# a FILED 2160p record on standard (hasFile set, as real Radarr reports) — the dedup loser
+_STD_DUP_2160 = {"id": 1, "tmdbId": 862, "title": "Toy Story", "monitored": True, "qualityProfileId": 9,
+                 "hasFile": True, "rootFolderPath": "/data/media/movies/standard",
+                 "movieFile": {"id": 50, "path": "/data/media/movies/standard/Toy Story (1995)/ts.mkv",
+                               "quality": {"quality": {"resolution": 2160}}}}
+# the intended dual-version end state: a 1080p baseline on standard for tmdb 862
+_STD_1080_862 = {"id": 1, "tmdbId": 862, "title": "Toy Story", "monitored": True, "qualityProfileId": 3,
+                 "hasFile": True, "movieFile": {"id": 50, "quality": {"quality": {"resolution": 1080}}}}
+
+
+class _XCache:
+    """global_cache stub exposing only the backup gate key."""
+    def __init__(self, gate=None): self._d = {GATE_KEY: gate} if gate is not None else {}
+    def get(self, k, *a, **kw): return self._d.get(k)
+
+
+def _xcfg(*, move=True, dedup=True, mode="cross_instance"):
+    c = {"routing": {"configured": True, "reorg_mode": mode,
+                     "movies": {"4k_policy": "both"}, "tv": {}},
+         "movieRootFolders": {"standard": "/data/media/movies/standard", "4k": "/data/media/movies/4k"},
+         "radarr_instances": {"standard": {"url": "s"}, "ultra": {"url": "u"}, "default_instance": "standard"},
+         "radarr_instances_categorized": {"720p": "standard", "1080p": "standard", "4K": "ultra"}}
+    if move:
+        c["cross_instance_move_consent"] = True
+    if dedup:
+        c["cross_instance_dedup_consent"] = True
+    return c
+
+
+def _clear_x_env(monkeypatch):
+    for v in ("RECOMMENDARR_RELOCATION_CONSENT", "GLIDEARR_RELOCATION_CONSENT",
+              "RECOMMENDARR_CROSS_INSTANCE_MOVE_CONSENT", "GLIDEARR_CROSS_INSTANCE_MOVE_CONSENT",
+              "RECOMMENDARR_CROSS_INSTANCE_DEDUP_CONSENT", "GLIDEARR_CROSS_INSTANCE_DEDUP_CONSENT"):
+        monkeypatch.delenv(v, raising=False)
+
+
+def _xrun(std, ultra, monkeypatch, *, cfg=None, dry_run=False, gate=None, roots=None):
+    _clear_x_env(monkeypatch)
+    im = _Im({"standard": std, "ultra": ultra},
+             profiles={"standard": _STD_PROFILES, "ultra": _UHD_PROFILES},
+             roots=roots or _SHARED_ROOTS)
+    UhdReconcileManager(config=cfg or _xcfg(), logger=None, radarr=_Mgr(im), dry_run=dry_run,
+                        global_cache=_XCache(gate)).run()
+    return im
+
+
+# ── move under cross_instance mode (new gate + shared-storage probe) ──────────────
+def test_cross_instance_move_in_actuates_with_probe(monkeypatch):
+    im = _xrun([_M4K], [], monkeypatch)
+    assert len(im.adds) == 1 and im.adds[0][0] == "ultra"
+    scan = [c for c in im.commands if c[1].get("name") == "DownloadedMoviesScan"]
+    assert scan and scan[0][1]["importMode"] == "Move"
+    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts
+
+
+def test_cross_instance_move_held_when_storage_unconfirmed(monkeypatch):
+    # disjoint mounts → probe fails → move degrades to log-only.
+    im = _xrun([_M4K], [], monkeypatch,
+               roots={"standard": [{"path": "/mnt/a/movies"}], "ultra": [{"path": "/mnt/b/movies"}]})
+    assert im.adds == [] and im.commands == [] and im.puts == []
+
+
+def test_cross_instance_move_blocked_by_disarmed_backup(monkeypatch):
+    im = _xrun([_M4K], [], monkeypatch, gate={"armed": False})
+    assert im.adds == [] and im.commands == [] and im.puts == []
+
+
+# ── dedup under cross_instance mode ───────────────────────────────────────────────
+def test_cross_instance_dedup_reclaims_redundant_copy(monkeypatch):
+    im = _xrun([_STD_DUP_2160], [_U_DUP_2160], monkeypatch)
+    assert ("standard", "moviefile/50") in im.deletes          # standard's redundant 2160p file
+    assert not any(ep.startswith("movie/") and not ep.startswith("moviefile")
+                   for _, ep in im.deletes)                    # record never deleted
+
+
+def test_cross_instance_intended_dual_version_left_alone(monkeypatch):
+    im = _xrun([_STD_1080_862], [_U_DUP_2160], monkeypatch)
+    assert im.adds == [] and im.puts == [] and im.commands == [] and im.deletes == []
+
+
+def test_cross_instance_same_path_never_written(monkeypatch):
+    shared = "/data/media/movies/standard/Toy Story (1995)/ts.mkv"
+    std = dict(_M4K, movieFile={"id": 50, "path": shared, "quality": {"quality": {"resolution": 2160}}})
+    uhd = {"id": 5, "tmdbId": 862, "hasFile": True,
+           "movieFile": {"id": 71, "path": shared, "quality": {"quality": {"resolution": 2160}}}}
+    im = _xrun([std], [uhd], monkeypatch)
+    # both the dedup AND the move same-path guard must leave the shared file untouched
+    assert im.deletes == [] and im.adds == [] and im.commands == [] and im.puts == []
+
+
+def test_cross_instance_dedup_blocked_by_disarmed_backup(monkeypatch):
+    im = _xrun([_STD_DUP_2160], [_U_DUP_2160], monkeypatch, gate={"armed": False})
+    assert im.deletes == []                                    # dedup not actuated (gate down)
+
+
+def test_cross_instance_dedup_off_move_on(monkeypatch):
+    other = {"id": 2, "tmdbId": 999, "title": "Other", "monitored": True, "qualityProfileId": 9,
+             "hasFile": True,
+             "movieFile": {"id": 60, "path": "/data/media/movies/standard/Other (2020)/o.mkv",
+                           "quality": {"quality": {"resolution": 2160}}}}
+    im = _xrun([_STD_DUP_2160, other], [_U_DUP_2160], monkeypatch, cfg=_xcfg(dedup=False))
+    assert im.deletes == []                                    # dedup logged-only (no consent)
+    assert any(c[1].get("name") == "DownloadedMoviesScan" for c in im.commands)   # 999 still moves in

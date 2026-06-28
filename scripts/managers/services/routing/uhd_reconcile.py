@@ -15,38 +15,59 @@ and re-grabbed — the ``both`` end-state (1080p on standard + 2160p on the 4K i
 make-before-break (the source is only changed after the destination has the file) and idempotent
 across runs. State is read from BOTH instance libraries here; the mover does the gated API steps.
 
+It also DEDUPS: when a title exists on BOTH a standard-tier instance and the 4K instance (a redundant
+second physical file — e.g. a 2160p copy left on standard while the 4K instance also has one), it
+keeps the better copy and reclaims the worse copy's FILE (the loser's Radarr record is preserved).
+The dedup planner (``cross_instance_dedup.plan_dedup``) treats the intended dual-version split
+(≤1080p on standard + 2160p on the 4K instance) as the desired end state, NOT a duplicate, so the
+move and the dedup never fight; a same-path duplicate (two records, one physical file) is flagged for
+the operator and NEVER auto-acted.
+
 Gated, so it is inert until the operator opts in:
   • routing.configured              — the routing onboarding step has run.
   • routing.movies.4k_policy=='both'— "highest_only" (default) → skip.
   • a DISTINCT 4K instance           — the categorized "4K"/"4k" label resolves to another session.
   • routing.reorg_mode               — off (skip) / log_only (LOG the plan, move NOTHING — default)
-                                       / same_instance (actuate).
-  • relocation_consent               — the MOVE physically relocates files + re-searches, so (like a
-                                       folder move) it requires explicit consent. Without it, or
-                                       under dry_run, the mover only logs the plan.
+                                       / cross_instance (actuate the cross-instance move + dedup).
+                                       (same_instance still drives same-instance folder moves + the
+                                       proactive 4K acquire; cross_instance is the file-relocation
+                                       mode, un-conflated from folder moves.)
+  • cross_instance_move_consent      — the MOVE physically relocates a file + re-searches, so it
+                                       needs explicit consent (separate from the folder-move consent).
+  • cross_instance_dedup_consent     — dedup DELETES the worse copy's file, so it carries its own
+                                       consent on top, AND honours the backup gate. Without it (or
+                                       under dry_run / a disarmed backup gate) the plan is logged only.
+  • shared storage (pre-flight)      — the move only actuates when a probe confirms both instances
+                                       back onto one mount; otherwise it degrades to log-only rather
+                                       than churning a Move scan that can never complete.
 
-The re-grab fallback for deployments where the two instances do NOT share storage (so the 4K
-instance can't import from the standard folder) is a deliberate follow-up.
+Every destructive step honours ``effective_dry_run`` (the backup gate), so a real run whose backup
+pre-flight failed writes nothing. The re-grab fallback for genuinely non-shared deployments (re-grab
+a fresh 4K on the destination, then downgrade the source) is a deliberate follow-up.
 
 EXPERIMENTAL — the move uses Radarr's async import/rescan commands; the exact timing/convergence
 wants validation against a live shared-storage pair before the consent gate is flipped on. The
-source Radarr RECORD is never deleted (it is retuned in place, so its id/history survive) and no
-physical file is ever deleted. Known, non-data-loss limitation: on a deployment whose instances do
-NOT actually share storage, the destination import never completes and the move re-issues a scan
-each run (harmless churn — no copy is ever lost).
+source Radarr RECORD is never deleted (it is retuned in place, so its id/history survive); the only
+file ever deleted is a dedup LOSER's, and only after the keeper's file is confirmed present.
 """
 from __future__ import annotations
 
 from scripts.managers.machine_learning.space import dual_version
+from scripts.managers.machine_learning.space.cross_instance_dedup import plan_dedup
 from scripts.managers.machine_learning.space.routing_targets import (
+    cross_instance_dedup_enabled,
+    cross_instance_move_enabled,
     evict_uhd_first,
     proactive_4k_enabled,
-    relocation_consented,
+    relocation_enabled,
     reorg_mode,
     uhd_remote_play_ok,
 )
 from scripts.managers.services.acquisition.gateway import ArrGateway
+from scripts.managers.services.radarr.storage.cross_instance_dedup_apply import CrossInstanceDedup
 from scripts.managers.services.radarr.storage.cross_instance_move import CrossInstanceMove
+from scripts.managers.services.radarr.storage.shared_storage import shared_storage_confirmed
+from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.size_model import profile_max_quality
 from scripts.support.utilities.space_targets import space_targets
 from scripts.support.utilities.watch_likelihood import watch_likelihood
@@ -136,13 +157,21 @@ class UhdReconcileManager:
         fourk = self._uhd_instance(gw)
         if not fourk:
             return                                          # no distinct 4K instance → nowhere to route
+        self._plan_rows = []                                # consolidated move/dedup preview grid
+        self._plan_file_started = False
         # MOVE / ACQUIRE owned standard-tier titles toward the 4K instance (reorg-gated).
         if mode != "off":
             self._run_move_acquire(gw, fourk, mode)
+        # DEDUP redundant cross-instance copies (cross_instance mode only). The plan is LOGGED even
+        # when the dedup consent is off; a file is reclaimed only when the gate is armed AND the
+        # backup gate is up — and never for a same-path duplicate.
+        if mode == "cross_instance":
+            self._run_dedup(gw, fourk)
         # DOWNGRADE low-watchability 4K-ONLY titles to a 1080p baseline on standard under pressure
         # (evict-gated), so the coordinator can then reclaim their 4K without losing the title.
         if evict:
             self._downgrade_orphan_4k(gw, fourk)
+        self._flush_plan_grid()
 
     def _run_move_acquire(self, gw, fourk, mode):
         dest_pid, _ = self._top_profile(gw, fourk)
@@ -151,22 +180,52 @@ class UhdReconcileManager:
             self._log("log_warning", f"[UHD] 4K instance '{fourk}' has no quality profile or root "
                                      f"folder configured — skipping cross-instance move.")
             return
-        # Actuating the MOVE physically relocates files + re-searches, so it needs explicit
-        # relocation consent AND the same_instance mode AND a live run. Otherwise the mover runs
-        # dry (logs the plan, writes nothing) — log_only / no-consent are safe by default.
-        actuate = (mode == "same_instance") and relocation_consented(self.config) and not self.dry_run
-        mover = CrossInstanceMove(gw, self.logger, dry_run=not actuate)
+        eff_dry = effective_dry_run(self.dry_run, self.global_cache)
+        # Two ways the cross-instance FILE MOVE may actuate:
+        #   • cross_instance mode + move consent — the HARDENED path: additionally requires the backup
+        #     gate up AND a per-source shared-storage pre-flight (degrade-to-log when unconfirmed).
+        #   • same_instance mode + relocation consent — the LEGACY dual-version reconcile, unchanged
+        #     (no probe), so existing installs keep behaving exactly as before.
+        # The two are mutually exclusive (reorg_mode is single-valued).
+        move_cross_armed = cross_instance_move_enabled(self.config)
+        move_legacy_armed = relocation_enabled(self.config)
+        # Proactive 4K ACQUIRE (a NEW copy on the 4K instance; the source is untouched) is NOT a
+        # cross-instance move, so it keeps the existing same-instance dual-version consent gate.
+        acquire_actuate = move_legacy_armed and not eff_dry
+        acq_mover = CrossInstanceMove(gw, self.logger, dry_run=not acquire_actuate)
 
         ultra = gw.library_items(fourk) or []
         present = {m.get("tmdbId") for m in ultra if isinstance(m, dict) and m.get("tmdbId") is not None}
         hasfile = {m.get("tmdbId") for m in ultra
                    if isinstance(m, dict) and m.get("tmdbId") is not None and m.get("hasFile")}
+        # Per-tmdb 4K-side file path → lets the move SKIP same-path duplicates (two records, one
+        # physical file): retuning/searching/Move-scanning such a title could destroy the shared file
+        # the 4K record depends on (Invariant 4). Detected + flagged, never actuated.
+        uhd_paths = {}
+        for m in ultra:
+            if not isinstance(m, dict) or m.get("tmdbId") is None:
+                continue
+            p = str(((m.get("movieFile") or {}).get("path")) or "").replace("\\", "/").strip().rstrip("/")
+            if p:
+                uhd_paths[m.get("tmdbId")] = p
 
         # Stage-C remote-play gate (household-global) — computed once for the whole sweep.
         crp = self._remote_play_ok()
 
         for name in self._source_instances(gw, fourk):
-            self._reconcile_instance(gw, mover, name, fourk, dest_root, dest_pid, present, hasfile, crp)
+            move_actuate = False
+            if not eff_dry:
+                if move_cross_armed:
+                    ok, why = shared_storage_confirmed(gw, name, fourk)
+                    move_actuate = ok
+                    if not ok:
+                        self._log("log_warning", f"[UHD] {name} -> {fourk}: cross-instance move held "
+                                                 f"to log-only ({why}).")
+                elif move_legacy_armed:
+                    move_actuate = True
+            move_mover = CrossInstanceMove(gw, self.logger, dry_run=not move_actuate)
+            self._reconcile_instance(gw, move_mover, acq_mover, name, fourk, dest_root, dest_pid,
+                                     present, hasfile, uhd_paths, crp)
 
     def _source_instances(self, gw, fourk) -> list:
         """The HD/standard-tier instances to scan as MOVE SOURCES — where the 1080p baseline lives.
@@ -183,6 +242,73 @@ class UhdReconcileManager:
         if default and default != fourk and default not in names:
             names.append(default)
         return names
+
+    # ── dedup redundant cross-instance copies ─────────────────────────────────────
+    def _run_dedup(self, gw, fourk):
+        """Reclaim the worse of two copies when a title exists on BOTH a standard-tier instance and
+        the 4K instance. Plans are computed from the libraries already fetched and LOGGED regardless;
+        a file is deleted only when the dedup gate is armed AND the backup gate is up — and never for
+        a same-path duplicate (two records, one physical file)."""
+        eff_dry = effective_dry_run(self.dry_run, self.global_cache)
+        actuate = cross_instance_dedup_enabled(self.config) and not eff_dry
+        dedup = CrossInstanceDedup(gw, self.logger, dry_run=not actuate)
+        try:
+            uhd_movies = gw.library_items(fourk) or []
+        except Exception as e:
+            self._log("log_warning", f"[Dedup] 4K library fetch failed for '{fourk}': {e}")
+            return
+        reclaimed = flagged = 0
+        for src in self._source_instances(gw, fourk):
+            try:
+                std_movies = gw.library_items(src) or []
+            except Exception as e:
+                self._log("log_warning", f"[Dedup] library fetch failed for '{src}': {e}")
+                continue
+            for p in plan_dedup(src, std_movies, fourk, uhd_movies):
+                try:
+                    st = dedup.apply(p).get("status")
+                except Exception as e:                      # one bad title never aborts the sweep
+                    self._log("log_warning", f"[Dedup] apply failed for '{p.get('title')}' "
+                                             f"(tmdb {p.get('tmdb')}): {e}; skipping.")
+                    continue
+                loser = p.get("loser_inst", src)
+                keeper = p.get("keeper_inst", fourk)
+                self._record_plan(p.get("title"), p.get("tmdb"), loser, keeper, "dedup", st,
+                                  reason=p.get("reason", ""))
+                if st in ("deduped", "would-dedup"):
+                    reclaimed += 1
+                elif st == "flag-same-path":
+                    flagged += 1
+        if reclaimed or flagged:
+            verb = "reclaimed" if actuate else "would reclaim"
+            self._log("log_info", f"[Dedup] {verb} {reclaimed} redundant cross-instance copy(ies); "
+                                  f"{flagged} same-path duplicate(s) flagged for the operator.")
+
+    # ── consolidated plan preview (grid + per-title file sink) ─────────────────────
+    def _record_plan(self, title, tmdb, frm, to, op, status, reason=""):
+        """Append one row to the consolidated reconcile preview and mirror it to the dedicated
+        ``relocation`` log file (so the per-title plan doesn't flood the main run log)."""
+        rows = getattr(self, "_plan_rows", None)
+        if rows is None:
+            self._plan_rows = rows = []
+        rows.append([str(title or "?")[:38], str(tmdb if tmdb is not None else "?"),
+                     str(frm or "?"), str(to or "?"), op, status])
+        line = f"{op:7} | {status:16} | {frm} -> {to} | {title} (tmdb {tmdb}){(' | ' + reason) if reason else ''}"
+        self._log_to_file_safe(line)
+
+    def _log_to_file_safe(self, line):
+        started = getattr(self, "_plan_file_started", False)
+        if self.logger and hasattr(self.logger, "log_to_file"):
+            self.logger.log_to_file("relocation", line, reset=not started)
+        self._plan_file_started = True
+
+    def _flush_plan_grid(self):
+        rows = getattr(self, "_plan_rows", None)
+        if not rows:
+            return
+        if self.logger and hasattr(self.logger, "log_grid"):
+            self.logger.log_grid(["Title", "TMDB", "From", "To", "Op", "Status"], rows,
+                                 title="Cross-instance reconcile plan")
 
     # ── downgrade low-watchability 4K-only titles under pressure ──────────────────
     def _downgrade_orphan_4k(self, gw, fourk):
@@ -210,6 +336,7 @@ class UhdReconcileManager:
         threshold = int((self._routing.get("movies", {}) or {}).get("4k_dual_min_score")
                         or dual_version.DEFAULT_UHD_SCORE)
         likelihoods = self._likelihood_map(fourk)
+        eff_dry = effective_dry_run(self.dry_run, self.global_cache)
         downgraded = 0
         for mv in (gw.library_items(fourk) or []):
             tmdb = mv.get("tmdbId")
@@ -218,7 +345,7 @@ class UhdReconcileManager:
             lk = likelihoods.get(tmdb)
             if lk is None or lk >= threshold:
                 continue                                    # warrants 4K (or unscored) → keep in 4K
-            if self.dry_run:
+            if eff_dry:
                 self._log("log_info", f"[UHD] would downgrade 4K-only '{mv.get('title')}' (watch {lk:.0f})"
                                       f" → 1080p baseline on {std_inst}; 4K reclaimed once it lands.")
                 downgraded += 1
@@ -269,8 +396,9 @@ class UhdReconcileManager:
             return False
 
     # ── per standard instance ──────────────────────────────────────────────────
-    def _reconcile_instance(self, gw, mover, std_inst, fourk, dest_root, dest_pid, present, hasfile,
-                            can_remote_play=True):
+    def _reconcile_instance(self, gw, move_mover, acq_mover, std_inst, fourk, dest_root, dest_pid,
+                            present, hasfile, uhd_paths=None, can_remote_play=True):
+        uhd_paths = uhd_paths or {}
         try:
             movies = gw.library_items(std_inst) or []
         except Exception as e:
@@ -298,6 +426,16 @@ class UhdReconcileManager:
             lk = likelihoods.get(tmdb)
             watch = f" (watch {lk:.0f})" if lk is not None else ""
 
+            # SAME-PATH guard (Invariant 4): if the source and 4K records point at ONE physical file,
+            # never move/finalize it — retuning/searching/Move-scanning could destroy the shared file.
+            src_path = str(((mv.get("movieFile") or {}).get("path")) or "").replace("\\", "/").strip().rstrip("/")
+            if src_path and src_path == uhd_paths.get(tmdb):
+                self._log("log_warning", f"[UHD] {std_inst}: '{mv.get('title')}' shares ONE physical "
+                                         f"file with {fourk} (same path) — skipping move/finalize; "
+                                         f"operator must resolve on disk.")
+                self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "move", "flag-same-path")
+                continue
+
             # PROACTIVE ACQUIRE: an owned movie that WARRANTS 4K (watch-likelihood ≥ threshold) but
             # has no 4K anywhere (no 2160p file on the source AND not on the 4K instance) → acquire a
             # fresh 4K copy on the 4K instance; the source keeps its ≤1080 baseline. Gated on the
@@ -305,11 +443,12 @@ class UhdReconcileManager:
             if proactive and not dest_present and res < _UHD_RES and dual_version.wants_uhd(
                     keep_tagged=False, score=lk, space_allows=space_ok_4k,
                     uhd_threshold=threshold, can_remote_play=can_remote_play):
-                ast = mover.acquire(mv, to_inst=fourk, dest_root=dest_root,
-                                    dest_profile_id=dest_pid).get("status")
+                ast = acq_mover.acquire(mv, to_inst=fourk, dest_root=dest_root,
+                                        dest_profile_id=dest_pid).get("status")
                 if ast not in ("skip", "noop"):
                     acted += 1
                     self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} [{ast}]")
+                    self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "acquire", ast)
                 continue
 
             # FINALIZE: the 2160p has landed on the 4K instance and the source isn't yet the 1080p
@@ -321,12 +460,13 @@ class UhdReconcileManager:
             is_movein = (not dest_hasfile) and res >= _UHD_RES
             if not (is_finalize or is_movein):
                 continue
-            st = mover.relocate(mv, from_inst=std_inst, to_inst=fourk, dest_root=dest_root,
-                                dest_profile_id=dest_pid, hd_profile_id=hd_pid,
-                                dest_present=dest_present, dest_hasfile=dest_hasfile).get("status")
+            st = move_mover.relocate(mv, from_inst=std_inst, to_inst=fourk, dest_root=dest_root,
+                                     dest_profile_id=dest_pid, hd_profile_id=hd_pid,
+                                     dest_present=dest_present, dest_hasfile=dest_hasfile).get("status")
             if st not in ("skip", "noop"):
                 acted += 1
                 self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} [{st}]")
+                self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "move", st)
         if acted:
             self._log("log_info", f"[UHD] {std_inst}: {acted} title(s) routed to {fourk} (move/acquire).")
 
