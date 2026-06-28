@@ -317,10 +317,111 @@ def test_read_total_and_space_targets():
     _check("free_space_limit drives band", Tc == 2500.0 and abs(Uc - 2750.0) < 1e-6, f"({Tc},{Uc})")
 
 
+# ── run(): deletion is floor-gated for hysteresis ─────────────────────────────
+class _Rec:
+    """Tally which stages run() actually reaches."""
+    def __init__(self):
+        self.radarr_downgrades = 0
+        self.sonarr_downgrades = 0
+        self.delete_candidates_built = 0
+        self.downgrade_insts = []
+
+
+def _coord(free, rec, *, fsl=5500.0, radarr_instances=None):
+    """A coordinator wired to stub managers, with free space pinned to ``free``.
+    T=fsl, U=fsl*1.1. Stubs record downgrade + delete-pool calls; deletion would
+    fire iff run() reaches build_delete_candidates. ``radarr_instances`` (a list)
+    gives radarr_sp.radarr_api.get_all_radarr_apis() so the multi-instance downgrade
+    loop can be exercised; when None the api lacks the method (single-instance)."""
+    class _Api:
+        def get_all_radarr_apis(self): return {n: None for n in radarr_instances}
+    class _RadarrSP:
+        radarr_api = _Api() if radarr_instances else None
+        def _resolve_instance(self, _): return "standard"
+        def run_downgrades(self, inst, fr):
+            rec.radarr_downgrades += 1; rec.downgrade_insts.append(inst); return {"downgraded": 0}
+        def load_movie_files(self, inst):
+            return pd.DataFrame([{"tmdb_id": 1, "movie_file_id": 10, "title": "X"}])
+        def build_delete_candidates(self, inst, df, **k):
+            rec.delete_candidates_built += 1
+            return []
+    class _SonarrSP:
+        sonarr_api = None
+        def run_downgrades(self, inst, fr): rec.sonarr_downgrades += 1; return {"downgraded": 0}
+    class _SonarrEF:
+        def _resolve_instance(self, _): return "standard"
+        def load(self, inst): return None
+        def restore_recovered_episode_deletions(self, inst): return {"restored": 0}
+    class _RadarrRestore:
+        def restore_recovered_deletions(self, inst): return {"restored": 0}
+
+    c = object.__new__(C)
+    c.config = {"space_coordinator_enabled": True, "deletions_consent": True,
+                "free_space_limit": fsl}
+    c.logger = _StubLogger()
+    c.dry_run = True
+    c.global_cache = None
+    _mgrs = {"RadarrSpacePressureManager": _RadarrSP(),
+             "SonarrSpacePressureManager": _SonarrSP(),
+             "SonarrCacheEpisodeFilesManager": _SonarrEF(),
+             "RadarrRepairAnomalyManager": _RadarrRestore()}
+    c._mgr = lambda key: _mgrs.get(key)        # type: ignore
+    c._read_total = lambda *a, **k: 10000.0     # type: ignore
+    c._read_free = lambda *a, **k: free         # type: ignore
+    return c
+
+
+def test_run_deletion_is_floor_gated():
+    print("test_run_deletion_is_floor_gated:")
+    # T=5500, U=6050.
+
+    # Comfortable (free >= U): bail before any reclamation.
+    rec = _Rec(); out = _coord(6200.0, rec).run()
+    _check("free >= U: action none", out.get("action") == "none", f"out={out}")
+    _check("free >= U: no downgrades", rec.radarr_downgrades == 0 and rec.sonarr_downgrades == 0)
+    _check("free >= U: no delete pool", rec.delete_candidates_built == 0)
+
+    # In the band (T <= free < U): non-destructive downgrades run, but the delete
+    # pool HOLDS — this is the floor-gated hysteresis (the bug this test guards).
+    rec = _Rec(); out = _coord(5557.0, rec).run()
+    _check("band: downgrades ran", rec.radarr_downgrades == 1 and rec.sonarr_downgrades == 1, f"rec={rec.__dict__}")
+    _check("band: action band_hold", out.get("action") == "band_hold", f"out={out}")
+    _check("band: NO delete pool built", rec.delete_candidates_built == 0, f"built={rec.delete_candidates_built}")
+
+    # Below floor (free < T): downgrades run AND the deletion path is reached.
+    rec = _Rec(); out = _coord(5400.0, rec).run()
+    _check("below floor: downgrades ran", rec.radarr_downgrades == 1 and rec.sonarr_downgrades == 1)
+    _check("below floor: delete pool built", rec.delete_candidates_built == 1, f"built={rec.delete_candidates_built}")
+    _check("below floor: not band_hold", out.get("action") != "band_hold", f"out={out}")
+
+
+def test_run_downgrades_all_radarr_instances():
+    print("test_run_downgrades_all_radarr_instances:")
+    insts = ["standard", "ultra", "test"]
+
+    # Below floor: coordinator downgrades EVERY instance once, default first.
+    rec = _Rec(); out = _coord(5400.0, rec, radarr_instances=insts).run()
+    _check("downgraded all 3 instances", sorted(rec.downgrade_insts) == ["standard", "test", "ultra"], f"insts={rec.downgrade_insts}")
+    _check("default instance first", rec.downgrade_insts[0] == "standard", f"insts={rec.downgrade_insts}")
+    _check("each downgraded exactly once", rec.radarr_downgrades == 3, f"n={rec.radarr_downgrades}")
+
+    # Band (T<=free<U): still downgrades all instances, but deletion HOLDS.
+    rec = _Rec(); out = _coord(5557.0, rec, radarr_instances=insts).run()
+    _check("band: all instances downgraded", rec.radarr_downgrades == 3, f"n={rec.radarr_downgrades}")
+    _check("band: action band_hold", out.get("action") == "band_hold", f"out={out}")
+    _check("band: no delete pool", rec.delete_candidates_built == 0, f"built={rec.delete_candidates_built}")
+
+    # Single-instance setup (api lacks get_all_radarr_apis) -> only the default.
+    rec = _Rec(); _coord(5400.0, rec).run()
+    _check("single-instance: only default downgraded", rec.downgrade_insts == ["standard"], f"insts={rec.downgrade_insts}")
+
+
 if __name__ == "__main__":
     test_select_for_target()
     test_critic_sort()
     test_episode_candidates_and_delete()
     test_candidate_failsafes()
     test_read_total_and_space_targets()
+    test_run_deletion_is_floor_gated()
+    test_run_downgrades_all_radarr_instances()
     print("\nAll coordinator tests passed")

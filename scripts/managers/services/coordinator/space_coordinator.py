@@ -15,8 +15,11 @@ Pipeline (all stages dry_run-safe; the leaf managers log-only under dry_run):
            its own per-service delete loop (this manager is simply never invoked).
   Stage 1 — run BOTH downgrade passes (Radarr → HD-720p, Sonarr → HD-720p). These
            reclaim projected space cheaply (re-grab smaller files) before any
-           deletion. Re-read free; return if we've recovered to U.
-  Stage 2 — build the COMBINED delete pool: Radarr movie candidates +
+           deletion. Downgrades are non-destructive (restorable re-grabs), so they run
+           throughout the band. Re-read free; if free ≥ the floor T — whether recovered
+           all the way to U or merely holding in the band (T ≤ free < U) — STOP here: the
+           destructive delete pool is floor-gated for hysteresis.
+  Stage 2 — (only when free < the floor T) build the COMBINED delete pool: Radarr movie candidates +
            Sonarr episode candidates, each carrying its persisted
            ``watchability_score``. Sort ascending by score, then by critic
            rating, then by size descending; accumulate from the bottom until the
@@ -43,7 +46,11 @@ from scripts.managers.machine_learning.space.coordinator_ranker import (
     critic_sort,
     select_for_target,
 )
-from scripts.managers.machine_learning.space.routing_targets import evict_uhd_first
+from scripts.managers.machine_learning.space.routing_targets import (
+    evict_uhd_first,
+    rehome_4k_only_enabled,
+)
+from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_targets import coordinator_owns_deletion, space_targets
@@ -55,6 +62,13 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
     # Last-resort pressure floor — only when free_space_limit is unset AND the shared
     # mount's total size is unreadable (otherwise the floor is 25% of the total drive).
     PRESSURE_FALLBACK_GB = 1000.0
+
+    # FORK-D: global_cache key for the cross-run "rehomed 4K copy awaiting eviction" ledger,
+    # per 4K instance. {str(tmdb): {std_inst, uhd_movie_id, uhd_file_id, size_bytes, queued_at}}.
+    _PENDING_EVICT_KEY = "radarr/{inst}/pending_4k_evicts"
+    # FORK-D: 4K copies already evicted (file gone, record unmonitored) awaiting SPACE recovery to
+    # be re-added as a dual-version bonus. {str(tmdb): {std_inst, uhd_movie_id, size_bytes, evicted_at}}.
+    _SPACE_EVICTED_KEY = "radarr/{inst}/space_evicted_4k"
 
     @LoggerManager().log_function_entry
     @timeit("__init__")
@@ -163,24 +177,47 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
             f"[SpaceCoordinator] shared pool: {free:.0f} GB free "
             f"(floor {T:.0f} GB, target band top {U:.0f} GB, dry_run={self.dry_run})."
         )
+
+        # FORK-D RE-ADD (runs on EVERY path, incl. the healthy one below): when free has
+        # recovered to a comfortable margin above the band top, re-acquire the 4K copies we
+        # evicted under pressure so the title returns to a proper dual-version. Gated well above
+        # U so it can never thrash against the evict (which only fires below the floor T).
+        readd_stats = None
+        if rehome_4k_only_enabled(self.config) and radarr_inst:
+            _ruhd_readd = self._uhd_instance(radarr_inst)
+            if _ruhd_readd:
+                readd_stats = self._readd_space_evicted_4k(radarr_sp, _ruhd_readd, free, U)
+
         if free >= U:
             self.logger.log_info(
                 f"[SpaceCoordinator] {free:.0f} GB ≥ {U:.0f} GB — no space pressure, skipping."
             )
-            return {"enabled": True, "action": "none", "free_space_gb": round(free, 1)}
+            out = {"enabled": True, "action": "none", "free_space_gb": round(free, 1)}
+            if readd_stats is not None:
+                out["readd_4k"] = readd_stats
+            return out
 
         stats: dict = {"enabled": True, "free_before_gb": round(free, 1),
                        "downgrades": {}, "deletions": {}, "restores": {}}
-        # Bound up-front (None) so the Stage-1 "downgrades_only" and the "no candidates" early
-        # returns can pass uhd_inst to _run_restores before the Stage-2 4K block (re)assigns it.
+        # Bound up-front (None) so the "no candidates" early return can reference uhd_inst
+        # for its restore set before the Stage-2 4K block (re)assigns it.
         uhd_inst, uhd_df = None, None
 
-        # ── Stage 1: downgrades (both services) ─────────────────────────────────
-        if radarr_sp and radarr_inst:
-            try:
-                stats["downgrades"]["radarr"] = radarr_sp.run_downgrades(radarr_inst, free)
-            except Exception as e:
-                self.logger.log_warning(f"[SpaceCoordinator] Radarr downgrades failed: {e}")
+        # ── Stage 1: downgrades (both services, ALL Radarr instances) ───────────
+        # All Radarr instances share the one media mount, so the coordinator owns the
+        # downgrade pass for EVERY instance (not just the default) — this is what makes
+        # it the single point of contact. Per-instance failures are isolated so one bad
+        # instance never aborts the others. Downgrades are non-destructive (profile flip
+        # + re-grab on recovery), so looping here before the floor gate is safe.
+        if radarr_sp:
+            stats["downgrades"]["radarr"] = {}
+            for inst in self._all_radarr_instances(radarr_sp, radarr_inst):
+                try:
+                    stats["downgrades"]["radarr"][inst] = radarr_sp.run_downgrades(inst, free)
+                except Exception as e:
+                    self.logger.log_warning(
+                        f"[SpaceCoordinator] Radarr downgrades failed for '{inst}': {e}"
+                    )
         if sonarr_sp and sonarr_inst:
             try:
                 stats["downgrades"]["sonarr"] = sonarr_sp.run_downgrades(sonarr_inst, free)
@@ -189,13 +226,30 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
 
         free = self._read_free(radarr_sp, radarr_inst, sonarr_sp, sonarr_inst)
         stats["free_after_downgrades_gb"] = round(free, 1)
-        if free >= U:
-            self.logger.log_info(
-                f"[SpaceCoordinator] downgrades recovered to {free:.0f} GB ≥ {U:.0f} GB — "
-                f"no deletion needed."
-            )
-            stats["action"] = "downgrades_only"
-            stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, uhd_inst=uhd_inst)
+        # Deletion is floor-gated for hysteresis: it triggers only once free actually
+        # breaches the floor T, NOT merely the band top U. While T <= free < U we are in
+        # the pressure band — the Stage-1 downgrades above (non-destructive, restorable)
+        # have run, but the destructive delete pool HOLDS. This mirrors the per-service
+        # run_deletions (``if free >= T: return``) and space_targets.py's documented rule
+        # ("T <= free < U → hold steady, deletion loop stops here = hysteresis"). Once
+        # free < T, Stage 2 below reclaims all the way back up to U (the high-watermark).
+        if free >= T:
+            if free >= U:
+                self.logger.log_info(
+                    f"[SpaceCoordinator] downgrades recovered to {free:.0f} GB ≥ {U:.0f} GB — "
+                    f"no deletion needed."
+                )
+                stats["action"] = "downgrades_only"
+            else:
+                self.logger.log_info(
+                    f"[SpaceCoordinator] {free:.0f} GB ≥ floor {T:.0f} GB (pressure band "
+                    f"{T:.0f}–{U:.0f} GB) — downgrades ran; deletion holds until free "
+                    f"breaches the floor (hysteresis)."
+                )
+                stats["action"] = "band_hold"
+            # No deletion happened (downgrades only / band hold) → restore the default
+            # instance + Sonarr (uhd_inst is still None here, before the Stage-2 4K pass).
+            stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst)
             return stats
 
         # ── Stage 2: combined ranked delete pool ────────────────────────────────
@@ -211,10 +265,20 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         radarr_df = radarr_sp.load_movie_files(radarr_inst) if (radarr_sp and radarr_inst) else None
         sonarr_df = sonarr_ef.load(sonarr_inst) if (sonarr_ef and sonarr_inst) else None
 
+        # instance_dfs maps each Radarr instance name → its loaded movie_files df so the
+        # delete branch can route every pick back to the instance/df it came from. The
+        # default instance is keyed first; the 4K pass and Pass-3 add the rest.
+        instance_dfs: dict = {}
+        if radarr_inst is not None:
+            instance_dfs[radarr_inst] = radarr_df
+
         pool: list[dict] = []
         if radarr_sp and radarr_df is not None and not radarr_df.empty:
             try:
-                pool += radarr_sp.build_delete_candidates(radarr_inst, radarr_df)
+                _std = radarr_sp.build_delete_candidates(radarr_inst, radarr_df)
+                for c in _std:
+                    c.setdefault("instance", radarr_inst)   # route default-instance deletes correctly
+                pool += _std
             except Exception as e:
                 self.logger.log_warning(f"[SpaceCoordinator] movie candidate build failed: {e}")
         if sonarr_ef and sonarr_df is not None and not sonarr_df.empty:
@@ -238,6 +302,7 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                     self.logger.log_warning(f"[SpaceCoordinator] 4K movie_files load failed for "
                                             f"'{uhd_inst}': {e}")
                     uhd_df = None
+                instance_dfs[uhd_inst] = uhd_df   # route 4K-copy deletes to the 4K instance df
                 if uhd_df is not None and not uhd_df.empty:
                     try:
                         uhd_cands = radarr_sp.build_delete_candidates(
@@ -258,6 +323,91 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                             f"[SpaceCoordinator] {added} reclaimable 4K copy(ies) on '{uhd_inst}' "
                             f"(1080p baseline survives → reclaimed before any whole title).")
 
+        # ── Pass 2b (FORK-D, default-off): queue cold 4K-ONLY films for rehome-then-evict ──
+        # A 4K-only film is a 2160p copy on the 4K instance with NO 1080p baseline on standard
+        # (the exact inverse of the evict pass's survivors test). Rather than protect it forever
+        # (Pass 3 excludes it), queue it: later this run we add a watchability-matched <=1080p
+        # copy on standard, and a LATER run evicts the 4K once that copy imports (the drain). Only
+        # the coldest titles, up to the reclaim target — never churn-add the whole 4K library.
+        rehome_queue: list = []
+        if rehome_4k_only_enabled(self.config) and radarr_sp and radarr_inst:
+            _ruhd = self._uhd_instance(radarr_inst)
+            if _ruhd and _ruhd != radarr_inst:
+                uhd_inst = _ruhd                       # make restore/drain aware of the 4K instance
+                survivors = self._baseline_survivors(radarr_df)
+                _rdf = instance_dfs.get(_ruhd)
+                if _rdf is None:
+                    try:
+                        _rdf = radarr_sp.load_movie_files(_ruhd)
+                    except Exception as e:
+                        self.logger.log_warning(f"[SpaceCoordinator] FORK-D 4K load failed for '{_ruhd}': {e}")
+                        _rdf = None
+                    instance_dfs[_ruhd] = _rdf
+                if _rdf is not None and not _rdf.empty:
+                    try:
+                        _cands = radarr_sp.build_delete_candidates(_ruhd, _rdf, ignore_score_ceiling=True)
+                    except Exception as e:
+                        self.logger.log_warning(f"[SpaceCoordinator] FORK-D candidate build failed: {e}")
+                        _cands = []
+                    only4k = [c for c in _cands
+                              if c.get("resolution") and int(c["resolution"]) > 1080
+                              and c.get("tmdb_id") not in survivors]
+                    # coldest first (lowest watchability), then biggest file, up to the reclaim target.
+                    only4k.sort(key=lambda c: ((c.get("score") if c.get("score") is not None else 0),
+                                               -float(c.get("size_bytes") or 0.0)))
+                    _budget_gb = max(0.0, U - free)   # GB to reclaim (sizes below are BYTES)
+                    _acc_gb = 0.0
+                    for c in only4k:
+                        if _acc_gb >= _budget_gb:
+                            break
+                        try:
+                            _mid = int(_rdf.at[c["idx"], "movie_id"])
+                        except Exception:
+                            continue                  # can't identify the 4K movie record → skip (never guess)
+                        _sz = float(c.get("size_bytes") or 0.0)
+                        rehome_queue.append({
+                            "tmdb_id": c.get("tmdb_id"), "uhd_inst": _ruhd,
+                            "uhd_movie_id": _mid, "uhd_file_id": c.get("fid"),
+                            "size_bytes": _sz, "title": c.get("title"),
+                            "row": _rdf.loc[c["idx"]].to_dict(),
+                        })
+                        _acc_gb += _sz / (1024 ** 3)
+                    if rehome_queue:
+                        self.logger.log_info(
+                            f"[SpaceCoordinator] FORK-D queued {len(rehome_queue)} cold 4K-only "
+                            f"film(s) on '{_ruhd}' to rehome → standard (evicted once the copy imports).")
+
+        # ── Pass 3: pool the REMAINING Radarr instances (not the default, not the
+        # config-labeled 4K instance) as whole-title candidates. They share the one mount,
+        # so their low-watchability titles compete in the same ranked pool under all the
+        # same keep/score/recent guards. The 4K instance is deliberately EXCLUDED here —
+        # its only coordinator-eligible candidates are the baseline-backed bonus copies
+        # added in Pass 2; whole-title reclamation of a 4K-only film is the pending
+        # rehome-then-evict path, so the coordinator never deletes a 4K-only title today.
+        if radarr_sp and radarr_inst:
+            protected_uhd = self._uhd_instance(radarr_inst)   # config 4K instance (independent of the evict flag)
+            for other_inst in self._all_radarr_instances(radarr_sp, radarr_inst):
+                if other_inst == radarr_inst or other_inst == protected_uhd:
+                    continue
+                try:
+                    other_df = radarr_sp.load_movie_files(other_inst)
+                except Exception as e:
+                    self.logger.log_warning(
+                        f"[SpaceCoordinator] movie_files load failed for '{other_inst}': {e}"
+                    )
+                    other_df = None
+                instance_dfs[other_inst] = other_df
+                if other_df is not None and not other_df.empty:
+                    try:
+                        _oc = radarr_sp.build_delete_candidates(other_inst, other_df)
+                        for c in _oc:
+                            c.setdefault("instance", other_inst)
+                        pool += _oc
+                    except Exception as e:
+                        self.logger.log_warning(
+                            f"[SpaceCoordinator] movie candidate build failed for '{other_inst}': {e}"
+                        )
+
         # Shield titles the per-user playlists are actively recommending (esp. a kid's top
         # picks) from the delete pool. The household-blended watchability score can dilute a
         # child's clear favourite below the delete ceiling, and deleting what we just put in
@@ -273,75 +423,106 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         if not pool:
             self.logger.log_info("[SpaceCoordinator] no eligible delete candidates — nothing to do.")
             stats["action"] = "no_candidates"
-            stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, uhd_inst=uhd_inst)
-            return stats
-
-        # Rank lowest watchability first, then lowest critic, then biggest file
-        # first, and accumulate from the bottom until we'd reach U.
-        need = U - free   # GB we must reclaim
-        # Optional recency weighting: a file watched in the last few days sinks to the
-        # bottom of the delete order so the sweep takes cold titles first. Default-off
-        # (the ramp must be enabled) → the bare watchability ranking, byte-identical.
-        _recency_ramp = (self.config or {}).get("delete_recency_ramp", {}) or {}
-        _now = datetime.now(timezone.utc) if _recency_ramp.get("enabled") else None
-        # Optional likelihood-tier bucketing: within a watchability tier, take the
-        # biggest file first (fewer deletions to hit the target). Default-off (unset /
-        # <=0) → no bucketing, byte-identical.
-        try:
-            _tier_size = float((self.config or {}).get("delete_tier_size", 0) or 0) or None
-        except (TypeError, ValueError):
-            _tier_size = None
-        selected, projected = self._select_for_target(
-            pool, need, recency_ramp=_recency_ramp, now=_now, tier_size=_tier_size,
-            uhd_first=bool(uhd_inst),
-        )
-
-        movie_picks = [c for c in selected if c.get("service") == "movie"]
-        episode_picks = [c for c in selected if c.get("service") == "episode"]
-        # Split the movie picks by instance: the standard 1080p-tier titles delete against the
-        # standard instance/df; the dual-version 4K copies delete against the 4K instance/df.
-        std_movie_picks = [c for c in movie_picks if not c.get("is_uhd_copy")]
-        uhd_movie_picks = [c for c in movie_picks if c.get("is_uhd_copy")]
-        for c in movie_picks:
-            c["reason"] = f"coordinator pool (score {c.get('score')})"
-        episode_fids = [c["fid"] for c in episode_picks if c.get("fid") is not None]
-
-        self.logger.log_info(
-            f"[SpaceCoordinator] need {need:.0f} GB → selected {len(selected)} item(s) "
-            f"({len(movie_picks)} movie, {len(episode_picks)} episode) projecting "
-            f"~{projected:.0f} GB reclaim."
-        )
-        if projected < need:
-            self.logger.log_warning(
-                f"[SpaceCoordinator] pool exhausted — only ~{projected:.0f} GB of {need:.0f} GB "
-                f"reclaimable from {len(pool)} candidate(s); deleting all eligible."
+            deleted_instances: set = set()
+        else:
+            # Rank lowest watchability first, then lowest critic, then biggest file
+            # first, and accumulate from the bottom until we'd reach U.
+            need = U - free   # GB we must reclaim
+            # Optional recency weighting: a file watched in the last few days sinks to the
+            # bottom of the delete order so the sweep takes cold titles first. Default-off
+            # (the ramp must be enabled) → the bare watchability ranking, byte-identical.
+            _recency_ramp = (self.config or {}).get("delete_recency_ramp", {}) or {}
+            _now = datetime.now(timezone.utc) if _recency_ramp.get("enabled") else None
+            # Optional likelihood-tier bucketing: within a watchability tier, take the
+            # biggest file first (fewer deletions to hit the target). Default-off (unset /
+            # <=0) → no bucketing, byte-identical.
+            try:
+                _tier_size = float((self.config or {}).get("delete_tier_size", 0) or 0) or None
+            except (TypeError, ValueError):
+                _tier_size = None
+            selected, projected = self._select_for_target(
+                pool, need, recency_ramp=_recency_ramp, now=_now, tier_size=_tier_size,
+                uhd_first=bool(uhd_inst),
             )
 
-        if std_movie_picks and radarr_sp and radarr_df is not None:
-            try:
-                stats["deletions"]["radarr"] = radarr_sp.delete_selected_movie_files(radarr_inst, radarr_df, std_movie_picks)
-            except Exception as e:
-                self.logger.log_warning(f"[SpaceCoordinator] movie deletion failed: {e}")
-        if uhd_movie_picks and radarr_sp and uhd_df is not None:
-            try:
-                # Deletes ONLY the 2160p file on the 4K instance (separate DB/record); the standard
-                # instance's 1080p baseline is untouched. Recorded under the 4K instance's restore ledger.
-                stats["deletions"]["radarr_uhd"] = radarr_sp.delete_selected_movie_files(uhd_inst, uhd_df, uhd_movie_picks)
-            except Exception as e:
-                self.logger.log_warning(f"[SpaceCoordinator] 4K copy deletion failed: {e}")
-        if episode_fids and sonarr_ef:
-            try:
-                stats["deletions"]["sonarr"] = sonarr_ef.delete_selected_episode_files(sonarr_inst, episode_fids)
-            except Exception as e:
-                self.logger.log_warning(f"[SpaceCoordinator] episode deletion failed: {e}")
+            movie_picks = [c for c in selected if c.get("service") == "movie"]
+            episode_picks = [c for c in selected if c.get("service") == "episode"]
+            for c in movie_picks:
+                c.setdefault("instance", radarr_inst)
+                c["reason"] = f"coordinator pool (score {c.get('score')})"
+            episode_fids = [c["fid"] for c in episode_picks if c.get("fid") is not None]
 
-        stats["free_after_deletions_gb"] = round(
-            self._read_free(radarr_sp, radarr_inst, sonarr_sp, sonarr_inst), 1
-        )
-        stats["action"] = "deleted"
+            self.logger.log_info(
+                f"[SpaceCoordinator] need {need:.0f} GB → selected {len(selected)} item(s) "
+                f"({len(movie_picks)} movie, {len(episode_picks)} episode) projecting "
+                f"~{projected:.0f} GB reclaim."
+            )
+            if projected < need:
+                self.logger.log_warning(
+                    f"[SpaceCoordinator] pool exhausted — only ~{projected:.0f} GB of {need:.0f} GB "
+                    f"reclaimable from {len(pool)} candidate(s); deleting all eligible."
+                )
+
+            # Route each movie pick back to its origin instance's df and delete there. At most
+            # one delete call per instance, so the per-instance restore ledger and reclaim
+            # accounting are never double-counted. A pick whose instance df failed to load is
+            # SKIPPED (never guess the target df → never delete the wrong file).
+            deleted_instances = set()
+            if radarr_sp and movie_picks:
+                picks_by_inst: dict = {}
+                for c in movie_picks:
+                    picks_by_inst.setdefault(c.get("instance") or radarr_inst, []).append(c)
+                stats["deletions"]["radarr"] = {}
+                for inst, picks in picks_by_inst.items():
+                    idf = instance_dfs.get(inst)
+                    if idf is None:
+                        self.logger.log_warning(
+                            f"[SpaceCoordinator] skipping {len(picks)} delete pick(s) for '{inst}' — "
+                            f"no movie_files df loaded (never guess the target df)."
+                        )
+                        continue
+                    try:
+                        res = radarr_sp.delete_selected_movie_files(inst, idf, picks)
+                        stats["deletions"]["radarr"][inst] = res
+                        if res and res.get("deleted"):
+                            deleted_instances.add(inst)
+                    except Exception as e:
+                        self.logger.log_warning(f"[SpaceCoordinator] movie deletion failed for '{inst}': {e}")
+            if episode_fids and sonarr_ef:
+                try:
+                    stats["deletions"]["sonarr"] = sonarr_ef.delete_selected_episode_files(sonarr_inst, episode_fids)
+                except Exception as e:
+                    self.logger.log_warning(f"[SpaceCoordinator] episode deletion failed: {e}")
+
+            stats["free_after_deletions_gb"] = round(
+                self._read_free(radarr_sp, radarr_inst, sonarr_sp, sonarr_inst), 1
+            )
+            stats["action"] = "deleted"
+
+        # ── FORK-D: execute queued rehomes — add the watchability-matched <=1080p copy on
+        # standard + register the deferred 4K eviction. Runs on BOTH the deleted and the
+        # no-candidates paths (a cold 4K-only film is exactly when the standard pool is empty).
+        # No-op when nothing was queued (flag off → byte-identical).
+        if rehome_queue:
+            stats["rehomes"] = self._execute_rehomes(rehome_queue, radarr_sp, radarr_inst, uhd_inst)
 
         # ── Stage 3: restore recovered ──────────────────────────────────────────
-        stats["restores"] = self._run_restores(radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, uhd_inst=uhd_inst)
+        # Always restore the default instance; additionally restore the 4K instance (its
+        # ledger may hold evicted copies) and every other instance that deleted this run,
+        # so a recovered title on any instance is re-grabbed.
+        restore_extra = set(deleted_instances)
+        if uhd_inst:
+            restore_extra.add(uhd_inst)
+        stats["restores"] = self._run_restores(
+            radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, extra_insts=restore_extra
+        )
+
+        # ── FORK-D: deferred-evict DRAIN — the ONLY place a rehomed 4K copy is deleted, and
+        # only once its standard replacement is confirmed imported (see _execute_pending_uhd_evicts).
+        if rehome_4k_only_enabled(self.config) and uhd_inst and radarr_inst:
+            stats["pending_4k_evicts"] = self._execute_pending_uhd_evicts(radarr_sp, radarr_inst, uhd_inst)
+        if readd_stats is not None:
+            stats["readd_4k"] = readd_stats
         return stats
 
     # ── playlist-pick delete shield ──────────────────────────────────────────────
@@ -393,6 +574,98 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         return kept, shielded
 
     # ── Helpers ──────────────────────────────────────────────────────────────────
+    def _all_radarr_instances(self, radarr_sp, default_inst) -> list:
+        """Every Radarr instance name on the shared mount, with ``default_inst`` FIRST
+        (the 4K baseline-survivors pass must read the standard df before the 4K pass).
+        Mirrors RadarrOrchestrationManager._all_instances(); falls back to just the
+        default when the api can't enumerate (single-instance setups), so behaviour is
+        unchanged there."""
+        api = getattr(radarr_sp, "radarr_api", None) if radarr_sp else None
+        names: list = []
+        if api is not None and hasattr(api, "get_all_radarr_apis"):
+            try:
+                names = [str(k) for k in api.get_all_radarr_apis().keys()]
+            except Exception:
+                names = []
+        if default_inst:
+            names = [default_inst] + [n for n in names if n != default_inst]
+        return names
+
+    # ── FORK-D: rehome target-profile resolution ──────────────────────────────────
+    def _instance_profiles(self, radarr_sp, inst) -> dict:
+        """``{profile_id: name}`` actually configured on a Radarr instance (live
+        ``GET qualityprofile``). Empty dict on any failure → caller treats it as
+        'cannot resolve a target' and skips the rehome (fail-safe: the 4K copy stays)."""
+        api = getattr(radarr_sp, "radarr_api", None) if radarr_sp else None
+        if api is None or not hasattr(api, "_make_request"):
+            return {}
+        try:
+            rows = api._make_request(inst, "qualityprofile", fallback=[]) or []
+        except Exception:
+            return {}
+        out: dict = {}
+        for r in rows:
+            try:
+                out[int(r.get("id"))] = r.get("name")
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _rehome_target_profile(self, row, radarr_sp, std_inst) -> "int | None":
+        """The watchability-matched Radarr quality profile id to grab a rehomed 4K-only film
+        at on the standard instance. HARD-CAPPED below the 4K cutoff (a rehome can NEVER
+        re-grab 2160p — INV-5), then validated to actually EXIST on ``std_inst``: walk DOWN
+        to the best present profile at/below the earned ladder rank, never below the hard
+        floor (``routing.movies.rehome_floor_profile``, default 'HD-720p'). Returns None when
+        no valid sub-4K profile exists on the instance → the caller skips the rehome and the
+        4K copy stays protected (fail-safe to today's behaviour)."""
+        try:
+            from scripts.managers.machine_learning.likelihood.watch_likelihood import (
+                ladder_rank, profile_id_for_likelihood, watch_likelihood,
+            )
+        except Exception:
+            return None
+        cfg = self.config or {}
+        # Cap the likelihood just below the 4K cutoff so the earned profile is never a 4K tier.
+        try:
+            uhd_cutoff = float((cfg.get("watch_likelihood", {}) or {}).get("uhd_cutoff", 75.0))
+        except (TypeError, ValueError):
+            uhd_cutoff = 75.0
+        try:
+            L = min(float(watch_likelihood(row, config=cfg)), uhd_cutoff - 1.0)
+        except Exception:
+            return None
+        earned_rank = ladder_rank(profile_id_for_likelihood(L, config=cfg), config=cfg)
+        # The lowest 4K ladder rank — the UNCONDITIONAL ceiling: a rehome may NEVER return a
+        # profile at or above this rank (INV-5), including via the floor fallback below.
+        cap_rank = ladder_rank(profile_id_for_likelihood(uhd_cutoff, config=cfg), config=cfg)
+        present = self._instance_profiles(radarr_sp, std_inst)
+        if not present:
+            return None
+        floor_name = str(((cfg.get("routing", {}) or {}).get("movies", {}) or {})
+                         .get("rehome_floor_profile", "HD-720p")).strip().lower()
+        floor_id = next((pid for pid, nm in present.items()
+                         if str(nm or "").strip().lower() == floor_name), None)
+        floor_rank = ladder_rank(floor_id, config=cfg) if floor_id is not None else -1
+        # A misconfigured 4K-tier floor is treated as "no valid floor" so it can never leak a
+        # 2160p grab through the fallback — the fail-safe (None → keep the 4K copy) holds instead.
+        if cap_rank >= 0 and floor_rank >= cap_rank:
+            floor_id, floor_rank = None, -1
+        best_id, best_rank = None, -1
+        for pid in present:
+            r = ladder_rank(pid, config=cfg)
+            if r < 0 or r > earned_rank:           # off-ladder or above the capped tier
+                continue
+            if cap_rank >= 0 and r >= cap_rank:    # 4K tier — never (belt-and-braces vs earned_rank)
+                continue
+            if floor_rank >= 0 and r < floor_rank:  # below the hard floor
+                continue
+            if r > best_rank:
+                best_id, best_rank = pid, r
+        if best_id is not None:
+            return int(best_id)
+        return int(floor_id) if floor_id is not None else None
+
     def _read_free(self, radarr_sp, radarr_inst, sonarr_sp, sonarr_inst) -> float:
         """Free GB on the shared media mount. Radarr and Sonarr report the same
         underlying mount, so take the MIN of whatever's available (conservative)."""
@@ -463,24 +736,280 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         vals = [v for v in vals if v == v and v > 0 and v != float("inf")]
         return min(vals) if vals else None
 
-    def _run_restores(self, radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, *, uhd_inst=None) -> dict:
+    def _run_restores(self, radarr_restore, radarr_inst, sonarr_ef, sonarr_inst, *, extra_insts=None) -> dict:
         out: dict = {}
-        if radarr_restore and radarr_inst and hasattr(radarr_restore, "restore_recovered_deletions"):
-            try:
-                out["radarr"] = radarr_restore.restore_recovered_deletions(radarr_inst)
-            except Exception as e:
-                self.logger.log_warning(f"[SpaceCoordinator] Radarr restore failed: {e}")
-        # Evicted 4K copies are recorded under the 4K instance's own restore ledger, so restore
-        # must run for it too — otherwise a 4K copy whose watchability recovers is never re-grabbed.
-        if radarr_restore and uhd_inst and uhd_inst != radarr_inst \
-                and hasattr(radarr_restore, "restore_recovered_deletions"):
-            try:
-                out["radarr_uhd"] = radarr_restore.restore_recovered_deletions(uhd_inst)
-            except Exception as e:
-                self.logger.log_warning(f"[SpaceCoordinator] 4K restore failed: {e}")
+        # Restore the default instance always, plus every other Radarr instance that deleted
+        # this run (the 4K-evict instance and any Pass-3 instance). Each instance's restore
+        # reads its OWN per-instance ledger and re-grabs titles whose watchability recovered;
+        # deduped so a single instance is never restored twice.
+        radarr_insts: list = [radarr_inst] if radarr_inst else []
+        for inst in (extra_insts or ()):
+            if inst and inst != radarr_inst and inst not in radarr_insts:
+                radarr_insts.append(inst)
+        if radarr_restore and hasattr(radarr_restore, "restore_recovered_deletions"):
+            for inst in radarr_insts:
+                # Keep the default instance's key as plain "radarr" (byte-identical telemetry for
+                # the common single-instance case); extra instances use a per-instance key.
+                k = "radarr" if inst == radarr_inst else f"radarr:{inst}"
+                try:
+                    out[k] = radarr_restore.restore_recovered_deletions(inst)
+                except Exception as e:
+                    self.logger.log_warning(f"[SpaceCoordinator] Radarr restore failed for '{inst}': {e}")
         if sonarr_ef and sonarr_inst and hasattr(sonarr_ef, "restore_recovered_episode_deletions"):
             try:
                 out["sonarr"] = sonarr_ef.restore_recovered_episode_deletions(sonarr_inst)
             except Exception as e:
                 self.logger.log_warning(f"[SpaceCoordinator] Sonarr restore failed: {e}")
+        return out
+
+    # ── FORK-D: rehome execution + deferred 4K eviction ───────────────────────────
+    def _execute_rehomes(self, rehome_queue, radarr_sp, std_inst, uhd_inst) -> dict:
+        """For each queued cold 4K-only film, add a watchability-matched <=1080p copy on the
+        standard instance (via AcquisitionManager.rehome_to_standard) and, on success, REGISTER
+        a pending 4K eviction. NEVER deletes the 4K here — eviction is the drain's job, and only
+        once the standard copy has imported."""
+        out = {"queued": len(rehome_queue), "rehomed": 0, "skipped": 0, "failed": 0}
+        acq = self._mgr("AcquisitionManager")
+        if acq is None or not hasattr(acq, "rehome_to_standard"):
+            self.logger.log_warning(
+                "[SpaceCoordinator] FORK-D: AcquisitionManager unavailable — keeping 4K copies.")
+            out["skipped"] = len(rehome_queue)
+            return out
+        for q in rehome_queue:
+            tmdb = q.get("tmdb_id")
+            profile_id = self._rehome_target_profile(q.get("row") or {}, radarr_sp, std_inst)
+            if profile_id is None:
+                self.logger.log_info(
+                    f"[SpaceCoordinator] FORK-D: no valid <=1080p profile for '{q.get('title')}' "
+                    f"on '{std_inst}' — keeping the 4K copy.")
+                out["skipped"] += 1
+                continue
+            try:
+                res = acq.rehome_to_standard(tmdb, std_inst=std_inst, target_profile_id=profile_id)
+            except Exception as e:
+                self.logger.log_warning(
+                    f"[SpaceCoordinator] FORK-D rehome failed for '{q.get('title')}': {e}")
+                out["failed"] += 1
+                continue
+            action = (res or {}).get("action")
+            # On any successful add/search (or an already-present standard copy), queue the 4K
+            # eviction. would-add/would-search are dry-run actions → _register no-ops in dry_run.
+            if action in ("added", "would-add", "searched", "would-search", "already-owned"):
+                self._register_pending_uhd_evict(
+                    uhd_inst, tmdb, q.get("uhd_movie_id"), q.get("uhd_file_id"),
+                    std_inst, q.get("size_bytes"))
+                out["rehomed"] += 1
+            else:
+                self.logger.log_info(
+                    f"[SpaceCoordinator] FORK-D rehome '{q.get('title')}' → {action} "
+                    f"(no eviction queued).")
+                out["skipped"] += 1
+        return out
+
+    def _register_pending_uhd_evict(self, uhd_inst, tmdb, uhd_movie_id, uhd_file_id,
+                                    std_inst, size_bytes) -> None:
+        """Record a 4K copy to evict LATER, once its standard rehome copy imports. Keyed by tmdb;
+        re-queuing UPDATES the fields but PRESERVES the original ``queued_at`` so the import-timeout
+        clock measures from first queue (a persistent stall really does age out — without this the
+        7-day clock would restart every run and never fire). No write under effective_dry_run — a
+        preview or backup-disarmed run must never arm a real eviction (INV-4)."""
+        if tmdb is None or not uhd_inst:
+            return
+        if effective_dry_run(self.dry_run, self.global_cache) or not self.global_cache:
+            self.logger.log_debug(
+                f"[SpaceCoordinator] FORK-D [dry_run] would queue 4K eviction for tmdb {tmdb}.")
+            return
+        key = self._PENDING_EVICT_KEY.format(inst=uhd_inst)
+        try:
+            led = self.global_cache.get(key)
+            led = led if isinstance(led, dict) else {}
+            prev = led.get(str(tmdb)) or {}
+            led[str(tmdb)] = {
+                "std_inst": std_inst, "uhd_movie_id": uhd_movie_id, "uhd_file_id": uhd_file_id,
+                "size_bytes": float(size_bytes or 0.0),
+                "queued_at": prev.get("queued_at") or datetime.now(timezone.utc).isoformat(),
+            }
+            self.global_cache.set(key, led)
+        except Exception as e:
+            self.logger.log_warning(
+                f"[SpaceCoordinator] FORK-D: failed to persist pending evict for {tmdb}: {e}")
+
+    def _execute_pending_uhd_evicts(self, radarr_sp, std_inst, uhd_inst) -> dict:
+        """FORK-D DRAIN — evict the rehomed 4K copy TEMPORARILY (restored when space recovers, see
+        _readd_space_evicted_4k), never permanently. ONLY when a real standard file for that tmdb is
+        confirmed present in a FRESHLY-reloaded standard df (INV-1: no no-copy gap): delete the 4K
+        FILE and UNMONITOR the 4K movie (the cheap record is KEPT so re-acquisition is just
+        re-monitor+search, and unmonitoring stops Radarr re-grabbing it while still under pressure),
+        then move the entry to the space-evicted ledger. A not-yet-imported entry is kept; one older
+        than the import timeout is dropped while KEEPING the 4K intact. Re-checks consent; all writes
+        guarded by effective_dry_run."""
+        out = {"checked": 0, "evicted": 0, "still_waiting": 0, "timed_out": 0, "failed": 0}
+        if not uhd_inst or not self.global_cache:
+            return out
+        if not coordinator_owns_deletion(self.config):     # consent can be revoked between runs
+            return out
+        key = self._PENDING_EVICT_KEY.format(inst=uhd_inst)
+        led = self.global_cache.get(key)
+        if not isinstance(led, dict) or not led:
+            return out
+        # Reload the STANDARD movie_files FRESH so an import that landed since this run started is seen.
+        try:
+            if radarr_sp and hasattr(radarr_sp, "_get_movie_files_manager"):
+                _mfm = radarr_sp._get_movie_files_manager()
+                if _mfm is not None and hasattr(_mfm, "reset_run_cache"):
+                    _mfm.reset_run_cache()
+            std_df = radarr_sp.load_movie_files(std_inst) if radarr_sp else None
+        except Exception as e:
+            self.logger.log_warning(
+                f"[SpaceCoordinator] FORK-D drain: standard reload failed: {e} — keeping all pending evicts.")
+            return out
+        if std_df is None:
+            return out                                     # never guess — keep all entries
+        present = self._baseline_survivors(std_df)          # tmdbs with a real file on standard
+        api = getattr(radarr_sp, "radarr_api", None) if radarr_sp else None
+        try:
+            timeout_days = float(((self.config or {}).get("routing", {}) or {}).get("movies", {})
+                                 .get("rehome_import_timeout_days", 7) or 7)
+        except (TypeError, ValueError):
+            timeout_days = 7.0
+        now = datetime.now(timezone.utc)
+        dry = effective_dry_run(self.dry_run, self.global_cache)
+        changed = False
+        evicted_led = None
+        for tmdb_str, ent in list(led.items()):
+            out["checked"] += 1
+            try:
+                tmdb = int(tmdb_str)
+            except (TypeError, ValueError):
+                led.pop(tmdb_str, None); changed = True
+                continue
+            if tmdb in present:                             # standard imported → evict the 4K (temporarily)
+                mid, fid = ent.get("uhd_movie_id"), ent.get("uhd_file_id")
+                if mid is None or api is None:
+                    out["failed"] += 1
+                    continue                                # can't act safely → keep the entry
+                if dry:
+                    self.logger.log_info(
+                        f"[SpaceCoordinator] FORK-D [dry_run] would evict 4K copy (movie {mid}, "
+                        f"file {fid}) on '{uhd_inst}' — standard rehome imported.")
+                    out["evicted"] += 1
+                    continue                                # read-only: never mutate the ledger
+                try:
+                    if fid is not None:
+                        api._make_request(uhd_inst, f"moviefile/{fid}", method="DELETE")
+                    api._make_request(uhd_inst, "movie/editor", method="PUT",
+                                      payload={"movieIds": [mid], "monitored": False})
+                except Exception as e:
+                    out["failed"] += 1
+                    self.logger.log_warning(
+                        f"[SpaceCoordinator] FORK-D 4K eviction failed for movie {mid} on "
+                        f"'{uhd_inst}': {e}")
+                    continue                                # keep the entry; retry next run
+                self.logger.log_info(
+                    f"[SpaceCoordinator] FORK-D evicted 4K copy (movie {mid}) on '{uhd_inst}' — "
+                    f"standard rehome imported; will re-add when space recovers.")
+                out["evicted"] += 1
+                # Move pending → space-evicted (awaiting space-recovery re-add to dual-version).
+                if evicted_led is None:
+                    _e = self.global_cache.get(self._SPACE_EVICTED_KEY.format(inst=uhd_inst))
+                    evicted_led = _e if isinstance(_e, dict) else {}
+                evicted_led[tmdb_str] = {
+                    "std_inst": ent.get("std_inst"), "uhd_movie_id": mid,
+                    "size_bytes": float(ent.get("size_bytes") or 0.0), "evicted_at": now.isoformat(),
+                }
+                led.pop(tmdb_str, None); changed = True
+            else:                                           # not imported yet — keep unless aged out
+                aged = False
+                try:
+                    aged = (now - datetime.fromisoformat(ent.get("queued_at"))).total_seconds() \
+                        > timeout_days * 86400
+                except Exception:
+                    aged = False
+                if aged:
+                    self.logger.log_warning(
+                        f"[SpaceCoordinator] FORK-D: rehome of tmdb {tmdb} never imported in "
+                        f"{timeout_days:.0f}d — abandoning the eviction, KEEPING the 4K copy.")
+                    out["timed_out"] += 1
+                    if not dry:
+                        led.pop(tmdb_str, None); changed = True
+                else:
+                    out["still_waiting"] += 1
+        if changed and not dry:
+            try:
+                self.global_cache.set(key, led)
+                if evicted_led is not None:
+                    self.global_cache.set(self._SPACE_EVICTED_KEY.format(inst=uhd_inst), evicted_led)
+            except Exception as e:
+                self.logger.log_warning(
+                    f"[SpaceCoordinator] FORK-D: failed to persist drained ledger: {e}")
+        return out
+
+    def _readd_space_evicted_4k(self, radarr_sp, uhd_inst, free, U) -> dict:
+        """FORK-D RE-ADD — once free space recovers to a comfortable margin above the band top U
+        (``routing.movies.rehome_readd_margin``, default 0.25 → free >= U*1.25), re-acquire the 4K
+        copies evicted under pressure: re-monitor + 4K-search each on the 4K instance (the record
+        was kept, only unmonitored), so the title becomes a proper dual-version (standard baseline +
+        4K bonus). Budgeted so the re-grabs can't drop free back into the band. All writes guarded
+        by effective_dry_run. The wide evict(<T) → re-add(>=U*1.25) gap is the anti-thrash hysteresis."""
+        out = {"pending": 0, "readded": 0, "skipped": 0, "failed": 0}
+        if not uhd_inst or not self.global_cache:
+            return out
+        ekey = self._SPACE_EVICTED_KEY.format(inst=uhd_inst)
+        led = self.global_cache.get(ekey)
+        if not isinstance(led, dict) or not led:
+            return out
+        out["pending"] = len(led)
+        try:
+            margin = float(((self.config or {}).get("routing", {}) or {}).get("movies", {})
+                           .get("rehome_readd_margin", 0.25))
+        except (TypeError, ValueError):
+            margin = 0.25
+        threshold = U * (1.0 + max(0.0, margin))
+        if free < threshold:
+            return out                                     # not comfortable enough — hold (anti-thrash)
+        api = getattr(radarr_sp, "radarr_api", None) if radarr_sp else None
+        if api is None:
+            return out
+        dry = effective_dry_run(self.dry_run, self.global_cache)
+        budget_gb = max(0.0, free - U)                     # keep free above the band even if all re-grab
+        acc_gb = 0.0
+        changed = False
+        # Cheapest first → fit the most titles back under the budget (sizes are BYTES, budget is GB).
+        for tmdb_str, ent in sorted(led.items(), key=lambda kv: float(kv[1].get("size_bytes") or 0.0)):
+            sz_gb = float(ent.get("size_bytes") or 0.0) / (1024 ** 3)
+            if acc_gb + sz_gb > budget_gb:
+                break
+            mid = ent.get("uhd_movie_id")
+            if mid is None:
+                led.pop(tmdb_str, None); changed = True
+                continue
+            if dry:
+                self.logger.log_info(
+                    f"[SpaceCoordinator] FORK-D [dry_run] would re-add 4K (movie {mid}) on "
+                    f"'{uhd_inst}' — space recovered.")
+                out["readded"] += 1
+                acc_gb += sz_gb
+                continue
+            try:
+                api._make_request(uhd_inst, "movie/editor", method="PUT",
+                                  payload={"movieIds": [mid], "monitored": True})
+                api._make_request(uhd_inst, "command", method="POST",
+                                  payload={"name": "MoviesSearch", "movieIds": [mid]})
+            except Exception as e:
+                out["failed"] += 1
+                self.logger.log_warning(
+                    f"[SpaceCoordinator] FORK-D 4K re-add failed for movie {mid} on '{uhd_inst}': {e}")
+                continue
+            self.logger.log_info(
+                f"[SpaceCoordinator] FORK-D re-added 4K (movie {mid}) on '{uhd_inst}' — space "
+                f"recovered to {free:.0f} GB (>= {threshold:.0f} GB).")
+            out["readded"] += 1
+            acc_gb += sz_gb
+            led.pop(tmdb_str, None); changed = True
+        if changed and not dry:
+            try:
+                self.global_cache.set(ekey, led)
+            except Exception as e:
+                self.logger.log_warning(
+                    f"[SpaceCoordinator] FORK-D: failed to persist space-evicted ledger: {e}")
         return out
