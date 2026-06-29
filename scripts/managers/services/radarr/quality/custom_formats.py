@@ -38,7 +38,8 @@ class RadarrCustomFormatsManager(BaseManager, ComponentManagerMixin):
         if cached is not None:
             return cached
         formats = self.radarr_api._make_request(resolved, "customformat", fallback=[]) or []
-        self.global_cache.set(f"radarr.custom_formats.{resolved}", formats)
+        if formats:                      # never cache an empty/failed read — a cached [] would poison
+            self.global_cache.set(f"radarr.custom_formats.{resolved}", formats)   # every later read this run
         return formats
 
     @LoggerManager().log_function_entry

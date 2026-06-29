@@ -156,6 +156,12 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
         eff_dry = self._eff_dry()
         source = self._cfg().get("source_instance", "standard")
         source_cfs = cf.get_custom_formats(source) or []
+        if not source_cfs:
+            self.logger.log_warning(f"[CFSync] source '{source}' returned 0 custom formats — the "
+                                    f"customformat read came back empty, so definition + score sync "
+                                    f"and the 4K-instance CF carryover all NO-OP this run. (If the "
+                                    f"profiles have format scores, the API read failed, not the data.)")
+            return stats
         for inst in self._target_instances(source):
             have = {str(c.get("name", "")).strip().lower() for c in (cf.get_custom_formats(inst) or [])}
             made = 0
@@ -234,6 +240,12 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
         have = {str(p.get("name", "")).strip().lower()
                 for p in (self.radarr_api._make_request(dst, "qualityprofile", fallback=[]) or [])}
         dst_cf_ids = cf.cf_name_to_id(fourk) or {}
+        if not dst_cf_ids:
+            self.logger.log_warning(f"[CFSync] 4K instance '{fourk}' returned 0 custom formats — "
+                                    f"skipping UHD-profile creation so we never write 2160p profiles "
+                                    f"with empty custom-format scoring (CF read empty / def sync did "
+                                    f"not run).")
+            return stats
         dst_names = {str(c.get("name", "")).strip().lower(): c.get("name")
                      for c in (cf.get_custom_formats(fourk) or [])}
         snapped = False
@@ -453,6 +465,11 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
         for inst in self._target_instances(source):
             target_by_profile = cf.read_profile_scores_by_name(inst) or {}
             target_ids = cf.cf_name_to_id(inst) or {}
+            if target_by_profile and not target_ids:
+                self.logger.log_warning(f"[CFSync] target '{inst}' has {len(target_by_profile)} "
+                                        f"profile(s) but its custom-format read returned EMPTY — every "
+                                        f"score will read as definition-missing and nothing will sync "
+                                        f"(API read failed, not a real absence of custom formats).")
             for pname, pscores in target_by_profile.items():
                 pscores_lower = {str(k).strip().lower(): v for k, v in pscores.items()}
                 for cf_name, new_score in canonical.items():

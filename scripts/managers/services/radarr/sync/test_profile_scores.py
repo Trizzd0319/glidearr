@@ -414,6 +414,42 @@ def test_apply_score_disarmed_backup_gate_no_put():
     assert api.puts == []
 
 
+# ── empty custom-format read must not poison the run or write degraded profiles ─────────────────
+def test_get_custom_formats_does_not_cache_empty_read():
+    # an empty/failed customformat read must NOT be cached — a cached [] poisons every later read
+    # this run (the root of the silent definition-missing no-op CF sync).
+    ps, api = _build(_cfg())
+    cf = ps._cf()
+    api._cfs["standard"] = []                                 # transient empty read
+    assert cf.get_custom_formats("standard") == []
+    assert ps.global_cache.get("radarr.custom_formats.standard", default="MISS") == "MISS"  # not cached
+    api._cfs["standard"] = [{"id": 1, "name": "x265"}]
+    assert cf.get_custom_formats("standard") == [{"id": 1, "name": "x265"}]   # re-read, now succeeds + caches
+
+
+def test_sync_definitions_noops_and_warns_when_source_cf_read_empty():
+    cfs, profiles = _data()
+    cfs["standard"] = []                                     # source CF read empty
+    ps, api = _build(_cfg(), cfs, profiles)
+    stats = ps.sync_definitions()
+    assert stats == {"created": 0, "present": 0} and api.posts == []   # vacuous no-op, nothing created
+
+
+def test_sync_uhd_profiles_skips_when_4k_cf_read_empty():
+    cfs, profiles = _uhd_data()
+    cfs["ultra"] = []                                        # 4K instance CF read empty
+    ps, api = _build(_uhd_cfg(), cfs, profiles)
+    stats = ps.sync_uhd_profiles()
+    assert stats["created"] == 0 and api.profile_posts == []   # never create CF-less 2160p profiles
+
+
+def test_get_custom_formats_caches_non_empty_read():
+    ps, _ = _build(_cfg())
+    cf = ps._cf()
+    cf.get_custom_formats("standard")                        # real data present in fixture
+    assert ps.global_cache.get("radarr.custom_formats.standard", default="MISS") != "MISS"  # cached
+
+
 # ── RadarrSyncManager.run() gating (defs then scores; inert when disabled) ──────
 def test_sync_manager_run_gating_and_order():
     from scripts.managers.services.radarr.sync import RadarrSyncManager
