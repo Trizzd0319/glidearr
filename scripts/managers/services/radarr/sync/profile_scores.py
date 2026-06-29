@@ -97,6 +97,19 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
     def _overwrite_armed(self) -> bool:
         return bool(self._cfg().get("overwrite_existing", False)) and cf_sync_overwrite_consented(self.config)
 
+    def _instance_has_custom_formats(self, inst) -> bool:
+        """Does the instance actually HAVE custom formats — judged independently of the (possibly
+        empty) ``customformat`` read? A quality profile's ``formatItems`` enumerate the instance's
+        custom formats, so any non-empty ``formatItems`` means CFs exist, i.e. an empty customformat
+        read was a FAILED read rather than a true absence. Used to tell a transient read failure (skip)
+        from a genuinely CF-less new instance (proceed)."""
+        try:
+            profiles = self.radarr_api._make_request(self._resolve_instance(inst), "qualityprofile",
+                                                     fallback=[]) or []
+        except Exception:
+            return False
+        return any(p.get("formatItems") for p in profiles)
+
     def _eff_dry(self) -> bool:
         """dry-run a LIVE-CONFIG write should honour: bare dry_run OR a disarmed backup gate (a real
         run whose pre-destructive backup pre-flight failed → degrade-to-dry-run). These methods mutate
@@ -164,6 +177,12 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
             return stats
         for inst in self._target_instances(source):
             have = {str(c.get("name", "")).strip().lower() for c in (cf.get_custom_formats(inst) or [])}
+            if not have and self._instance_has_custom_formats(inst):
+                self.logger.log_warning(f"[CFSync] target '{inst}' custom-format read returned EMPTY but "
+                                        f"its quality profiles reference custom formats — the read "
+                                        f"FAILED; skipping its definition sync so the whole source "
+                                        f"library is not re-created as duplicate-named formats.")
+                continue
             made = 0
             for c in source_cfs:
                 nm = str(c.get("name", "")).strip().lower()
@@ -307,12 +326,14 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
 
     @staticmethod
     def _cap_items_above(prof, tier_res) -> int:
-        """Set ``allowed=False`` on every quality whose resolution EXCEEDS ``tier_res`` — top-level,
-        a grouped sub-quality, OR a quality GROUP the cap has just EMPTIED (no member left allowed).
-        That last case matters: a quality-group PARENT carries no ``quality`` key, so an allowed-but-
-        empty group reads as resolution 0 in ``profile_max_quality`` and would mask the brick guard —
-        disabling the emptied parent keeps the profile's allowed set honest. Returns the count newly
-        disallowed. Idempotent — only flips True→False, never enables a quality, never deletes one."""
+        """Set ``allowed=False`` on every quality whose resolution EXCEEDS ``tier_res`` (top-level or a
+        grouped sub-quality), and disable any allowed quality GROUP left with NO allowed member — be it
+        emptied by this cap OR arriving pre-emptied from an external Recyclarr/manual edit. That group
+        cleanup matters: a quality-group PARENT carries no ``quality`` key, so an allowed-but-empty
+        group reads as resolution 0 in ``profile_max_quality`` and would mask the brick guard. The
+        cleanup is NOT counted as an above-tier disallow (it never, by itself, forces a PUT or inflates
+        the "disallow N higher" message). Returns the count of above-tier qualities newly disallowed.
+        Idempotent — only flips True→False, never enables a quality, never deletes one."""
         changed = 0
         for item in (prof.get("items") or []):
             q = item.get("quality") or {}
@@ -321,17 +342,16 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
                 item["allowed"] = False
                 changed += 1
             subs = item.get("items") or []
-            capped_sub = False
             for sub in subs:
                 sq = sub.get("quality") or {}
                 sr = sq.get("resolution")
                 if isinstance(sr, (int, float)) and int(sr) > tier_res and sub.get("allowed"):
                     sub["allowed"] = False
                     changed += 1
-                    capped_sub = True
-            if capped_sub and item.get("allowed") and not any(s.get("allowed") for s in subs):
-                item["allowed"] = False                # emptied group → drop the phantom parent
-                changed += 1
+            # a GROUP with zero allowed members must not stay 'allowed' (phantom reads as res 0);
+            # disable it however it got empty, but do not count it as an above-tier disallow.
+            if subs and item.get("allowed") and not any(s.get("allowed") for s in subs):
+                item["allowed"] = False
         return changed
 
     @staticmethod
@@ -465,11 +485,11 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
         for inst in self._target_instances(source):
             target_by_profile = cf.read_profile_scores_by_name(inst) or {}
             target_ids = cf.cf_name_to_id(inst) or {}
-            if target_by_profile and not target_ids:
-                self.logger.log_warning(f"[CFSync] target '{inst}' has {len(target_by_profile)} "
-                                        f"profile(s) but its custom-format read returned EMPTY — every "
-                                        f"score will read as definition-missing and nothing will sync "
-                                        f"(API read failed, not a real absence of custom formats).")
+            if target_by_profile and not target_ids and any(target_by_profile.values()):
+                self.logger.log_warning(f"[CFSync] target '{inst}' has profile(s) that reference custom "
+                                        f"formats but its custom-format read returned EMPTY — the read "
+                                        f"FAILED; every score reads as definition-missing and nothing "
+                                        f"will sync this run.")
             for pname, pscores in target_by_profile.items():
                 pscores_lower = {str(k).strip().lower(): v for k, v in pscores.items()}
                 for cf_name, new_score in canonical.items():

@@ -379,6 +379,50 @@ def test_cap_repoints_cutoff_off_a_nested_sub_quality():
     assert cutoff != 18 and cutoff in (7, 17)              # off the capped nested 2160p to a 1080p entry
 
 
+def test_cap_skips_pre_emptied_phantom_group_with_capped_top_level():
+    # a group that ARRIVED already-emptied (parent allowed, all subs disabled by an external edit),
+    # co-resident with a capped top-level above-tier quality. The phantom must be recognized so the
+    # profile reads un-grabbable and is SKIPPED — not PUT as a brick with an orphaned cutoff.
+    cfs = {"standard": [{"id": 1, "name": "x265"}], "ultra": [{"id": 10, "name": "x265"}]}
+    profiles = {"standard": [{"id": 1, "name": "WEB 1080p", "cutoff": 9, "formatItems": [], "items": [
+        {"allowed": True, "quality": {"id": 9, "name": "Bluray-2160p", "resolution": 2160}},   # capped top-level
+        {"id": 8, "name": "WEB 2160p", "allowed": True, "items": [                              # PRE-emptied phantom
+            {"allowed": False, "quality": {"id": 18, "name": "WEBDL-2160p", "resolution": 2160}},
+            {"allowed": False, "quality": {"id": 19, "name": "WEBRip-2160p", "resolution": 2160}}]}]}],
+        "ultra": []}
+    ps, api = _build(_cfg(instances=("standard", "ultra")), cfs, profiles)
+    stats = ps.cap_profiles_to_tier()
+    assert api.puts == [] and stats["capped"] == 0          # phantom recognized → un-grabbable → SKIP
+
+
+def test_cap_cleans_pre_emptied_phantom_but_keeps_grabbable_profile():
+    # same pre-emptied phantom, but a below-tier top-level survives → profile is still grabbable, so
+    # it IS PUT and the phantom parent is cleaned in the same write.
+    cfs = {"standard": [{"id": 1, "name": "x265"}], "ultra": [{"id": 10, "name": "x265"}]}
+    profiles = {"standard": [{"id": 1, "name": "WEB 1080p", "cutoff": 5, "formatItems": [], "items": [
+        {"allowed": True, "quality": {"id": 5, "name": "Bluray-1080p", "resolution": 1080}},
+        {"allowed": True, "quality": {"id": 9, "name": "Bluray-2160p", "resolution": 2160}},
+        {"id": 8, "name": "WEB 2160p", "allowed": True, "items": [
+            {"allowed": False, "quality": {"id": 18, "name": "WEBDL-2160p", "resolution": 2160}}]}]}],
+        "ultra": []}
+    ps, api = _build(_cfg(instances=("standard", "ultra")), cfs, profiles)
+    stats = ps.cap_profiles_to_tier()
+    assert stats["capped"] == 1
+    payload = api.puts[0][1]
+    assert next(it for it in payload["items"] if it.get("id") == 8)["allowed"] is False   # phantom cleaned
+    assert next(it for it in payload["items"] if (it.get("quality") or {}).get("id") == 5)["allowed"] is True
+
+
+def test_sync_definitions_skips_target_with_failed_read_not_reposting_duplicates():
+    # target CF read transiently empty, but the target's profiles reference CFs (the read FAILED) —
+    # must NOT re-POST the entire source library as duplicate-named formats onto it.
+    cfs, profiles = _data()
+    cfs["ultra"] = []                                       # ultra customformat read returns empty
+    ps, api = _build(_cfg(), cfs, profiles)                 # ultra profile still carries formatItems
+    stats = ps.sync_definitions()
+    assert api.posts == [] and stats["created"] == 0        # skipped — no duplicate POSTs
+
+
 # ── backup-gate: a real run with a DISARMED gate degrades every config write to dry-run ─────────
 def _disarm(ps):
     from scripts.managers.services.backup import GATE_KEY
