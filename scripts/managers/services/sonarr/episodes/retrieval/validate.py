@@ -1,5 +1,3 @@
-from arrapi import SonarrAPI
-
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.services.sonarr.quality import SonarrQualitySelectorManager
@@ -39,7 +37,7 @@ class SonarrEpisodesRetrievalValidationManager(BaseManager, ComponentManagerMixi
             self.logger.log_warning("⚠️ No Sonarr instances configured.")
             return []
 
-        api = SonarrAPI(logger=self.logger, config=self.config, sonarr_instances=sonarr_instances)
+        api = self.sonarr_api            # reuse the validated, cache-aware client (was a fresh SonarrAPI per call)
         missing_final = []
 
         for ep in episode_list:

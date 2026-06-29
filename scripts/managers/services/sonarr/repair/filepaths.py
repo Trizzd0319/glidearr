@@ -14,13 +14,15 @@ class SonarrRepairFilepathsManager(BaseManager, ComponentManagerMixin):
     """
 
     def __init__(self, logger=None, config=None, global_cache=None, validator=None, registry=None, **kwargs):
+        self.parent_name = "SonarrRepair"            # set BEFORE super() so the parent-link resolves it
         super().__init__(logger, config, global_cache, validator, registry, **kwargs)
         self.register()
-        self.parent_name = "SonarrRepair"
 
-        self.sonarr_api = kwargs.get("sonarr_api") or kwargs.get("api") or getattr(self.registry.get("manager", self.parent_name), "api", None)
-        self.manager = kwargs.get("manager")
-        self.dry_run = getattr(self.manager, "dry_run", False)
+        parent = self.registry.get("manager", self.parent_name)
+        # parent exposes 'sonarr_api' (not 'api') — the old getattr(parent,'api') fallback was dead
+        self.sonarr_api = kwargs.get("sonarr_api") or kwargs.get("api") or getattr(parent, "sonarr_api", None)
+        self.manager = kwargs.get("manager") or getattr(parent, "manager", None)
+        self.dry_run = kwargs.get("dry_run", getattr(self.manager, "dry_run", False))
         self.auto_repair = getattr(self.manager, "auto_repair", False)
         self.rebuild_metadata = getattr(self.manager, "rebuild_metadata", False)
 

@@ -22,6 +22,9 @@ class SonarrValidatorManager(BaseManager, ComponentManagerMixin):
         manager = kwargs.get("manager") or {}
         self.sonarr_cache = kwargs.get("sonarr_cache") or getattr(manager, "sonarr_cache", None)
         self.global_cache = global_cache or getattr(manager, "global_cache", None)
+        # forward dry_run so the SonarrCacheManager child below doesn't run its episode-file ops live
+        self.dry_run = kwargs.get("dry_run", getattr(manager, "dry_run", False))
+        self.instance_manager = kwargs.get("instance_manager") or getattr(manager, "instance_manager", None)
 
         self.register()
 
@@ -48,6 +51,8 @@ class SonarrValidatorManager(BaseManager, ComponentManagerMixin):
             "sonarr_cache": self.sonarr_cache,
             "manager": self,
             "sonarr_api": sonarr_api or self,
+            "dry_run": self.dry_run,
+            "instance_manager": self.instance_manager,
         }
 
         critical_components, noncritical_components = split_components(

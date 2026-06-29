@@ -33,7 +33,7 @@ class SonarrValidatorCacheManager(BaseManager, ComponentManagerMixin):
         self.register()
 
         self.manager = manager
-        self.dry_run = getattr(self.manager, "dry_run", False)
+        self.dry_run = kwargs.get("dry_run", getattr(self.manager, "dry_run", False))
         self.sonarr_apis = kwargs.get("sonarr_apis") or getattr(manager, "sonarr_apis", {})
 
         if not self.logger:

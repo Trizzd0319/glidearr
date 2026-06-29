@@ -33,7 +33,8 @@ class SonarrStorageSelectionManager(BaseManager, ComponentManagerMixin):
         from .space import SonarrStorageSpaceManager
         space_manager = SonarrStorageSpaceManager(
             logger=self.logger, config=self.config, global_cache=self.global_cache,
-            validator=self.validator, registry=self.registry, api=self.sonarr_api, manager=self.manager
+            validator=self.validator, registry=self.registry, sonarr_api=self.sonarr_api,
+            manager=self.manager, dry_run=self.dry_run,
         )
         free_space = space_manager.get_free_space_per_instance()
         self.logger.log_debug(f"📦 Free space by instance: {free_space}")
@@ -64,7 +65,8 @@ class SonarrStorageSelectionManager(BaseManager, ComponentManagerMixin):
         from .space import SonarrStorageSpaceManager
         space_manager = SonarrStorageSpaceManager(
             logger=self.logger, config=self.config, global_cache=self.global_cache,
-            validator=self.validator, registry=self.registry, api=self.sonarr_api, manager=self.manager
+            validator=self.validator, registry=self.registry, sonarr_api=self.sonarr_api,
+            manager=self.manager, dry_run=self.dry_run,
         )
         folders = space_manager.get_root_folders(resolved_instance)
         if folders:
