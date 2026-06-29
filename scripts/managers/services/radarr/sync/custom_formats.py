@@ -140,6 +140,46 @@ class RadarrSyncCustomFormatsManager(BaseManager, ComponentManagerMixin):
                     self.add_custom_format(instance, cf)
 
     @LoggerManager().log_function_entry
+    @timeit("read_profile_scores_by_name")
+    def read_profile_scores_by_name(self, instance: str) -> dict:
+        """``{profile_name: {cf_name: score}}`` for an instance, keyed by NAME (not the per-instance
+        cf id) so it can be compared/applied across instances. A profile's formatItems already carry
+        the cf ``name``; we fall back to resolving the format id via the instance's custom formats
+        when a name is absent."""
+        resolved = self._resolve_instance(instance)
+        profiles = self.radarr_api._make_request(resolved, "qualityprofile", fallback=[]) or []
+        id_to_name = {c.get("id"): c.get("name") for c in self.get_custom_formats(resolved)}
+        out: dict = {}
+        for prof in profiles:
+            pname = prof.get("name")
+            if not pname:
+                continue
+            scores: dict = {}
+            for fi in (prof.get("formatItems") or []):
+                name = fi.get("name")
+                if not name:
+                    fid = fi.get("format")
+                    if isinstance(fid, dict):
+                        fid = fid.get("id")
+                    name = id_to_name.get(fid)
+                if name:
+                    try:
+                        scores[name] = int(fi.get("score", 0) or 0)
+                    except (TypeError, ValueError):
+                        scores[name] = 0
+            out[pname] = scores
+        return out
+
+    @LoggerManager().log_function_entry
+    @timeit("cf_name_to_id")
+    def cf_name_to_id(self, instance: str) -> dict:
+        """``{cf_name_lower: cf_id}`` on an instance — the per-instance resolution a cross-instance
+        score apply needs (cf ids are per-instance; names are the stable key)."""
+        resolved = self._resolve_instance(instance)
+        return {str(c.get("name", "")).strip().lower(): c.get("id")
+                for c in self.get_custom_formats(resolved) if c.get("id") is not None}
+
+    @LoggerManager().log_function_entry
     @timeit("get_profile_scores_by_format")
     def get_profile_scores_by_format(self, instance: str) -> dict:
         resolved = self._resolve_instance(instance)

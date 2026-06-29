@@ -125,6 +125,10 @@ def empty_config() -> dict:
         # requires a shared-storage pre-flight; dedup also honours the pre-destructive backup gate.
         "cross_instance_move_consent": False,
         "cross_instance_dedup_consent": False,
+        # Explicit opt-in to OVERWRITE existing (non-zero) custom-format scores during cf_sync — the
+        # only mode that can erase per-instance CF tuning. Required (with scoring.cf_sync.overwrite_existing)
+        # before any non-zero target score is changed. Env: RECOMMENDARR_/GLIDEARR_CF_SYNC_OVERWRITE_CONSENT.
+        "cf_sync_overwrite_consent": False,
         "animeGenres": [],
         "documentaryGenres": [],
         "realityGenres": [],
@@ -264,6 +268,16 @@ def empty_config() -> dict:
             # sooner than legacy_regrab_cooldown_days (the cooldown ledger doubles as the resume checkpoint).
             "codec_profiles": {"enabled": False, "report": True, "legacy_regrab": False,
                                "legacy_regrab_budget": 10, "legacy_regrab_cooldown_days": 14},
+            # cf_sync: align custom-format DEFINITIONS + per-profile SCORES across Radarr instances so
+            # the 4K instance scores releases the same way the source (default 'standard') does. Keyed
+            # by NAME (cf/profile ids are per-instance). Default OFF → complete no-op. overwrite_existing
+            # FALSE = fill-only (set only a target's UNSET score==0; a differing score is a conflict,
+            # logged + skipped, never clobbered); TRUE additionally needs cf_sync_overwrite_consent (env
+            # RECOMMENDARR_/GLIDEARR_CF_SYNC_OVERWRITE_CONSENT) — the destructive mode that can erase
+            # per-instance tuning. reference_profile null = derive the canonical {cf:score} map from the
+            # richest source profile. include_test gates the experimental 'test' instance.
+            "cf_sync": {"enabled": False, "source_instance": "standard", "reference_profile": None,
+                        "overwrite_existing": False, "include_test": True},
         },
         # JIT next-episode quality: per_episode_tiers (default ON) lets each upcoming episode earn
         # its OWN best-that-fits tier, so one series can mix tiers (e.g. one 2160p next to four

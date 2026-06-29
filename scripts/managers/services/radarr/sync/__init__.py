@@ -4,6 +4,7 @@ from scripts.managers.services.radarr.sync.custom_formats import RadarrSyncCusto
 from scripts.managers.services.radarr.sync.folders import RadarrSyncFoldersManager
 from scripts.managers.services.radarr.sync.media_management import RadarrSyncMediaManager
 from scripts.managers.services.radarr.sync.naming import RadarrSyncNamingManager
+from scripts.managers.services.radarr.sync.profile_scores import RadarrSyncProfileScoresManager
 from scripts.managers.services.radarr.sync.tags import RadarrSyncTagsManager
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
@@ -46,10 +47,11 @@ class RadarrSyncManager(BaseManager, ComponentManagerMixin):
             "folders":          RadarrSyncFoldersManager,
             "media_management": RadarrSyncMediaManager,
             "naming":           RadarrSyncNamingManager,
+            "profile_scores":   RadarrSyncProfileScoresManager,
             "tags":             RadarrSyncTagsManager,
         }
 
-        critical_keys = {"custom_formats", "folders", "media_management", "naming", "tags"}
+        critical_keys = {"custom_formats", "folders", "media_management", "naming", "profile_scores", "tags"}
 
         critical_components, noncritical_components = split_components(
             all_components=all_component_classes,
@@ -91,3 +93,23 @@ class RadarrSyncManager(BaseManager, ComponentManagerMixin):
             noncritical_components=noncritical_components.keys(),
             all_critical_loaded=all_critical_loaded,
         )
+
+    @LoggerManager().log_function_entry
+    @timeit("run")
+    def run(self):
+        """Cross-instance custom-format DEFINITION + per-profile SCORE sync. INERT unless
+        ``scoring.cf_sync.enabled`` (default off → complete no-op, byte-identical to before). The
+        other sync leaves (tags / folders / naming / media_management) stay caller-driven and are
+        NOT run here — in particular media_management.sync_quality_across_instances (a clobbering
+        blind-POST) is never invoked. Definitions are synced first (additive), then scores
+        (fill-only by default; overwrite needs the explicit flag + consent; always dry-run-safe)."""
+        ps = getattr(self, "profile_scores", None)
+        if ps is None or not ps.enabled():
+            return
+        self.logger.log_info("[CFSync] running custom-format definition + score sync "
+                             "(scoring.cf_sync.enabled).")
+        try:
+            ps.sync_definitions()
+            ps.apply_score_sync()
+        except Exception as e:
+            self.logger.log_error(f"[CFSync] sync failed: {e}")

@@ -88,7 +88,13 @@ class RadarrSyncMediaManager(BaseManager, ComponentManagerMixin):
     @LoggerManager().log_function_entry
     @timeit("sync_quality_across_instances")
     def sync_quality_across_instances(self):
-        """Synchronise quality profiles and custom formats across all Radarr instances."""
+        """DEPRECATED — DO NOT USE for cross-instance quality alignment. This blind-POSTs every source
+        profile + custom format to the other instances with NO name-keying: it CREATES DUPLICATE
+        profiles/CFs and ignores scores. Use ``RadarrSyncProfileScoresManager`` (sync/profile_scores.py)
+        instead — it keys by name, round-trips full profile payloads, is fill-only by default, and is
+        dry-run/consent gated. Left only for any legacy caller; never wired into RadarrSyncManager.run()."""
+        self.logger.log_warning("[Sync] sync_quality_across_instances is DEPRECATED (blind-POST, creates "
+                                "duplicates) — use scoring.cf_sync (RadarrSyncProfileScoresManager).")
         all_instances = self._get_all_instances()
         if not all_instances:
             self.logger.log_error("No Radarr instances found for quality sync.")
