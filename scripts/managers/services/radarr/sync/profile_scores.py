@@ -180,6 +180,12 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
 
     @staticmethod
     def _is_uhd_profile(profile) -> bool:
+        """A 2160p/UHD-tier profile to route to the 4K instance. A profile EXPLICITLY named for a
+        lower tier (1080p/720p/…) is NOT a 4K profile even though it may ALLOW 2160p as a fallback
+        (a common TRaSH pattern) — so name-exclude those first, then require a genuine 2160p reach."""
+        name = str(profile.get("name") or "").lower()
+        if any(h in name for h in ("1080", "720", "576", "480", "360")):
+            return False
         try:
             res = profile_max_quality(profile)[0]
         except Exception:
@@ -310,6 +316,10 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
         actionable_actions = {"fill"} | ({"overwrite"} if self._overwrite_armed() else set())
         actionable = [r for r in rows if r["action"] in actionable_actions]
         if not actionable:
+            self.logger.log_info(f"[CFSync] custom-format scores already in sync across "
+                                 f"{len({(r['instance'], r['profile']) for r in rows})} profile(s) — "
+                                 f"nothing to change ({stats['conflicts']} conflict(s), "
+                                 f"{stats['missing']} definition-missing).")
             return stats
         if self.dry_run:
             self.logger.log_info(f"[CFSync] [dry_run] would update {len(actionable)} score(s) across "

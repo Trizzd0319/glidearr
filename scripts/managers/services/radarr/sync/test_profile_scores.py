@@ -293,6 +293,19 @@ def test_sync_uhd_profiles_copies_only_2160p_to_4k_instance():
     assert fmt["x265"] == (10, 8) and fmt["BR-DISK"] == (11, -50)
 
 
+def test_sync_uhd_profiles_excludes_lower_tier_named_profile():
+    # a profile NAMED for 1080p that merely ALLOWS 2160p (TRaSH fallback) is NOT a 4K profile
+    cfs, profiles = _uhd_data()
+    profiles["standard"].append({
+        "id": 9, "name": "Remux + WEB 1080p (HEVC)", "cutoff": 1, "minFormatScore": 0,
+        "items": [{"allowed": True, "quality": {"name": "Remux-2160p", "resolution": 2160}}],
+        "formatItems": [{"format": 1, "name": "x265", "score": 5}]})
+    ps, api = _build(_uhd_cfg(), cfs, profiles)
+    ps.sync_uhd_profiles()
+    assert all(p["name"] != "Remux + WEB 1080p (HEVC)" for _, p in api.profile_posts)   # excluded
+    assert any(p["name"] == "Ultra-HD" for _, p in api.profile_posts)                   # genuine 2160p copied
+
+
 def test_sync_uhd_profiles_dry_run_no_post():
     cfs, profiles = _uhd_data()
     ps, api = _build(_uhd_cfg(), cfs, profiles, dry_run=True)
