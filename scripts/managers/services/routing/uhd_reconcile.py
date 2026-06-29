@@ -174,11 +174,25 @@ class UhdReconcileManager:
         self._flush_plan_grid()
 
     def _run_move_acquire(self, gw, fourk, mode):
-        dest_pid, _ = self._top_profile(gw, fourk)
+        dest_pid, dest_name = self._top_profile(gw, fourk)
         dest_root = self._mrf.get("4k") or self._first_root(gw, fourk)
         if dest_pid is None or not dest_root:
             self._log("log_warning", f"[UHD] 4K instance '{fourk}' has no quality profile or root "
                                      f"folder configured — skipping cross-instance move.")
+            return
+        # The 4K instance must offer a genuine 2160p profile: every title routed here is added at
+        # this top profile, so if it is NOT a 2160p profile the instance is misconfigured for 4K and
+        # we must NOT land sub-4K copies on it. (This is the glidearr side of "only the 2160p QP is
+        # selectable on the 4K instance"; also restrict the 4K instance's profiles in Radarr.)
+        _dest_prof = next((p for p in (gw.quality_profiles(fourk) or []) if p.get("id") == dest_pid), None)
+        try:
+            _dest_res = profile_max_quality(_dest_prof)[0] if _dest_prof else None
+        except Exception:
+            _dest_res = None
+        if not _dest_res or int(_dest_res) < _UHD_RES:
+            self._log("log_warning", f"[UHD] 4K instance '{fourk}' top profile '{dest_name}' is "
+                                     f"{_dest_res or '?'}p, not 2160p — skipping (configure a 2160p "
+                                     f"quality profile on the 4K instance).")
             return
         eff_dry = effective_dry_run(self.dry_run, self.global_cache)
         # Two ways the cross-instance FILE MOVE may actuate:
@@ -450,7 +464,7 @@ class UhdReconcileManager:
                     keep_tagged=False, score=lk, space_allows=space_ok_4k,
                     uhd_threshold=threshold, can_remote_play=can_remote_play):
                 ast = acq_mover.acquire(mv, to_inst=fourk, dest_root=dest_root,
-                                        dest_profile_id=dest_pid).get("status")
+                                        dest_profile_id=dest_pid, from_inst=std_inst).get("status")
                 if ast not in ("skip", "noop"):
                     acted += 1
                     self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} [{ast}]")

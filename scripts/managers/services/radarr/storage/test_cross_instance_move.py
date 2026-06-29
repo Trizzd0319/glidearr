@@ -11,6 +11,10 @@ from scripts.managers.services.radarr.storage.cross_instance_move import CrossIn
 class _GW:
     def __init__(self):
         self.adds, self.commands, self.puts = [], [], []
+        # standard has two tags; ultra shares 'anime' (different id) and is MISSING 'keep-universe-mcu'
+        self._tags = {"standard": [{"id": 7, "label": "keep-universe-mcu"}, {"id": 9, "label": "anime"}],
+                      "ultra": [{"id": 2, "label": "anime"}]}
+        self.created = []
 
     def add(self, inst, payload):
         self.adds.append((inst, payload)); return {"id": 500}
@@ -20,6 +24,18 @@ class _GW:
 
     def put(self, inst, endpoint, payload):
         self.puts.append((inst, endpoint, payload)); return {"ok": True}
+
+    def tags(self, inst):
+        return self._tags.get(inst, [])
+
+    def ensure_tag(self, inst, label):
+        existing = next((t for t in self._tags.get(inst, []) if t["label"].lower() == label.lower()), None)
+        if existing:
+            return existing["id"]
+        nid = 100 + len(self.created)
+        self._tags.setdefault(inst, []).append({"id": nid, "label": label})
+        self.created.append((inst, label))
+        return nid
 
 
 _MOVIE = {"id": 1, "title": "Toy Story", "tmdbId": 862, "year": 1995, "monitored": True,
@@ -154,3 +170,35 @@ def test_acquire_dry_run_no_add():
     m, gw = _mover(dry_run=True)
     res = m.acquire(_MOVIE, to_inst="ultra", dest_root="/r", dest_profile_id=7)
     assert res["status"] == "would-acquire" and gw.adds == []
+
+
+# ── tags carried across instances by LABEL (per-instance ids must NOT be copied raw) ──
+def test_move_in_carries_tags_by_label():
+    m, gw = _mover()
+    tagged = dict(_MOVIE, tags=[7, 9])                 # standard ids: keep-universe-mcu(7), anime(9)
+    res = _relocate(m, tagged, dest_present=False, dest_hasfile=False)
+    assert res["status"] == "moved-in"
+    _, payload = gw.adds[0]
+    # 'anime' maps to ultra's existing id 2; the raw standard ids (7, 9) are NEVER carried
+    assert 2 in payload["tags"] and 7 not in payload["tags"] and 9 not in payload["tags"]
+    # the label missing on ultra is created there
+    assert ("ultra", "keep-universe-mcu") in gw.created
+    assert len(payload["tags"]) == 2                   # anime + the newly-created keep-universe-mcu
+
+
+def test_acquire_carries_tags_by_label():
+    m, gw = _mover()
+    tagged = dict(_MOVIE, tags=[9])                     # anime only
+    res = m.acquire(tagged, to_inst="ultra", dest_root="/r", dest_profile_id=7, from_inst="standard")
+    assert res["status"] == "acquired"
+    _, payload = gw.adds[0]
+    assert payload["tags"] == [2]                      # anime -> ultra's id 2, nothing created
+    assert gw.created == []
+
+
+def test_no_source_instance_copies_no_tags():
+    # without a source instance we can't resolve labels → carry NO tags (never the raw source ids)
+    m, gw = _mover()
+    res = m.acquire(dict(_MOVIE, tags=[7, 9]), to_inst="ultra", dest_root="/r", dest_profile_id=7)
+    assert res["status"] == "acquired"
+    assert gw.adds[0][1]["tags"] == []

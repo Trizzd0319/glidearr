@@ -26,6 +26,7 @@ class ArrGateway:
         self._qp: dict = {}
         self._rf: dict = {}
         self._qd: dict = {}
+        self._tags: dict = {}
 
     @property
     def available(self) -> bool:
@@ -107,6 +108,13 @@ class ArrGateway:
             self._qd[inst] = self._req(inst, "qualitydefinition", fallback=[]) or []
         return self._qd[inst]
 
+    def tags(self, inst) -> list:
+        """All tag definitions on the instance — ``[{id, label}, …]`` (cached per run)."""
+        inst = self.resolve(inst)
+        if inst not in self._tags:
+            self._tags[inst] = self._req(inst, "tag", fallback=[]) or []
+        return self._tags[inst]
+
     def lookup(self, inst, term: str) -> list:
         base = "series/lookup" if self.service == "sonarr" else "movie/lookup"
         return self._req(inst, f"{base}?term={quote(term)}", fallback=[]) or []
@@ -126,3 +134,18 @@ class ArrGateway:
         """DELETE an endpoint on the instance (e.g. ``moviefile/{id}`` to remove a FILE while keeping
         the Radarr record). Mirrors :meth:`put`/:meth:`command`; the caller owns gating."""
         return self._req(self.resolve(inst), endpoint, method="DELETE")
+
+    def ensure_tag(self, inst, label):
+        """Return the id of the tag with ``label`` on the instance, CREATING it if missing (POST
+        /tag). Tag ids are per-instance, so this is how a label is carried across instances. Returns
+        None if the create fails. The caller owns dry-run gating (a write)."""
+        inst = self.resolve(inst)
+        existing = next((t for t in self.tags(inst)
+                         if str(t.get("label", "")).lower() == str(label).lower()), None)
+        if existing is not None:
+            return existing.get("id")
+        created = self._req(inst, "tag", method="POST", payload={"label": label})
+        tid = created.get("id") if isinstance(created, dict) else None
+        if tid is not None:
+            self._tags.setdefault(inst, []).append({"id": tid, "label": label})
+        return tid

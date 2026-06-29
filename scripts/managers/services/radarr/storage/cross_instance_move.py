@@ -115,8 +115,10 @@ class CrossInstanceMove:
         if not folder:
             return {"status": "skip", "reason": "no source file path", "title": title, "tmdb": tmdb}
         if self.dry_run:
+            tags = self._src_tag_labels(src_movie, from_inst)
+            tagtxt = f"; tags -> {tags}" if tags else ""
             self._log("log_info", f"[Relocate] would move '{title}': {to_inst} imports 2160p from "
-                                  f"{folder} → {dest_root} (Move); {from_inst} un-monitored meanwhile.")
+                                  f"{folder} → {dest_root} (Move); {from_inst} un-monitored meanwhile{tagtxt}.")
             return {"status": "would-move-in", "title": title, "tmdb": tmdb}
 
         # Race guard + in-flight marker: stop the source auto-re-grabbing the 2160p once its file
@@ -124,36 +126,63 @@ class CrossInstanceMove:
         if monitored:
             self.gw.put(from_inst, "movie/editor", {"movieIds": [src_id], "monitored": False})
         if not dest_present:
-            if not self._add_to_dest(src_movie, to_inst, dest_root, dest_profile_id):
+            if not self._add_to_dest(src_movie, to_inst, dest_root, dest_profile_id, from_inst=from_inst):
                 return {"status": "add-failed", "title": title, "tmdb": tmdb}
         self.gw.command(to_inst, {"name": "DownloadedMoviesScan", "path": folder, "importMode": "Move"})
         self._log("log_info", f"[Relocate] '{title}': {to_inst} importing 2160p from {folder} (Move); "
                               f"{from_inst} retuned to 1080p once the import confirms.")
         return {"status": "moved-in" if monitored else "pending-import", "title": title, "tmdb": tmdb}
 
-    def acquire(self, src_movie: dict, *, to_inst: str, dest_root: str, dest_profile_id) -> dict:
+    def acquire(self, src_movie: dict, *, to_inst: str, dest_root: str, dest_profile_id,
+                from_inst=None) -> dict:
         """Acquire a NEW 4K copy on the destination instance (monitored, SEARCH ON) for an owned
         movie that WARRANTS 4K but has none — the proactive dual-version fill. The SOURCE instance
-        is untouched (it keeps its existing ≤1080 baseline); this only adds the 4K side. The caller
-        owns eligibility (proactive_4k gate + watchability + space); this just emits the add."""
+        is untouched (it keeps its existing ≤1080 baseline); this only adds the 4K side, carrying the
+        source's tags across by label. The caller owns eligibility (proactive_4k gate + watchability
+        + space); this just emits the add."""
         tmdb = src_movie.get("tmdbId")
         title = src_movie.get("title")
         if tmdb is None:
             return {"status": "skip", "title": title, "tmdb": tmdb}
         if self.dry_run:
+            tags = self._src_tag_labels(src_movie, from_inst)
+            tagtxt = f"; tags -> {tags}" if tags else ""
             self._log("log_info", f"[Relocate] would acquire a 4K copy of '{title}' on {to_inst} "
-                                  f"(search ON; {src_movie.get('rootFolderPath') or 'source'} stays ≤1080).")
+                                  f"(search ON; {src_movie.get('rootFolderPath') or 'source'} stays ≤1080{tagtxt}).")
             return {"status": "would-acquire", "title": title, "tmdb": tmdb}
-        ok = self._add_to_dest(src_movie, to_inst, dest_root, dest_profile_id, search=True)
+        ok = self._add_to_dest(src_movie, to_inst, dest_root, dest_profile_id, search=True,
+                               from_inst=from_inst)
         if ok:
             self._log("log_success", f"[Relocate] acquiring a 4K copy of '{title}' on {to_inst} (search ON).")
         return {"status": "acquired" if ok else "acquire-failed", "title": title, "tmdb": tmdb}
 
-    def _add_to_dest(self, src_movie, to_inst, dest_root, dest_profile_id, *, search: bool = False) -> bool:
+    def _src_tag_labels(self, src_movie, from_inst) -> list:
+        """The LABELS of the source movie's tags. Radarr tag ids are per-instance, so we carry the
+        labels (not the raw ids) across instances. Empty when there are no tags or no source."""
+        ids = src_movie.get("tags") or []
+        if not ids or not from_inst:
+            return []
+        by_id = {t.get("id"): t.get("label") for t in (self.gw.tags(from_inst) or [])
+                 if t.get("id") is not None}
+        return [by_id[i] for i in ids if by_id.get(i)]
+
+    def _dest_tag_ids(self, labels, to_inst) -> list:
+        """Resolve labels to the DESTINATION instance's tag ids, creating any that are missing, so
+        the moved/acquired copy carries the SAME tags (keep/universe/franchise) as the source."""
+        out = []
+        for label in labels:
+            tid = self.gw.ensure_tag(to_inst, label)
+            if tid is not None and tid not in out:
+                out.append(tid)
+        return out
+
+    def _add_to_dest(self, src_movie, to_inst, dest_root, dest_profile_id, *, search: bool = False,
+                     from_inst=None) -> bool:
         """Add the title to the destination, monitored. ``search`` False (default) = take the moved
         file, not a fresh download (the MOVE path); True = acquire a fresh copy (the proactive 4K
         path). Clones the source object; strips the source identity + its absolute path so the
-        destination's ``rootFolderPath`` is authoritative. Returns ok."""
+        destination's ``rootFolderPath`` is authoritative; carries TAGS across by label (per-instance
+        ids would be wrong) and forces the destination quality profile. Returns ok."""
         payload = dict(src_movie)
         for k in ("id", "movieFile", "movieFileId", "path", "folderName"):
             payload.pop(k, None)
@@ -162,6 +191,9 @@ class CrossInstanceMove:
         payload["monitored"] = True
         payload.setdefault("minimumAvailability", "released")
         payload["addOptions"] = {"searchForMovie": bool(search)}
+        # Tags by LABEL, not the source's per-instance ids (else the destination gets mismatched or
+        # nonexistent tags). Missing labels are created on the destination.
+        payload["tags"] = self._dest_tag_ids(self._src_tag_labels(src_movie, from_inst), to_inst)
         try:
             return bool(self.gw.add(to_inst, payload))
         except Exception as e:

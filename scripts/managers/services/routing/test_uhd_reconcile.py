@@ -491,6 +491,17 @@ def test_cross_instance_move_blocked_by_disarmed_backup(monkeypatch):
     assert im.adds == [] and im.commands == [] and im.puts == []
 
 
+def test_skips_when_4k_instance_has_no_2160p_profile(monkeypatch):
+    # the 4K instance only offers a 1080p profile → never land a sub-4K copy there
+    _clear_x_env(monkeypatch)
+    im = _Im({"standard": [_M4K], "ultra": []},
+             profiles={"standard": _STD_PROFILES, "ultra": [_profile(3, "HD-1080", 1080)]},
+             roots=_SHARED_ROOTS)
+    UhdReconcileManager(config=_xcfg(), logger=None, radarr=_Mgr(im), dry_run=False,
+                        global_cache=_XCache()).run()
+    assert im.adds == [] and im.commands == []
+
+
 # ── dedup under cross_instance mode ───────────────────────────────────────────────
 def test_cross_instance_dedup_reclaims_redundant_copy(monkeypatch):
     im = _xrun([_STD_DUP_2160], [_U_DUP_2160], monkeypatch)
