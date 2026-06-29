@@ -9,7 +9,10 @@ instance's profiles to it, so the 4K instance scores releases the same way stand
 Everything is keyed by NAME (cf ids + profile ids are per-instance) and defaults to a complete no-op:
 
   • ``scoring.cf_sync.enabled`` is False by default → the whole feature is inert.
-  • ``self.dry_run`` → log the full per-CF diff grid, PUT nothing.
+  • dry-run — bare ``dry_run`` OR a real run whose pre-destructive backup gate is DISARMED (the
+    backup pre-flight failed → degrade-to-dry-run) — logs the full per-CF diff grid, PUT/POST
+    nothing. Every live-config write (tier-cap, 2160p-profile creation, definition + score sync)
+    branches on ``effective_dry_run`` so a failed backup can never leave Radarr config half-written.
   • FILL-ONLY by default → only set a target score that is currently UNSET (0); a target score that
     already differs is a CONFLICT, logged and SKIPPED, never clobbered. Overwriting an existing
     score requires BOTH ``overwrite_existing`` AND the ``cf_sync_overwrite_consent`` opt-in.
@@ -24,6 +27,7 @@ import os
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
+from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.size_model import profile_max_quality
@@ -93,6 +97,14 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
     def _overwrite_armed(self) -> bool:
         return bool(self._cfg().get("overwrite_existing", False)) and cf_sync_overwrite_consented(self.config)
 
+    def _eff_dry(self) -> bool:
+        """dry-run a LIVE-CONFIG write should honour: bare dry_run OR a disarmed backup gate (a real
+        run whose pre-destructive backup pre-flight failed → degrade-to-dry-run). These methods mutate
+        live Radarr quality profiles, so they must respect the gate exactly like the destructive media
+        paths (space_pressure / uhd_reconcile / space_coordinator) do — never write config a failed
+        backup couldn't protect."""
+        return effective_dry_run(self.dry_run, self.global_cache)
+
     def _cf(self):
         """The sibling custom-formats manager (carries the name-keyed readers)."""
         return getattr(self._parent, "custom_formats", None)
@@ -141,6 +153,7 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
         cf = self._cf()
         if cf is None:
             return stats
+        eff_dry = self._eff_dry()
         source = self._cfg().get("source_instance", "standard")
         source_cfs = cf.get_custom_formats(source) or []
         for inst in self._target_instances(source):
@@ -153,14 +166,18 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
                 if nm in have:
                     stats["present"] += 1
                     continue
-                cf.add_custom_format(inst, {k: v for k, v in c.items() if k != "id"})  # strip source id
+                if eff_dry:
+                    self.logger.log_info(f"[CFSync] [dry_run] would create custom format "
+                                         f"'{c.get('name')}' on {self._resolve_instance(inst)}.")
+                else:
+                    cf.add_custom_format(inst, {k: v for k, v in c.items() if k != "id"})  # strip source id
                 stats["created"] += 1
                 made += 1
-            if made and not self.dry_run:
+            if made and not eff_dry:
                 self.global_cache.set(f"radarr.custom_formats.{self._resolve_instance(inst)}", None)
         if stats["created"]:
             self.logger.log_info(f"[CFSync] custom-format definitions: {stats['created']} "
-                                 f"{'would be ' if self.dry_run else ''}created on target(s), "
+                                 f"{'would be ' if eff_dry else ''}created on target(s), "
                                  f"{stats['present']} already present.")
         return stats
 
@@ -209,6 +226,7 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
             return stats
         src = self._resolve_instance(source)
         dst = self._resolve_instance(fourk)
+        eff_dry = self._eff_dry()
         src_profiles = self.radarr_api._make_request(src, "qualityprofile", fallback=[]) or []
         uhd_src = [p for p in src_profiles if self._is_uhd_profile(p)]
         if not uhd_src:
@@ -218,21 +236,25 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
         dst_cf_ids = cf.cf_name_to_id(fourk) or {}
         dst_names = {str(c.get("name", "")).strip().lower(): c.get("name")
                      for c in (cf.get_custom_formats(fourk) or [])}
+        snapped = False
         for p in uhd_src:
             nm = str(p.get("name", "")).strip().lower()
             if nm in have:
                 stats["present"] += 1
                 continue
             payload = self._uhd_profile_payload(p, dst_cf_ids, dst_names)
-            if self.dry_run:
+            if eff_dry:
                 self.logger.log_info(f"[CFSync] [dry_run] would create 2160p profile "
                                      f"'{p.get('name')}' on the 4K instance '{fourk}'.")
             else:
+                if not snapped:
+                    self._snapshot(dst)              # capture the 4K instance's profiles+CFs first
+                    snapped = True
                 self.radarr_api._make_request(dst, "qualityprofile", method="POST", payload=payload)
             stats["created"] += 1
         if stats["created"]:
             self.logger.log_info(f"[CFSync] {stats['created']} UHD profile(s) "
-                                 f"{'would be ' if self.dry_run else ''}created on the 4K instance "
+                                 f"{'would be ' if eff_dry else ''}created on the 4K instance "
                                  f"'{fourk}' ({stats['present']} already present).")
         return stats
 
@@ -291,6 +313,54 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
                     changed += 1
         return changed
 
+    @staticmethod
+    def _cutoff_candidates(prof):
+        """The cutoff-referenceable entries of a profile as ``(entry_id, resolution, allowed)``. A
+        Radarr ``cutoff`` names a top-level quality id (ungrouped) or a quality-GROUP id; a group is
+        only a valid (allowed) cutoff target when the group itself is allowed AND at least one of its
+        sub-qualities is still allowed (a cap can disable them all). Used to keep ``cutoff`` pointing
+        at a still-allowed quality after a cap."""
+        out = []
+        for item in (prof.get("items") or []):
+            subs = item.get("items") or []
+            if subs:                                   # a quality GROUP — cutoff references item['id']
+                gid = item.get("id")
+                if gid is None:
+                    continue
+                allowed_subs = [s for s in subs if s.get("allowed")]
+                res = max((int((s.get("quality") or {}).get("resolution", 0)) for s in allowed_subs
+                           if isinstance((s.get("quality") or {}).get("resolution"), (int, float))),
+                          default=0)
+                out.append((gid, res, bool(item.get("allowed")) and bool(allowed_subs)))
+            else:                                      # ungrouped — cutoff references quality['id']
+                q = item.get("quality") or {}
+                qid = q.get("id")
+                if qid is None:
+                    continue
+                r = q.get("resolution", 0)
+                out.append((qid, int(r) if isinstance(r, (int, float)) else 0, bool(item.get("allowed"))))
+        return out
+
+    def _guard_and_repair_cutoff(self, prof) -> bool:
+        """After a cap, make sure the profile is still GRABBABLE and its ``cutoff`` is valid. Returns
+        False (caller skips the PUT — never bricks a live profile) when NOTHING is allowed any more.
+        When the cutoff now positively points at a quality we just disallowed, re-point it to the
+        highest still-allowed entry (logged) so Radarr never rejects the PUT or runs a profile with an
+        orphaned cutoff. The grabbable check (``profile_max_quality``) is authoritative on its own; the
+        cutoff is only touched when both the orphaned cutoff AND a replacement resolve by id (never
+        guessed)."""
+        if profile_max_quality(prof)[0] < 0:           # zero allowed qualities → un-acquirable
+            return False
+        cands = self._cutoff_candidates(prof)
+        cutoff = prof.get("cutoff")
+        disallowed = {cid for cid, _, ok in cands if not ok}
+        allowed = [(cid, res) for cid, res, ok in cands if ok]
+        if cutoff in disallowed and allowed:           # cutoff was capped away → re-point it
+            prof["cutoff"] = max(allowed, key=lambda t: t[1])[0]
+            self.logger.log_info(f"[CFSync] tier-cap: re-pointed cutoff of '{prof.get('name')}' "
+                                 f"from {cutoff} to {prof['cutoff']} (old cutoff was capped away).")
+        return True
+
     @LoggerManager().log_function_entry
     @timeit("cap_profiles_to_tier")
     def cap_profiles_to_tier(self) -> dict:
@@ -302,6 +372,7 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
         stats = {"capped": 0}
         if not self.enabled() or self.radarr_api is None:
             return stats
+        eff_dry = self._eff_dry()
         for inst in self._all_instances():
             resolved = self._resolve_instance(inst)
             try:
@@ -309,6 +380,7 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
             except Exception as e:
                 self.logger.log_warning(f"[CFSync] tier-cap: profile fetch failed for {resolved}: {e}")
                 continue
+            snapped = False
             for prof in profiles:
                 tier = self._designated_tier_res(prof.get("name"))
                 if tier is None or prof.get("id") is None:
@@ -316,10 +388,21 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
                 n = self._cap_items_above(prof, tier)
                 if not n:
                     continue
-                if self.dry_run:
+                # never brick a profile: skip the PUT if the cap left zero allowed qualities,
+                # and re-point an orphaned cutoff to the highest still-allowed quality.
+                if not self._guard_and_repair_cutoff(prof):
+                    self.logger.log_warning(f"[CFSync] tier-cap: capping '{prof.get('name')}' on "
+                                            f"{resolved} to <= {tier}p would leave NO allowed quality "
+                                            f"(its only allowed quality is above its named tier) — "
+                                            f"SKIPPED to avoid an un-acquirable profile.")
+                    continue
+                if eff_dry:
                     self.logger.log_info(f"[CFSync] [dry_run] would cap '{prof.get('name')}' on "
                                          f"{resolved} to <= {tier}p (disallow {n} higher quality(ies)).")
                 else:
+                    if not snapped:
+                        self._snapshot(resolved)        # capture this instance's profiles+CFs first
+                        snapped = True
                     try:
                         self.radarr_api._make_request(resolved, f"qualityprofile/{prof['id']}",
                                                       method="PUT", payload=prof)
@@ -330,7 +413,7 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
                 stats["capped"] += 1
         if stats["capped"]:
             self.logger.log_info(f"[CFSync] {stats['capped']} profile(s) "
-                                 f"{'would be ' if self.dry_run else ''}capped to their named tier "
+                                 f"{'would be ' if eff_dry else ''}capped to their named tier "
                                  f"(no above-tier grabs).")
         return stats
 
@@ -401,7 +484,7 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
                                  f"nothing to change ({stats['conflicts']} conflict(s), "
                                  f"{stats['missing']} definition-missing).")
             return stats
-        if self.dry_run:
+        if self._eff_dry():
             self.logger.log_info(f"[CFSync] [dry_run] would update {len(actionable)} score(s) across "
                                  f"{len({(r['instance'], r['profile']) for r in actionable})} profile(s); PUT nothing.")
             return stats

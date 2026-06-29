@@ -284,6 +284,71 @@ def test_designated_tier_from_name():
     assert f("Any") is None                                  # no tier hint -> leave untouched
 
 
+def test_cap_skips_profile_left_with_no_allowed_quality():
+    # a profile NAMED 1080p whose ONLY allowed quality is 2160p — capping it would disable
+    # everything → un-acquirable. The guard SKIPS the PUT rather than brick a live profile.
+    cfs = {"standard": [{"id": 1, "name": "x265"}], "ultra": [{"id": 10, "name": "x265"}]}
+    profiles = {"standard": [{"id": 1, "name": "Remux 1080p", "cutoff": 20, "formatItems": [],
+                              "items": [{"allowed": True,
+                                         "quality": {"id": 20, "name": "2160p", "resolution": 2160}}]}],
+                "ultra": []}
+    ps, api = _build(_cfg(instances=("standard", "ultra")), cfs, profiles)
+    stats = ps.cap_profiles_to_tier()
+    assert api.puts == [] and stats["capped"] == 0           # never PUT an un-acquirable profile
+
+
+def test_cap_repoints_orphaned_cutoff_to_highest_allowed():
+    # a 1080p-named profile that allows 2160p as a fallback with the cutoff ON that 2160p quality:
+    # capping disables 2160p, so the now-orphaned cutoff is re-pointed to the highest still-allowed.
+    cfs = {"standard": [{"id": 1, "name": "x265"}], "ultra": [{"id": 10, "name": "x265"}]}
+    profiles = {"standard": [{"id": 1, "name": "WEB 1080p", "cutoff": 9, "formatItems": [], "items": [
+        {"allowed": True, "quality": {"id": 7, "name": "1080p", "resolution": 1080}},
+        {"allowed": True, "quality": {"id": 9, "name": "2160p", "resolution": 2160}}]}],
+        "ultra": []}
+    ps, api = _build(_cfg(instances=("standard", "ultra")), cfs, profiles)
+    stats = ps.cap_profiles_to_tier()
+    assert stats["capped"] == 1
+    payload = api.puts[0][1]
+    res_allowed = {it["quality"]["resolution"]: it["allowed"] for it in payload["items"]}
+    assert res_allowed[2160] is False and res_allowed[1080] is True
+    assert payload["cutoff"] == 7                            # re-pointed off the capped 2160p (id 9) to 1080p (id 7)
+
+
+# ── backup-gate: a real run with a DISARMED gate degrades every config write to dry-run ─────────
+def _disarm(ps):
+    from scripts.managers.services.backup import GATE_KEY
+    ps.global_cache.set(GATE_KEY, {"armed": False})         # backup pre-flight failed → writes blocked
+
+
+def test_cap_disarmed_backup_gate_no_put():
+    ps, api = _build(_cfg(instances=("standard", "ultra")), *_cap_data())
+    _disarm(ps)
+    ps.cap_profiles_to_tier()
+    assert api.puts == []                                   # real run + failed backup → degrade to dry-run
+
+
+def test_sync_definitions_disarmed_backup_gate_no_post():
+    ps, api = _build(_cfg())
+    _disarm(ps)
+    ps.sync_definitions()
+    assert api.posts == []
+
+
+def test_sync_uhd_profiles_disarmed_backup_gate_no_post():
+    cfs, profiles = _uhd_data()
+    ps, api = _build(_uhd_cfg(), cfs, profiles)
+    _disarm(ps)
+    ps.sync_uhd_profiles()
+    assert api.profile_posts == []
+
+
+def test_apply_score_disarmed_backup_gate_no_put():
+    ps, api = _build(_cfg())
+    _disarm(ps)
+    ps.apply_score_sync()
+    assert api.puts == []
+
+
 # ── RadarrSyncManager.run() gating (defs then scores; inert when disabled) ──────
 def test_sync_manager_run_gating_and_order():
     from scripts.managers.services.radarr.sync import RadarrSyncManager
