@@ -22,6 +22,14 @@ class SonarrQualitySelectorManager(BaseManager, ComponentManagerMixin):
         self.sonarr_api = kwargs.get("sonarr_api") or getattr(parent, "sonarr_api", None)
         self.logger = self.logger or getattr(parent, "logger", None)
         self.manager = manager or getattr(parent, "manager", None)
+        # every public method calls self.instance_manager.resolve_instance(...) and several use
+        # self.key_builder — resolve both here (kwargs → manager → parent) or they AttributeError.
+        self.instance_manager = (kwargs.get("instance_manager")
+                                 or getattr(self.manager, "instance_manager", None)
+                                 or getattr(parent, "instance_manager", None))
+        self.key_builder = (kwargs.get("key_builder")
+                            or getattr(self.manager, "key_builder", None)
+                            or getattr(parent, "key_builder", None))
         self.dry_run = kwargs.get("dry_run", getattr(self.manager, "dry_run", False))
 
         if not self.logger:

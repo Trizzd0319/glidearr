@@ -78,7 +78,8 @@ class TraktMoviePeopleManager(BaseManager, ComponentManagerMixin):
         # Shared cache — injected by TraktMoviesManager, or created standalone
         self.cache: TraktMovieCacheManager = kwargs.get("cache_manager") or TraktMovieCacheManager(
             logger=self.logger, config=self.config,
-            global_cache=self.global_cache, dry_run=self.dry_run,
+            global_cache=self.global_cache, validator=self.validator,
+            registry=self.registry, manager=self, dry_run=self.dry_run,
         )
 
         # Read auth from config

@@ -75,7 +75,9 @@ class BaseManager:
                 self.logger.log_debug(f"🔗 Linking {self.name} to parent: {parent.__class__.__name__}")
                 self.logger = getattr(parent, "logger", self.logger)
                 self.config = getattr(parent, "config", self.config)
-                self.global_cache = getattr(parent, "cache", self.global_cache)
+                # canonical attr is 'global_cache' (matches line ~191 and the deferred path);
+                # `or self.global_cache` so a parent whose cache is None never clobbers a good one.
+                self.global_cache = getattr(parent, "global_cache", None) or self.global_cache
                 self.validator = getattr(parent, "validator", self.validator)
                 self.manager = getattr(parent, "manager", parent)
             else:
@@ -188,7 +190,8 @@ class BaseManager:
                 if parent and parent is not self:
                     self.logger = getattr(parent, "logger", self.logger)
                     self.config = getattr(parent, "config", self.config)
-                    self.global_cache = getattr(parent, "global_cache", self.global_cache)
+                    # `or self.global_cache`: a parent whose cache is None must not clobber a good one
+                    self.global_cache = getattr(parent, "global_cache", None) or self.global_cache
                     self.validator = getattr(parent, "validator", self.validator)
                     self.manager = getattr(parent, "manager", parent)
                     self.logger.log_info(f"🔗 Deferred linking: {self.name} → {self.parent_name}")

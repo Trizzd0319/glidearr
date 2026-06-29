@@ -30,7 +30,7 @@ class SonarrSyncManager(BaseManager, ComponentManagerMixin):
         init_args = {
             "logger": self.logger,
             "config": self.config,
-            "cache": self.global_cache,
+            "global_cache": self.global_cache,   # canonical key — 'cache' left every child's global_cache=None
             "validator": self.validator,
             "registry": self.registry,
             "manager": self,

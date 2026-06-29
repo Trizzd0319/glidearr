@@ -80,7 +80,7 @@ class SonarrSyncMediaManager(BaseManager, ComponentManagerMixin):
         instance = config.get_default_sonarr_instance_name()
         from scripts.managers.services.sonarr.sync.media import SonarrSyncMediaManager
 
-        manager = SonarrSyncMediaManager(logger=logger, config=config, cache=cache)
+        manager = SonarrSyncMediaManager(logger=logger, config=config, global_cache=cache)
         cache.get_or_generate_cache(
             key=Paths.sonarr.METADATA,
             generator_function=manager.get_metadata,

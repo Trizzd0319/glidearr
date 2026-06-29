@@ -26,7 +26,8 @@ class TraktMoviesManager(BaseManager, ComponentManagerMixin):
         # Shared disk cache — injected into people so they share one instance
         self.cache = TraktMovieCacheManager(
             logger=self.logger, config=self.config,
-            global_cache=self.global_cache, dry_run=self.dry_run,
+            global_cache=self.global_cache, validator=self.validator,
+            registry=self.registry, manager=self, dry_run=self.dry_run,
         )
 
         init_kwargs = {

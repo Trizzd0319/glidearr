@@ -39,9 +39,11 @@ class SonarrManager(BaseManager, ComponentManagerMixin):
 
     @LoggerManager().log_function_entry
     def __init__(self, logger=None, config=None, global_cache=None, validator=None, registry=None, **kwargs):
-        # ✅ Set global_cache → cache (BaseManager expects 'cache')
+        # BaseManager's param is 'global_cache' (NOT 'cache') — passing cache= left
+        # self.global_cache=None on this manager. self.cache stays as an alias for the
+        # init_args/child constructions below.
         self.cache = global_cache
-        super().__init__(logger=logger, config=config, cache=self.cache, validator=validator, registry=registry, **kwargs)
+        super().__init__(logger=logger, config=config, global_cache=global_cache, validator=validator, registry=registry, **kwargs)
 
         self.dry_run = kwargs.get("dry_run", False)
         self.load_summary = {}

@@ -28,8 +28,6 @@ class SonarrSyncNamingManager(BaseManager, ComponentManagerMixin):
 
         self.logger.log_debug(f"🧰 Initialized {class_name} (Parent: {self.parent_name})")
 
-        self.dry_run = kwargs.get("dry_run", False)
-
     @LoggerManager().log_function_entry
     @timeit("sanitize_naming_format")
     def sanitize_naming_format(self, fmt):

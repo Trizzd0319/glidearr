@@ -44,8 +44,11 @@ class TraktInstanceManager(BaseManager, ComponentManagerMixin):
         self.register()
         self.load_summary: dict = {}
 
-        self.registrar         = TraktInstanceRegistrarManager(logger=self.logger, config=self.config)
-        self.summary_formatter = TraktInstanceSummaryFormatterManager(logger=self.logger, config=self.config)
+        _child_kw = dict(logger=self.logger, config=self.config, global_cache=self.global_cache,
+                         validator=self.validator, registry=self.registry, manager=self,
+                         dry_run=getattr(self, "dry_run", False))
+        self.registrar         = TraktInstanceRegistrarManager(**_child_kw)
+        self.summary_formatter = TraktInstanceSummaryFormatterManager(**_child_kw)
 
     # ── Public entry point ────────────────────────────────────────────────────
 
