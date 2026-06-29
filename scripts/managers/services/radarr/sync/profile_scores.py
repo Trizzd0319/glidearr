@@ -254,6 +254,86 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
         payload["formatItems"] = format_items
         return payload
 
+    # ── tier-cap: never let a profile grab above its designated tier ─────────────
+    def _all_instances(self) -> list:
+        return [k for k in (self.config.get("radarr_instances") or {}) if k != "default_instance"] \
+            if self.config else []
+
+    @staticmethod
+    def _designated_tier_res(name):
+        """The resolution tier a profile NAME designates (2160/1080/720/576/480), or None when the
+        name carries no tier hint (then it is left untouched — never guess)."""
+        n = str(name or "").lower()
+        if any(h in n for h in ("2160", "uhd", "4k", "ultra-hd", "ultrahd")):
+            return 2160
+        for tier in (1080, 720, 576, 480):
+            if str(tier) in n:
+                return tier
+        return None
+
+    @staticmethod
+    def _cap_items_above(prof, tier_res) -> int:
+        """Set ``allowed=False`` on every quality (top-level or grouped) whose resolution EXCEEDS
+        ``tier_res``. Returns the count newly disallowed. Idempotent — only flips True→False, never
+        enables a quality, never deletes one."""
+        changed = 0
+        for item in (prof.get("items") or []):
+            q = item.get("quality") or {}
+            r = q.get("resolution")
+            if isinstance(r, (int, float)) and int(r) > tier_res and item.get("allowed"):
+                item["allowed"] = False
+                changed += 1
+            for sub in (item.get("items") or []):
+                sq = sub.get("quality") or {}
+                sr = sq.get("resolution")
+                if isinstance(sr, (int, float)) and int(sr) > tier_res and sub.get("allowed"):
+                    sub["allowed"] = False
+                    changed += 1
+        return changed
+
+    @LoggerManager().log_function_entry
+    @timeit("cap_profiles_to_tier")
+    def cap_profiles_to_tier(self) -> dict:
+        """For EVERY quality profile on EVERY instance, disallow any quality ABOVE the profile's
+        designated tier (from its name — 720p/1080p/2160p/UHD/4K), so a profile can never grab above
+        its tier (e.g. a '… 1080p' profile stops allowing 2160p as a fallback). Profiles whose name
+        has no tier hint are left untouched. Only flips allowed:true→false above-tier; honours
+        dry_run; idempotent (a re-run caps nothing)."""
+        stats = {"capped": 0}
+        if not self.enabled() or self.radarr_api is None:
+            return stats
+        for inst in self._all_instances():
+            resolved = self._resolve_instance(inst)
+            try:
+                profiles = self.radarr_api._make_request(resolved, "qualityprofile", fallback=[]) or []
+            except Exception as e:
+                self.logger.log_warning(f"[CFSync] tier-cap: profile fetch failed for {resolved}: {e}")
+                continue
+            for prof in profiles:
+                tier = self._designated_tier_res(prof.get("name"))
+                if tier is None or prof.get("id") is None:
+                    continue
+                n = self._cap_items_above(prof, tier)
+                if not n:
+                    continue
+                if self.dry_run:
+                    self.logger.log_info(f"[CFSync] [dry_run] would cap '{prof.get('name')}' on "
+                                         f"{resolved} to <= {tier}p (disallow {n} higher quality(ies)).")
+                else:
+                    try:
+                        self.radarr_api._make_request(resolved, f"qualityprofile/{prof['id']}",
+                                                      method="PUT", payload=prof)
+                    except Exception as e:
+                        self.logger.log_warning(f"[CFSync] tier-cap PUT failed for '{prof.get('name')}' "
+                                                f"on {resolved}: {e}")
+                        continue
+                stats["capped"] += 1
+        if stats["capped"]:
+            self.logger.log_info(f"[CFSync] {stats['capped']} profile(s) "
+                                 f"{'would be ' if self.dry_run else ''}capped to their named tier "
+                                 f"(no above-tier grabs).")
+        return stats
+
     # ── plan (read-only diff grid) ───────────────────────────────────────────────
     @LoggerManager().log_function_entry
     @timeit("plan_score_sync")

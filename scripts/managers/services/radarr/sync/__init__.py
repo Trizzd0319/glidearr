@@ -109,6 +109,7 @@ class RadarrSyncManager(BaseManager, ComponentManagerMixin):
         self.logger.log_info("[CFSync] running cross-instance custom-format + quality-profile sync "
                              f"({self._instance_count()} instances).")
         try:
+            ps.cap_profiles_to_tier()   # 0. cap every profile to its named tier (no above-tier grabs)
             ps.sync_definitions()       # 1. CF definitions exist everywhere (additive)
             ps.sync_uhd_profiles()      # 2. copy the source's 2160p profiles onto the 4K instance
             ps.apply_score_sync()       # 3. align per-profile CF scores (fill-only default, gated)

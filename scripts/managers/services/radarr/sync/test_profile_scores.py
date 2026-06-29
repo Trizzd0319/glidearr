@@ -4,6 +4,8 @@ never clobbers a tuned score without overwrite+consent, honours dry-run + the en
 missing definitions, preserves the rest of the profile on PUT, and is idempotent."""
 from __future__ import annotations
 
+import copy
+
 from scripts.managers.services.radarr.sync.custom_formats import RadarrSyncCustomFormatsManager
 from scripts.managers.services.radarr.sync.profile_scores import (
     RadarrSyncProfileScoresManager, cf_sync_overwrite_consented,
@@ -38,8 +40,7 @@ class _Api:
         if endpoint == "customformat" and method == "GET":
             return [dict(c) for c in self._cfs.get(inst, [])]
         if endpoint == "qualityprofile" and method == "GET":
-            return [dict(p, formatItems=[dict(fi) for fi in p.get("formatItems", [])])
-                    for p in self._profiles.get(inst, [])]
+            return [copy.deepcopy(p) for p in self._profiles.get(inst, [])]   # isolated, like real JSON
         if endpoint == "customformat" and method == "POST":
             self.posts.append((inst, payload))
             rec = {"id": 900 + len(self.posts), **payload}
@@ -232,6 +233,57 @@ def test_sync_definitions_dry_run_no_post():
     assert api.posts == []
 
 
+# ── tier-cap: profiles never grab above their named tier ─────────────────────────
+def _cap_data():
+    def _it(res, allowed=True):
+        return {"allowed": allowed, "quality": {"name": f"{res}p", "resolution": res}}
+    cfs = {"standard": [{"id": 1, "name": "x265"}], "ultra": [{"id": 10, "name": "x265"}]}
+    profiles = {"standard": [
+        {"id": 1, "name": "Remux + WEB 1080p", "items": [_it(720), _it(1080), _it(2160)], "formatItems": []},
+        {"id": 2, "name": "Remux 2160p", "items": [_it(1080), _it(2160)], "formatItems": []},
+        {"id": 3, "name": "HD-1080p grouped",
+         "items": [{"allowed": True, "name": "WEB", "items": [_it(1080), _it(2160)]}], "formatItems": []},
+        {"id": 4, "name": "Any", "items": [_it(2160)], "formatItems": []}],
+        "ultra": []}
+    return cfs, profiles
+
+
+def test_cap_disallows_above_tier_only():
+    ps, api = _build(_cfg(instances=("standard", "ultra")), *_cap_data())
+    stats = ps.cap_profiles_to_tier()
+    assert stats["capped"] == 2                              # the 1080p + grouped-1080p profiles
+    put = {p["id"]: p for _, p in api.puts}
+    r1 = {it["quality"]["resolution"]: it["allowed"] for it in put[1]["items"]}
+    assert r1[2160] is False and r1[1080] is True and r1[720] is True   # only 2160p disallowed
+    sub = {s["quality"]["resolution"]: s["allowed"] for s in put[3]["items"][0]["items"]}
+    assert sub[2160] is False and sub[1080] is True          # grouped 2160p sub-item disallowed
+    assert 2 not in put and 4 not in put                     # genuine 2160p + no-tier 'Any' untouched
+
+
+def test_cap_dry_run_no_put():
+    ps, api = _build(_cfg(instances=("standard", "ultra")), *_cap_data(), dry_run=True)
+    ps.cap_profiles_to_tier()
+    assert api.puts == []
+
+
+def test_cap_idempotent():
+    ps, api = _build(_cfg(instances=("standard", "ultra")), *_cap_data())
+    ps.cap_profiles_to_tier()
+    api.puts.clear()
+    ps.cap_profiles_to_tier()                                # already capped -> nothing to do
+    assert api.puts == []
+
+
+def test_designated_tier_from_name():
+    f = RadarrSyncProfileScoresManager._designated_tier_res
+    assert f("Remux + WEB 1080p (HEVC)") == 1080
+    assert f("Remux 2160p (Combined)") == 2160
+    assert f("UHD Bluray + WEB") == 2160
+    assert f("Ultra-HD") == 2160
+    assert f("HD-720p") == 720
+    assert f("Any") is None                                  # no tier hint -> leave untouched
+
+
 # ── RadarrSyncManager.run() gating (defs then scores; inert when disabled) ──────
 def test_sync_manager_run_gating_and_order():
     from scripts.managers.services.radarr.sync import RadarrSyncManager
@@ -239,6 +291,7 @@ def test_sync_manager_run_gating_and_order():
     class _PS:
         def __init__(self, on): self._on, self.calls = on, []
         def enabled(self): return self._on
+        def cap_profiles_to_tier(self): self.calls.append("cap")
         def sync_definitions(self): self.calls.append("def")
         def sync_uhd_profiles(self): self.calls.append("uhd")
         def apply_score_sync(self): self.calls.append("score")
@@ -253,7 +306,7 @@ def test_sync_manager_run_gating_and_order():
     on = RadarrSyncManager.__new__(RadarrSyncManager)
     on.logger, on.profile_scores, on.config = _Logger(), _PS(True), _two
     on.run()
-    assert on.profile_scores.calls == ["def", "uhd", "score"]   # defs -> uhd profiles -> scores
+    assert on.profile_scores.calls == ["cap", "def", "uhd", "score"]   # cap -> defs -> uhd -> scores
 
 
 # ── 2160p/UHD profile routing to the 4K instance ────────────────────────────────
