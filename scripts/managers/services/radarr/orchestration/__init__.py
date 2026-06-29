@@ -181,7 +181,12 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
                     self.radarr_api._make_request(instance_name, "customformat", fallback=[])
                     if self.radarr_api else []
                 )
-            self.global_cache.set(f"radarr.custom_formats.{instance_name}", formats)
+            if not formats:              # never cache an empty/failed read — it would poison every
+                self.logger.log_warning( # later custom-format read this run (def/score sync, scoring)
+                    f"Custom-format read for {instance_name} returned empty — not caching "
+                    f"(would poison later reads); leaving the cache to re-fetch.")
+                continue
+            self.global_cache.set(f"radarr/custom_formats/{instance_name}", formats)  # slash key: per-instance
             self.logger.log_info(f"Custom formats cached for {instance_name}")
 
     @LoggerManager().log_function_entry

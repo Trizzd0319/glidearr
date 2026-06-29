@@ -199,7 +199,7 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
                 stats["created"] += 1
                 made += 1
             if made and not eff_dry:
-                self.global_cache.set(f"radarr.custom_formats.{self._resolve_instance(inst)}", None)
+                self.global_cache.set(f"radarr/custom_formats/{self._resolve_instance(inst)}", None)
         if stats["created"]:
             self.logger.log_info(f"[CFSync] custom-format definitions: {stats['created']} "
                                  f"{'would be ' if eff_dry else ''}created on target(s), "
@@ -590,7 +590,7 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
                     elif r["action"] == "overwrite":
                         stats["overwritten"] += 1
                 if self.global_cache:
-                    self.global_cache.set(f"radarr.custom_formats.{resolved}", None)  # invalidate read cache
+                    self.global_cache.set(f"radarr/custom_formats/{resolved}", None)  # invalidate read cache
             except Exception as e:
                 stats["failed"] += 1
                 self.logger.log_warning(f"[CFSync] profile '{pname}' on {resolved} failed: {e}")

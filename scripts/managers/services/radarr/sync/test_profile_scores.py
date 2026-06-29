@@ -466,7 +466,7 @@ def test_get_custom_formats_does_not_cache_empty_read():
     cf = ps._cf()
     api._cfs["standard"] = []                                 # transient empty read
     assert cf.get_custom_formats("standard") == []
-    assert ps.global_cache.get("radarr.custom_formats.standard", default="MISS") == "MISS"  # not cached
+    assert ps.global_cache.get("radarr/custom_formats/standard", default="MISS") == "MISS"  # not cached
     api._cfs["standard"] = [{"id": 1, "name": "x265"}]
     assert cf.get_custom_formats("standard") == [{"id": 1, "name": "x265"}]   # re-read, now succeeds + caches
 
@@ -491,7 +491,18 @@ def test_get_custom_formats_caches_non_empty_read():
     ps, _ = _build(_cfg())
     cf = ps._cf()
     cf.get_custom_formats("standard")                        # real data present in fixture
-    assert ps.global_cache.get("radarr.custom_formats.standard", default="MISS") != "MISS"  # cached
+    assert ps.global_cache.get("radarr/custom_formats/standard", default="MISS") != "MISS"  # cached
+
+
+def test_get_custom_formats_reheals_from_poisoned_empty_cache():
+    # a stale [] cached by an earlier run/path must be treated as a MISS and re-fetched — this is the
+    # real defect: the endpoint had data but the reader kept returning a cached empty list.
+    ps, api = _build(_cfg())
+    cf = ps._cf()
+    ps.global_cache.set("radarr/custom_formats/standard", [])   # poisoned cache from a pre-fix run
+    got = cf.get_custom_formats("standard")
+    assert [c["name"] for c in got] == ["x265", "BR-DISK", "LQ"]   # re-fetched real data, self-healed
+    assert ps.global_cache.get("radarr/custom_formats/standard")   # cache now holds the real, non-empty list
 
 
 # ── RadarrSyncManager.run() gating (defs then scores; inert when disabled) ──────

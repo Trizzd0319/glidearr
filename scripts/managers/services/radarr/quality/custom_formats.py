@@ -34,12 +34,14 @@ class RadarrCustomFormatsManager(BaseManager, ComponentManagerMixin):
     @timeit("get_custom_formats")
     def get_custom_formats(self, instance: str) -> list:
         resolved = self._resolve_instance(instance)
-        cached = self.global_cache.get(f"radarr.custom_formats.{resolved}", default=None)
-        if cached is not None:
-            return cached
+        # SLASH-delimited key: a dotted "radarr.custom_formats.<inst>" collapses to one file on disk
+        # (Path.with_suffix treats ".<inst>" as an extension) so every instance would share one entry.
+        cached = self.global_cache.get(f"radarr/custom_formats/{resolved}", default=None)
+        if cached:                       # a cached EMPTY list is treated as a miss → re-fetch (self-heal
+            return cached                # from an []-poisoned cache); only a real, non-empty cache hits
         formats = self.radarr_api._make_request(resolved, "customformat", fallback=[]) or []
         if formats:                      # never cache an empty/failed read — a cached [] would poison
-            self.global_cache.set(f"radarr.custom_formats.{resolved}", formats)   # every later read this run
+            self.global_cache.set(f"radarr/custom_formats/{resolved}", formats)   # every later read this run
         return formats
 
     @LoggerManager().log_function_entry
