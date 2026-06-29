@@ -4,11 +4,18 @@ from .config_loader import ConfigLoader
 from .config_sanitizer import ConfigSanitizer
 from .config_resolver import ConfigResolver
 
+# Absolute path to scripts/support/config/config.json, resolved from THIS module's
+# location (…/scripts/managers/factories/config/__Init__.py → parents[3] == …/scripts).
+# A bare relative "support/config/config.json" only resolves when the cwd happens to
+# be scripts/, so any run from the repo root fell back to an empty config and logged
+# "Config file not found" once per manager that loads config without an inherited one.
+_DEFAULT_CONFIG = Path(__file__).resolve().parents[3] / "support" / "config" / "config.json"
+
 
 class ConfigManager:
-    def __init__(self, logger=None, config_path="support/config/config.json", **kwargs):
+    def __init__(self, logger=None, config_path=None, **kwargs):
         self.logger = logger or LoggerManager()
-        self.path = Path(config_path)
+        self.path = Path(config_path) if config_path else _DEFAULT_CONFIG
         self.loader = ConfigLoader(self.path, logger=self.logger)
         self.config = self.loader.load()
 
