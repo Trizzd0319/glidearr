@@ -25,9 +25,12 @@ class RadarrRepairInterfaceManager(BaseManager, ComponentManagerMixin):
             logger=self.logger,
             global_cache=self.global_cache,
             config=self.config,
+            validator=self.validator,
+            registry=self.registry,
             radarr_api=self.radarr_api,
             instance_manager=self.instance_manager,
             manager=self.manager,
+            dry_run=self.dry_run,
         )
 
     @LoggerManager().log_function_entry
