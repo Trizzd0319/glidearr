@@ -314,6 +314,71 @@ def test_cap_repoints_orphaned_cutoff_to_highest_allowed():
     assert payload["cutoff"] == 7                            # re-pointed off the capped 2160p (id 9) to 1080p (id 7)
 
 
+# ── tier-cap with quality GROUPS (the TRaSH shape that defeated the first brick guard) ───────────
+def test_cap_skips_grouped_profile_when_only_content_is_an_above_tier_group():
+    # a 1080p-named profile whose ONLY allowed content is a 2160p quality GROUP: capping empties the
+    # group, so the parent must be disabled too — else an allowed-but-empty group reads as resolution
+    # 0 and the profile is PUT un-grabbable. Must SKIP, never PUT.
+    cfs = {"standard": [{"id": 1, "name": "x265"}], "ultra": [{"id": 10, "name": "x265"}]}
+    profiles = {"standard": [{"id": 1, "name": "WEB 1080p", "cutoff": 8, "formatItems": [], "items": [
+        {"id": 8, "name": "WEB 2160p", "allowed": True, "items": [
+            {"allowed": True, "quality": {"id": 18, "name": "WEBDL-2160p", "resolution": 2160}},
+            {"allowed": True, "quality": {"id": 19, "name": "WEBRip-2160p", "resolution": 2160}}]}]}],
+        "ultra": []}
+    ps, api = _build(_cfg(instances=("standard", "ultra")), cfs, profiles)
+    stats = ps.cap_profiles_to_tier()
+    assert api.puts == [] and stats["capped"] == 0          # emptied group → un-grabbable → SKIP
+
+
+def test_cap_disables_emptied_group_parent_but_keeps_top_level_tier():
+    # 1080p-named profile: top-level Remux-1080p (kept) + an all-2160p group (emptied). The group
+    # PARENT must end allowed=False (no phantom), the 1080p stays, and the profile is PUT clean.
+    cfs = {"standard": [{"id": 1, "name": "x265"}], "ultra": [{"id": 10, "name": "x265"}]}
+    profiles = {"standard": [{"id": 1, "name": "Remux + WEB 1080p", "cutoff": 5, "formatItems": [], "items": [
+        {"allowed": True, "quality": {"id": 5, "name": "Remux-1080p", "resolution": 1080}},
+        {"id": 8, "name": "WEB 2160p", "allowed": True, "items": [
+            {"allowed": True, "quality": {"id": 18, "name": "WEBDL-2160p", "resolution": 2160}}]}]}],
+        "ultra": []}
+    ps, api = _build(_cfg(instances=("standard", "ultra")), cfs, profiles)
+    stats = ps.cap_profiles_to_tier()
+    assert stats["capped"] == 1
+    payload = api.puts[0][1]
+    group = next(it for it in payload["items"] if it.get("id") == 8)
+    assert group["allowed"] is False                        # emptied group parent disabled (no phantom)
+    assert group["items"][0]["allowed"] is False            # its 2160p sub disabled
+    top = next(it for it in payload["items"] if (it.get("quality") or {}).get("id") == 5)
+    assert top["allowed"] is True                           # top-level 1080p kept
+    assert payload["cutoff"] == 5                           # cutoff already valid (on the kept 1080p)
+
+
+def test_cap_repoints_cutoff_off_an_emptied_group():
+    cfs = {"standard": [{"id": 1, "name": "x265"}], "ultra": [{"id": 10, "name": "x265"}]}
+    profiles = {"standard": [{"id": 1, "name": "Remux + WEB 1080p", "cutoff": 8, "formatItems": [], "items": [
+        {"allowed": True, "quality": {"id": 5, "name": "Remux-1080p", "resolution": 1080}},
+        {"id": 8, "name": "WEB 2160p", "allowed": True, "items": [
+            {"allowed": True, "quality": {"id": 18, "name": "WEBDL-2160p", "resolution": 2160}}]}]}],
+        "ultra": []}
+    ps, api = _build(_cfg(instances=("standard", "ultra")), cfs, profiles)
+    ps.cap_profiles_to_tier()
+    assert api.puts[0][1]["cutoff"] == 5                    # re-pointed off the now-dead group (8) to 1080p (5)
+
+
+def test_cap_repoints_cutoff_off_a_nested_sub_quality():
+    # cutoff names a quality NESTED in a group (as the repo's anime profiles do); capping that nested
+    # quality must re-point the cutoff to a still-allowed entry, not leave it orphaned.
+    cfs = {"standard": [{"id": 1, "name": "x265"}], "ultra": [{"id": 10, "name": "x265"}]}
+    profiles = {"standard": [{"id": 1, "name": "WEB 1080p", "cutoff": 18, "formatItems": [], "items": [
+        {"id": 7, "name": "WEB 1080p", "allowed": True, "items": [
+            {"allowed": True, "quality": {"id": 17, "name": "WEBDL-1080p", "resolution": 1080}}]},
+        {"id": 8, "name": "WEB 2160p", "allowed": True, "items": [
+            {"allowed": True, "quality": {"id": 18, "name": "WEBDL-2160p", "resolution": 2160}}]}]}],
+        "ultra": []}
+    ps, api = _build(_cfg(instances=("standard", "ultra")), cfs, profiles)
+    ps.cap_profiles_to_tier()
+    cutoff = api.puts[0][1]["cutoff"]
+    assert cutoff != 18 and cutoff in (7, 17)              # off the capped nested 2160p to a 1080p entry
+
+
 # ── backup-gate: a real run with a DISARMED gate degrades every config write to dry-run ─────────
 def _disarm(ps):
     from scripts.managers.services.backup import GATE_KEY

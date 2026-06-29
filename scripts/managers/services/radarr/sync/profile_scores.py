@@ -295,9 +295,12 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
 
     @staticmethod
     def _cap_items_above(prof, tier_res) -> int:
-        """Set ``allowed=False`` on every quality (top-level or grouped) whose resolution EXCEEDS
-        ``tier_res``. Returns the count newly disallowed. Idempotent — only flips True→False, never
-        enables a quality, never deletes one."""
+        """Set ``allowed=False`` on every quality whose resolution EXCEEDS ``tier_res`` — top-level,
+        a grouped sub-quality, OR a quality GROUP the cap has just EMPTIED (no member left allowed).
+        That last case matters: a quality-group PARENT carries no ``quality`` key, so an allowed-but-
+        empty group reads as resolution 0 in ``profile_max_quality`` and would mask the brick guard —
+        disabling the emptied parent keeps the profile's allowed set honest. Returns the count newly
+        disallowed. Idempotent — only flips True→False, never enables a quality, never deletes one."""
         changed = 0
         for item in (prof.get("items") or []):
             q = item.get("quality") or {}
@@ -305,33 +308,48 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
             if isinstance(r, (int, float)) and int(r) > tier_res and item.get("allowed"):
                 item["allowed"] = False
                 changed += 1
-            for sub in (item.get("items") or []):
+            subs = item.get("items") or []
+            capped_sub = False
+            for sub in subs:
                 sq = sub.get("quality") or {}
                 sr = sq.get("resolution")
                 if isinstance(sr, (int, float)) and int(sr) > tier_res and sub.get("allowed"):
                     sub["allowed"] = False
                     changed += 1
+                    capped_sub = True
+            if capped_sub and item.get("allowed") and not any(s.get("allowed") for s in subs):
+                item["allowed"] = False                # emptied group → drop the phantom parent
+                changed += 1
         return changed
 
     @staticmethod
     def _cutoff_candidates(prof):
-        """The cutoff-referenceable entries of a profile as ``(entry_id, resolution, allowed)``. A
-        Radarr ``cutoff`` names a top-level quality id (ungrouped) or a quality-GROUP id; a group is
-        only a valid (allowed) cutoff target when the group itself is allowed AND at least one of its
-        sub-qualities is still allowed (a cap can disable them all). Used to keep ``cutoff`` pointing
-        at a still-allowed quality after a cap."""
+        """The ids a ``cutoff`` may legitimately reference, as ``(entry_id, resolution, allowed)``.
+        Radarr's cutoff can name a top-level ungrouped quality id, a quality-GROUP id, OR a quality
+        NESTED inside a group (the repo's own anime profiles set nested cutoffs). Allowed-ness mirrors
+        ``profile_max_quality``: a group is a valid target only when the group is allowed AND ≥1 member
+        is allowed; a nested member only when its own flag AND the parent group flag are set. Used to
+        keep ``cutoff`` pointing at a still-allowed quality after a cap."""
         out = []
         for item in (prof.get("items") or []):
             subs = item.get("items") or []
-            if subs:                                   # a quality GROUP — cutoff references item['id']
-                gid = item.get("id")
-                if gid is None:
-                    continue
+            if subs:                                   # a quality GROUP
+                parent_ok = bool(item.get("allowed"))
                 allowed_subs = [s for s in subs if s.get("allowed")]
-                res = max((int((s.get("quality") or {}).get("resolution", 0)) for s in allowed_subs
-                           if isinstance((s.get("quality") or {}).get("resolution"), (int, float))),
-                          default=0)
-                out.append((gid, res, bool(item.get("allowed")) and bool(allowed_subs)))
+                for s in subs:                         # cutoff may reference a nested sub-quality id
+                    sq = s.get("quality") or {}
+                    sid = sq.get("id")
+                    if sid is None:
+                        continue
+                    sr = sq.get("resolution", 0)
+                    out.append((sid, int(sr) if isinstance(sr, (int, float)) else 0,
+                                parent_ok and bool(s.get("allowed"))))
+                gid = item.get("id")
+                if gid is not None:                    # …or the group id itself
+                    res = max((int((s.get("quality") or {}).get("resolution", 0)) for s in allowed_subs
+                               if isinstance((s.get("quality") or {}).get("resolution"), (int, float))),
+                              default=0)
+                    out.append((gid, res, parent_ok and bool(allowed_subs)))
             else:                                      # ungrouped — cutoff references quality['id']
                 q = item.get("quality") or {}
                 qid = q.get("id")
