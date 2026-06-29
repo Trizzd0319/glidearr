@@ -268,15 +268,18 @@ def empty_config() -> dict:
             # sooner than legacy_regrab_cooldown_days (the cooldown ledger doubles as the resume checkpoint).
             "codec_profiles": {"enabled": False, "report": True, "legacy_regrab": False,
                                "legacy_regrab_budget": 10, "legacy_regrab_cooldown_days": 14},
-            # cf_sync: align custom-format DEFINITIONS + per-profile SCORES across Radarr instances so
-            # the 4K instance scores releases the same way the source (default 'standard') does. Keyed
-            # by NAME (cf/profile ids are per-instance). Default OFF → complete no-op. overwrite_existing
-            # FALSE = fill-only (set only a target's UNSET score==0; a differing score is a conflict,
-            # logged + skipped, never clobbered); TRUE additionally needs cf_sync_overwrite_consent (env
-            # RECOMMENDARR_/GLIDEARR_CF_SYNC_OVERWRITE_CONSENT) — the destructive mode that can erase
-            # per-instance tuning. reference_profile null = derive the canonical {cf:score} map from the
-            # richest source profile. include_test gates the experimental 'test' instance.
-            "cf_sync": {"enabled": False, "source_instance": "standard", "reference_profile": None,
+            # cf_sync: align custom-format DEFINITIONS + per-profile SCORES across instances so every
+            # instance scores releases the same way the source (default 'standard') does, AND copy the
+            # source's 2160p/UHD quality PROFILES onto the dedicated 4K instance. Keyed by NAME (cf /
+            # profile ids are per-instance). AUTOMATIC: runs whenever a service has 2+ instances (a
+            # single-instance install is a no-op); set "enabled": false to opt out. Still honours
+            # dry_run (preview the diff grid, write nothing). overwrite_existing FALSE = fill-only (set
+            # only a target's UNSET score==0; a differing score is a conflict, logged + skipped, never
+            # clobbered); TRUE additionally needs cf_sync_overwrite_consent (env RECOMMENDARR_/GLIDEARR_
+            # CF_SYNC_OVERWRITE_CONSENT) — the destructive mode that can erase per-instance tuning.
+            # reference_profile null = derive the canonical {cf:score} map from the richest source
+            # profile. include_test gates the experimental 'test' instance.
+            "cf_sync": {"source_instance": "standard", "reference_profile": None,
                         "overwrite_existing": False, "include_test": True},
         },
         # JIT next-episode quality: per_episode_tiers (default ON) lets each upcoming episode earn

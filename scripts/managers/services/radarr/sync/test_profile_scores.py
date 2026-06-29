@@ -30,7 +30,7 @@ class _Api:
     def __init__(self, cfs, profiles):
         self._cfs = cfs
         self._profiles = profiles
-        self.puts, self.posts = [], []
+        self.puts, self.posts, self.profile_posts = [], [], []
 
     def resolve_instance(self, i): return i
 
@@ -44,6 +44,11 @@ class _Api:
             self.posts.append((inst, payload))
             rec = {"id": 900 + len(self.posts), **payload}
             self._cfs.setdefault(inst, []).append(rec)
+            return rec
+        if endpoint == "qualityprofile" and method == "POST":
+            self.profile_posts.append((inst, payload))
+            rec = {"id": 800 + len(self.profile_posts), **payload}
+            self._profiles.setdefault(inst, []).append(rec)
             return rec
         if endpoint.startswith("qualityprofile/") and method == "PUT":
             self.puts.append((inst, payload))
@@ -166,6 +171,16 @@ def test_disabled_is_total_noop():
     assert api.puts == [] and stats["filled"] == 0
 
 
+def test_automatic_on_2plus_instances_off_on_single():
+    # no explicit enabled key -> AUTOMATIC by instance count
+    cfg2 = _cfg(); cfg2["scoring"]["cf_sync"].pop("enabled", None)
+    assert _build(cfg2)[0].enabled() is True                       # standard + ultra -> on
+    cfg1 = _cfg(instances=("standard",)); cfg1["scoring"]["cf_sync"].pop("enabled", None)
+    assert _build(cfg1)[0].enabled() is False                      # single instance -> no-op
+    cfg_off = _cfg(); cfg_off["scoring"]["cf_sync"]["enabled"] = False
+    assert _build(cfg_off)[0].enabled() is False                   # explicit opt-out wins
+
+
 def test_overwrite_needs_flag_and_consent():
     # differing score + overwrite flag but NO consent -> conflict, not written
     cfs, profiles = _data()
@@ -225,17 +240,79 @@ def test_sync_manager_run_gating_and_order():
         def __init__(self, on): self._on, self.calls = on, []
         def enabled(self): return self._on
         def sync_definitions(self): self.calls.append("def")
+        def sync_uhd_profiles(self): self.calls.append("uhd")
         def apply_score_sync(self): self.calls.append("score")
 
+    _two = {"radarr_instances": {"default_instance": {"name": "standard"}, "standard": {}, "ultra": {}}}
+
     off = RadarrSyncManager.__new__(RadarrSyncManager)
-    off.logger, off.profile_scores = _Logger(), _PS(False)
+    off.logger, off.profile_scores, off.config = _Logger(), _PS(False), _two
     off.run()
     assert off.profile_scores.calls == []                 # disabled -> complete no-op
 
     on = RadarrSyncManager.__new__(RadarrSyncManager)
-    on.logger, on.profile_scores = _Logger(), _PS(True)
+    on.logger, on.profile_scores, on.config = _Logger(), _PS(True), _two
     on.run()
-    assert on.profile_scores.calls == ["def", "score"]    # definitions BEFORE scores
+    assert on.profile_scores.calls == ["def", "uhd", "score"]   # defs -> uhd profiles -> scores
+
+
+# ── 2160p/UHD profile routing to the 4K instance ────────────────────────────────
+def _uhd_data():
+    cfs = {"standard": [{"id": 1, "name": "x265"}, {"id": 2, "name": "BR-DISK"}],
+           "ultra":    [{"id": 10, "name": "x265"}, {"id": 11, "name": "BR-DISK"}]}
+
+    def _prof(pid, name, res, scores):
+        return {"id": pid, "name": name, "cutoff": 1, "minFormatScore": 0,
+                "items": [{"allowed": True, "quality": {"name": name, "resolution": res}}],
+                "formatItems": [{"format": cid, "name": n, "score": scores.get(n, 0)}
+                                for cid, n in ((1, "x265"), (2, "BR-DISK"))]}
+    profiles = {"standard": [_prof(1, "HD-1080p", 1080, {"x265": 5}),
+                             _prof(2, "Ultra-HD", 2160, {"x265": 8, "BR-DISK": -50})],
+                "ultra": []}                                   # 4K instance has no profiles yet
+    return cfs, profiles
+
+
+def _uhd_cfg(**kw):
+    c = _cfg(instances=("standard", "ultra"), **kw)
+    c["radarr_instances_categorized"] = {"4K": "ultra"}
+    return c
+
+
+def test_sync_uhd_profiles_copies_only_2160p_to_4k_instance():
+    cfs, profiles = _uhd_data()
+    ps, api = _build(_uhd_cfg(), cfs, profiles)
+    stats = ps.sync_uhd_profiles()
+    assert stats["created"] == 1                               # only the 2160p profile
+    inst, payload = api.profile_posts[0]
+    assert inst == "ultra" and payload["name"] == "Ultra-HD"
+    assert "id" not in payload                                 # source id stripped
+    # 1080p profile is NOT copied to the 4K instance
+    assert all(p["name"] != "HD-1080p" for _, p in api.profile_posts)
+    # CF scores carried by name, resolved to ultra's cf ids (10/11)
+    fmt = {fi["name"]: (fi["format"], fi["score"]) for fi in payload["formatItems"]}
+    assert fmt["x265"] == (10, 8) and fmt["BR-DISK"] == (11, -50)
+
+
+def test_sync_uhd_profiles_dry_run_no_post():
+    cfs, profiles = _uhd_data()
+    ps, api = _build(_uhd_cfg(), cfs, profiles, dry_run=True)
+    ps.sync_uhd_profiles()
+    assert api.profile_posts == []
+
+
+def test_sync_uhd_profiles_skips_existing():
+    cfs, profiles = _uhd_data()
+    profiles["ultra"].append({"id": 50, "name": "Ultra-HD", "items": [], "formatItems": []})
+    ps, api = _build(_uhd_cfg(), cfs, profiles)
+    stats = ps.sync_uhd_profiles()
+    assert stats["created"] == 0 and api.profile_posts == []   # already present -> additive no-op
+
+
+def test_sync_uhd_profiles_noop_without_distinct_4k_instance():
+    cfs, profiles = _uhd_data()
+    cfg = _cfg(instances=("standard", "ultra"))                # no radarr_instances_categorized 4K
+    ps, api = _build(cfg, cfs, profiles)
+    assert ps.sync_uhd_profiles()["created"] == 0 and api.profile_posts == []
 
 
 # ── consent reader ──────────────────────────────────────────────────────────────

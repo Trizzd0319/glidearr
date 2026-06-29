@@ -106,10 +106,15 @@ class RadarrSyncManager(BaseManager, ComponentManagerMixin):
         ps = getattr(self, "profile_scores", None)
         if ps is None or not ps.enabled():
             return
-        self.logger.log_info("[CFSync] running custom-format definition + score sync "
-                             "(scoring.cf_sync.enabled).")
+        self.logger.log_info("[CFSync] running cross-instance custom-format + quality-profile sync "
+                             f"({self._instance_count()} instances).")
         try:
-            ps.sync_definitions()
-            ps.apply_score_sync()
+            ps.sync_definitions()       # 1. CF definitions exist everywhere (additive)
+            ps.sync_uhd_profiles()      # 2. copy the source's 2160p profiles onto the 4K instance
+            ps.apply_score_sync()       # 3. align per-profile CF scores (fill-only default, gated)
         except Exception as e:
             self.logger.log_error(f"[CFSync] sync failed: {e}")
+
+    def _instance_count(self) -> int:
+        return len([k for k in (self.config.get("radarr_instances") or {}) if k != "default_instance"]) \
+            if self.config else 0

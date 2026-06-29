@@ -26,9 +26,13 @@ from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
+from scripts.support.utilities.size_model import profile_max_quality
 
 _CONSENT_ENV_VARS = ("RECOMMENDARR_CF_SYNC_OVERWRITE_CONSENT", "GLIDEARR_CF_SYNC_OVERWRITE_CONSENT")
 _CONSENT_TRUTHY = {"1", "true", "yes", "on", "y"}
+# the dedicated 4K instance's categorized labels (mirror uhd_reconcile._UHD_LABELS)
+_UHD_LABELS = ("4K", "4k", "uhd", "UHD", "2160p", "2160")
+_UHD_RES = 2160
 
 
 def cf_sync_overwrite_consented(config) -> bool:
@@ -73,8 +77,18 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
     def _cfg(self) -> dict:
         return ((self.config.get("scoring") or {}).get("cf_sync") or {}) if self.config else {}
 
+    def _instance_count(self) -> int:
+        return len([k for k in (self.config.get("radarr_instances") or {}) if k != "default_instance"]) \
+            if self.config else 0
+
     def enabled(self) -> bool:
-        return bool(self._cfg().get("enabled", False))
+        """AUTOMATIC: runs whenever the service has 2+ instances (there is something to keep in sync),
+        unless the operator explicitly opts out with ``scoring.cf_sync.enabled: false``. A single-
+        instance install is a natural no-op (no targets). Writes still honour dry_run + the fill-only /
+        consent gates, so 'automatic' never means 'unsupervised clobber'."""
+        if self._cfg().get("enabled") is False:
+            return False
+        return self._instance_count() >= 2
 
     def _overwrite_armed(self) -> bool:
         return bool(self._cfg().get("overwrite_existing", False)) and cf_sync_overwrite_consented(self.config)
@@ -149,6 +163,90 @@ class RadarrSyncProfileScoresManager(BaseManager, ComponentManagerMixin):
                                  f"{'would be ' if self.dry_run else ''}created on target(s), "
                                  f"{stats['present']} already present.")
         return stats
+
+    # ── 2160p/UHD quality-profile routing to the 4K instance (additive) ──────────
+    def _uhd_instance(self):
+        """The dedicated 4K instance (categorized 4K/uhd/2160p label that resolves to a DISTINCT
+        instance), or None. Mirrors uhd_reconcile._uhd_instance."""
+        cat = (self.config.get("radarr_instances_categorized") or {}) if self.config else {}
+        insts = (self.config.get("radarr_instances") or {}) if self.config else {}
+        di = insts.get("default_instance")
+        default = di.get("name") if isinstance(di, dict) else di
+        for label in _UHD_LABELS:
+            inst = cat.get(label)
+            if inst and str(inst) in insts and str(inst) != str(default):
+                return str(inst)
+        return None
+
+    @staticmethod
+    def _is_uhd_profile(profile) -> bool:
+        try:
+            res = profile_max_quality(profile)[0]
+        except Exception:
+            return False
+        return res is not None and int(res) >= _UHD_RES
+
+    @LoggerManager().log_function_entry
+    @timeit("sync_uhd_profiles")
+    def sync_uhd_profiles(self) -> dict:
+        """Copy the source instance's 2160p/UHD quality PROFILES onto the dedicated 4K instance,
+        by NAME (create if missing — ADDITIVE; never overwrites or deletes an existing profile). The
+        profile's per-CF scores are carried by name (CF ids resolved on the 4K instance, so run the
+        definition sync first). No-op when there is no distinct 4K instance. Honours dry_run."""
+        stats = {"created": 0, "present": 0}
+        if not self.enabled():
+            return stats
+        cf = self._cf()
+        fourk = self._uhd_instance()
+        source = self._cfg().get("source_instance", "standard")
+        if cf is None or not fourk or self._resolve_instance(fourk) == self._resolve_instance(source):
+            return stats
+        src = self._resolve_instance(source)
+        dst = self._resolve_instance(fourk)
+        src_profiles = self.radarr_api._make_request(src, "qualityprofile", fallback=[]) or []
+        uhd_src = [p for p in src_profiles if self._is_uhd_profile(p)]
+        if not uhd_src:
+            return stats
+        have = {str(p.get("name", "")).strip().lower()
+                for p in (self.radarr_api._make_request(dst, "qualityprofile", fallback=[]) or [])}
+        dst_cf_ids = cf.cf_name_to_id(fourk) or {}
+        dst_names = {str(c.get("name", "")).strip().lower(): c.get("name")
+                     for c in (cf.get_custom_formats(fourk) or [])}
+        for p in uhd_src:
+            nm = str(p.get("name", "")).strip().lower()
+            if nm in have:
+                stats["present"] += 1
+                continue
+            payload = self._uhd_profile_payload(p, dst_cf_ids, dst_names)
+            if self.dry_run:
+                self.logger.log_info(f"[CFSync] [dry_run] would create 2160p profile "
+                                     f"'{p.get('name')}' on the 4K instance '{fourk}'.")
+            else:
+                self.radarr_api._make_request(dst, "qualityprofile", method="POST", payload=payload)
+            stats["created"] += 1
+        if stats["created"]:
+            self.logger.log_info(f"[CFSync] {stats['created']} UHD profile(s) "
+                                 f"{'would be ' if self.dry_run else ''}created on the 4K instance "
+                                 f"'{fourk}' ({stats['present']} already present).")
+        return stats
+
+    @staticmethod
+    def _uhd_profile_payload(src_profile, dst_cf_ids, dst_names) -> dict:
+        """Build the POST payload to create a copy of a source profile on the 4K instance: clone the
+        source (strip its id), and rebuild formatItems against the TARGET's CF ids (by name) carrying
+        the source's scores — a target CF the source doesn't score gets 0 (its default)."""
+        src_scores = {}
+        for fi in (src_profile.get("formatItems") or []):
+            if fi.get("name"):
+                try:
+                    src_scores[str(fi["name"]).strip().lower()] = int(fi.get("score", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+        format_items = [{"format": cid, "name": dst_names.get(lower, lower),
+                         "score": src_scores.get(lower, 0)} for lower, cid in dst_cf_ids.items()]
+        payload = {k: v for k, v in src_profile.items() if k != "id"}
+        payload["formatItems"] = format_items
+        return payload
 
     # ── plan (read-only diff grid) ───────────────────────────────────────────────
     @LoggerManager().log_function_entry
