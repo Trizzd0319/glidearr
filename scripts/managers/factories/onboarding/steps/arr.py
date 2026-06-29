@@ -50,6 +50,7 @@ class ArrStep(Step):
             instances["default_instance"] = {"name": self._default_name(prompter, service, names, instances)}
             if self.categorized:
                 self._collect_categorized(prompter, cfg, names)
+            self._collect_cf_sync(prompter, cfg, names)
         else:
             results.append(StepResult(service, ok=None, detail="no sessions configured", skipped=True))
         return results
@@ -101,6 +102,56 @@ class ArrStep(Step):
                 block = schema.instance_block(host, port, api)
                 res = validators.arr_status(block["base_url"], api, kind=self.kind)
         return res, block
+
+    def _collect_cf_sync(self, prompter, cfg, names):
+        """With 2+ sessions, confirm the cross-instance custom-format / quality-profile sync
+        (``scoring.cf_sync``). It is AUTO-ON for multi-instance and non-destructive by default (fills
+        unset scores, creates missing CFs, copies the source's 2160p profiles onto the 4K session —
+        never overwrites tuning). Here the operator can opt out, pick the source-of-truth session,
+        include/exclude a 'test' session, and arm the destructive OVERWRITE mode (which also writes
+        the consent). Interactive only; headless uses the schema defaults + the
+        ``*_CF_SYNC_OVERWRITE_CONSENT`` env var. NOTE: ``scoring.cf_sync`` is a single global block
+        today and the sync is Radarr-wired, so ``source_instance`` should name a session of the
+        service the sync actually runs for (Radarr); per-service config arrives with the Sonarr lift."""
+        names = [n for n in names if n]
+        if not prompter.is_interactive or len(names) < 2:
+            return
+        svc = self.service
+        cf_sync = cfg.setdefault("scoring", {}).setdefault("cf_sync", {})
+        prompter.notice(f"   With multiple {svc.capitalize()} sessions, the app can keep custom formats")
+        prompter.notice("   and quality-profile scoring in sync across them (your 2160p profiles are also")
+        prompter.notice("   copied onto the 4K session). It fills gaps and never overwrites your tuning")
+        prompter.notice("   unless you opt in below.")
+        if not prompter.confirm(f"{svc}.cf_sync.enabled",
+                                f"   Keep custom formats + quality profiles in sync across the "
+                                f"{svc.capitalize()} sessions?",
+                                default=cf_sync.get("enabled", True) is not False):
+            cf_sync["enabled"] = False          # explicit opt-out
+            return
+        cf_sync.pop("enabled", None)            # auto-on: no explicit flag needed
+        di = (cfg.get(f"{svc}_instances", {}) or {}).get("default_instance")
+        cur_default = di.get("name") if isinstance(di, dict) else (di or "")
+        cur_src = cf_sync.get("source_instance")
+        default_src = cur_src if cur_src in names else (cur_default if cur_default in names else names[0])
+        cf_sync["source_instance"] = prompter.choice(
+            f"{svc}.cf_sync.source_instance",
+            "   Which session is the source of truth (its scoring is copied to the others)?",
+            options=list(names), default=default_src)
+        if any(str(n).lower() == "test" for n in names):
+            cf_sync["include_test"] = prompter.confirm(
+                f"{svc}.cf_sync.include_test", "   Include the 'test' session in the sync?",
+                default=cf_sync.get("include_test", True))
+        prompter.notice("   Fill-only (default) sets only scores that are UNSET on the other sessions;")
+        prompter.notice("   OVERWRITE replaces any existing/hand-tuned scores with the source's.")
+        if prompter.confirm(f"{svc}.cf_sync.overwrite",
+                            "   Overwrite existing custom-format scores on the other sessions to match "
+                            "the source? (destructive — erases per-session tuning)",
+                            default=bool(cf_sync.get("overwrite_existing"))):
+            cf_sync["overwrite_existing"] = True
+            cfg["cf_sync_overwrite_consent"] = True
+        else:
+            cf_sync["overwrite_existing"] = False
+            cfg["cf_sync_overwrite_consent"] = False
 
     def _default_name(self, prompter, service, names, instances):
         cur_default = ""
