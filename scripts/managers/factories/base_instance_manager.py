@@ -501,15 +501,36 @@ class BaseInstanceManager(BaseManager, ComponentManagerMixin):
         """
         Free bytes available to this instance's root folders, deduped by physical
         mount (root folders sharing a disk are counted once). Returns
-        float('inf') on error or when there are no root folders (legacy
-        'assume sufficient' contract).
+        float('inf') when there are genuinely no root folders, or on a PERSISTENT
+        fetch failure (legacy 'assume sufficient' contract — the safe fail direction
+        for a media library: never trigger deletions off a bad read; worst case is
+        over-consuming, which the *arr import guards and the next run corrects).
+
+        A SINGLE transient connect blip used to fall straight through to inf and
+        silently disable every space gate for the rest of the run, so the rootfolder
+        read is retried a couple of times (``_make_request`` itself only retries
+        SQLite-locked, not connection errors) and a persistent failure is logged
+        loudly instead of vanishing into the empty-fallback path.
         """
         try:
-            roots = self._make_request(instance, "rootfolder", fallback=[]) or []
+            # fallback=None lets us tell a FAILED fetch from a genuinely-empty list.
+            roots = None
+            for attempt in range(3):
+                roots = self._make_request(instance, "rootfolder", fallback=None)
+                if roots is not None:
+                    break
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))   # absorb a transient blip
+            if roots is None:
+                self.logger.log_warning(
+                    f"[{self._service_name()}] rootfolder read FAILED for '{instance}' after "
+                    f"retries — assuming sufficient free space (space gates skipped this pass)."
+                )
+                return float("inf")
             root_paths = [self._norm_path(r.get("path", "")) for r in roots
                           if isinstance(r, dict) and r.get("path")]
             if not root_paths:
-                return float("inf")
+                return float("inf")   # genuinely no root folders configured
 
             disks  = self._make_request(instance, "diskspace", fallback=[]) or []
             mounts = [d for d in disks if isinstance(d, dict) and d.get("path")]
