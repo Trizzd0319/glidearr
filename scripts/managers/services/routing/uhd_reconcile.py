@@ -71,7 +71,6 @@ from scripts.managers.machine_learning.space.routing_targets import (
 from scripts.managers.services.acquisition.gateway import ArrGateway
 from scripts.managers.services.radarr.storage.cross_instance_dedup_apply import CrossInstanceDedup
 from scripts.managers.services.radarr.storage.cross_instance_move import CrossInstanceMove
-from scripts.managers.services.radarr.storage.shared_storage import shared_storage_confirmed
 from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.size_model import profile_max_quality
 from scripts.support.utilities.space_targets import space_targets
@@ -235,30 +234,25 @@ class UhdReconcileManager:
                                      f"quality profile on the 4K instance).")
             return
         eff_dry = effective_dry_run(self.dry_run, self.global_cache)
-        # Two ways the cross-instance FILE MOVE may actuate:
-        #   • cross_instance mode + move consent — the HARDENED path: additionally requires the backup
-        #     gate up AND a per-source shared-storage pre-flight (degrade-to-log when unconfirmed).
-        #   • same_instance mode + relocation consent — the LEGACY dual-version reconcile, unchanged
-        #     (no probe), so existing installs keep behaving exactly as before.
-        # The two are mutually exclusive (reorg_mode is single-valued).
-        move_cross_armed = cross_instance_move_enabled(self.config)
-        move_legacy_armed = relocation_enabled(self.config)
-        # Proactive 4K ACQUIRE (a NEW copy on the 4K instance; the source is untouched, no shared
-        # storage needed) actuates under EITHER move gate — same_instance (legacy) or cross_instance
-        # — so it stays coupled to the standard upgrade cap (proactive_4k_enabled) in both modes.
-        acquire_actuate = (move_legacy_armed or move_cross_armed) and not eff_dry
-        acq_mover = CrossInstanceMove(gw, self.logger, dry_run=not acquire_actuate)
+        # DOWNLOAD-BASED dual-version (no cross-instance file move): the 4K instance ACQUIRES its own
+        # 2160p (download) and the standard record is retuned to its ≤1080 baseline (Radarr grabs a
+        # 1080p and replaces the 2160p on import). Actuates under the same gate the file-move used to —
+        # cross_instance + move consent, OR the legacy same_instance relocation consent; both modes now
+        # do the same download-based reconcile, and no shared mount / storage probe is needed. eff_dry
+        # already folds in the pre-destructive backup gate (the retune drops the source 2160p once a
+        # 1080p imports).
+        dual_armed = cross_instance_move_enabled(self.config) or relocation_enabled(self.config)
+        actuator = CrossInstanceMove(gw, self.logger, dry_run=not (dual_armed and not eff_dry))
 
         ultra = gw.library_items(fourk) or []
         present = {m.get("tmdbId") for m in ultra if isinstance(m, dict) and m.get("tmdbId") is not None}
         hasfile = {m.get("tmdbId") for m in ultra
                    if isinstance(m, dict) and m.get("tmdbId") is not None and m.get("hasFile")}
-        # Per-tmdb 4K-side file path → lets the move SKIP same-path duplicates (two records, one
-        # physical file): retuning/searching/Move-scanning such a title could destroy the shared file
-        # the 4K record depends on (Invariant 4). Detected + flagged, never actuated. Also per-tmdb
-        # 4K-side file RESOLUTION → so FINALIZE never downgrades a standard file to 1080p unless the
-        # 4K instance genuinely holds an equal-or-higher-res copy (else the high-res standard file
-        # would be the only one, and retune+search could destroy it).
+        # Per-tmdb 4K-side file path → SKIP same-path duplicates (two records, one physical file):
+        # retuning/searching such a title could destroy the shared file the 4K record depends on
+        # (Invariant 4). Detected + flagged, never actuated. Also per-tmdb 4K-side RESOLUTION → so the
+        # standard retune never downgrades a 2160p to 1080p when the 4K side holds only a LOWER-res copy
+        # and no fresh 4K is being acquired (else the better copy would be the only one and get lost).
         uhd_paths, uhd_res = {}, {}
         for m in ultra:
             if not isinstance(m, dict) or m.get("tmdbId") is None:
@@ -270,20 +264,8 @@ class UhdReconcileManager:
 
         # Stage-C remote-play gate (household-global) — computed once for the whole sweep.
         crp = self._remote_play_ok()
-
         for name in self._source_instances(gw, fourk):
-            move_actuate = False
-            if not eff_dry:
-                if move_cross_armed:
-                    ok, why = shared_storage_confirmed(gw, name, fourk)
-                    move_actuate = ok
-                    if not ok:
-                        self._log("log_warning", f"[UHD] {name} -> {fourk}: cross-instance move held "
-                                                 f"to log-only ({why}).")
-                elif move_legacy_armed:
-                    move_actuate = True
-            move_mover = CrossInstanceMove(gw, self.logger, dry_run=not move_actuate)
-            self._reconcile_instance(gw, move_mover, acq_mover, name, fourk, dest_root, dest_pid,
+            self._reconcile_instance(gw, actuator, name, fourk, dest_root, dest_pid,
                                      present, hasfile, uhd_paths, uhd_res, crp)
 
     def _source_instances(self, gw, fourk) -> list:
@@ -678,7 +660,7 @@ class UhdReconcileManager:
             return False
 
     # ── per standard instance ──────────────────────────────────────────────────
-    def _reconcile_instance(self, gw, move_mover, acq_mover, std_inst, fourk, dest_root, dest_pid,
+    def _reconcile_instance(self, gw, actuator, std_inst, fourk, dest_root, dest_pid,
                             present, hasfile, uhd_paths=None, uhd_res=None, can_remote_play=True):
         uhd_paths = uhd_paths or {}
         uhd_res = uhd_res or {}
@@ -726,42 +708,52 @@ class UhdReconcileManager:
             if proactive and not dest_present and res < _UHD_RES and dual_version.wants_uhd(
                     keep_tagged=False, score=lk, space_allows=space_ok_4k,
                     uhd_threshold=threshold, can_remote_play=can_remote_play):
-                ast = acq_mover.acquire(mv, to_inst=fourk, dest_root=dest_root,
-                                        dest_profile_id=dest_pid, from_inst=std_inst).get("status")
+                ast = actuator.acquire(mv, to_inst=fourk, dest_root=dest_root,
+                                       dest_profile_id=dest_pid, from_inst=std_inst).get("status")
                 if ast not in ("skip", "noop"):
                     acted += 1
                     self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} [{ast}]")
                     self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "acquire", ast)
                 continue
 
-            # FINALIZE: the 2160p has landed on the 4K instance and the source isn't yet the 1080p
-            # baseline — but NOT a title already AT the baseline profile or already holding a healthy
-            # ≤1080 file (a steady dual title is left untouched). MOVE-IN/PENDING: a 2160p file not
-            # yet (with a file) on the 4K side.
+            # DOWNLOAD-BASED dual-version for a 2160p that lives on the standard instance (or whose
+            # 2160p is already on the 4K instance but the standard record isn't the baseline yet): the
+            # 4K instance ACQUIRES its own 2160p if it has no file (download, search ON, ASAP), and the
+            # standard record is retuned to its ≤1080 baseline — Radarr grabs a 1080p and REPLACES the
+            # 2160p ON IMPORT (make-before-break: the source keeps its 2160p until the 1080p lands, so
+            # it is never file-less). No cross-instance file move.
             already_baseline = (mv.get("qualityProfileId") == hd_pid) or (mv.get("hasFile") and 0 < res <= 1080)
-            is_finalize = dest_hasfile and not already_baseline
-            is_movein = (not dest_hasfile) and res >= _UHD_RES
-            # SAFETY: never retune the source down to 1080p unless the 4K instance genuinely holds an
-            # equal-or-higher-res copy. If the 4K side is LOWER res than the source's current file,
-            # the source is the better copy — finalize would search+replace it down to 1080p and the
-            # high-res original would be lost. Hold it for dedup/move instead.
-            if is_finalize and res > 0 and uhd_res.get(tmdb, 0) < res:
-                self._log("log_warning", f"[UHD] {std_inst}: '{mv.get('title')}' held — {fourk} copy "
-                                         f"({uhd_res.get(tmdb, 0)}p) is lower-res than standard ({res}p); "
-                                         f"not downgrading the better copy.")
-                self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "move", "held-uhd-lower-res")
+            if already_baseline or not (res >= _UHD_RES or dest_hasfile):
+                continue                                       # already a 1080p baseline, or nothing to do
+            # MAKE-BEFORE-BREAK ACROSS INSTANCES: standard's existing 2160p is the only in-hand 4K copy,
+            # so it is downgraded to 1080p ONLY once the 4K instance genuinely holds its OWN 2160p file —
+            # never before. `uhd_has_2160` is that gate; until it's true the standard 2160p is held.
+            uhd_has_2160 = dest_hasfile and uhd_res.get(tmdb, 0) >= _UHD_RES
+            # 4K side: get its own 2160p on its way. Acquire (add, search ON, ASAP) only when the 4K
+            # instance has NO record yet; if it has a record but not yet a 2160p file, its own monitoring
+            # grabs/upgrades it (don't re-add — that would duplicate the record).
+            if not uhd_has_2160 and not dest_present:
+                ast = actuator.acquire(mv, to_inst=fourk, dest_root=dest_root,
+                                       dest_profile_id=dest_pid, from_inst=std_inst).get("status")
+                if ast not in ("skip", "noop"):
+                    acted += 1
+                    self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} acquire-4K [{ast}]")
+                    self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "acquire-4k", ast)
+            # Standard side: HOLD the 2160p until the 4K instance confirms its OWN 2160p; only then retune
+            # down to the ≤1080 baseline (Radarr replaces the 2160p on import). Never discard the only
+            # in-hand 4K copy for a download that may never land.
+            if not uhd_has_2160:
+                self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} holding 2160p until "
+                                      f"{fourk} confirms its own 4K copy (no downgrade yet).")
+                self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "dual", "await-4k")
                 continue
-            if not (is_finalize or is_movein):
-                continue
-            st = move_mover.relocate(mv, from_inst=std_inst, to_inst=fourk, dest_root=dest_root,
-                                     dest_profile_id=dest_pid, hd_profile_id=hd_pid,
-                                     dest_present=dest_present, dest_hasfile=dest_hasfile).get("status")
+            st = actuator.retune_baseline(mv, inst=std_inst, hd_profile_id=hd_pid).get("status")
             if st not in ("skip", "noop"):
                 acted += 1
-                self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} [{st}]")
-                self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "move", st)
+                self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → 1080p baseline [{st}]")
+                self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "retune-1080", st)
         if acted:
-            self._log("log_info", f"[UHD] {std_inst}: {acted} title(s) routed to {fourk} (move/acquire).")
+            self._log("log_info", f"[UHD] {std_inst}: {acted} title(s) reconciled to dual-version on {fourk}.")
 
     # ── helpers ─────────────────────────────────────────────────────────────────
     def _uhd_instance(self, gw):

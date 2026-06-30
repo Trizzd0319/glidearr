@@ -1,10 +1,9 @@
-"""Tests for UhdReconcileManager — the steady-state dual-version cross-instance MOVE driver.
+"""Tests for UhdReconcileManager — the steady-state DOWNLOAD-BASED dual-version driver.
 Verifies the gates (configured / 4k_policy=='both' / distinct 4K instance / reorg_mode +
-relocation_consent + dry_run) and that the reconcile drives CrossInstanceMove with the right
-state read from BOTH libraries: a 2160p standard movie with no 4K copy → MOVE-IN (un-monitor
-source, add dest search-off, DownloadedMoviesScan Move); once the 4K instance has the file →
-FINALIZE (retune source to the 1080p baseline + search). A fake instance-manager records the
-movie/command/editor calls."""
+consent + dry_run) and that the reconcile drives the right state read from BOTH libraries: a 2160p
+standard movie that warrants 4K → the 4K instance ACQUIRES its own 2160p (add, SEARCH ON) and the
+standard record is retuned to its ≤1080 baseline + search (Radarr replaces the 2160p on import). No
+cross-instance file move. A fake instance-manager records the movie/command/editor calls."""
 from __future__ import annotations
 
 
@@ -106,17 +105,18 @@ def _run(cfg, std, ultra, *, dry_run=False, monkeypatch=None):
     return im
 
 
-# ── MOVE-IN actuation ─────────────────────────────────────────────────────────
-def test_move_in_2160p_standard_movie(monkeypatch):
+# ── first contact: acquire 4K, HOLD standard's 2160p until the 4K copy is confirmed ───────────────
+def test_2160p_standard_acquires_4k_and_holds_until_confirmed(monkeypatch):
     im = _run(_cfg(), [_M4K, _M1080], [], monkeypatch=monkeypatch)
-    # source un-monitored (race guard), added to ultra search-off, dest told to Move-import
-    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts
+    # the 4K instance acquires its OWN 2160p: add, SEARCH ON, 4k root + 2160p profile
     assert len(im.adds) == 1 and im.adds[0][0] == "ultra"
-    assert im.adds[0][1]["addOptions"] == {"searchForMovie": False}
+    assert im.adds[0][1]["addOptions"] == {"searchForMovie": True}
     assert im.adds[0][1]["qualityProfileId"] == 7 and im.adds[0][1]["rootFolderPath"] == "/data/media/movies/4k"
-    scan = [c for c in im.commands if c[1].get("name") == "DownloadedMoviesScan"]
-    assert scan and scan[0][1]["importMode"] == "Move"
-    assert scan[0][1]["path"] == "/data/media/movies/Kids/Toy Story (1995)"
+    # MAKE-BEFORE-BREAK: standard's 2160p is NOT downgraded yet (the 4K copy isn't confirmed) — no
+    # profile change / rescan / search on standard, and never a Move. _M1080 is already a baseline.
+    assert im.puts == []
+    assert not any(c[1].get("name") in ("RescanMovie", "MoviesSearch", "DownloadedMoviesScan")
+                   for c in im.commands)
 
 
 def test_does_not_move_1080p(monkeypatch):
@@ -159,12 +159,21 @@ def test_unmonitored_steady_1080_baseline_not_finalized(monkeypatch):
     assert im.deletes == [] and im.adds == [] and im.commands == [] and im.puts == []
 
 
-def test_pending_import_rescans_without_touching_source(monkeypatch):
+def test_4k_record_no_file_holds_standard_no_readd(monkeypatch):
     im = _run(_cfg(), [dict(_M4K, monitored=False)], [_U_NOFILE], monkeypatch=monkeypatch)
-    # on dest but no file yet → just re-scan; source already un-monitored, so no editor PUT
-    assert im.adds == []
-    assert any(c[1].get("name") == "DownloadedMoviesScan" for c in im.commands)
-    assert im.puts == []
+    # ultra has a record but NO 2160p file yet → its own monitoring re-grabs (we don't re-add), and
+    # standard is HELD (not downgraded until the 4K copy lands) → nothing written this pass.
+    assert im.adds == [] and im.puts == []
+    assert not any(c[1].get("name") in ("RescanMovie", "MoviesSearch", "DownloadedMoviesScan")
+                   for c in im.commands)
+
+
+def test_finalize_retunes_once_4k_confirmed(monkeypatch):
+    # ONCE the 4K instance holds its own 2160p (dest_hasfile) → standard is safely retuned to 1080p.
+    im = _run(_cfg(), [_M4K], [_U_HASFILE], monkeypatch=monkeypatch)
+    assert im.adds == []                                   # ultra already has it → no acquire
+    assert ("standard", {"movieIds": [1], "qualityProfileId": 3, "monitored": True}) in im.puts
+    assert ("standard", {"name": "MoviesSearch", "movieIds": [1]}) in im.commands
 
 
 # ── gates ─────────────────────────────────────────────────────────────────────
@@ -470,20 +479,21 @@ def _xrun(std, ultra, monkeypatch, *, cfg=None, dry_run=False, gate=None, roots=
     return im
 
 
-# ── move under cross_instance mode (new gate + shared-storage probe) ──────────────
-def test_cross_instance_move_in_actuates_with_probe(monkeypatch):
+# ── dual-version under cross_instance mode (download-based; no probe, no shared mount) ──────────
+def test_cross_instance_acquires_4k_and_holds_standard(monkeypatch):
     im = _xrun([_M4K], [], monkeypatch)
     assert len(im.adds) == 1 and im.adds[0][0] == "ultra"
-    scan = [c for c in im.commands if c[1].get("name") == "DownloadedMoviesScan"]
-    assert scan and scan[0][1]["importMode"] == "Move"
-    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts
+    assert im.adds[0][1]["addOptions"] == {"searchForMovie": True}
+    assert im.puts == []                                   # standard HELD until ultra confirms its 2160p
+    assert not any(c[1].get("name") == "DownloadedMoviesScan" for c in im.commands)
 
 
-def test_cross_instance_move_held_when_storage_unconfirmed(monkeypatch):
-    # disjoint mounts → probe fails → move degrades to log-only.
+def test_cross_instance_actuates_regardless_of_mounts(monkeypatch):
+    # download-based dual-version needs NO shared mount → disjoint mounts no longer block the acquire.
     im = _xrun([_M4K], [], monkeypatch,
                roots={"standard": [{"path": "/mnt/a/movies"}], "ultra": [{"path": "/mnt/b/movies"}]})
-    assert im.adds == [] and im.commands == [] and im.puts == []
+    assert len(im.adds) == 1 and im.adds[0][0] == "ultra"  # 4K still acquired (no mount needed)
+    assert im.puts == []                                   # standard held until ultra confirms
 
 
 def test_cross_instance_move_blocked_by_disarmed_backup(monkeypatch):
@@ -549,11 +559,12 @@ def test_proactive_acquire_actuates_under_cross_instance(monkeypatch):
     assert acq[0][1]["addOptions"] == {"searchForMovie": True}   # actuates (not would-acquire)
 
 
-def test_cross_instance_dedup_off_move_on(monkeypatch):
+def test_cross_instance_dedup_off_dual_version_on(monkeypatch):
     other = {"id": 2, "tmdbId": 999, "title": "Other", "monitored": True, "qualityProfileId": 9,
              "hasFile": True,
              "movieFile": {"id": 60, "path": "/data/media/movies/standard/Other (2020)/o.mkv",
                            "quality": {"quality": {"resolution": 2160}}}}
     im = _xrun([_STD_DUP_2160, other], [_U_DUP_2160], monkeypatch, cfg=_xcfg(dedup=False))
     assert im.deletes == []                                    # dedup logged-only (no consent)
-    assert any(c[1].get("name") == "DownloadedMoviesScan" for c in im.commands)   # 999 still moves in
+    # 999 (2160p on standard, not on ultra) → the 4K instance acquires its own 2160p
+    assert any(a[0] == "ultra" and a[1].get("tmdbId") == 999 for a in im.adds)
