@@ -99,6 +99,35 @@ class CrossInstanceMove:
             self._log("log_success", f"[Relocate] acquiring a 4K copy of '{title}' on {to_inst} (search ON).")
         return {"status": "acquired" if ok else "acquire-failed", "title": title, "tmdb": tmdb}
 
+    def ensure_acquiring(self, movie_id, *, inst, profile_id) -> dict:
+        """Drive an EXISTING 4K-instance record that has no 2160p yet to acquire one: set it to the 4K
+        quality profile + monitored, then MoviesSearch. For a record that already exists but is stale /
+        un-monitored (e.g. left over from earlier churn) so its own RSS would never grab. No add, no
+        delete — just movie/editor + search. dry_run-aware."""
+        if movie_id is None or profile_id is None:
+            return {"status": "noop"}
+        if self.dry_run:
+            self._log("log_info", f"[Relocate] would set 4K record {movie_id} on {inst} → 4K profile "
+                                  f"+ monitored + search.")
+            return {"status": "would-acquire"}
+        self.gw.put(inst, "movie/editor",
+                    {"movieIds": [movie_id], "qualityProfileId": profile_id, "monitored": True})
+        self.gw.command(inst, {"name": "MoviesSearch", "movieIds": [movie_id]})
+        self._log("log_success", f"[Relocate] 4K record {movie_id} on {inst}: set 4K profile + "
+                                 f"monitored + searched.")
+        return {"status": "acquiring"}
+
+    def unmonitor(self, movie_id, *, inst) -> dict:
+        """Freeze a record by un-monitoring it (keeps its file; stops Radarr touching/upgrading it).
+        Used to hold the standard 2160p while the 4K instance acquires its own copy. dry_run-aware."""
+        if movie_id is None:
+            return {"status": "noop"}
+        if self.dry_run:
+            self._log("log_info", f"[Relocate] would unmonitor record {movie_id} on {inst} (freeze).")
+            return {"status": "would-freeze"}
+        self.gw.put(inst, "movie/editor", {"movieIds": [movie_id], "monitored": False})
+        return {"status": "frozen"}
+
     def _src_tag_labels(self, src_movie, from_inst) -> list:
         """The LABELS of the source movie's tags. Radarr tag ids are per-instance, so we carry the
         labels (not the raw ids) across instances. Empty when there are no tags or no source."""

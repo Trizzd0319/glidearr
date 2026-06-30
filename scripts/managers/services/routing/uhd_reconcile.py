@@ -253,7 +253,10 @@ class UhdReconcileManager:
         # (Invariant 4). Detected + flagged, never actuated. Also per-tmdb 4K-side RESOLUTION → so the
         # standard retune never downgrades a 2160p to 1080p when the 4K side holds only a LOWER-res copy
         # and no fresh 4K is being acquired (else the better copy would be the only one and get lost).
-        uhd_paths, uhd_res = {}, {}
+        # uhd_ids: tmdb → the 4K-instance movie id, so we can DRIVE an existing-but-fileless 4K record
+        # (profile + monitor + search) instead of relying on its own RSS — fixes a stale/un-monitored
+        # 4K shell that would otherwise never grab its own 2160p.
+        uhd_paths, uhd_res, uhd_ids = {}, {}, {}
         for m in ultra:
             if not isinstance(m, dict) or m.get("tmdbId") is None:
                 continue
@@ -261,12 +264,14 @@ class UhdReconcileManager:
             if p:
                 uhd_paths[m.get("tmdbId")] = p
             uhd_res[m.get("tmdbId")] = self._res(m)
+            if m.get("id") is not None:
+                uhd_ids[m.get("tmdbId")] = m.get("id")
 
         # Stage-C remote-play gate (household-global) — computed once for the whole sweep.
         crp = self._remote_play_ok()
         for name in self._source_instances(gw, fourk):
             self._reconcile_instance(gw, actuator, name, fourk, dest_root, dest_pid,
-                                     present, hasfile, uhd_paths, uhd_res, crp)
+                                     present, hasfile, uhd_paths, uhd_res, crp, uhd_ids)
 
     def _source_instances(self, gw, fourk) -> list:
         """The HD/standard-tier instances to scan as MOVE SOURCES — where the 1080p baseline lives.
@@ -661,9 +666,11 @@ class UhdReconcileManager:
 
     # ── per standard instance ──────────────────────────────────────────────────
     def _reconcile_instance(self, gw, actuator, std_inst, fourk, dest_root, dest_pid,
-                            present, hasfile, uhd_paths=None, uhd_res=None, can_remote_play=True):
+                            present, hasfile, uhd_paths=None, uhd_res=None, can_remote_play=True,
+                            uhd_ids=None):
         uhd_paths = uhd_paths or {}
         uhd_res = uhd_res or {}
+        uhd_ids = uhd_ids or {}
         try:
             movies = gw.library_items(std_inst) or []
         except Exception as e:
@@ -729,24 +736,33 @@ class UhdReconcileManager:
             # so it is downgraded to 1080p ONLY once the 4K instance genuinely holds its OWN 2160p file —
             # never before. `uhd_has_2160` is that gate; until it's true the standard 2160p is held.
             uhd_has_2160 = dest_hasfile and uhd_res.get(tmdb, 0) >= _UHD_RES
-            # 4K side: get its own 2160p on its way. Acquire (add, search ON, ASAP) only when the 4K
-            # instance has NO record yet; if it has a record but not yet a 2160p file, its own monitoring
-            # grabs/upgrades it (don't re-add — that would duplicate the record).
-            if not uhd_has_2160 and not dest_present:
-                ast = actuator.acquire(mv, to_inst=fourk, dest_root=dest_root,
-                                       dest_profile_id=dest_pid, from_inst=std_inst).get("status")
+            # PHASE 1 — the 4K instance does NOT yet hold its own 2160p: DRIVE it to acquire one (4K
+            # profile + monitored + search) and FREEZE standard's 2160p (un-monitor) until that copy
+            # lands. Driving the 4K side even when a record already exists fixes a stale / un-monitored 4K
+            # shell that its own RSS would otherwise never grab.
+            if not uhd_has_2160:
+                if not dest_present:                           # no 4K record yet → add it (search ON)
+                    ast = actuator.acquire(mv, to_inst=fourk, dest_root=dest_root,
+                                           dest_profile_id=dest_pid, from_inst=std_inst).get("status")
+                else:                                          # 4K record exists but no 2160p → drive it
+                    ast = actuator.ensure_acquiring(uhd_ids.get(tmdb), inst=fourk,
+                                                    profile_id=dest_pid).get("status")
                 if ast not in ("skip", "noop"):
                     acted += 1
                     self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} acquire-4K [{ast}]")
                     self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "acquire-4k", ast)
-            # Standard side: HOLD the 2160p until the 4K instance confirms its OWN 2160p; only then retune
-            # down to the ≤1080 baseline (Radarr replaces the 2160p on import). Never discard the only
-            # in-hand 4K copy for a download that may never land.
-            if not uhd_has_2160:
-                self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} holding 2160p until "
-                                      f"{fourk} confirms its own 4K copy (no downgrade yet).")
-                self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "dual", "await-4k")
+                # Freeze standard's 2160p (un-monitor) so Radarr won't touch it while the 4K is acquired;
+                # phase 2 re-monitors it at the 1080p baseline once the 4K copy is confirmed. The 2160p
+                # file STAYS — so the title is never file-less and the only 4K copy is never lost.
+                if mv.get("monitored") and mv.get("id") is not None:
+                    fst = actuator.unmonitor(mv.get("id"), inst=std_inst).get("status")
+                    verb = "would freeze" if fst == "would-freeze" else "froze"
+                    self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}' {verb} standard 2160p "
+                                          f"(un-monitored) until {fourk} confirms its 4K copy.")
+                    self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "freeze-std", fst)
                 continue
+            # PHASE 2 — the 4K instance confirmed its own 2160p → reset standard to the ≤1080 baseline
+            # (profile → monitor → search; Radarr replaces the 2160p on import).
             st = actuator.retune_baseline(mv, inst=std_inst, hd_profile_id=hd_pid).get("status")
             if st not in ("skip", "noop"):
                 acted += 1

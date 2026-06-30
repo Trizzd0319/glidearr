@@ -106,17 +106,18 @@ def _run(cfg, std, ultra, *, dry_run=False, monkeypatch=None):
 
 
 # ── first contact: acquire 4K, HOLD standard's 2160p until the 4K copy is confirmed ───────────────
-def test_2160p_standard_acquires_4k_and_holds_until_confirmed(monkeypatch):
+def test_2160p_standard_acquires_4k_and_freezes_standard(monkeypatch):
     im = _run(_cfg(), [_M4K, _M1080], [], monkeypatch=monkeypatch)
     # the 4K instance acquires its OWN 2160p: add, SEARCH ON, 4k root + 2160p profile
     assert len(im.adds) == 1 and im.adds[0][0] == "ultra"
     assert im.adds[0][1]["addOptions"] == {"searchForMovie": True}
     assert im.adds[0][1]["qualityProfileId"] == 7 and im.adds[0][1]["rootFolderPath"] == "/data/media/movies/4k"
-    # MAKE-BEFORE-BREAK: standard's 2160p is NOT downgraded yet (the 4K copy isn't confirmed) — no
-    # profile change / rescan / search on standard, and never a Move. _M1080 is already a baseline.
-    assert im.puts == []
-    assert not any(c[1].get("name") in ("RescanMovie", "MoviesSearch", "DownloadedMoviesScan")
-                   for c in im.commands)
+    # MAKE-BEFORE-BREAK: standard's 2160p is FROZEN (un-monitored), kept on disk, NOT retuned-down yet.
+    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts
+    assert not any(p[0] == "standard" and "qualityProfileId" in p[1] for p in im.puts)   # no retune yet
+    assert not any(c[1].get("name") in ("RescanMovie", "DownloadedMoviesScan") for c in im.commands)
+    # _M1080 is already a 1080p baseline → never touched
+    assert not any(p[0] == "standard" and p[1].get("movieIds") == [2] for p in im.puts)
 
 
 def test_does_not_move_1080p(monkeypatch):
@@ -134,13 +135,19 @@ def test_finalize_retunes_standard_in_place(monkeypatch):
     assert ("standard", {"name": "MoviesSearch", "movieIds": [1]}) in im.commands
 
 
-def test_finalize_held_when_ultra_copy_is_lower_res(monkeypatch):
-    # standard holds 2160p but the 4K instance only has 1080p → standard is the BETTER copy;
-    # finalize must NOT downgrade+search it away (data-loss guard).
+def test_lower_res_4k_is_driven_to_2160_and_standard_frozen(monkeypatch):
+    # standard holds 2160p but the 4K instance only has 1080p → DRIVE the 4K record to its own 2160p
+    # (4K profile + monitor + search) and FREEZE standard's 2160p; never downgrade the only high-res
+    # copy until the 4K side genuinely holds its own 2160p.
     u_1080 = {"id": 5, "tmdbId": 862, "hasFile": True,
               "movieFile": {"id": 55, "quality": {"quality": {"resolution": 1080}}}}
     im = _run(_cfg(), [_M4K], [u_1080], monkeypatch=monkeypatch)
-    assert im.puts == [] and im.commands == [] and im.adds == []   # standard untouched
+    assert im.adds == []                                            # ultra record exists → driven, not re-added
+    assert ("ultra", {"movieIds": [5], "qualityProfileId": 7, "monitored": True}) in im.puts   # drive 4K
+    assert ("ultra", {"name": "MoviesSearch", "movieIds": [5]}) in im.commands
+    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts                       # freeze std
+    assert not any(p[0] == "standard" and "qualityProfileId" in p[1] for p in im.puts)           # no retune
+    assert im.deletes == []                                         # standard 2160p never deleted
 
 
 def test_steady_baseline_title_is_noop(monkeypatch):
@@ -159,13 +166,14 @@ def test_unmonitored_steady_1080_baseline_not_finalized(monkeypatch):
     assert im.deletes == [] and im.adds == [] and im.commands == [] and im.puts == []
 
 
-def test_4k_record_no_file_holds_standard_no_readd(monkeypatch):
+def test_4k_record_no_file_is_driven_to_acquire_no_readd(monkeypatch):
     im = _run(_cfg(), [dict(_M4K, monitored=False)], [_U_NOFILE], monkeypatch=monkeypatch)
-    # ultra has a record but NO 2160p file yet → its own monitoring re-grabs (we don't re-add), and
-    # standard is HELD (not downgraded until the 4K copy lands) → nothing written this pass.
-    assert im.adds == [] and im.puts == []
-    assert not any(c[1].get("name") in ("RescanMovie", "MoviesSearch", "DownloadedMoviesScan")
-                   for c in im.commands)
+    # ultra has a record but NO 2160p file → DRIVE it (4K profile + monitor + search), don't re-add.
+    assert im.adds == []
+    assert ("ultra", {"movieIds": [5], "qualityProfileId": 7, "monitored": True}) in im.puts
+    assert ("ultra", {"name": "MoviesSearch", "movieIds": [5]}) in im.commands
+    # standard is already un-monitored → no standard write; never retuned/deleted while 4K not confirmed
+    assert not any(p[0] == "standard" for p in im.puts) and im.deletes == []
 
 
 def test_finalize_retunes_once_4k_confirmed(monkeypatch):
@@ -480,11 +488,12 @@ def _xrun(std, ultra, monkeypatch, *, cfg=None, dry_run=False, gate=None, roots=
 
 
 # ── dual-version under cross_instance mode (download-based; no probe, no shared mount) ──────────
-def test_cross_instance_acquires_4k_and_holds_standard(monkeypatch):
+def test_cross_instance_acquires_4k_and_freezes_standard(monkeypatch):
     im = _xrun([_M4K], [], monkeypatch)
     assert len(im.adds) == 1 and im.adds[0][0] == "ultra"
     assert im.adds[0][1]["addOptions"] == {"searchForMovie": True}
-    assert im.puts == []                                   # standard HELD until ultra confirms its 2160p
+    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts   # standard frozen, not retuned
+    assert not any(p[0] == "standard" and "qualityProfileId" in p[1] for p in im.puts)
     assert not any(c[1].get("name") == "DownloadedMoviesScan" for c in im.commands)
 
 
@@ -493,7 +502,7 @@ def test_cross_instance_actuates_regardless_of_mounts(monkeypatch):
     im = _xrun([_M4K], [], monkeypatch,
                roots={"standard": [{"path": "/mnt/a/movies"}], "ultra": [{"path": "/mnt/b/movies"}]})
     assert len(im.adds) == 1 and im.adds[0][0] == "ultra"  # 4K still acquired (no mount needed)
-    assert im.puts == []                                   # standard held until ultra confirms
+    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts   # standard frozen
 
 
 def test_cross_instance_move_blocked_by_disarmed_backup(monkeypatch):

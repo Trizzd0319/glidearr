@@ -130,6 +130,46 @@ def test_acquire_dry_run_no_add():
     assert res["status"] == "would-acquire" and gw.adds == []
 
 
+# ── ensure_acquiring (drive an EXISTING 4K record) + unmonitor (freeze standard) ──────────────────
+def test_ensure_acquiring_drives_existing_record():
+    m, gw = _mover()
+    res = m.ensure_acquiring(55, inst="ultra", profile_id=7)
+    assert res["status"] == "acquiring"
+    assert gw.puts == [("ultra", "movie/editor",
+                        {"movieIds": [55], "qualityProfileId": 7, "monitored": True})]
+    assert gw.commands == [("ultra", {"name": "MoviesSearch", "movieIds": [55]})]
+    assert gw.adds == []                                   # drives the existing record, never re-adds
+
+
+def test_ensure_acquiring_dry_run():
+    m, gw = _mover(dry_run=True)
+    res = m.ensure_acquiring(55, inst="ultra", profile_id=7)
+    assert res["status"] == "would-acquire"
+    assert gw.puts == [] and gw.commands == []
+
+
+def test_ensure_acquiring_noop_without_id_or_profile():
+    m, gw = _mover()
+    assert m.ensure_acquiring(None, inst="ultra", profile_id=7)["status"] == "noop"
+    assert m.ensure_acquiring(55, inst="ultra", profile_id=None)["status"] == "noop"
+    assert gw.puts == [] and gw.commands == []
+
+
+def test_unmonitor_freezes_record():
+    m, gw = _mover()
+    res = m.unmonitor(1, inst="standard")
+    assert res["status"] == "frozen"
+    assert gw.puts == [("standard", "movie/editor", {"movieIds": [1], "monitored": False})]
+    assert gw.commands == []                               # freeze only — no search, no delete
+
+
+def test_unmonitor_dry_run():
+    m, gw = _mover(dry_run=True)
+    res = m.unmonitor(1, inst="standard")
+    assert res["status"] == "would-freeze"
+    assert gw.puts == []
+
+
 # ── tags carried across instances by LABEL (per-instance ids must NOT be copied raw) ──
 def test_acquire_carries_tags_by_label():
     m, gw = _mover()
