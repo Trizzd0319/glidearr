@@ -22,10 +22,18 @@ class RadarrQualityCacheManager(BaseManager, ComponentManagerMixin):
 
         self.logger.log_debug(f"Initialized {self.__class__.__name__}")
 
+    # SLASH-delimited, per-instance keys that READER and WRITER agree on. The old
+    # pair never reconciled: refresh wrote "radarr.quality_profiles.<inst>" /
+    # "radarr.custom_formats.<inst>" while the getters read
+    # "radarr.<inst>.quality.profiles" / "...custom_formats" — different files, so
+    # a read never saw what a refresh had written. The custom-format key matches
+    # the live managers (radarr/custom_formats/<inst>) so they share one cache.
+    # compressed= is dropped: GlobalCacheManager.set doesn't accept it (it would
+    # TypeError and the write would never happen) and compression is a no-op anyway.
     def refresh_quality_profiles(self, instance):
         profiles = self.radarr_api._make_request(instance, "qualityprofile", fallback=[]) if self.radarr_api else []
         if profiles:
-            self.global_cache.set(f"radarr.quality_profiles.{instance}", profiles, compressed=True)
+            self.global_cache.set(f"radarr/quality_profiles/{instance}", profiles)
             self.logger.log_info(f"✅ Cached quality profiles for {instance}")
         else:
             self.logger.log_warning(f"⚠️ No quality profiles for {instance}")
@@ -33,16 +41,16 @@ class RadarrQualityCacheManager(BaseManager, ComponentManagerMixin):
     def refresh_custom_formats(self, instance):
         formats = self.radarr_api._make_request(instance, "customformat", fallback=[]) if self.radarr_api else []
         if formats:
-            self.global_cache.set(f"radarr.custom_formats.{instance}", formats, compressed=True)
+            self.global_cache.set(f"radarr/custom_formats/{instance}", formats)
             self.logger.log_info(f"✅ Cached custom formats for {instance}")
         else:
             self.logger.log_warning(f"⚠️ No custom formats for {instance}")
 
     def get_quality_profiles(self, instance):
-        return self.global_cache.get(f"radarr.{instance}.quality.profiles", default=[])
+        return self.global_cache.get(f"radarr/quality_profiles/{instance}", default=[])
 
     def get_custom_formats(self, instance):
-        return self.global_cache.get(f"radarr.{instance}.quality.custom_formats", default=[])
+        return self.global_cache.get(f"radarr/custom_formats/{instance}", default=[])
 
     def refresh_quality_definitions(self, instance):
         try:

@@ -55,7 +55,19 @@ class CacheKeyBuilder:
         attempt raises ValueError rather than touching the filesystem.
         """
         safe_parts = [_sanitize_part(p) for p in parts]
-        path = self.base_dir.joinpath(*safe_parts).with_suffix(suffix)
+        path = self.base_dir.joinpath(*safe_parts)
+
+        # APPEND the suffix rather than replacing the trailing dot-segment.
+        # Path.with_suffix treats everything after the final dot as an extension
+        # and swaps it out, so a single dotted key part like
+        # "radarr.tags.standard" had ".standard" stripped → "radarr.tags.json",
+        # collapsing every per-instance key (standard/ultra/test) onto one shared
+        # file and cross-contaminating instances. Appending keeps the whole key in
+        # the filename; the endswith guard avoids doubling a suffix that a caller
+        # already baked into the key (e.g. "...library_series_enriched.parquet" or
+        # a "<name>.last_updated" timestamp key), which with_suffix used to absorb.
+        if not path.name.endswith(suffix):
+            path = path.with_name(path.name + suffix)
 
         if not path.resolve().is_relative_to(self.base_dir):
             raise ValueError(

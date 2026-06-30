@@ -7,7 +7,7 @@
 
 `SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin)` is reachable as `sonarr_cache.series`. Every method takes a **pre-resolved** instance-name string; callers resolve `None` → default before calling here.
 
-Storage layout: files live at `{key_builder.base_dir}/sonarr/{instance}/library/{letter}.json.gz`. Paths are built **directly** from `key_builder.base_dir` (not via `build_cache_path`), because `CacheKeyBuilder.build_cache_path` calls `.with_suffix(...)` which would mangle the compound `.json.gz` extension into `.json.json`. The bucket letter for a title is its first alphanumeric character lower-cased; non-alphanumeric → `_`.
+Storage layout: files live at `{key_builder.base_dir}/sonarr/{instance}/library/{letter}.json.gz`. Paths are built **directly** from `key_builder.base_dir` (not via `build_cache_path`), because `CacheKeyBuilder.build_cache_path` appends its suffix to the key, which would mangle the compound `.json.gz` extension into `.json.gz.json`. The bucket letter for a title is its first alphanumeric character lower-cased; non-alphanumeric → `_`.
 
 In-memory memo: `load_letter_cache` gunzips + JSON-parses a bucket on the first read of `(instance, letter)`, then serves a shared reference from `_bucket_memo_store` thereafter (callers must treat returned lists as read-only). Every write path keeps the memo in sync (`_bucket_memo_set`) or invalidates it (`_bucket_memo_invalidate`). This was added because full-library scans re-loaded the same ~40 buckets thousands of times per run.
 

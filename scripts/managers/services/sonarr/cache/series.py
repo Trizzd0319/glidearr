@@ -41,10 +41,10 @@ class SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin):
     # ─────────────────────────────────────────────
     # 📂 Path Helpers (bypass build_cache_path)
     # ─────────────────────────────────────────────
-    # CacheKeyBuilder.build_cache_path always calls .with_suffix(suffix), which
-    # mangles compound extensions: "d.json.gz" → "d.json.json".  For letter
-    # bucket files we therefore construct paths directly from cache_root so that
-    # the on-disk extension is exactly ".json.gz".
+    # CacheKeyBuilder.build_cache_path appends the requested suffix to the key,
+    # which mangles compound extensions: a "d.json.gz" key + ".json" suffix →
+    # "d.json.gz.json".  For letter bucket files we therefore construct paths
+    # directly from cache_root so that the on-disk extension is exactly ".json.gz".
 
     def _library_dir(self, instance: str):
         """Return the Path to the library directory, creating it if needed.
