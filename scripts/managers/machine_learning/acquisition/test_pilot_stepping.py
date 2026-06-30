@@ -15,6 +15,7 @@ from scripts.managers.machine_learning.acquisition.pilot_stepping import (
     next_pilot_profile_descend,
     pilot_backoff_interval,
     pilot_search_due,
+    pilot_watchability_keep,
     profile_max_resolution,
     rank_pilot_profiles,
 )
@@ -321,3 +322,25 @@ def test_descend_clamps_out_of_range_start_rank():
                                       last_pid=None, ranked=_RANKED_D) == (13, "target")   # → top
     assert next_pilot_profile_descend(start_rank=-5, current_pid=5, current_rank=0,
                                       last_pid=None, ranked=_RANKED_D) == (11, "target")   # → floor
+
+
+# ── pilot_watchability_keep — the affinity gate on the interactive pilot search ──
+def test_watchability_keep_basic():
+    s = pd.Series([5.0, 19.9, 20.0, 80.0, None], index=[1, 2, 3, 4, 5])
+    keep = pilot_watchability_keep(s, 20.0)
+    # below floor → drop; at/above floor → keep; missing (NaN) → keep (sample once).
+    assert list(keep) == [False, False, True, True, True]
+    assert list(keep.index) == [1, 2, 3, 4, 5]   # index preserved
+
+
+def test_watchability_keep_floor_zero_or_none_disables_gate():
+    s = pd.Series([0.0, 5.0, None])
+    assert pilot_watchability_keep(s, 0).all()       # floor 0 → keep everything
+    assert pilot_watchability_keep(s, None).all()    # None → keep everything
+
+
+def test_watchability_keep_non_numeric_scores_treated_as_missing():
+    s = pd.Series(["", "n/a", "30", 10.0])
+    keep = pilot_watchability_keep(s, 20.0)
+    # "" and "n/a" coerce to NaN → keep (sample); "30" → keep; 10 → drop.
+    assert list(keep) == [True, True, True, False]

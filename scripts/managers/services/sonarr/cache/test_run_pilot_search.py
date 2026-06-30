@@ -49,17 +49,20 @@ class _FakeApi:
         return fallback
 
 
-def _stub_df(last_pid=None):
-    return pd.DataFrame([{
+def _stub_df(last_pid=None, score="__omit__"):
+    row = {
         "series_id": 1, "series_title": "S", "is_pilot": True, "episode_file_id": None,
         "pilot_search_attempts": (1 if last_pid is not None else None),
         "pilot_last_searched_at": None,
         "pilot_last_profile_id": last_pid,
-    }])
+    }
+    if score != "__omit__":              # omit → no watchability_score column (first-run / un-graded)
+        row["watchability_score"] = score
+    return pd.DataFrame([row])
 
 
-def _run(config, *, free_gb, series_qp=99, last_pid=None):
-    df = _stub_df(last_pid=last_pid)
+def _run(config, *, free_gb, series_qp=99, last_pid=None, score="__omit__"):
+    df = _stub_df(last_pid=last_pid, score=score)
     api = _FakeApi(series_qp=series_qp)
     m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
@@ -492,4 +495,38 @@ def test_climb_dry_run_does_not_spawn_or_write():
     assert spawned == []          # no background worker in dry-run
     assert saved == []            # df not persisted in dry-run
     assert api.puts == []         # no profile writes
+    assert stats["searched"] == 1
+
+
+# ── watchability gate on the interactive pilot search ───────────────────────────────
+_GATE = {**_ON, "pilot_interactive": {"min_watchability": 20}}
+
+
+def test_pilot_held_back_when_below_watchability_floor():
+    # graded score 5 < floor 20 → held back from the search (never searched / stamped). The row is
+    # untouched, so refresh_scores keeps re-grading it and it returns once affinity climbs.
+    df, stats, api = _run(_GATE, free_gb=5000, score=5.0)
+    assert stats["searched"] == 0
+    assert pd.isna(df.at[0, "pilot_last_profile_id"])
+    assert api.puts == []
+
+
+def test_pilot_searched_when_at_or_above_floor():
+    df, stats, _ = _run(_GATE, free_gb=5000, score=80.0)
+    assert stats["searched"] == 1
+    assert int(df.at[0, "pilot_last_profile_id"]) == 13
+
+
+def test_pilot_unscored_is_sampled_once():
+    # column absent (first post-reset run) → gate inert → searched.
+    df, stats, _ = _run(_GATE, free_gb=5000)                      # score omitted
+    assert stats["searched"] == 1
+    # graded-but-NaN (newly added series before its first refresh) → also sampled.
+    df2, stats2, _ = _run(_GATE, free_gb=5000, score=float("nan"))
+    assert stats2["searched"] == 1
+
+
+def test_pilot_gate_off_when_floor_zero_searches_low_score():
+    cfg = {**_ON, "pilot_interactive": {"min_watchability": 0}}   # gate disabled
+    df, stats, _ = _run(cfg, free_gb=5000, score=5.0)
     assert stats["searched"] == 1

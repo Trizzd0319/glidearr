@@ -342,9 +342,14 @@ def empty_config() -> dict:
         # release at the floor tier rather than flagging UNACQUIRABLE — so genuinely SD-only shows are
         # still seeded. floor_res=0 (+ soft_floor) restores the old "lowest of everything" behavior.
         # enabled:false falls back to the blind climb.
+        # min_watchability (default 20): interactive-search a stub pilot only when its affinity-driven
+        # watchability_score is >= this OR not yet graded — so the household's plausibly-wanted shows
+        # get sampled, not every empty series (which otherwise hammers indexers for thousands of
+        # zero-affinity pilots/run). The row + score are never gated, so a held-back stub keeps being
+        # re-graded and returns once its affinity climbs back over the floor. 0 disables the gate.
         "pilot_interactive": {"enabled": True, "recheck_days": 7, "floor_res": 720,
                               "search_no_resolution": True, "skip_hard_rejects": True,
-                              "soft_floor": True, "anime_ladder": True},
+                              "soft_floor": True, "anime_ladder": True, "min_watchability": 20},
         # Legacy escape hatch (only used when pilot_floor_climb is OFF). best_tier_first ON makes a
         # stub pilot target the HIGHEST tier whose grab keeps the space reserve, diverting DOWN one
         # rung per empty run (never likelihood-gated). OFF = legacy floor-first/step-up across runs.

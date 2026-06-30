@@ -122,6 +122,24 @@ def pilot_search_due(last_searched, now, interval) -> bool:
         return True
 
 
+def pilot_watchability_keep(scores, floor):
+    """Boolean keep-mask for the pilot INTERACTIVE search, gated by watch-likelihood so the daemon
+    stops hammering indexers for thousands of low-affinity stub pilots every run.
+
+    Keep a stub when its ``watchability_score`` is MISSING (NaN — not yet graded, so sample it ONCE)
+    OR at/above ``floor``. A graded stub BELOW the floor is held back from the expensive search — but
+    its parquet row + score are untouched, so ``refresh_scores`` keeps re-grading it (affinity for an
+    unwatched show: cast/crew/studio/genre vs the household's evolving taste), and it returns to the
+    search the instant its affinity climbs back over the floor. No permanent dead-zone.
+
+    ``floor`` <= 0 (or None) DISABLES the gate (keep everything). ``scores`` is a pandas Series; the
+    returned mask shares its index."""
+    if floor is None or float(floor) <= 0:
+        return pd.Series(True, index=scores.index)
+    s = pd.to_numeric(scores, errors="coerce")
+    return s.isna() | (s >= float(floor))
+
+
 def pilot_backoff_interval(base_interval, attempts_done, *, backoff=None):
     """Effective re-search interval for a stub given how many times it has already been
     searched. DEFAULT (``backoff`` falsy / ``enabled`` not set) -> ``base_interval``

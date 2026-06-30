@@ -67,6 +67,7 @@ from scripts.managers.machine_learning.acquisition.pilot_stepping import (
     pilot_backoff_interval,
     pilot_recheck_due,
     pilot_search_due,
+    pilot_watchability_keep,
     profile_max_resolution,
     rank_pilot_profiles,
 )
@@ -108,6 +109,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     GRACE_HOURS       = 3        # keep a watched file available this long before deletion
     RECENT_AIR_DAYS   = 30       # never delete an episode that aired within this many days
     PREFETCH_HOURS    = 3.0      # target runtime budget of upcoming episodes to pre-acquire per series
+    PILOT_MIN_WATCHABILITY = 20.0  # interactive-search a stub pilot only when its (affinity-driven)
+                                   # watchability_score is >= this OR not yet graded — so the daemon
+                                   # samples the shows the household is plausibly interested in, not
+                                   # every empty series. 0 disables the gate (search every stub). The
+                                   # row + score are never gated, so a held-back stub keeps being
+                                   # re-graded and returns once its affinity climbs back over the floor.
     # Cache key the Plex playlist builder writes the fetched mdblist universe lists under; the
     # per-group prefetch walk reads the SAME source so acquisition + playlists agree on grouping.
     _UNIVERSE_SRC_KEY = "plex/playlists/universe_source"
@@ -4394,9 +4401,31 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             df["is_pilot"].infer_objects(copy=False).fillna(False).astype(bool)
             & df["episode_file_id"].isna()
         )
+        # ── Watchability gate ─────────────────────────────────────────────────────────────────
+        # Only INTERACTIVE-SEARCH stub pilots the household is plausibly interested in: keep a stub
+        # whose persisted watchability_score (affinity for an unwatched show — cast/crew/studio/genre)
+        # is >= the floor, OR is not yet graded (NaN → sample once). A graded low-affinity stub is held
+        # back from the expensive indexer search but its row + score are UNTOUCHED, so refresh_scores
+        # keeps re-grading it every run and it returns the moment its affinity climbs back over the
+        # floor (no dead-zone). Inert when the column is absent (first post-reset run) or the floor is 0.
+        try:
+            _pilot_floor = float((((self.config or {}).get("pilot_interactive", {}) or {})
+                                  .get("min_watchability", self.PILOT_MIN_WATCHABILITY)))
+        except (TypeError, ValueError):
+            _pilot_floor = self.PILOT_MIN_WATCHABILITY
+        if _pilot_floor > 0 and "watchability_score" in df.columns:
+            _keep = pilot_watchability_keep(df["watchability_score"], _pilot_floor)
+            _gated_out = int((stub_mask & ~_keep).sum())
+            if _gated_out:
+                stub_mask = stub_mask & _keep
+                self.logger.log_info(
+                    f"[PilotSearch] watchability gate: holding back {_gated_out} low-affinity stub "
+                    f"pilot(s) (score < {_pilot_floor:.0f}) from search — re-graded each run, sampled "
+                    f"once affinity climbs."
+                )
         if not stub_mask.any():
             self.logger.log_info(
-                f"[PilotSearch] No stub pilots for '{instance}' — nothing to search."
+                f"[PilotSearch] No stub pilots due for '{instance}' — nothing to search."
             )
             return stats
 
