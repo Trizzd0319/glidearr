@@ -2,6 +2,9 @@ from datetime import datetime, timedelta, timezone
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
+from scripts.managers.machine_learning.classification.keep_policy import series_keep_policy
+from scripts.managers.machine_learning.lifecycle.series_monitor_policy import series_monitor_action
+from scripts.managers.machine_learning.lifecycle.stale_prune_policy import clock_age
 from scripts.managers.machine_learning.likelihood.watch_likelihood import (
     resolution_cap_for_likelihood,
     watch_likelihood,
@@ -424,6 +427,236 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
         )
         return stats
 
+
+    # ── Monitor-by-watchability (dormant the low-affinity tail; recover climbers) ────
+    @LoggerManager().log_function_entry
+    @timeit("run_monitor_by_watchability")
+    def run_monitor_by_watchability(self, instance: str) -> dict:
+        """Sonarr monitor-by-watchability — the MONITOR-ONLY twin of Radarr's owned-monitor / stale
+        prune. UNMONITOR the persistently low-affinity tail (so Sonarr stops grabbing the empty-series
+        backlog and every pass has fewer monitored series to chew through) and RE-MONITOR a series
+        whose watchability score climbs back — with the same sticky hysteresis band + optional dwell as
+        the pilot gate, and HARD GUARDS: a keep_series/keep_season-tagged series (the user pinned it) or
+        one the household has WATCHED is never unmonitored; an un-graded series defers. NEVER deletes a
+        series or any file — it only flips Sonarr's ``monitored`` flag. Decision in
+        ``lifecycle/series_monitor_policy.series_monitor_action``.
+
+        ALWAYS ON — there is no enable/disable switch; the policy runs every pass. The score band and
+        dwell are still tunable (``series_monitor_score_threshold`` / ``series_demote_score_threshold``
+        / ``series_demote_dwell_days``), and the hard guards (keep-tag, household-watched, un-graded
+        defer, fail-safe keep-tag fetch) keep it conservative. Honours dry_run. Runs AFTER
+        refresh_scores so it reads this run's fresh per-series score."""
+        import pandas as pd
+        instance = (self.instance_manager.resolve_instance(instance)
+                    if self.instance_manager else instance)
+        stats = {"checked": 0, "monitored": 0, "unmonitored": 0, "held": 0,
+                 "guarded": 0, "deferred": 0, "aging": 0, "failed": 0, "guard_deferred": 0}
+
+        def _int_cfg(key, default):
+            try:
+                return int((self.config or {}).get(key, default))
+            except (TypeError, ValueError):
+                return default
+        promote_threshold = _int_cfg("series_monitor_score_threshold", 35)
+        demote_floor      = _int_cfg("series_demote_score_threshold", 20)
+        dwell_days        = max(0, _int_cfg("series_demote_dwell_days", 2))
+
+        # ── Per-series score + watched flag from the parquet (refresh_scores ran just before us) ──
+        try:
+            ep_mgr = self.registry.get("manager", "SonarrCacheEpisodeFilesManager") if self.registry else None
+            df = ep_mgr.load(instance) if ep_mgr else None
+        except Exception as e:
+            self.logger.log_warning(f"[SeriesMonitor] could not load episode_files for '{instance}': {e}")
+            return stats
+        if df is None or getattr(df, "empty", True) or "series_id" not in df.columns:
+            return stats
+        score_by_series: dict[int, float | None] = {}
+        watched_series: set[int] = set()
+        if "watchability_score" in df.columns:
+            grp = df.groupby("series_id")
+            for sid, sc in grp["watchability_score"].first().items():
+                try:
+                    score_by_series[int(sid)] = float(sc) if pd.notna(sc) else None
+                except (TypeError, ValueError):
+                    continue
+            if "is_watched" in df.columns:
+                for sid, w in grp["is_watched"].any().items():
+                    if bool(w):
+                        try:
+                            watched_series.add(int(sid))
+                        except (TypeError, ValueError):
+                            continue
+
+        # ── Live series objects (current monitored + tags) from the fresh series cache ──
+        series_cache = getattr(self.sonarr_cache, "series", None)
+        all_series = list(series_cache.iter_all_series(instance)) if series_cache else []
+        if not all_series:
+            return stats
+
+        # keep_series / keep_season tag ids for this instance → intent-preservation.
+        # FAIL-SAFE: the keep tag is exactly how a user pins a LOW-affinity show this policy would
+        # otherwise dormant, so the guard must never fail open. Pass fallback=None so we can tell a
+        # FAILED fetch (→ None) from a genuinely-empty catalogue (→ []): _make_request returns the
+        # real response (even []) on success and only the fallback on error. On failure we suppress
+        # the UNMONITOR leg below (re-monitoring climbers stays safe); a real empty catalogue means
+        # no keep tags exist, so nothing is pinned and unmonitoring is fine.
+        tags_ok = True
+        try:
+            raw_tags = self.sonarr_api._make_request(instance, "tag", fallback=None)
+            if raw_tags is None:
+                tags_ok = False
+                raw_tags = []
+            tag_id = {str(t.get("label", "")).lower(): t.get("id")
+                      for t in raw_tags if isinstance(t, dict) and t.get("id") is not None}
+        except Exception:
+            tags_ok = False
+            tag_id = {}
+        keep_series_id = tag_id.get("keep_series")
+        keep_season_id = tag_id.get("keep_season")
+
+        clock_key = f"sonarr/{instance}/monitor_demote_clock"
+        clock = self.global_cache.get(clock_key) if self.global_cache else None
+        clock = clock if isinstance(clock, dict) else {}
+        new_clock: dict[str, str] = {}
+        now = datetime.now(tz=timezone.utc)
+        now_iso = now.isoformat()
+
+        monitor_ids: list[int] = []
+        unmonitor_ids: list[int] = []
+        unmonitor_since: dict[str, str] = {}   # sid → dwell start, for dry_run clock preservation
+        for s in all_series:
+            sid = s.get("id")
+            if sid is None:
+                continue
+            stats["checked"] += 1
+            sid = int(sid)
+            score = score_by_series.get(sid)
+            has_score = score is not None
+            keep_tagged = series_keep_policy(s.get("tags") or [], keep_series_id, keep_season_id) is not None
+            watched = sid in watched_series
+            monitored = bool(s.get("monitored"))
+
+            # Advance the dwell clock only while a monitored, non-guarded series sits below the floor.
+            below_floor = (monitored and has_score and not keep_tagged and not watched
+                           and score < demote_floor)
+            since_iso, age_days = (clock_age(clock.get(str(sid)) or now_iso, now)
+                                   if below_floor else (now_iso, 0))
+
+            action = series_monitor_action(
+                monitored=monitored, score=score, has_score=has_score,
+                keep_tagged=keep_tagged, watched=watched,
+                promote_threshold=promote_threshold, demote_floor=demote_floor,
+                age_days=age_days, dwell_days=dwell_days,
+            )
+            if action == "unmonitor":
+                unmonitor_ids.append(sid)            # real run drops the clock (acted)
+                unmonitor_since[str(sid)] = since_iso  # dry_run keeps it (see preview below)
+            elif action == "monitor":
+                monitor_ids.append(sid)
+            elif action == "defer":
+                stats["deferred"] += 1
+            else:  # hold — categorise (mutually exclusive): aging / guarded / plain hold
+                if below_floor:
+                    new_clock[str(sid)] = since_iso  # still aging toward the dwell
+                    stats["aging"] += 1
+                elif monitored and (keep_tagged or watched) and has_score and score < demote_floor:
+                    stats["guarded"] += 1            # would-demote but pinned/watched → spared
+                else:
+                    stats["held"] += 1
+
+        # Keep-guard unavailable (tag fetch failed) → suppress the UNMONITOR leg this pass so a
+        # user-pinned series can never be dormanted unguarded. Re-monitoring climbers stays safe.
+        if not tags_ok and unmonitor_ids:
+            stats["guard_deferred"] = len(unmonitor_ids)
+            self.logger.log_warning(
+                f"  ⚠️ [{instance}] keep-tag catalogue unavailable — deferring unmonitor of "
+                f"{len(unmonitor_ids)} series this pass (keep guard would be unenforced)."
+            )
+            unmonitor_ids = []
+            unmonitor_since = {}
+
+        # ── Apply (bulk series/editor PUT, like Radarr's movie/editor) — dry_run-aware ──
+        if self.dry_run:
+            stats["unmonitored"] = len(unmonitor_ids)
+            stats["monitored"] = len(monitor_ids)
+            # Preview stability: a dwell-met candidate isn't actually unmonitored in dry_run, so keep
+            # its dwell clock — else the next preview resets age→0 and the series oscillates
+            # "would unmonitor" / quiet / "would unmonitor". (Mirrors the Radarr twin in anomaly.py.)
+            for k, v in unmonitor_since.items():
+                new_clock.setdefault(k, v)
+            if unmonitor_ids or monitor_ids:
+                self.logger.log_info(
+                    f"  [dry_run] [{instance}] would unmonitor {len(unmonitor_ids)} low-affinity "
+                    f"series + (re)monitor {len(monitor_ids)} climber(s)."
+                )
+        else:
+            # Chunk the ids like router_show.py / sonarr_regrab_deleted_pilots.py: each Sonarr write +
+            # write-lock-hold stays small, well under the shared 30s HTTP timeout, and a large first-
+            # enablement pass is resumable instead of one oversized PUT that can time out and mis-mark
+            # the whole set as failed (the client returns the fallback on timeout).
+            _BATCH = 200
+            for ids, mon, key in ((unmonitor_ids, False, "unmonitored"), (monitor_ids, True, "monitored")):
+                if not ids:
+                    continue
+                ok = 0
+                for i in range(0, len(ids), _BATCH):
+                    chunk = ids[i:i + _BATCH]
+                    try:
+                        resp = self.sonarr_api._make_request(
+                            instance, "series/editor", method="PUT",
+                            payload={"seriesIds": chunk, "monitored": mon},
+                        )
+                        if resp:
+                            ok += len(chunk)
+                        else:
+                            stats["failed"] += len(chunk)
+                    except Exception as e:
+                        self.logger.log_warning(
+                            f"  ⚠️ [{instance}] series/editor monitored={mon} chunk failed: {e}")
+                        stats["failed"] += len(chunk)
+                if ok:
+                    stats[key] = ok
+                    self.logger.log_info(
+                        f"  {'🔕' if not mon else '📈'} [{instance}] set monitored={mon} for "
+                        f"{ok} series ({key})."
+                    )
+
+        if self.global_cache is not None:
+            try:
+                self.global_cache.set(clock_key, new_clock)   # aging state (non-destructive)
+            except Exception:
+                pass
+
+        prefix = "[dry_run] " if self.dry_run else ""
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["checked",     stats["checked"]],
+                ["unmonitored", stats["unmonitored"]],
+                ["monitored",   stats["monitored"]],
+                ["held",        stats["held"]],
+                ["aging",       stats["aging"]],
+                ["guarded",     stats["guarded"]],
+                ["deferred",    stats["deferred"]],
+                ["guard_deferred", stats["guard_deferred"]],
+                ["failed",      stats["failed"]],
+            ],
+            title=(f"[SeriesMonitor] {prefix}Monitor-by-watchability - '{instance}' "
+                   f"(monitor>={promote_threshold}, demote<{demote_floor}, dwell {dwell_days}d)"),
+            caption="Dormant the low-affinity tail + recover climbers by watchability (never deletes).",
+            descriptions=[
+                "series examined this pass",
+                "low-affinity series set unmonitored (dormant — Sonarr stops grabbing)",
+                "climbers (score recovered) set monitored",
+                "left as-is (sticky band / guarded / clocking)",
+                "below-floor series whose dwell clock advanced",
+                "spared: keep-tagged or household-watched",
+                "deferred: not yet graded (no score)",
+                "unmonitor skipped this pass: keep-tag catalogue unavailable (fail-safe)",
+                "series whose series/editor call errored",
+            ],
+        )
+        return stats
 
     @LoggerManager().log_function_entry
     @timeit("get_series_profile_id")

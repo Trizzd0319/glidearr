@@ -54,11 +54,12 @@ class SonarrOrchestrationSeriesManager(BaseManager, ComponentManagerMixin):
         self.logger.log_info(f"🔄 Running series retrieval pipeline (instance={instance})...")
 
         from_cache = False  # default: assume a sync happened
+        live_series = None  # the live /series list refresh_all_series fetched (reused by validation)
         if full_refresh:
             result = self.retrieval.fetch.refresh_all_series(instance=instance)
             # refresh_all_series returns (series_list, from_cache: bool)
             if isinstance(result, tuple) and len(result) == 2:
-                _, from_cache = result
+                live_series, from_cache = result
 
         if validate:
             if from_cache:
@@ -67,7 +68,9 @@ class SonarrOrchestrationSeriesManager(BaseManager, ComponentManagerMixin):
                     "Series count and schema were confirmed at last sync."
                 )
             else:
-                self.retrieval.validate.validate_series_count(instance)
+                # Reuse the live list refresh_all_series just fetched — the count-drift check needs a
+                # live count, but there's no reason to pull all ~8k series from Sonarr a second time.
+                self.retrieval.validate.validate_series_count(instance, live_series=live_series)
                 self.retrieval.validate.validate_series_schema(instance)
 
         self.retrieval.series_cache.persist_letter_cache(instance)
@@ -133,9 +136,10 @@ class SonarrOrchestrationSeriesManager(BaseManager, ComponentManagerMixin):
         self.logger.log_info(
             f"📚 Episode file enrichment: {len(all_series)} series in '{resolved}'"
         )
+        # Create/refresh the stub-pilot rows now so refresh_scores (below) grades them THIS run; the
+        # interactive search itself is deferred until AFTER scoring so its watchability gate reads the
+        # current run's score (no one-run lag).
         episode_files_mgr.run_pilot_batch(resolved, all_series)
-        # Search for missing pilots, stepping down quality profile if previously attempted
-        episode_files_mgr.run_pilot_search(resolved)
         # Restore any JIT-upgraded episodes that were watched since last run
         episode_files_mgr.run_jit_quality_restores(resolved)
         # sync_from_tautulli: upserts watched history + computes next_episode
@@ -155,6 +159,13 @@ class SonarrOrchestrationSeriesManager(BaseManager, ComponentManagerMixin):
             self.logger.log_warning(
                 f"[ShowScore] refresh_scores failed for '{resolved}': {e}"
             )
+        # Search for missing pilots — runs AFTER refresh_scores so the watchability gate
+        # (pilot_interactive.min_watchability) reads THIS run's fresh per-series score instead of the
+        # prior run's, and so it works on the very first run after a cache reset. The stub rows were
+        # created by run_pilot_batch above (so refresh_scores already graded them); the interactive
+        # search steps the quality profile down if a prior attempt found nothing. Enqueued after the
+        # JIT next-up grabs, so the JIT-priority daemon claims those first.
+        episode_files_mgr.run_pilot_search(resolved)
         # Broadcast per-series genres + cast/crew + Trakt rating onto the episode rows
         # (from Sonarr + the enrich daemon's show buckets) so the cross-medium next-watch
         # affinity reads TV taste from the same columns as movie_files. Guarded + best-effort.
@@ -187,6 +198,10 @@ class SonarrOrchestrationSeriesManager(BaseManager, ComponentManagerMixin):
         self.run_series_sync(instance=instance, use_tautulli=False, force_all=False)
         self.run_episode_file_enrichment(instance=instance)
         self.run_active_watcher_upgrades(instance=instance)
+        # Monitor-by-watchability: dormant the low-affinity tail (Sonarr stops grabbing it) + recover
+        # climbers. Runs AFTER refresh_scores (fresh scores) and after the upgrade pass so monitored
+        # state is settled before the space-pressure work. Always on (no enable/disable switch).
+        self.run_monitor_by_watchability(instance=instance)
         # Stage-1 TV downgrade under space pressure — runs AFTER refresh_scores (in
         # run_episode_file_enrichment) so it ranks on fresh watchability scores.
         self.run_space_pressure_downgrades(instance=instance)
@@ -219,6 +234,28 @@ class SonarrOrchestrationSeriesManager(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_warning(
                 f"[Orchestration] Active-watcher upgrades failed for '{resolved}': {e}"
+            )
+            return {}
+
+    @timeit("run_monitor_by_watchability")
+    def run_monitor_by_watchability(self, instance: str = None):
+        """Dormant the low-affinity tail + recover climbers by watchability (monitor-only; never
+        deletes). Delegates to series.quality.run_monitor_by_watchability, which always runs (no
+        enable/disable switch)."""
+        resolved = (
+            self.manager.instance_manager.resolve_instance(instance)
+            if getattr(getattr(self, "manager", None), "instance_manager", None) else instance
+        )
+        try:
+            quality_mgr = getattr(self.series_manager, "quality", None)
+            if quality_mgr is None or not hasattr(quality_mgr, "run_monitor_by_watchability"):
+                return {}
+            stats = quality_mgr.run_monitor_by_watchability(resolved)
+            self.logger.log_info(f"[Orchestration] Monitor-by-watchability for '{resolved}': {stats}")
+            return stats
+        except Exception as e:
+            self.logger.log_warning(
+                f"[Orchestration] Monitor-by-watchability failed for '{resolved}': {e}"
             )
             return {}
 

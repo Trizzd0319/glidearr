@@ -38,12 +38,18 @@ class SonarrSeriesRetrievalValidationManager(BaseManager, ComponentManagerMixin)
 
     @LoggerManager().log_function_entry
     @timeit("validate_series_count")
-    def validate_series_count(self, instance: str) -> float:
+    def validate_series_count(self, instance: str, live_series: list = None) -> float:
         """
         Checks for drift between live Sonarr series and cache count.
+
+        ``live_series``: when the caller already fetched the live ``/series`` list THIS run (the
+        ``run_series_retrieval`` after a live refresh — exactly when this drift check runs), pass it
+        in to skip a redundant second full ``/series`` fetch of all ~8k series. The drift comparison
+        (live count vs cache count) is identical; we just don't pull the same list twice.
         """
         resolved_instance = self.instance_manager.resolve_instance(instance)
-        live_series = self.sonarr_api.get_all_sonarr_apis()[resolved_instance].all_series()
+        if live_series is None:
+            live_series = self.sonarr_api.get_all_sonarr_apis()[resolved_instance].all_series()
         cached_ids = self.series_cache.get_all_series_ids(resolved_instance)
 
         live_count = len(live_series)

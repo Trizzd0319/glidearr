@@ -174,6 +174,20 @@ def empty_config() -> dict:
         "space_coordinator_enabled": True,
         "tv_downgrade_enabled": True,
         "tv_space_pressure_score_ceiling": 20,
+        # Sonarr SERIES monitor-by-watchability (the monitor-only twin of the Radarr owned-monitor
+        # policy): UNMONITOR the persistently low-affinity tail so Sonarr stops grabbing the
+        # empty-series backlog (and every pass has fewer monitored series to process), and RE-MONITOR
+        # a series whose score climbs back. ALWAYS ON — there is no enable/disable switch; it runs every
+        # pass, kept conservative by sticky hysteresis (monitor at the threshold, demote only below the
+        # floor), dwell, keep-tag / household-watched hard guards, and a defer for un-graded series. It
+        # NEVER deletes a series or any file — only flips the monitored flag. Only the band + dwell are
+        # tunable: demote_score_threshold/monitor_score_threshold form the sticky band; demote_dwell_days
+        # requires the score to stay below the floor for N days before unmonitoring — non-zero so a show
+        # someone is mid-watch (but Tautulli hasn't synced yet, so the watched guard hasn't tripped) is
+        # never dormanted on a single below-floor pass; set to 0 to act on the first pass.
+        "series_monitor_score_threshold": 35,
+        "series_demote_score_threshold": 20,
+        "series_demote_dwell_days": 2,
         # Pre-destructive safety: before a REAL run (dry_run=false) makes any delete / re-grab,
         # snapshot each Radarr/Sonarr DB+config via its native Backup command and validate it is
         # loadable. On failure the run DEGRADES TO DRY-RUN (no destructive changes). deep_validate
