@@ -62,7 +62,7 @@ class QueueCancelMixin:
             records = resp.get("records") or (resp if isinstance(resp, list) else [])
         except Exception as e:
             self.logger.log_warning(
-                f"[Queue] Could not fetch Sonarr queue for '{series_title}': {e}"
+                f"[Queue] [{instance}] Could not fetch Sonarr queue for '{series_title}': {e}"
             )
             return 0
 
@@ -75,7 +75,7 @@ class QueueCancelMixin:
         for qid in to_delete:
             if self.dry_run:
                 self.logger.log_info(
-                    f"  [dry_run] Would cancel queue item {qid} for '{series_title}'"
+                    f"  [dry_run] [{instance}] Would cancel queue item {qid} for '{series_title}'"
                 )
                 cancelled += 1
                 continue
@@ -86,12 +86,12 @@ class QueueCancelMixin:
                     method="DELETE",
                 )
                 self.logger.log_info(
-                    f"  🗑️ Cancelled queue item {qid} for '{series_title}'"
+                    f"  🗑️ [{instance}] Cancelled queue item {qid} for '{series_title}'"
                 )
                 cancelled += 1
             except Exception as e:
                 self.logger.log_warning(
-                    f"  ⚠️ Failed to cancel queue item {qid}: {e}"
+                    f"  ⚠️ [{instance}] Failed to cancel queue item {qid}: {e}"
                 )
 
         return cancelled
@@ -117,7 +117,7 @@ class QueueCancelMixin:
             records = resp.get("records") or (resp if isinstance(resp, list) else [])
         except Exception as e:
             self.logger.log_warning(
-                f"[Queue] Could not fetch Sonarr queue for series {series_id}: {e}"
+                f"[Queue] [{instance}] Could not fetch Sonarr queue for series {series_id}: {e}"
             )
             return 0
 
@@ -129,7 +129,7 @@ class QueueCancelMixin:
                 continue
             if self.dry_run:
                 self.logger.log_info(
-                    f"  [dry_run] Would cancel queue item {qid} for '{series_title}'"
+                    f"  [dry_run] [{instance}] Would cancel queue item {qid} for '{series_title}'"
                 )
                 cancelled += 1
                 continue
@@ -140,12 +140,12 @@ class QueueCancelMixin:
                     method="DELETE",
                 )
                 self.logger.log_info(
-                    f"  🗑️ Cancelled queue item {qid} for '{series_title}'"
+                    f"  🗑️ [{instance}] Cancelled queue item {qid} for '{series_title}'"
                 )
                 cancelled += 1
             except Exception as e:
                 self.logger.log_warning(
-                    f"  ⚠️ Failed to cancel queue item {qid}: {e}"
+                    f"  ⚠️ [{instance}] Failed to cancel queue item {qid}: {e}"
                 )
 
         return cancelled
@@ -173,7 +173,7 @@ class QueueCancelMixin:
             records = resp.get("records") or (resp if isinstance(resp, list) else [])
         except Exception as e:
             self.logger.log_warning(
-                f"[Queue] Could not fetch Radarr queue for '{movie_title}': {e}"
+                f"[Queue] [{instance}] Could not fetch Radarr queue for '{movie_title}': {e}"
             )
             return 0
 
@@ -185,7 +185,7 @@ class QueueCancelMixin:
                 continue
             if self.dry_run:
                 self.logger.log_info(
-                    f"  [dry_run] Would cancel Radarr queue item {qid} for '{movie_title}'"
+                    f"  [dry_run] [{instance}] Would cancel Radarr queue item {qid} for '{movie_title}'"
                 )
                 cancelled += 1
                 continue
@@ -196,12 +196,12 @@ class QueueCancelMixin:
                     method="DELETE",
                 )
                 self.logger.log_info(
-                    f"  🗑️ Cancelled Radarr queue item {qid} for '{movie_title}'"
+                    f"  🗑️ [{instance}] Cancelled Radarr queue item {qid} for '{movie_title}'"
                 )
                 cancelled += 1
             except Exception as e:
                 self.logger.log_warning(
-                    f"  ⚠️ Failed to cancel Radarr queue item {qid}: {e}"
+                    f"  ⚠️ [{instance}] Failed to cancel Radarr queue item {qid}: {e}"
                 )
 
         return cancelled
