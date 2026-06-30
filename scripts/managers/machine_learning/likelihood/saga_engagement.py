@@ -2,7 +2,7 @@
 saga_engagement.py — gather the HOUSEHOLD, cross-media saga engagement that feeds the saga QUALITY
 credit (:func:`watch_likelihood.saga_credit`).
 ================================================================================
-The per-member math is PURE (``universe_order.saga_member_engagement`` + ``watch_likelihood.
+The per-member math is PURE (``saga_order.saga_member_engagement`` + ``watch_likelihood.
 saga_credit``); this module is the thin I/O layer that assembles their inputs from the caches the
 universe-acquisition capstone already populates, so movie + TV engagement is read ONE way:
 
@@ -17,7 +17,7 @@ callers (``_apply_universe_credit`` in the Radarr + Sonarr pre-pass) further wra
 """
 from __future__ import annotations
 
-from scripts.managers.services.plex.playlists.universe_order import (
+from scripts.managers.machine_learning.likelihood.saga_order import (
     saga_member_engagement,
     unified_universe_order,
 )
