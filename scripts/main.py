@@ -760,6 +760,24 @@ class Main(BaseManager, ComponentManagerMixin):
 
 if __name__ == "__main__":
     logger = LoggerManager()
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # STEP 0 — CLI: a tiny opt-in parser (parse_known_args so a no-flag run is unchanged).
+    #   --reset-caches [--apply] : wipe the rebuildable sonarr/radarr/trakt/library/operational
+    #   caches for a clean test rebuild, PRESERVING the expensive internet enrichment + the
+    #   collection/saga/universe data. Previews by default (deletes nothing); add --apply to delete.
+    #   Runs BEFORE config/onboarding (the reset needs neither) and exits.
+    # ════════════════════════════════════════════════════════════════════════════
+    import argparse as _argparse
+    _cli_parser = _argparse.ArgumentParser(add_help=False)
+    _cli_parser.add_argument("--reset-caches", action="store_true")
+    _cli_parser.add_argument("--apply", action="store_true")
+    _cli_args, _ = _cli_parser.parse_known_args()
+    if _cli_args.reset_caches:
+        from scripts.support.tools.cache_reset import run_cache_reset
+        run_cache_reset(apply=_cli_args.apply, logger=logger)
+        raise SystemExit(0)
+
     # ════════════════════════════════════════════════════════════════════════════
     # STEP 1 — CONFIGURATION: check the config, run setup to GENERATE it if needed,
     #          then load it. Onboarding runs FIRST (before ConfigManager) so it
