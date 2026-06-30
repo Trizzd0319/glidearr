@@ -52,11 +52,16 @@ file ever deleted is a dedup LOSER's, and only after the keeper's file is confir
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from scripts.managers.machine_learning.classification.keep_policy import resolve_keep_policy
+from scripts.managers.machine_learning.lifecycle.stale_prune_policy import clock_age
 from scripts.managers.machine_learning.space import dual_version
 from scripts.managers.machine_learning.space.cross_instance_dedup import plan_dedup
 from scripts.managers.machine_learning.space.routing_targets import (
     cross_instance_dedup_enabled,
     cross_instance_move_enabled,
+    demote_4k_on_watchability_enabled,
     evict_uhd_first,
     proactive_4k_enabled,
     relocation_enabled,
@@ -78,7 +83,30 @@ _UHD_LABELS = ("4K", "4k", "uhd", "UHD", "2160p", "2160")
 _UHD_RES = 2160
 
 
+def _tmdb_present(ledger_key, present_tmdbs) -> bool:
+    """Is a watch-demote ledger key (a str tmdbId) still in the current 4K library (a set of int
+    tmdbIds)? Used to prune ledger entries whose 4K record vanished entirely."""
+    try:
+        return int(ledger_key) in present_tmdbs
+    except (TypeError, ValueError):
+        return False
+
+
+def _norm_path(p) -> str:
+    """Slash-tolerant path normalisation for same-physical-file comparison across instances."""
+    return str(p or "").replace("\\", "/").strip().rstrip("/")
+
+
 class UhdReconcileManager:
+    # global_cache ledger of titles whose 4K BONUS was demoted on WATCHABILITY (fileless,
+    # unmonitored 4K record kept). Keyed by 4K instance; entries drop when the title's score
+    # recovers (re-acquired), regains a 4K file by other means, or leaves the 4K library.
+    _WATCH_DEMOTED_KEY = "radarr/{inst}/watch_demoted_4k"
+    # Per-title "continuously below the demote floor since" clock (ISO), for the optional dwell that
+    # absorbs a transient large affinity swing. Keyed by 4K instance; reset the instant a title
+    # recovers to/above the demote floor.
+    _WATCH_DEMOTE_CLOCK_KEY = "radarr/{inst}/watch_demote_clock"
+
     def __init__(self, config=None, logger=None, *, radarr=None, dry_run=False, registry=None, **kwargs):
         self.config = config or {}
         self.logger = logger
@@ -148,8 +176,9 @@ class UhdReconcileManager:
             return                                          # single-copy policy → nothing to do
         mode = reorg_mode(self.config)
         evict = evict_uhd_first(self.config)
-        if mode == "off" and not evict:
-            return                                          # neither path enabled → nothing
+        demote = demote_4k_on_watchability_enabled(self.config)
+        if mode == "off" and not evict and not demote:
+            return                                          # no path enabled → nothing
         im = self._im
         if im is None or not hasattr(im, "_get_apis") or not hasattr(im, "_make_request"):
             return
@@ -159,6 +188,11 @@ class UhdReconcileManager:
             return                                          # no distinct 4K instance → nowhere to route
         self._plan_rows = []                                # consolidated move/dedup preview grid
         self._plan_file_started = False
+        self._baselines_grabbed = set()                     # tmdbs given a standard baseline THIS run —
+        #                                                     shared by the pressure (_downgrade_orphan_4k)
+        #                                                     and watchability (_demote_overqualified_4k)
+        #                                                     legs so they never double-grab one title (the
+        #                                                     gateway library cache wouldn't reflect the add).
         # MOVE / ACQUIRE owned standard-tier titles toward the 4K instance (reorg-gated).
         if mode != "off":
             self._run_move_acquire(gw, fourk, mode)
@@ -171,6 +205,12 @@ class UhdReconcileManager:
         # (evict-gated), so the coordinator can then reclaim their 4K without losing the title.
         if evict:
             self._downgrade_orphan_4k(gw, fourk)
+        # DEMOTE dual-version 4K BONUS copies whose WATCHABILITY fell below the UHD threshold — even
+        # when space is fine (the pressure path stays with evict_uhd_first / the coordinator). The
+        # 1080p baseline must survive on standard (never the last copy); the 4K record is kept so the
+        # companion is re-acquired if the score recovers.
+        if demote:
+            self._demote_overqualified_4k(gw, fourk)
         self._flush_plan_grid()
 
     def _run_move_acquire(self, gw, fourk, mode):
@@ -356,11 +396,12 @@ class UhdReconcileManager:
                         or dual_version.DEFAULT_UHD_SCORE)
         likelihoods = self._likelihood_map(fourk)
         eff_dry = effective_dry_run(self.dry_run, self.global_cache)
+        grabbed = self.__dict__.setdefault("_baselines_grabbed", set())   # shared with the demote leg
         downgraded = 0
         for mv in (gw.library_items(fourk) or []):
             tmdb = mv.get("tmdbId")
-            if tmdb is None or tmdb in present:
-                continue                                    # has a baseline (or one pending) → skip
+            if tmdb is None or tmdb in present or tmdb in grabbed:
+                continue                                    # has a baseline (pending/filed/just-grabbed) → skip
             lk = likelihoods.get(tmdb)
             if lk is None or lk >= threshold:
                 continue                                    # warrants 4K (or unscored) → keep in 4K
@@ -370,11 +411,233 @@ class UhdReconcileManager:
                 downgraded += 1
             elif self._grab_baseline(gw, std_inst, mv, hd_pid, std_root):
                 downgraded += 1
+                grabbed.add(tmdb)                           # block the demote leg from re-grabbing it
                 self._log("log_info", f"[UHD] downgrading 4K-only '{mv.get('title')}' (watch {lk:.0f}) →"
                                       f" 1080p baseline searching on {std_inst}; 4K reclaimed once it lands.")
         if downgraded:
             self._log("log_info", f"[UHD] {downgraded} low-watchability 4K-only title(s) downgrading to a "
                                   f"1080p baseline (make-before-break; 4K reclaimed by the coordinator next run).")
+
+    # ── watchability-driven demote of dual-version 4K bonus copies ────────────────
+    def _keep_pinned(self, movie, tag_label_map) -> bool:
+        """True when the title carries a keep/universe pin (keep_forever/keep_movie/keep_universe/
+        universe) → spared from the watchability demote regardless of score (a saga member keeps its
+        4K). The recency-decayed borrowed credit for UNTAGGED saga members is already folded into the
+        watch-likelihood, so between this pin and that credit the saga bonus is fully honoured."""
+        try:
+            return resolve_keep_policy(movie, tag_label_map) is not None
+        except Exception:
+            return False
+
+    def _demote_overqualified_4k(self, gw, fourk):
+        """Demote 4K copies whose saga-aware WATCHABILITY fell below the UHD threshold — the
+        pressure-INDEPENDENT companion to the coordinator's space-driven evict. A HYSTERESIS BAND
+        (promote at the UHD threshold, demote only below ``threshold - 4k_demote_gap``) plus an
+        optional per-title dwell clock (``4k_demote_dwell_days``) stop a title from FLAPPING (delete +
+        re-acquire its 4K file every run) as the household watches SIBLING-ADJACENT films
+        (genre/cast/crew/studio) and nudges its affinity-driven score across the line. For a 2160p
+        title below the demote floor (for ≥ the dwell), not keep/universe-pinned:
+          • a SURVIVING 1080p baseline FILE on a standard-tier instance exists → delete the 4K FILE +
+            unmonitor (record kept, fileless, ledgered). NEVER the last copy.
+          • NO baseline yet (a 4K-ONLY title) → make-before-break: grab a ≤1080 baseline on standard
+            NOW (4K untouched); next run, once it imports, the title is a survivor and the branch above
+            evicts the 4K. No separate drain ledger — the survivor guard IS the make-before-break.
+        RECOVER: a ledgered, fileless, unmonitored 4K shell whose score climbs back to/above the UHD
+        threshold (the upper band edge) is re-monitored + searched. The asymmetry is deliberate —
+        demote fires below the FLOOR but recover only at/above the THRESHOLD, so a demoted title must
+        cross the whole band to re-acquire its 4K and can never demote-then-recover on a small swing
+        (a shell that recovers only INTO the band stays demoted; this is the anti-thrash, not a bug).
+        Space pressure stays the coordinator's job (``evict_uhd_first`` / FORK-D); the two compose."""
+        eff_dry = effective_dry_run(self.dry_run, self.global_cache)
+        mv_cfg = self._routing.get("movies", {}) or {}
+
+        def _int_cfg(key, default):
+            try:
+                return int(mv_cfg.get(key) or default)   # falsy (None/"" /0-as-unset) → default
+            except (TypeError, ValueError):
+                return default                            # non-numeric string → default, never raise
+        threshold = _int_cfg("4k_dual_min_score", dual_version.DEFAULT_UHD_SCORE)
+        gap = max(0, _int_cfg("4k_demote_gap", 10))
+        dwell_days = max(0, _int_cfg("4k_demote_dwell_days", 0))
+        demote_floor = max(0, threshold - gap)             # band [demote_floor, threshold) is sticky
+        try:
+            ultra = gw.library_items(fourk) or []
+        except Exception as e:
+            self._log("log_warning", f"[UHD] 4K library fetch failed for '{fourk}': {e}")
+            return
+        # Standard-tier state: every tmdb with ANY record (so a 4K-only rehome never re-grabs a pending
+        # baseline) and the subset with an actual FILE (the survivors — the make-before-break guard).
+        # survivor_path keeps the baseline file's path so we never delete a 4K file that is the SAME
+        # physical file as the "survivor" (shared storage / symlink — mirrors the move path's guard).
+        std_records: set = set()
+        survivors: set = set()
+        survivor_path: dict = {}
+        for name in self._source_instances(gw, fourk):
+            for m in (gw.library_items(name) or []):
+                if m.get("tmdbId") is None:
+                    continue
+                std_records.add(m.get("tmdbId"))
+                if m.get("hasFile"):
+                    survivors.add(m.get("tmdbId"))
+                    p = _norm_path(((m.get("movieFile") or {}).get("path")) or "")
+                    if p:
+                        survivor_path[m.get("tmdbId")] = p
+        likelihoods = self._likelihood_map(fourk)
+        tag_label_map = {t.get("id"): t.get("label") for t in (gw.tags(fourk) or [])
+                         if t.get("id") is not None}
+        # ≤1080 baseline target on the standard instance (for the 4K-only rehome leg).
+        std_inst = gw.default_instance()
+        hd = dual_version.pick_hd_profile(gw.quality_profiles(std_inst) or [], None) if std_inst else None
+        hd_pid = hd.get("id") if hd else None
+        std_root = self._mrf.get("standard") or (self._first_root(gw, std_inst) if std_inst else "")
+
+        key = self._WATCH_DEMOTED_KEY.format(inst=fourk)
+        ledger = self.global_cache.get(key) if self.global_cache else None
+        ledger = dict(ledger) if isinstance(ledger, dict) else {}
+        clock_key = self._WATCH_DEMOTE_CLOCK_KEY.format(inst=fourk)
+        clock = self.global_cache.get(clock_key) if self.global_cache else None
+        clock = clock if isinstance(clock, dict) else {}
+        new_clock: dict = {}
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        present_tmdbs: set = set()
+        demoted = rehomed = recovered = 0
+
+        for mv in ultra:
+            tmdb = mv.get("tmdbId")
+            if tmdb is None:
+                continue
+            present_tmdbs.add(tmdb)
+            lk = likelihoods.get(tmdb)
+
+            # ── RECOVER: a demoted shell (fileless, unmonitored, ledgered) whose watchability
+            # climbed back to/above the UHD threshold (the upper band edge) → re-monitor + search.
+            if not mv.get("hasFile"):
+                if (str(tmdb) in ledger and not mv.get("monitored")
+                        and lk is not None and lk >= threshold and mv.get("id") is not None):
+                    if eff_dry:
+                        self._log("log_info", f"[UHD] would re-acquire demoted 4K '{mv.get('title')}' "
+                                              f"(watch {lk:.0f}) on {fourk}.")
+                    else:
+                        gw.put(fourk, "movie/editor", {"movieIds": [mv.get("id")], "monitored": True})
+                        gw.command(fourk, {"name": "MoviesSearch", "movieIds": [mv.get("id")]})
+                        ledger.pop(str(tmdb), None)
+                        self._log("log_info", f"[UHD] re-acquiring demoted 4K '{mv.get('title')}' "
+                                              f"(watch {lk:.0f}) on {fourk}: re-monitored + searched.")
+                    self._record_plan(mv.get("title"), tmdb, "standard", fourk, "recover-4k",
+                                      "would-recover" if eff_dry else "recovered",
+                                      reason=f"watch {lk:.0f} >= {threshold}")
+                    recovered += 1
+                continue
+
+            # A 4K record that HAS a file is no longer a demoted shell — drop any stale ledger entry.
+            ledger.pop(str(tmdb), None)
+
+            # ── DEMOTE candidacy: 2160p, scored, not keep/universe-pinned, BELOW the demote floor.
+            if self._res(mv) <= 1080 or lk is None:
+                continue                                   # not a 2160p copy, or unscored → keep
+            if self._keep_pinned(mv, tag_label_map):
+                continue                                   # keep/universe pin → keep 4K (clock resets)
+            if lk >= demote_floor:
+                continue                                   # at/above the demote floor → sticky, keep 4K
+            # Below the demote floor → advance the dwell clock; only act once it's been below for the
+            # configured dwell (0 = act now; the band alone is the anti-flap).
+            since_iso, age_days = clock_age(clock.get(str(tmdb)) or now_iso, now)
+            if age_days < dwell_days:
+                new_clock[str(tmdb)] = since_iso           # keep aging, don't act yet
+                continue
+
+            grabbed = self.__dict__.setdefault("_baselines_grabbed", set())   # baselines added THIS run
+
+            if tmdb in survivors:
+                # SAME-PHYSICAL-FILE guard (shared storage): never delete a 4K file that IS the
+                # "surviving" baseline file — that would orphan the standard record (mirrors the
+                # move path's same-path guard). Hold it for the operator; keep aging the clock.
+                cur_4k_path = _norm_path(((mv.get("movieFile") or {}).get("path")) or "")
+                if cur_4k_path and cur_4k_path == survivor_path.get(tmdb):
+                    self._log("log_warning", f"[UHD] '{mv.get('title')}' on {fourk} shares ONE physical file "
+                                             f"with its standard baseline (same path) — skipping demote.")
+                    self._record_plan(mv.get("title"), tmdb, fourk, "standard", "demote", "flag-same-path")
+                    new_clock[str(tmdb)] = since_iso
+                    continue
+                # Baseline survives → safe to evict the 4K file now (make-before-break satisfied).
+                mid = mv.get("id")
+                fid = (mv.get("movieFile") or {}).get("id")
+                if mid is None or fid is None:
+                    continue
+                if eff_dry:
+                    self._log("log_info", f"[UHD] would demote 4K bonus '{mv.get('title')}' (watch {lk:.0f}) "
+                                          f"on {fourk}: delete 4K file + unmonitor (1080p baseline survives).")
+                    new_clock[str(tmdb)] = since_iso       # not actually demoted → keep aging the clock
+                else:
+                    # Unmonitor BEFORE deleting the file so Radarr won't instantly re-grab the 2160p.
+                    # Isolated so a single failed delete neither aborts the sweep nor half-applies: on
+                    # error we keep the clock and retry next run rather than ledger a non-demotion.
+                    try:
+                        gw.put(fourk, "movie/editor", {"movieIds": [mid], "monitored": False})
+                        gw.delete(fourk, f"moviefile/{fid}")
+                    except Exception as e:
+                        self._log("log_warning", f"[UHD] demote failed for '{mv.get('title')}' on {fourk}: {e}")
+                        new_clock[str(tmdb)] = since_iso
+                        continue
+                    ledger[str(tmdb)] = now_iso            # file gone → ledger tracks the shell for recovery
+                    self._log("log_info", f"[UHD] demoted 4K bonus '{mv.get('title')}' (watch {lk:.0f}) on "
+                                          f"{fourk}: 4K file deleted + unmonitored; 1080p baseline survives.")
+                self._record_plan(mv.get("title"), tmdb, fourk, "standard", "demote",
+                                  "would-demote" if eff_dry else "demoted",
+                                  reason=f"watch {lk:.0f} < {demote_floor}")
+                demoted += 1
+            elif tmdb not in std_records and tmdb not in grabbed:
+                # 4K-ONLY title below the floor → make-before-break: grab a ≤1080 baseline on standard
+                # NOW (4K untouched). Keep the clock; once the baseline imports it becomes a survivor
+                # and the branch above evicts the 4K next run. The grabbed-this-run set stops a
+                # double-grab when the pressure-driven _downgrade_orphan_4k already added it (the
+                # gateway library cache wouldn't yet reflect that add).
+                new_clock[str(tmdb)] = since_iso
+                if hd_pid is None or not std_root:
+                    self._log("log_warning", f"[UHD] cannot rehome 4K-only '{mv.get('title')}' — standard "
+                                             f"'{std_inst}' has no ≤1080 profile / root folder.")
+                    continue
+                if eff_dry:
+                    self._log("log_info", f"[UHD] would rehome 4K-only '{mv.get('title')}' (watch {lk:.0f}) → "
+                                          f"1080p baseline on {std_inst}; 4K reclaimed once it lands.")
+                    rehomed += 1
+                    self._record_plan(mv.get("title"), tmdb, fourk, std_inst, "rehome-4k", "would-rehome",
+                                      reason=f"watch {lk:.0f} < {demote_floor}")
+                elif self._grab_baseline(gw, std_inst, mv, hd_pid, std_root):
+                    rehomed += 1
+                    grabbed.add(tmdb)
+                    self._log("log_info", f"[UHD] rehoming 4K-only '{mv.get('title')}' (watch {lk:.0f}) → 1080p "
+                                          f"baseline searching on {std_inst}; 4K reclaimed once it lands.")
+                    self._record_plan(mv.get("title"), tmdb, fourk, std_inst, "rehome-4k", "rehomed",
+                                      reason=f"watch {lk:.0f} < {demote_floor}")
+                else:
+                    self._log("log_warning", f"[UHD] rehome baseline grab failed for '{mv.get('title')}' "
+                                             f"on {std_inst}; 4K left intact, will retry.")
+            else:
+                # Baseline RECORD exists (or just grabbed this run) but no FILE yet (a rehome in
+                # flight) → keep clocking, wait for the import before evicting the 4K.
+                new_clock[str(tmdb)] = since_iso
+
+        # Prune ledger entries whose 4K record vanished from the library entirely.
+        for t in [t for t in ledger if not _tmdb_present(t, present_tmdbs)]:
+            ledger.pop(t, None)
+        if self.global_cache is not None:
+            # The dwell clock is non-destructive aging state → persist it even under eff_dry so a
+            # title's below-floor time survives a preview / backup-degraded run (mirrors the
+            # stale-prune clock). The demote LEDGER tracks REAL deletions, so it is only written on a
+            # live run.
+            writes = [(clock_key, new_clock)] if eff_dry else [(key, ledger), (clock_key, new_clock)]
+            for _k, _v in writes:
+                try:
+                    self.global_cache.set(_k, _v)
+                except Exception:
+                    pass
+        if demoted or rehomed or recovered:
+            verb = "would " if eff_dry else ""
+            self._log("log_info", f"[UHD] watchability 4K routing on {fourk}: {verb}demote {demoted}, "
+                                  f"{verb}rehome {rehomed}, {verb}re-acquire {recovered} "
+                                  f"(band {demote_floor}-{threshold}, dwell {dwell_days}d; baseline always survives).")
 
     def _under_pressure(self, gw, inst) -> bool:
         """True when the shared mount is in the pressure band (free < U). FAIL-OPEN: an unreadable

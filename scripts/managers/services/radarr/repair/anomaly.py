@@ -14,6 +14,7 @@ from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.classification.keep_policy import resolve_keep_policy
 from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
+from scripts.managers.machine_learning.space.dual_version import DEFAULT_UHD_SCORE, pick_hd_profile
 from scripts.managers.machine_learning.lifecycle.monitor_policy import (
     release_available,
     triage_action,
@@ -32,6 +33,12 @@ from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_targets import (
     coordinator_owns_deletion, deletions_enabled, space_targets,
 )
+
+
+# Alias-aware 4K/UHD instance labels — MUST match UhdReconcileManager._UHD_LABELS so the
+# monitored-missing triage and the dual-version reconcile agree on which Radarr session is the
+# dedicated 4K instance (the role map writes "4K" while the folder bucket is "4k").
+_UHD_LABELS = ("4K", "4k", "uhd", "UHD", "2160p", "2160")
 
 
 # ── Grid-cell formatters (shared by every Radarr movie table) ────────────────────
@@ -100,6 +107,73 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         if self.radarr_api and hasattr(self.radarr_api, "resolve_instance"):
             return self.radarr_api.resolve_instance(instance)
         return instance or "default"
+
+    def _uhd_instance_name(self) -> str | None:
+        """The DISTINCT 4K/UHD Radarr instance name (a categorized 4K label resolving to a session
+        OTHER than the default), or None when there is no separate 4K instance. Resolved through the
+        same ``ArrGateway`` the dual-version reconcile uses, so triage and the reconcile never
+        disagree on which instance is the 4K one. Best-effort — any failure returns None (legacy
+        triage behaviour)."""
+        im = self.instance_manager or self.radarr_api
+        if im is None or self.config is None:
+            return None
+        try:
+            from scripts.managers.services.acquisition.gateway import ArrGateway
+            gw = ArrGateway("radarr", im, self.config, self.logger)
+            default = gw.default_instance()
+            for label in _UHD_LABELS:
+                cand = gw.categorized_instance(label)
+                if cand and cand != default:
+                    return cand
+        except Exception:
+            return None
+        return None
+
+    def _acquire_standard_baseline(self, gw, std_inst, std_root, std_profiles, std_present,
+                                   movie, score) -> str:
+        """Acquire a ≤1080 SCORE-MATCHED baseline of a 4K-instance monitored-missing title on the
+        standard instance (monitored, search ON) — the completion of the 4K-instance demote: a title
+        that doesn't warrant 4K is unmonitored on the 4K instance AND actually acquired where it
+        belongs. The profile is picked from the score via the shared ladder (``pick_hd_profile`` →
+        1080p/720p/480p, never 4K). Skips a title that already has ANY standard record (left to the
+        standard instance's own management). Honours ``dry_run``. Returns acquired | would-acquire |
+        present | skip | failed."""
+        tmdb = movie.get("tmdbId") if movie else None
+        if tmdb is None or gw is None or not std_inst or not std_root:
+            return "skip"
+        if tmdb in std_present:
+            return "present"                       # already tracked on standard → leave it
+        profile = pick_hd_profile(std_profiles, score)
+        if profile is None:
+            return "skip"                          # no ≤1080 profile available on standard
+        pname = profile.get("name", "?")
+        if self.dry_run:
+            self.logger.log_info(
+                f"  📥 [{std_inst}] would acquire ≤1080 baseline of '{movie.get('title')}' "
+                f"(score {score} → {pname}) — monitored + search."
+            )
+            return "would-acquire"
+        payload = dict(movie)
+        for k in ("id", "movieFile", "movieFileId", "path", "folderName"):
+            payload.pop(k, None)
+        payload["qualityProfileId"] = profile.get("id")
+        payload["rootFolderPath"] = std_root
+        payload["monitored"] = True
+        payload.setdefault("minimumAvailability", "released")
+        payload["addOptions"] = {"searchForMovie": True}
+        try:
+            ok = bool(gw.add(std_inst, payload))
+        except Exception as e:
+            self.logger.log_warning(
+                f"  ⚠️ [{std_inst}] baseline acquire failed for '{movie.get('title')}': {e}"
+            )
+            return "failed"
+        if ok:
+            self.logger.log_info(
+                f"  📥 [{std_inst}] acquiring ≤1080 baseline of '{movie.get('title')}' "
+                f"(score {score} → {pname}) — monitored + searching."
+            )
+        return "acquired" if ok else "failed"
 
     # ── Keep-policy resolution ───────────────────────────────────────────────────
 
@@ -401,7 +475,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                 stats["triggered"] += 1
             except Exception as e:
                 self.logger.log_warning(
-                    f"[Anomaly] Search trigger failed for '{c['title']}' (id={mid}): {e}"
+                    f"[Anomaly] [{instance}] Search trigger failed for '{c['title']}' (id={mid}): {e}"
                 )
                 stats["failed"] += 1
 
@@ -1241,6 +1315,53 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             pass
         _hd720p_name = _prof_name_by_id.get(hd720p_id, "HD-720p") if hd720p_id is not None else "HD-720p"
 
+        # ── Dedicated 4K instance routing ─────────────────────────────────────────
+        # When this instance IS the distinct 4K/UHD instance, a monitored-missing title that
+        # doesn't warrant 4K must NOT be grabbed here at a sub-4K quality (no 720p/1080p file in
+        # the 4K library) — its lower-resolution baseline is the standard instance's job. Below the
+        # UHD threshold → unmonitor (or defer on unreliable data); never adjust-down-and-search.
+        # "Warrants 4K" is saga-aware: a keep/universe tag or a household watch outranks the score,
+        # and the live score itself already folds in the collection/universe group, so a hot-saga
+        # member's boosted score clears the bar.
+        uhd_inst        = self._uhd_instance_name()
+        is_uhd_instance = uhd_inst is not None and instance == uhd_inst
+        _routing_movies = (((self.config.get("routing", {}) if self.config else {}) or {})
+                           .get("movies", {}) or {})
+        try:
+            uhd_threshold = int(_routing_movies.get("4k_dual_min_score") or DEFAULT_UHD_SCORE)
+        except (TypeError, ValueError):
+            uhd_threshold = DEFAULT_UHD_SCORE
+
+        # ── Standard-baseline rehome (the 4K-instance demote completion) ──────────────
+        # When a 4K-instance missing title is unmonitored because it doesn't warrant 4K, acquire its
+        # ≤1080 score-matched baseline on the standard instance (monitored + search) so it actually
+        # lands where it belongs. Flag-gated (routing.movies.triage_rehome_to_standard, default OFF);
+        # the standard library/profiles/root are fetched ONCE here, not per title.
+        rehome_to_std = is_uhd_instance and bool(_routing_movies.get("triage_rehome_to_standard"))
+        std_gw = std_inst = std_root = None
+        std_profiles: list = []
+        std_present: set = set()
+        if rehome_to_std:
+            try:
+                from scripts.managers.services.acquisition.gateway import ArrGateway
+                std_gw = ArrGateway("radarr", self.instance_manager or self.radarr_api,
+                                    self.config, self.logger)
+                std_inst = std_gw.default_instance()
+                if not std_inst or std_inst == instance:
+                    rehome_to_std = False
+                else:
+                    std_profiles = std_gw.quality_profiles(std_inst) or []
+                    std_root = (((self.config.get("movieRootFolders", {}) if self.config else {}) or {})
+                                .get("standard")
+                                or next((f.get("path") for f in (std_gw.root_folders(std_inst) or [])
+                                         if isinstance(f, dict) and f.get("path")), ""))
+                    std_present = {m.get("tmdbId") for m in (std_gw.library_items(std_inst) or [])
+                                   if isinstance(m, dict) and m.get("tmdbId") is not None}
+                    if not std_root or not std_profiles:
+                        rehome_to_std = False
+            except Exception:
+                rehome_to_std = False
+
         # ── Score and act ────────────────────────────────────────────────────────
         # Live writes are deferred into id-lists and flushed as bulk /movie/editor
         # calls after the loop (one PUT per action vs a per-movie GET+PUT each).
@@ -1272,7 +1393,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             # lifecycle/monitor_policy.release_available).
             if movie and not release_available(movie, now_utc):
                 self.logger.log_debug(
-                    f"  ⏩ '{title}' — not yet available "
+                    f"  ⏩ [{instance}] '{title}' — not yet available "
                     f"(status={movie.get('status')}, isAvailable=False) — skipping search"
                 )
                 stats["not_available"] = stats.get("not_available", 0) + 1
@@ -1316,7 +1437,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                         keep_policy=keep_policy,
                     )
                 except Exception as e:
-                    self.logger.log_debug(f"  ↺ Score failed for '{title}': {e}")
+                    self.logger.log_debug(f"  ↺ [{instance}] Score failed for '{title}': {e}")
 
             cur_profile_id = (movie or {}).get("qualityProfileId")
             _cur_prof = (
@@ -1324,7 +1445,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             )
 
             self.logger.log_debug(
-                f"  📊 '{title}' (tmdb={tmdb_id}) — score={score}"
+                f"  📊 [{instance}] '{title}' (tmdb={tmdb_id}) — score={score}"
             )
 
             # ── Route by score (decision in lifecycle/monitor_policy.triage_action) ──
@@ -1338,11 +1459,18 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             # lost its file is always re-acquired, never unmonitored (mirrors the
             # stale-prune watched-set guard).
             household_watched = tmdb_id is not None and int(tmdb_id) in watched_tmdb_ids
+            # On the dedicated 4K instance: does this title warrant a 4K copy? A keep/universe tag
+            # or a household watch outranks the score; otherwise the (saga/collection-aware) score
+            # must clear the UHD threshold. Inert on every other instance (is_uhd_instance False).
+            warrants_uhd = is_uhd_instance and (
+                has_keep_tag or household_watched or score >= uhd_threshold
+            )
             action = triage_action(
                 score=score, has_keep_tag=has_keep_tag, credits_fetched=credits_fetched,
                 cur_profile_id=cur_profile_id, hd720p_id=hd720p_id,
                 watch_threshold=WATCH_THRESHOLD, unmonitor_below=UNMONITOR_BELOW,
                 household_watched=household_watched,
+                is_uhd_instance=is_uhd_instance, warrants_uhd=warrants_uhd,
             )
 
             # Shared leading cells for whichever action row we append below.
@@ -1355,14 +1483,22 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
 
             if action == "defer":
                 self.logger.log_debug(
-                    f"  ⏳ '{title}' — score={score} but no credits yet, deferring unmonitor decision"
+                    f"  ⏳ [{instance}] '{title}' — score={score} but no credits yet, deferring unmonitor decision"
                 )
                 stats["deferred"] = stats.get("deferred", 0) + 1
                 continue
 
             if action == "unmonitor":
-                # Unlikely to be watched — unmonitor (batched after the loop).
+                # Unlikely to warrant 4K here — unmonitor (batched after the loop). On the 4K instance
+                # with rehome enabled, ALSO acquire its ≤1080 score-matched baseline on the standard
+                # instance (the demote completion) so the title lands where it belongs.
                 _rows.append(_meta + ["unmonitor", str(score), _cur_prof])
+                if rehome_to_std and movie is not None:
+                    _st = self._acquire_standard_baseline(std_gw, std_inst, std_root, std_profiles,
+                                                          std_present, movie, score)
+                    if _st in ("acquired", "would-acquire"):
+                        stats["rehomed_to_standard"] = stats.get("rehomed_to_standard", 0) + 1
+                        std_present.add(movie.get("tmdbId"))   # don't re-acquire within this pass
                 if self.dry_run:
                     stats["unmonitored"] += 1
                     continue
@@ -1389,12 +1525,17 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             _rs.add_rows("radarr", "Monitored-missing triage", instance,
                          ["Title", "Year", "Rating", "Action", "Score", "Profile"], _rows, order=30)
         else:
+            _bands = (
+                f"4K instance: search>={uhd_threshold} (warrants 4K), else unmonitor"
+                if is_uhd_instance else
+                f"search>={WATCH_THRESHOLD}, adjust {UNMONITOR_BELOW}-{WATCH_THRESHOLD - 1}, "
+                f"unmonitor<{UNMONITOR_BELOW}"
+            )
             self.logger.log_grid(
                 ["Title", "Year", "Rating", "Action", "Score", "Profile"], _rows,
                 title=(
                     f"Radarr triage: monitored-missing{' [dry_run]' if self.dry_run else ''}"
-                    f"  (search>={WATCH_THRESHOLD}, adjust {UNMONITOR_BELOW}-{WATCH_THRESHOLD - 1}, "
-                    f"unmonitor<{UNMONITOR_BELOW})"
+                    f"  ({_bands})"
                 ),
                 cap=28,
             )
@@ -1413,16 +1554,16 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                     payload={"movieIds": adjust_ids, "qualityProfileId": hd720p_id},
                 )
             except Exception as e:
-                self.logger.log_warning(f"  ⚠️ Bulk HD-720p adjust failed: {e}")
+                self.logger.log_warning(f"  ⚠️ [{instance}] Bulk HD-720p adjust failed: {e}")
             if resp:
                 stats["adjusted_and_searched"] += len(adjust_ids)
-                self.logger.log_info(f"  📉 Adjusted {len(adjust_ids)} movie(s) to HD-720p")
+                self.logger.log_info(f"  📉 [{instance}] Adjusted {len(adjust_ids)} movie(s) to HD-720p")
             else:
                 stats["failed"] += len(adjust_ids)
                 _drop = set(adjust_ids)
                 search_ids = [i for i in search_ids if i not in _drop]
                 self.logger.log_warning(
-                    f"  ⚠️ HD-720p adjust failed for {len(adjust_ids)} movie(s) — skipping their search"
+                    f"  ⚠️ [{instance}] HD-720p adjust failed for {len(adjust_ids)} movie(s) — skipping their search"
                 )
 
         # ── Batch unmonitor (low-score missing movies) ───────────────────────────
@@ -1434,11 +1575,11 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                 )
                 if resp:
                     stats["unmonitored"] += len(unmonitor_ids)
-                    self.logger.log_info(f"  🔕 Unmonitored {len(unmonitor_ids)} low-score movie(s)")
+                    self.logger.log_info(f"  🔕 [{instance}] Unmonitored {len(unmonitor_ids)} low-score movie(s)")
                 else:
                     stats["failed"] += len(unmonitor_ids)
             except Exception as e:
-                self.logger.log_warning(f"  ⚠️ Bulk unmonitor failed: {e}")
+                self.logger.log_warning(f"  ⚠️ [{instance}] Bulk unmonitor failed: {e}")
                 stats["failed"] += len(unmonitor_ids)
 
         # ── Batch search ─────────────────────────────────────────────────────────
@@ -1459,11 +1600,11 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                     )
                 if _cancelled:
                     self.logger.log_info(
-                        f"  🗑️ Cancelled {_cancelled} in-flight queue item(s) before re-search"
+                        f"  🗑️ [{instance}] Cancelled {_cancelled} in-flight queue item(s) before re-search"
                     )
                     stats["queue_cancelled"] = stats.get("queue_cancelled", 0) + _cancelled
             except Exception as _qe:
-                self.logger.log_warning(f"  ⚠️ Queue cancel pass failed: {_qe}")
+                self.logger.log_warning(f"  ⚠️ [{instance}] Queue cancel pass failed: {_qe}")
 
 
         if search_ids and not self.dry_run:
@@ -1473,11 +1614,11 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                     payload={"name": "MoviesSearch", "movieIds": search_ids},
                 )
                 self.logger.log_info(
-                    f"  📡 Batch search triggered for {len(search_ids)} movie(s)"
+                    f"  📡 [{instance}] Batch search triggered for {len(search_ids)} movie(s)"
                 )
                 stats["searched"] += len(search_ids)
             except Exception as e:
-                self.logger.log_warning(f"  ⚠️ Batch search failed: {e}")
+                self.logger.log_warning(f"  ⚠️ [{instance}] Batch search failed: {e}")
                 stats["failed"] += len(search_ids)
         elif search_ids and self.dry_run:
             stats["searched"] += len(search_ids)
@@ -1490,6 +1631,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                 ["searched",              stats["searched"]],
                 ["adjusted_and_searched", stats["adjusted_and_searched"]],
                 ["unmonitored",           stats["unmonitored"]],
+                ["rehomed_to_standard",   stats.get("rehomed_to_standard", 0)],
                 ["skipped_keep_tagged",   stats["skipped_keep_tagged"]],
                 ["deferred",              stats.get("deferred", 0)],
                 ["not_available",         stats.get("not_available", 0)],
@@ -1502,6 +1644,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                 "movies a search was triggered for as-is",
                 "movies dropped to HD-720p then searched",
                 "low-score movies set unmonitored",
+                "4K-instance demotes given a ≤1080 baseline acquired on standard",
                 "skipped: keep/universe tagged, never unmonitored",
                 "deferred: Trakt credits not cached yet",
                 "skipped: no home-media release available yet",

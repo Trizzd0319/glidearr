@@ -85,6 +85,26 @@ def empty_config() -> dict:
                 "4k_dual_min_score": 0,
                 "proactive_4k": False,
                 "evict_uhd_first": False,
+                # Demote a 4K copy on WATCHABILITY (not just space pressure): when a title's
+                # saga-aware watch-likelihood falls below the UHD threshold, delete its 4K file +
+                # unmonitor the 4K record while a 1080p baseline SURVIVES on standard (never the
+                # last copy — a 4K-only title first gets a baseline grabbed, then the 4K is evicted
+                # once it imports); the companion is re-acquired if the score climbs back. Gated on
+                # deletion consent. Default OFF.
+                "demote_4k_on_watchability": False,
+                # HYSTERESIS so a title doesn't flap (delete + re-acquire its 4K every run) as the
+                # household watches SIBLING-ADJACENT films (genre/cast/crew/studio) and nudges its
+                # affinity score across the line. Band: promote at 4k_dual_min_score, demote only
+                # below (that - 4k_demote_gap) — the gap is sized to absorb a typical adjacent-watch
+                # swing (~6-8 pts). Dwell: require the score to stay below the demote floor for N days
+                # before acting (0 = band only; raise it to also absorb a transient large swing).
+                "4k_demote_gap": 10,
+                "4k_demote_dwell_days": 0,
+                # When the monitored-missing triage UNMONITORS a title on the dedicated 4K instance
+                # (it doesn't warrant 4K), also ACQUIRE its ≤1080 score-matched baseline on the
+                # standard instance (monitored + search) so the demoted title actually lands there
+                # instead of just being dropped from the 4K library. Default OFF.
+                "triage_rehome_to_standard": False,
                 # FORK-D: when a 4K-ONLY film (2160p on the dedicated 4K instance with NO
                 # 1080p baseline on standard) is the coldest title under floor pressure,
                 # REHOME it — add a watchability-matched (≤1080p) copy on the standard

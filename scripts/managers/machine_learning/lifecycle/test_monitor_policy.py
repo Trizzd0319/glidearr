@@ -99,3 +99,35 @@ def test_triage_household_watched_never_unmonitors():
         assert _act(s, has_keep_tag=True, credits_fetched=False, household_watched=True) in ("search", "adjust_and_search")
     # baseline (no override): the same low-score movie unmonitors
     assert _act(5, household_watched=False) == "unmonitor"
+
+
+# ── triage_action: dedicated 4K instance routing ─────────────────────────────────
+def _act4k(score, *, warrants_uhd=False, credits_fetched=True, household_watched=False,
+           has_keep_tag=False, cur_profile_id=1, hd720p_id=99):
+    return triage_action(score=score, has_keep_tag=has_keep_tag, credits_fetched=credits_fetched,
+                         cur_profile_id=cur_profile_id, hd720p_id=hd720p_id,
+                         watch_threshold=60, unmonitor_below=20, household_watched=household_watched,
+                         is_uhd_instance=True, warrants_uhd=warrants_uhd)
+
+
+def test_triage_4k_unmonitors_sub_threshold_titles_never_adjusts():
+    # On the 4K instance a title that does NOT warrant 4K is unmonitored — never grabbed
+    # at a sub-4K quality (the 'adjust_and_search' drop-to-720p branch is unreachable).
+    assert _act4k(65, warrants_uhd=False) == "unmonitor"     # would be 'search' on standard
+    assert _act4k(40, warrants_uhd=False) == "unmonitor"     # would be 'adjust_and_search' on standard
+    assert _act4k(5, warrants_uhd=False) == "unmonitor"
+
+
+def test_triage_4k_searches_titles_that_warrant_4k():
+    # warrants 4K (keep/universe tag, household-watched, or score >= UHD threshold) → search
+    # at the 4K profile, regardless of how low the raw score is.
+    assert _act4k(80, warrants_uhd=True) == "search"
+    assert _act4k(10, warrants_uhd=True) == "search"          # keep/universe tag carried in warrants_uhd
+    assert _act4k(10, warrants_uhd=False, household_watched=True) == "search"
+
+
+def test_triage_4k_defers_when_credits_unfetched():
+    # Sub-threshold but the score is unreliable (no credits) → defer, never unmonitor a
+    # potential favourite on understated data. Once enriched it routes search/unmonitor.
+    assert _act4k(10, warrants_uhd=False, credits_fetched=False) == "defer"
+    assert _act4k(10, warrants_uhd=True, credits_fetched=False) == "search"   # warrant outranks defer

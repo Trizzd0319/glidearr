@@ -57,7 +57,7 @@ def release_available(movie, now) -> bool:
 
 def triage_action(*, score, has_keep_tag, credits_fetched, cur_profile_id,
                   hd720p_id, watch_threshold, unmonitor_below,
-                  household_watched=False) -> str:
+                  household_watched=False, is_uhd_instance=False, warrants_uhd=False) -> str:
     """Route a monitored-but-missing movie by its watchability score:
 
       * 'keep_skip'         — below the unmonitor floor but keep/universe-tagged: a
@@ -74,7 +74,25 @@ def triage_action(*, score, has_keep_tag, credits_fetched, cur_profile_id,
     adjust-and-search) and never unmonitored/deferred/keep-skipped — a watched movie
     scoring low for lack of ratings must not be silently dropped. (The owned-movie
     stale prune already hard-guards the watched-set; this closes the same gap for the
-    monitored-missing triage.)"""
+    monitored-missing triage.)
+
+    ``is_uhd_instance`` flips the routing for a DEDICATED 4K/UHD instance (one that
+    holds ONLY titles warranting 4K). A monitored-missing title there must NEVER be
+    grabbed at a sub-4K quality — that would land a 720p/1080p file in the 4K library;
+    its lower-resolution baseline is the standard instance's job. So on the 4K instance
+    the 'adjust_and_search' (drop-to-720p) branch is unreachable and the routing is:
+
+      * warrants 4K (``warrants_uhd`` — keep/universe-tagged, household-watched, or a
+        score at/above the UHD threshold) → 'search' at the 4K profile (never adjusted),
+      * else, score unreliable (credits not fetched) → 'defer' (don't drop a household
+        favourite on understated data — the same protection the standard path gives),
+      * else → 'unmonitor' (no sub-4K grab into the 4K library)."""
+    if is_uhd_instance:
+        if warrants_uhd or household_watched:
+            return "search"
+        if not credits_fetched:
+            return "defer"
+        return "unmonitor"
     if not household_watched:
         if score < unmonitor_below and has_keep_tag:
             return "keep_skip"

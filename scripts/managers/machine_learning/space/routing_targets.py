@@ -217,6 +217,29 @@ def evict_uhd_first(config) -> bool:
     return coordinator_owns_deletion(config)
 
 
+def demote_4k_on_watchability_enabled(config) -> bool:
+    """Gate for the WATCHABILITY-driven demote of dual-version 4K BONUS copies — the
+    pressure-INDEPENDENT companion to :func:`evict_uhd_first` (which only fires under disk
+    pressure). When a title's saga-aware watch-likelihood falls below the UHD threshold, its
+    4K FILE is deleted + its 4K record unmonitored — but ONLY while a 1080p baseline file
+    SURVIVES on a standard-tier instance (never the last copy), and never for a keep/universe
+    pin. The 4K record is kept (fileless), so the proactive acquire / recover path re-adds the
+    companion if the score climbs back. Requires ``routing.movies.demote_4k_on_watchability``
+    AND ``4k_policy == "both"`` (it only touches the dual-version bonus) AND explicit deletion
+    consent (``deletions_consented`` — it deletes a file). DELIBERATELY independent of
+    ``free_space_limit`` / the coordinator: the whole point is to demote on watchability even
+    when space is fine (space pressure is still handled by ``evict_uhd_first``). The backup gate
+    (``effective_dry_run``) is enforced at actuation time. Default OFF."""
+    from scripts.managers.machine_learning.space.space_targets import deletions_consented
+    routing = _cfg_get(config, "routing", None) or {}
+    if not isinstance(routing, dict):
+        return False
+    mv = routing.get("movies", {}) or {}
+    if not isinstance(mv, dict) or not mv.get("demote_4k_on_watchability") or mv.get("4k_policy") != "both":
+        return False
+    return deletions_consented(config)
+
+
 def rehome_4k_only_enabled(config) -> bool:
     """Gate for FORK-D: rehome a cold 4K-ONLY film (2160p on the dedicated 4K instance with
     NO 1080p baseline on standard) down to a watchability-matched (≤1080p) copy on the
