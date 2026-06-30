@@ -398,6 +398,13 @@ def empty_config() -> dict:
         # but off.
         "plex": {"url": "", "port": 32400, "plex_token": "", "plex_media_path": "",
                  "episodes": {"enabled": False}, "movies": {"enabled": False},
+                 # exclude_sections: Plex library TITLES to skip in the owned-inventory
+                 # scans (plex/movies, plex/episodes) + the reconcile id-scan. Point
+                 # UMTK/TSSK "Coming Soon" placeholder libraries here so their unreleased
+                 # tmdbs/tvdbs never register as owned — otherwise a placeholder marks the
+                 # title owned, suppressing its real acquisition and leaking a seconds-long
+                 # stub into playlists/the anniversary shelf. Default empty → all scanned.
+                 "exclude_sections": [],
                  # Per-user playlist BUILD + (opt-in) WRITE-BACK knobs. Every value below
                  # mirrors the literal default the builder hard-codes inline today
                  # (services/plex/playlists/builder.py: _max_items / _episode_cap /

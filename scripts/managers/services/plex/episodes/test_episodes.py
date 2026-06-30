@@ -81,6 +81,7 @@ def _mgr(api, meta, cache):
     m.registry = _Reg(meta)
     m.dry_run = False
     m.logger = _Log()
+    m.config = {}
     return m
 
 
@@ -166,3 +167,25 @@ def test_full_coverage_logs_no_warning():
     m = _mgr(api, _Meta({"100": 555}), cache)
     m.run()
     assert m.logger.warns == []
+
+
+# ── plex.exclude_sections: a "Coming Soon" placeholder library is never scanned ──
+def test_excluded_show_section_is_skipped():
+    # two show sections; the excluded one's placeholder tvdb must NOT enter owned_inventory
+    # (else an unreleased show resolves to "owned" and its real grab is suppressed).
+    api = _Api(pages={
+        ("5", 2): [[show("100")], []], ("5", 4): [[ep("1001", 1, 1, "100")], []],
+        ("9", 2): [[show("900")], []], ("9", 4): [[ep("9001", 1, 1, "900")], []],
+    })
+    cache = _Cache({"plex/sections": {
+        "5": {"type": "show", "title": "TV Shows-Series"},
+        "9": {"type": "show", "title": "Coming Soon TV"},
+    }})
+    m = _mgr(api, _Meta({"100": 555, "900": 999}), cache)
+    m.config = {"plex": {"exclude_sections": ["coming soon tv"]}}   # case-insensitive
+    stats = m.run()
+    inv = cache.get(_INVENTORY_KEY)
+    assert "555:1:1" in inv                                  # real library kept
+    assert "999:1:1" not in inv                              # placeholder section skipped
+    assert stats["show_sections"] == 1
+    assert all(c[0] != "9" for c in api.calls)              # excluded section never queried

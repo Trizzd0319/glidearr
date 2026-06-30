@@ -78,3 +78,44 @@ def test_no_movie_sections_is_empty_not_error():
     stats = _mgr(cache, _Meta({}), api=_NoMovies()).run()
     assert stats["movie_sections"] == 0 and stats["movies_seen"] == 0
     assert cache.get(_INVENTORY_KEY) == {}
+
+
+# ── plex.exclude_sections: "Coming Soon" placeholder library is never scanned ────
+def test_excluded_section_is_skipped():
+    cache = _Cache()
+
+    class _TwoSections(_Api):
+        def get_sections(self):
+            return {"MediaContainer": {"Directory": [
+                {"key": "1", "title": "Movies", "type": "movie"},
+                {"key": "9", "title": "Coming Soon", "type": "movie"},
+            ]}}
+
+        def get_section_all(self, key, plex_type, start, size):
+            if start > 0:
+                return {"MediaContainer": {"Metadata": []}}
+            if str(key) == "1":
+                return {"MediaContainer": {"totalSize": 1, "Metadata": [
+                    {"ratingKey": "5001", "title": "The Matrix", "year": 1999, "type": "movie"}]}}
+            return {"MediaContainer": {"totalSize": 1, "Metadata": [   # the unreleased placeholder
+                {"ratingKey": "9001", "title": "Tron: Ares", "year": 2025, "type": "movie"}]}}
+
+    m = _mgr(cache, _Meta({"5001": 603, "9001": 100000}), api=_TwoSections())
+    m.config = {"plex": {"exclude_sections": ["Coming Soon"]}}
+    stats = m.run()
+    inv = cache.get(_INVENTORY_KEY)
+    assert stats["movie_sections"] == 1
+    assert inv == {"603": {"rating_key": "5001", "title": "The Matrix", "year": 1999, "section": "1"}}
+    assert "100000" not in inv          # placeholder tmdb never registers as owned
+
+
+def test_excluded_section_titles_helper():
+    from scripts.managers.services.plex._common import excluded_section_titles
+    assert excluded_section_titles(None) == set()
+    assert excluded_section_titles({}) == set()
+    assert excluded_section_titles({"plex": {}}) == set()
+    assert excluded_section_titles({"plex": {"exclude_sections": []}}) == set()
+    assert excluded_section_titles({"plex": {"exclude_sections": "Coming Soon"}}) == {"coming soon"}
+    assert excluded_section_titles(
+        {"plex": {"exclude_sections": [" Coming Soon ", "Coming Soon TV", "", "  "]}}
+    ) == {"coming soon", "coming soon tv"}

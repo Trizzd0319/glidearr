@@ -70,3 +70,24 @@ def parse_item(item: dict) -> dict:
         "view_offset_ms": item.get("viewOffset"),
         "duration_ms": item.get("duration"),
     }
+
+
+def excluded_section_titles(config) -> set:
+    """Lowercased set of Plex library TITLES to SKIP in the owned-inventory scans —
+    config ``plex.exclude_sections`` (list of titles; default empty).
+
+    Lets you point UMTK/TSSK-style "Coming Soon" placeholder libraries at Plex WITHOUT
+    their unreleased tmdbs/tvdbs entering ``plex/{movies,episodes}/owned_inventory``.
+    Without this, a placeholder for an unreleased title resolves the title to "owned",
+    which silently suppresses its real acquisition (universe_acquisition) and can surface
+    a seconds-long placeholder in playlists / the anniversary shelf. The scanners select
+    sections by TYPE (movie/show), so a dedicated Coming Soon library — itself a movie/show
+    library — is otherwise scanned like any other; this is the by-name escape hatch.
+
+    Default empty → every section scanned, byte-identical to prior behaviour. Tolerant of
+    a bare string (treated as a one-element list) and of blank/whitespace entries."""
+    plex_cfg = (config.get("plex", {}) if config else {}) or {}
+    raw = plex_cfg.get("exclude_sections") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(t).strip().lower() for t in raw if str(t).strip()}

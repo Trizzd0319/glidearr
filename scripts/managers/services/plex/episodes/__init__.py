@@ -21,7 +21,8 @@ writes to Plex. Schema-tolerant (every UNSTABLE field via ``.get``).
 from __future__ import annotations
 
 from scripts.managers.factories.base_manager import BaseManager
-from scripts.managers.services.plex._common import metadata_items, parse_item, total_size
+from scripts.managers.services.plex._common import (
+    excluded_section_titles, metadata_items, parse_item, total_size)
 from scripts.managers.services.plex.playlists.readiness import diagnose_tv_readiness
 
 _INVENTORY_KEY = "plex/episodes/owned_inventory"
@@ -47,8 +48,16 @@ class PlexEpisodesManager(BaseManager):
     def run(self) -> dict:
         meta = self.registry.get("manager", "PlexMetadataManager") if self.registry else None
         sections = self._sections()
+        excluded = excluded_section_titles(self.config)
         show_sections = {k: s for k, s in sections.items()
-                         if str(s.get("type", "")).lower() == "show"}
+                         if str(s.get("type", "")).lower() == "show"
+                         and str(s.get("title", "")).strip().lower() not in excluded}
+        skipped = [s.get("title") for s in sections.values()
+                   if str(s.get("type", "")).lower() == "show"
+                   and str(s.get("title", "")).strip().lower() in excluded]
+        if skipped:
+            self.logger.log_info(f"[PlexEpisodes] excluding {len(skipped)} section(s) per "
+                                 f"plex.exclude_sections: {', '.join(map(str, skipped))}")
 
         inventory: dict = {}
         stats = {

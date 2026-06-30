@@ -17,7 +17,8 @@ Schema-tolerant (every UNSTABLE field via ``.get``).
 from __future__ import annotations
 
 from scripts.managers.factories.base_manager import BaseManager
-from scripts.managers.services.plex._common import metadata_items, parse_item, total_size
+from scripts.managers.services.plex._common import (
+    excluded_section_titles, metadata_items, parse_item, total_size)
 
 _INVENTORY_KEY = "plex/movies/owned_inventory"
 _STATS_KEY = "plex/movies/resolution_stats"
@@ -42,8 +43,16 @@ class PlexMoviesManager(BaseManager):
     def run(self) -> dict:
         meta = self.registry.get("manager", "PlexMetadataManager") if self.registry else None
         sections = self._sections()
+        excluded = excluded_section_titles(self.config)
         movie_sections = {k: s for k, s in sections.items()
-                          if str(s.get("type", "")).lower() == "movie"}
+                          if str(s.get("type", "")).lower() == "movie"
+                          and str(s.get("title", "")).strip().lower() not in excluded}
+        skipped = [s.get("title") for s in sections.values()
+                   if str(s.get("type", "")).lower() == "movie"
+                   and str(s.get("title", "")).strip().lower() in excluded]
+        if skipped:
+            self.logger.log_info(f"[PlexMovies] excluding {len(skipped)} section(s) per "
+                                 f"plex.exclude_sections: {', '.join(map(str, skipped))}")
 
         inventory: dict = {}
         stats = {

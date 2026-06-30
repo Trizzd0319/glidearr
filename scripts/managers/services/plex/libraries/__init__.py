@@ -16,7 +16,8 @@ from __future__ import annotations
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.services.acquisition.gateway import ArrGateway
-from scripts.managers.services.plex._common import metadata_items, parse_item, total_size
+from scripts.managers.services.plex._common import (
+    excluded_section_titles, metadata_items, parse_item, total_size)
 
 _SECTIONS_KEY = "plex/sections"
 _LIBIDS_KEY = "plex/library_ids"
@@ -67,9 +68,12 @@ class PlexLibrarySectionsManager(BaseManager):
         guessed."""
         meta = self.registry.get("manager", "PlexMetadataManager") if self.registry else None
         movie_tmdb, show_tvdb, unresolved = set(), set(), 0
+        excluded = excluded_section_titles(self.config)
         for key, sec in sections.items():
             stype = sec["type"]
             if stype not in ("movie", "show"):
+                continue
+            if str(sec.get("title", "")).strip().lower() in excluded:
                 continue
             plex_type = 1 if stype == "movie" else 2
             start = 0
