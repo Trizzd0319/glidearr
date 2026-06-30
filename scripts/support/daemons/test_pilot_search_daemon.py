@@ -468,3 +468,27 @@ def test_claim_process_complete_drains_queue(monkeypatch, tmp_path):
     assert fake.searches == [901]
     assert not proc_path.exists()
     assert pilot_jobs.claim_next() is None
+
+
+# ── Per-request hard-deadline watchdog (_call_with_deadline) ─────────────────────
+import time as _time
+
+import pytest as _pytest
+
+
+def test_call_with_deadline_returns_fast_value():
+    assert psd._call_with_deadline(lambda: 42, 1.0) == 42
+
+
+def test_call_with_deadline_raises_timeout_on_overrun():
+    # A call that exceeds the deadline raises TimeoutError instead of blocking forever — this is
+    # what stops a slow-trickle indexer response from freezing the whole daemon.
+    with _pytest.raises(TimeoutError):
+        psd._call_with_deadline(lambda: _time.sleep(2.0), 0.2)
+
+
+def test_call_with_deadline_reraises_inner_exception():
+    def _boom():
+        raise ValueError("kaboom")
+    with _pytest.raises(ValueError):
+        psd._call_with_deadline(_boom, 1.0)

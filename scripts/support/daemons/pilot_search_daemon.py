@@ -40,6 +40,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,6 +80,36 @@ from scripts.managers.services.sonarr.cache.jit_search import (                 
 # is generous; a slow/hung indexer can't stall the whole daemon past this.
 _ARR_TIMEOUT = (10, 120)
 _ARR_RETRIES = 3
+# HARD wall-clock ceiling per HTTP attempt — the WATCHDOG. The (connect, read) tuple above only
+# bounds the gap BETWEEN bytes, so an indexer that trickles one byte every few seconds keeps the
+# connection "alive" and the read timeout NEVER fires — one such search then stalls the whole
+# as_completed batch behind it (the 4-hour daemon freeze we hit). This caps the TOTAL time of each
+# attempt: the request runs in a daemon thread we join with a timeout; a thread that overruns is
+# ABANDONED (Python can't force-kill a thread — its socket read eventually times out and it exits)
+# and the attempt is treated as a timeout (idempotent GET/PUT retry; POST single-attempt as before).
+_ARR_HARD_DEADLINE_S = 180
+
+
+def _call_with_deadline(fn, deadline_s):
+    """Run ``fn()`` in a daemon thread joined up to ``deadline_s``; return its value, re-raise its
+    exception, or raise ``TimeoutError`` if it overran (the worker thread is left to unwind on its
+    own once the underlying socket times out — never killed)."""
+    box: dict = {}
+
+    def _run():
+        try:
+            box["v"] = fn()
+        except BaseException as e:        # noqa: BLE001 — ferry any error to the calling thread
+            box["e"] = e
+
+    th = threading.Thread(target=_run, name="arr-http-watchdog", daemon=True)
+    th.start()
+    th.join(deadline_s)
+    if th.is_alive():
+        raise TimeoutError(f"request exceeded {deadline_s}s hard deadline")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
 
 
 # ── Logging ──────────────────────────────────────────────────────────────────────
@@ -207,12 +238,20 @@ class SonarrClient:
             if _stop_requested():
                 return fallback
             try:
+                # Every attempt is bounded by BOTH the requests (connect, read-gap) timeout AND the
+                # hard wall-clock watchdog, so a slow-trickle indexer can never freeze the daemon.
                 if method_upper == "GET":
-                    resp = self._session.get(url, headers=headers, timeout=_ARR_TIMEOUT)
+                    resp = _call_with_deadline(
+                        lambda: self._session.get(url, headers=headers, timeout=_ARR_TIMEOUT),
+                        _ARR_HARD_DEADLINE_S)
                 elif method_upper == "POST":
-                    resp = self._session.post(url, headers=headers, json=payload, timeout=_ARR_TIMEOUT)
+                    resp = _call_with_deadline(
+                        lambda: self._session.post(url, headers=headers, json=payload, timeout=_ARR_TIMEOUT),
+                        _ARR_HARD_DEADLINE_S)
                 elif method_upper == "PUT":
-                    resp = self._session.put(url, headers=headers, json=payload, timeout=_ARR_TIMEOUT)
+                    resp = _call_with_deadline(
+                        lambda: self._session.put(url, headers=headers, json=payload, timeout=_ARR_TIMEOUT),
+                        _ARR_HARD_DEADLINE_S)
                 else:
                     return fallback
                 resp.raise_for_status()
@@ -369,7 +408,14 @@ def process_job(cfg: dict, job: dict, ledger: LedgerCache, dry_run: bool) -> dic
         soft_floor=bool(job.get("soft_floor", True)),
         anime_ladder=anime_ladder, anime_sids=anime_sids,
         job_id=job_id, skip_sids=skip_sids,
+        # Cooperatively stop the (potentially hours-long) sweep when a time-sensitive JIT grab is
+        # queued, then resume from the checkpoint after it drains. The main loop re-enqueues on yield.
+        should_yield=lambda: pilot_jobs.has_higher_priority_pending("interactive"),
     )
+    if result.get("yielded"):
+        log.info(f"Interactive sweep for '{instance}' yielded to a higher-priority job — "
+                 f"re-queued to resume after it.")
+        return result
     # Completed cleanly → drop the resume checkpoint (a crash mid-run leaves it for the resume above).
     if ledger is not None:
         try:
@@ -747,10 +793,11 @@ def main():
                 continue
 
             proc_path, job = claimed
+            _result = None
             try:
                 loader = ConfigLoader(CONFIG_PATH)       # overlays Sonarr secrets from keyring/env
                 cfg    = loader.load()
-                process_job(cfg, job, ledger, dry_run=args.dry_run)
+                _result = process_job(cfg, job, ledger, dry_run=args.dry_run)
             except KeyboardInterrupt:
                 # Leave the claimed job in processing/ so the next start resumes it.
                 log.info("Interrupted mid-job — exiting (job will resume on restart).")
@@ -758,6 +805,11 @@ def main():
             except Exception as e:
                 log.error(f"Job {proc_path.name} failed: {e}", exc_info=True)
             finally:
+                # A cooperatively-YIELDED sweep is RE-QUEUED (id preserved → the checkpoint resumes
+                # the un-done stubs) so the loop can claim the waiting higher-priority JIT job next;
+                # everything else is just completed (processing file removed).
+                if isinstance(_result, dict) and _result.get("yielded"):
+                    pilot_jobs.requeue(job)
                 pilot_jobs.complete(proc_path)
             last_work = time.monotonic()
 

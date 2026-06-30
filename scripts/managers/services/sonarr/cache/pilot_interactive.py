@@ -39,6 +39,9 @@ from scripts.managers.machine_learning.acquisition.pilot_stepping import (
 # A long batch (thousands of interactive searches) must not look hung: emit a progress heartbeat
 # (one log line + a snapshot the daemon's --status reads) at most this often.
 PROGRESS_INTERVAL_S = 15.0
+# How many completed stubs between cooperative-yield checks (only when a should_yield callback is
+# supplied). Small enough to react within seconds; large enough that the queue glob is negligible.
+_YIELD_CHECK_EVERY = 32
 
 
 def unacquirable_key(instance: str) -> str:
@@ -89,6 +92,8 @@ def interactive_pilot_search(
     anime_sids=None,                # series ids that should use anime_ladder (anime seriesType)
     job_id=None,                    # stable id of the offloaded job → enables per-stub resume
     skip_sids=None,                 # sids already completed by a prior interrupted run (skip them)
+    should_yield=None,              # optional callable() -> bool; True → cooperatively stop early
+                                    # (a higher-priority JIT grab is waiting) and resume via checkpoint
 ) -> dict:
     """Two phases per batch:
 
@@ -278,6 +283,7 @@ def interactive_pilot_search(
         logger.log_info(
             f"[PilotSearch] progress {done}/{len(items)} — reasons so far: {reasons}")
 
+    yielded = False    # set True when we cooperatively stop early for a higher-priority JIT grab
     if len(items) <= 1:
         for sid, ep_id in items:
             _one(sid, ep_id)
@@ -289,6 +295,7 @@ def interactive_pilot_search(
             thread_name_prefix="pilot-interactive",
         ) as ex:
             futures = {ex.submit(_one, sid, ep_id): sid for sid, ep_id in items}
+            _since_yield_check = 0
             for fut in as_completed(futures):
                 try:
                     fut.result()
@@ -298,6 +305,27 @@ def interactive_pilot_search(
                     completed_sids.add(futures[fut])
                 done += 1
                 _emit_progress()
+                # ── Cooperative yield: a long sweep must not block a time-sensitive JIT grab. Every
+                # _YIELD_CHECK_EVERY completions, if a higher-priority job is waiting, cancel the
+                # still-QUEUED (not-started) tasks and stop — the checkpoint (written by
+                # _emit_progress) skips the done stubs when this batch resumes. In-flight tasks
+                # finish as the pool unwinds; their sids may re-run on resume (a harmless re-search).
+                _since_yield_check += 1
+                if should_yield is not None and _since_yield_check >= _YIELD_CHECK_EVERY:
+                    _since_yield_check = 0
+                    try:
+                        _do_yield = bool(should_yield())
+                    except Exception:
+                        _do_yield = False
+                    if _do_yield:
+                        for _f in futures:
+                            if not _f.done():
+                                _f.cancel()
+                        yielded = True
+                        logger.log_info(
+                            f"[PilotSearch] yielding after {done}/{len(items)} stub(s) — a "
+                            f"higher-priority JIT grab is queued; will resume from the checkpoint.")
+                        break
     _emit_progress(force=True)
 
     # ── Phase 2: batched EpisodeSearch (one command per `search_batch_size` episodes) ──
@@ -357,4 +385,5 @@ def interactive_pilot_search(
             f"in {fired_batches} batch(es) of ≤{batch_size} (Sonarr CF picks the release), "
             f"{len(flagged)} flagged UNACQUIRABLE. Reasons: {dict(reason_counts)}"
             + (f"; top rejections: {rejection_counts.most_common(5)}" if rejection_counts else ""))
-    return {"searched": sorted(searched), "flagged": flagged, "reasons": dict(reason_counts)}
+    return {"searched": sorted(searched), "flagged": flagged, "reasons": dict(reason_counts),
+            "yielded": yielded}

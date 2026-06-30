@@ -167,3 +167,41 @@ def test_hard_floor_flags_unacquirable_when_soft_floor_off():
     m.config = {"pilot_interactive": {"soft_floor": False}}
     m._pilot_interactive_worker("inst", [(1, 901)], LADDER, META, [1], 720, WEEK)
     assert api.searches == [] and "1" in gc.get("sonarr/pilot/unacquirable/inst")
+
+
+# ── Cooperative yield (a long sweep releases the daemon for a higher-priority JIT grab) ──
+from scripts.managers.services.sonarr.cache import pilot_interactive as _pi
+
+
+def test_interactive_search_yields_to_higher_priority(monkeypatch):
+    # When should_yield()==True the sweep stops early with yielded=True so the daemon re-enqueues it
+    # (id preserved → checkpoint resume) and claims the waiting JIT grab next. How many stubs were
+    # already in flight when the check fires is timing-dependent under a no-latency fake; a real
+    # multi-hour sweep genuinely stops with work left. 'yielded' is the contract the daemon keys off.
+    monkeypatch.setattr(_pi, "_YIELD_CHECK_EVERY", 2)
+    items = [(sid, 900 + sid) for sid in range(1, 11)]      # 10 stubs
+    api = _FakeApi({900 + sid: [_rel(720, guid=f"g{sid}")] for sid in range(1, 11)})
+    meta = {sid: {"title": f"S{sid}", "tvdb": 1000 + sid} for sid in range(1, 11)}
+
+    result = _pi.interactive_pilot_search(
+        make_request=api._make_request, logger=_StubLogger(), global_cache=_GC(),
+        instance="sonarr", items=items, ladder=LADDER, meta=meta,
+        current_indexers=[1], floor_res=0, max_workers=1,
+        should_yield=lambda: True,
+    )
+    assert result["yielded"] is True
+
+
+def test_interactive_search_no_yield_when_callback_false(monkeypatch):
+    monkeypatch.setattr(_pi, "_YIELD_CHECK_EVERY", 2)
+    items = [(sid, 900 + sid) for sid in range(1, 7)]
+    api = _FakeApi({900 + sid: [_rel(720, guid=f"g{sid}")] for sid in range(1, 7)})
+    meta = {sid: {"title": f"S{sid}", "tvdb": 1000 + sid} for sid in range(1, 7)}
+    result = _pi.interactive_pilot_search(
+        make_request=api._make_request, logger=_StubLogger(), global_cache=_GC(),
+        instance="sonarr", items=items, ladder=LADDER, meta=meta,
+        current_indexers=[1], floor_res=0, max_workers=2,
+        should_yield=lambda: False,
+    )
+    assert result["yielded"] is False
+    assert sorted(api.searches) == [900 + sid for sid in range(1, 7)]   # all processed, none skipped

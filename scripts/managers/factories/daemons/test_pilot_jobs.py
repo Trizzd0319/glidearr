@@ -105,3 +105,47 @@ def test_corrupt_queue_file_is_skipped(queue):
     q.mkdir(parents=True, exist_ok=True)
     (q / "sonarr.json").write_text("{ not json")
     assert pilot_jobs.claim_next() is None   # corrupt claim dropped, not raised
+
+
+# ── JIT-priority claim order + cooperative-yield helpers ─────────────────────────
+def _job_mode(mode, instance="sonarr", n=2):
+    j = _job(instance=instance, n=n)
+    j["mode"] = mode
+    return j
+
+
+def test_claim_prioritises_jit_over_an_older_interactive_sweep(queue):
+    # The interactive sweep is enqueued FIRST (older mtime); the JIT grab second. JIT is still
+    # claimed first — a bulk sweep can never starve a time-sensitive next-up grab queued behind it.
+    pilot_jobs.enqueue("sonarr", _job_mode("interactive", n=5))
+    pilot_jobs.enqueue("sonarr", _job_mode("jit", n=1))
+    _p, first = pilot_jobs.claim_next()
+    assert first["mode"] == "jit"
+    _p2, second = pilot_jobs.claim_next()
+    assert second["mode"] == "interactive"   # the sweep runs after the JIT grab
+
+
+def test_has_higher_priority_pending(queue):
+    pilot_jobs.enqueue("sonarr", _job_mode("interactive"))
+    assert pilot_jobs.has_higher_priority_pending("interactive") is False   # nothing outranks it yet
+    pilot_jobs.enqueue("sonarr", _job_mode("jit", n=1))
+    assert pilot_jobs.has_higher_priority_pending("interactive") is True    # jit outranks interactive
+    assert pilot_jobs.has_higher_priority_pending("jit") is False           # nothing outranks jit
+
+
+def test_requeue_preserves_enqueued_at_for_checkpoint_resume(queue):
+    pilot_jobs.enqueue("sonarr", _job_mode("interactive", n=4))
+    proc, job = pilot_jobs.claim_next()        # claimed → its queue slot is now empty
+    path = pilot_jobs.requeue(job)             # cooperative yield → re-queue, id preserved
+    assert path is not None and path.name == "sonarr__interactive.json"
+    reloaded = json.loads(path.read_text())
+    assert reloaded["enqueued_at"] == job["enqueued_at"]   # same id → checkpoint still resumes
+
+
+def test_requeue_does_not_clobber_a_fresher_pending_batch(queue):
+    pilot_jobs.enqueue("sonarr", _job_mode("interactive", n=4))
+    _proc, job = pilot_jobs.claim_next()
+    pilot_jobs.enqueue("sonarr", _job_mode("interactive", n=9))   # a fresher batch took the slot
+    assert pilot_jobs.requeue(job) is None       # superseded → not re-queued
+    _p, survivor = pilot_jobs.claim_next()
+    assert len(survivor["items"]) == 9           # the fresher batch survives

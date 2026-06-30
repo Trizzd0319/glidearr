@@ -68,6 +68,60 @@ def _queue_path(instance: str, mode: str) -> Path:
     return PILOT_QUEUE_DIR / f"{_slug(instance)}__{_slug(mode)}.json"
 
 
+# Claim priority by job mode (lower = claimed first). A time-sensitive JIT next-up grab is claimed
+# BEFORE a bulk 'interactive' pilot sweep — a sweep can carry thousands of stubs and run for hours,
+# so without this it would starve a freshly-enqueued JIT grab queued behind it. Unknown modes sit
+# between JIT and the bulk sweep. Within one priority tier, oldest-first (mtime) order is preserved.
+_MODE_PRIORITY = {"jit": 0, "legacy_regrab": 1, "interactive": 2}
+_DEFAULT_MODE_PRIORITY = 1
+
+
+def _mode_of(qpath: Path) -> str:
+    """The job mode encoded in a ``<instance>__<mode>.json`` queue filename. ``rsplit`` so an
+    instance whose slug itself contains '__' still resolves the trailing mode correctly; '' when
+    the stem has no '__' separator."""
+    stem = qpath.stem
+    return stem.rsplit("__", 1)[-1] if "__" in stem else ""
+
+
+def _priority_of(qpath: Path) -> int:
+    return _MODE_PRIORITY.get(_mode_of(qpath), _DEFAULT_MODE_PRIORITY)
+
+
+def has_higher_priority_pending(mode: str) -> bool:
+    """True when a PENDING queue job outranks ``mode`` (strictly lower priority number). Lets a
+    long-running bulk job (the interactive pilot sweep) cooperatively YIELD the daemon to a
+    freshly-enqueued JIT grab instead of blocking it for the rest of the sweep."""
+    try:
+        mine = _MODE_PRIORITY.get(mode, _DEFAULT_MODE_PRIORITY)
+        for qpath in PILOT_QUEUE_DIR.glob("*.json"):
+            if _priority_of(qpath) < mine:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def requeue(job: dict) -> "Path | None":
+    """Re-enqueue a job that COOPERATIVELY YIELDED mid-run so it resumes later, PRESERVING its
+    ``enqueued_at`` (the per-stub resume checkpoint is keyed on that id, so preserving it keeps the
+    already-done stubs skipped on resume — ``enqueue`` would stamp a new id and re-run everything).
+    Newest-wins: if a fresher batch already occupies the (instance, mode) slot, it supersedes and we
+    do NOT clobber it. Returns the queue path, or None when superseded / malformed."""
+    instance = job.get("instance")
+    mode = str(job.get("mode") or "interactive")
+    if not instance:
+        return None
+    path = _queue_path(instance, mode)
+    if path.exists():
+        return None                        # a fresher batch already supersedes this resume
+    try:
+        _atomic_write_json(path, job)      # writes the job AS-IS (keeps job['enqueued_at'])
+        return path
+    except Exception:
+        return None
+
+
 def enqueue(instance: str, job: dict) -> Path:
     """Write/overwrite the pending job for (instance, job['mode']) and return its path."""
     job = dict(job)
@@ -96,7 +150,10 @@ def claim_next() -> tuple[Path, dict] | None:
     Returns None when the queue is empty. A claim that loses the rename race or a corrupt
     file is skipped (the corrupt one is removed)."""
     try:
-        pending = sorted(PILOT_QUEUE_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        # JIT-priority first, then oldest-first within a tier (see _MODE_PRIORITY): a bulk pilot
+        # sweep can never be claimed ahead of a pending time-sensitive JIT grab.
+        pending = sorted(PILOT_QUEUE_DIR.glob("*.json"),
+                         key=lambda p: (_priority_of(p), p.stat().st_mtime))
     except OSError:
         return None
     for qpath in pending:
