@@ -149,6 +149,7 @@ A snapshot after ~6 months of development. Glidearr is already a working engine 
 **Per-user & multi-instance**
 - **Personalized playlists** — a deterministic, spoiler-safe "Up Next" ordering engine ranked by each viewer's taste, with opt-in write-back to each member's *own* Plex account (default-off, fail-closed, per-server token; movies fully end-to-end, TV built and gated on episode-data coverage).
 - **Multi-instance Sonarr/Radarr** — routes each title to the right instance and root folder (standard / 4K / anime).
+- **Dual-version 4K** — for the titles that warrant it, keeps a 2160p on your 4K instance *and* a right-sized ≤1080p on standard. When both instances share storage Glidearr **hardlinks** the existing 2160p across instead of re-downloading it (auto-detected, with a fresh download as the fallback on separate storage); the 4K instance is locked to 4K-only, so a title with no 4K available is simply served from the standard copy. Make-before-break throughout — the only in-hand 4K is never dropped before its replacement lands.
 
 **Integrations & automation**
 - **Connected services** — Plex, Sonarr, Radarr, Tautulli, Trakt, MyAnimeList, MDBList, TheTVDB, Common Sense Media — all optional, all degrade gracefully.
