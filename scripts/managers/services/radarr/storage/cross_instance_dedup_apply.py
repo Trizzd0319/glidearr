@@ -58,6 +58,28 @@ class CrossInstanceDedup:
             }
         return bool(self._hasfile_cache[inst].get(tmdb))
 
+    def _loser_file_stale(self, inst, movie_id, file_id) -> bool:
+        """POSITIVELY detect that the planned loser movieFile is no longer the loser's current file — a
+        fresh ``GET movie/{id}`` whose movieFile id DIFFERS from ``file_id`` (re-imported under a new id
+        by a concurrent retune/rescan) or that has no file at all (already reclaimed). The plan's
+        ``loser_file_id`` is a run-start snapshot, so deleting a re-id'd file 404s and reclaims nothing
+        (while still claiming success). Returns True ONLY on a positive fresh read that contradicts the
+        plan; when it can't confirm (no id / no im / read error / id still matches) it returns False so
+        the delete proceeds — never skip a valid reclaim on an unconfirmed read."""
+        if movie_id is None:
+            return False
+        im = getattr(self.gw, "im", None)
+        if im is None or not hasattr(im, "_make_request"):
+            return False
+        resolved = self.gw.resolve(inst) if hasattr(self.gw, "resolve") else inst
+        try:
+            rec = im._make_request(resolved, f"movie/{movie_id}", fallback=None)
+        except Exception:
+            return False
+        if not isinstance(rec, dict):
+            return False                                     # couldn't read → don't skip (proceed)
+        return (rec.get("movieFile") or {}).get("id") != file_id   # different / missing → stale
+
     def apply(self, plan: dict) -> dict:
         """Advance one dedup plan. Returns ``{status, title, tmdb}``; status is flag-same-path /
         keeper-unconfirmed / would-dedup / deduped / skip."""
@@ -90,6 +112,17 @@ class CrossInstanceDedup:
             self._log("log_info", f"[Dedup] would reclaim '{title}': {plan.get('reason')} "
                                   f"(delete moviefile/{loser_file_id} on {loser_inst}).")
             return {"status": "would-dedup", "title": title, "tmdb": tmdb}
+
+        # The planned loser_file_id is from a run-start snapshot; a concurrent retune/rescan (the
+        # dual-version baseline retune runs the same sweep) can re-import the loser's file under a NEW id
+        # or replace it with the 1080p, so deleting the stale id 404s + reclaims nothing (and must not
+        # claim success). Fresh-confirm the SAME file is still current; if it has moved on, the reclaim is
+        # already handled (or re-planned next run) — skip cleanly, no destructive call. Only guarded when
+        # the loser record id is known.
+        if self._loser_file_stale(loser_inst, loser_movie_id, loser_file_id):
+            self._log("log_info", f"[Dedup] '{title}': loser's copy on {loser_inst} is already gone or "
+                                  f"re-imported (moviefile/{loser_file_id} stale) — nothing to reclaim.")
+            return {"status": "already-reclaimed", "title": title, "tmdb": tmdb}
 
         # Stop the loser re-grabbing and recreating the duplicate, then delete only its FILE. A
         # transient Radarr error on the delete fails THIS title only (self-heals next run) — never

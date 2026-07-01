@@ -127,3 +127,34 @@ def test_fresh_keeper_confirm_allows_delete():
     res = d.apply(_RECLAIM)
     assert res["status"] == "deduped"
     assert gw.deletes == [("standard", "moviefile/700")]
+
+
+def test_stale_loser_file_id_skips_delete_no_404():
+    # the plan's loser_file_id (700) is stale: a concurrent retune re-imported the loser under a NEW id
+    # (999). Deleting 700 would 404 + reclaim nothing (and falsely log success) → skip cleanly instead.
+    gw = _GWim({"ultra": [{"tmdbId": 7, "hasFile": True}], "standard": [{"tmdbId": 7, "hasFile": True}]},
+               fresh={71: {"hasFile": True}, 70: {"hasFile": True, "movieFile": {"id": 999}}})
+    d = CrossInstanceDedup(gw, dry_run=False)
+    res = d.apply(_RECLAIM)
+    assert res["status"] == "already-reclaimed"
+    assert gw.deletes == []                                  # no stale-id delete → no 404 spam
+
+
+def test_loser_already_fileless_skips_delete():
+    # the loser's 2160p was already replaced (retune import) → fresh read shows no file → skip, not delete.
+    gw = _GWim({"ultra": [{"tmdbId": 7, "hasFile": True}], "standard": [{"tmdbId": 7, "hasFile": True}]},
+               fresh={71: {"hasFile": True}, 70: {"hasFile": False}})
+    d = CrossInstanceDedup(gw, dry_run=False)
+    res = d.apply(_RECLAIM)
+    assert res["status"] == "already-reclaimed"
+    assert gw.deletes == []
+
+
+def test_current_loser_file_id_still_deletes():
+    # fresh read confirms the loser STILL holds the SAME planned file (700) → the delete proceeds.
+    gw = _GWim({"ultra": [{"tmdbId": 7, "hasFile": True}], "standard": [{"tmdbId": 7, "hasFile": True}]},
+               fresh={71: {"hasFile": True}, 70: {"hasFile": True, "movieFile": {"id": 700}}})
+    d = CrossInstanceDedup(gw, dry_run=False)
+    res = d.apply(_RECLAIM)
+    assert res["status"] == "deduped"
+    assert gw.deletes == [("standard", "moviefile/700")]
