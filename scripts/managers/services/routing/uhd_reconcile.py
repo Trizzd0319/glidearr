@@ -107,6 +107,13 @@ class UhdReconcileManager:
     # absorbs a transient large affinity swing. Keyed by 4K instance; reset the instant a title
     # recovers to/above the demote floor.
     _WATCH_DEMOTE_CLOCK_KEY = "radarr/{inst}/watch_demote_clock"
+    # Per-title "relocate ManualImport issued at" ledger (ISO), keyed by 4K instance. The relocate copy
+    # is an ASYNC Radarr command; while a marker is within this grace window the reconcile must NOT re-
+    # issue the import (a sweep firing before the copy latches hasFile would otherwise re-command it every
+    # run). Once the 4K record gains its own 2160p the phase-1 branch stops firing and the marker is
+    # dropped; a marker aged past the grace re-issues (rate-limited), so a stuck import can't loop per-run.
+    _RELOCATE_PENDING_KEY = "radarr/{inst}/relocate_pending"
+    _RELOCATE_GRACE_DAYS = 0.5
 
     def __init__(self, config=None, logger=None, *, radarr=None, dry_run=False, registry=None, **kwargs):
         self.config = config or {}
@@ -277,10 +284,23 @@ class UhdReconcileManager:
         # "can the 4K instance actually see the file" check on top.
         shared_mode = shared_storage_mode(self.config)
         self._relocated = set()          # tmdbs relocated this sweep — a title on >1 source instance
-        for name in self._source_instances(gw, fourk):     # must not be re-imported into the 4K record
+        relo_key = self._RELOCATE_PENDING_KEY.format(inst=fourk)   # must not be re-imported into the 4K record
+        _rp = self.global_cache.get(relo_key) if self.global_cache else None
+        self._relo_prev = _rp if isinstance(_rp, dict) else {}     # {tmdb: issued-ISO} from prior sweeps
+        self._relo_new = {}              # markers still pending after THIS sweep (persisted below)
+        self._relo_now = datetime.now(timezone.utc)
+        for name in self._source_instances(gw, fourk):
             shared_ok = self._shared_storage_ok(gw, shared_mode, name, fourk)
             self._reconcile_instance(gw, actuator, name, fourk, dest_root, dest_pid,
                                      present, hasfile, uhd_paths, uhd_res, crp, uhd_ids, shared_ok)
+        # Persist the pending-relocate ledger (non-destructive tracking of async imports in flight; only
+        # a real 'relocating' issue is marked, so a dry-run adds nothing). A title that gained its 2160p
+        # is simply not carried forward, so its marker clears.
+        if self.global_cache is not None:
+            try:
+                self.global_cache.set(relo_key, self._relo_new)
+            except Exception:
+                pass
 
     def _shared_storage_ok(self, gw, mode, src, dst) -> bool:
         """Does ``src`` (standard) share one backing filesystem with ``dst`` (4K) — so the 4K side can
@@ -776,6 +796,16 @@ class UhdReconcileManager:
                 # shares a filesystem AND the actuator's per-title probe confirms the 4K instance can
                 # see the file — otherwise it returns a non-relocating status and we DOWNLOAD instead.
                 relocated = tmdb in self._relocated        # already relocated from another source instance
+                # A prior sweep's relocate copy is async — while its marker is within the grace window the
+                # import is still in flight, so HOLD (don't re-issue); an aged marker re-issues.
+                pend = self._relo_prev.get(str(tmdb)) if not relocated else None
+                if pend:
+                    _, _age = clock_age(pend, self._relo_now)
+                    if _age is not None and _age < self._RELOCATE_GRACE_DAYS:
+                        relocated = True
+                        self._relo_new[str(tmdb)] = pend   # keep aging until the 4K record latches hasFile
+                        self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} "
+                                              f"relocate pending (import in flight)")
                 if shared_ok and not relocated:
                     rst = actuator.relocate(mv, to_inst=fourk, dest_root=dest_root,
                                             dest_profile_id=dest_pid, from_inst=std_inst,
@@ -783,6 +813,8 @@ class UhdReconcileManager:
                     if rst in ("relocating", "would-relocate"):
                         relocated = True
                         self._relocated.add(tmdb)
+                        if rst == "relocating":            # a real async import was issued → track it
+                            self._relo_new[str(tmdb)] = self._relo_now.isoformat()
                         acted += 1
                         self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} "
                                               f"relocate-4K (hardlink) [{rst}]")

@@ -6,6 +6,7 @@ standard record is retuned to its ≤1080 baseline + search (Radarr replaces the
 cross-instance file move. A fake instance-manager records the movie/command/editor calls."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 
 from scripts.managers.services.routing.uhd_reconcile import UhdReconcileManager
 
@@ -455,9 +456,14 @@ _STD_1080_862 = {"id": 1, "tmdbId": 862, "title": "Toy Story", "monitored": True
 
 
 class _XCache:
-    """global_cache stub exposing only the backup gate key."""
-    def __init__(self, gate=None): self._d = {GATE_KEY: gate} if gate is not None else {}
+    """global_cache stub: backup gate key + arbitrary seeded keys, records set() writes."""
+    def __init__(self, gate=None, seed=None):
+        self._d = dict(seed or {})
+        if gate is not None:
+            self._d[GATE_KEY] = gate
+        self.writes = []
     def get(self, k, *a, **kw): return self._d.get(k)
+    def set(self, k, v, *a, **kw): self._d[k] = v; self.writes.append((k, v))
 
 
 def _xcfg(*, move=True, dedup=True, mode="cross_instance"):
@@ -480,13 +486,16 @@ def _clear_x_env(monkeypatch):
         monkeypatch.delenv(v, raising=False)
 
 
-def _xrun(std, ultra, monkeypatch, *, cfg=None, dry_run=False, gate=None, roots=None, manual=None):
+def _xrun(std, ultra, monkeypatch, *, cfg=None, dry_run=False, gate=None, roots=None, manual=None,
+          seed=None, cache=None):
     _clear_x_env(monkeypatch)
     im = _Im({"standard": std, "ultra": ultra},
              profiles={"standard": _STD_PROFILES, "ultra": _UHD_PROFILES},
              roots=roots or _SHARED_ROOTS, manual=manual)
+    gc = cache or _XCache(gate, seed)
     UhdReconcileManager(config=cfg or _xcfg(), logger=None, radarr=_Mgr(im), dry_run=dry_run,
-                        global_cache=_XCache(gate)).run()
+                        global_cache=gc).run()
+    im.cache = gc
     return im
 
 
@@ -525,6 +534,38 @@ def test_disjoint_mounts_download_no_relocate(monkeypatch):
     assert not any(c[1].get("name") == "ManualImport" for c in im.commands)   # never relocates
     assert len(im.adds) == 1 and im.adds[0][1]["addOptions"] == {"searchForMovie": True}  # downloads
     assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts
+
+
+_RELO_CAND = [{"path": "/data/media/movies/standard/Toy Story (1995)/ts.mkv", "size": 50_000_000_000,
+               "quality": {"quality": {"resolution": 2160}}, "languages": [], "releaseGroup": ""}]
+
+
+def test_relocate_marks_pending_ledger(monkeypatch):
+    im = _xrun([_M4K], [], monkeypatch, manual=_RELO_CAND)                    # no prior marker
+    assert any(c[1].get("name") == "ManualImport" for c in im.commands)       # relocates
+    assert "862" in im.cache.get("radarr/ultra/relocate_pending", {})         # and records it pending
+
+
+def test_relocate_pending_marker_holds_off_reissue(monkeypatch):
+    # a prior sweep's relocate copy is still in flight (fresh marker) → do NOT re-issue and do NOT
+    # download; just hold standard frozen and carry the marker forward.
+    fresh = datetime.now(timezone.utc).isoformat()
+    im = _xrun([_M4K], [], monkeypatch, manual=_RELO_CAND,
+               seed={"radarr/ultra/relocate_pending": {"862": fresh}})
+    assert not any(c[1].get("name") == "ManualImport" for c in im.commands)   # not re-issued
+    assert im.adds == []                                                       # not downloaded either
+    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts      # standard held (frozen)
+    assert im.cache.get("radarr/ultra/relocate_pending") == {"862": fresh}     # marker carried forward
+
+
+def test_relocate_stale_marker_reissues(monkeypatch):
+    # a marker aged past the grace ⇒ the copy is stuck, not in flight → re-issue (re-marked fresh),
+    # so a permanently-failing import is rate-limited, not looped every run.
+    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    im = _xrun([_M4K], [], monkeypatch, manual=_RELO_CAND,
+               seed={"radarr/ultra/relocate_pending": {"862": stale}})
+    assert any(c[1].get("name") == "ManualImport" for c in im.commands)       # re-issued
+    assert im.cache.get("radarr/ultra/relocate_pending", {}).get("862") != stale   # re-marked fresh
 
 
 def test_cross_instance_move_blocked_by_disarmed_backup(monkeypatch):
