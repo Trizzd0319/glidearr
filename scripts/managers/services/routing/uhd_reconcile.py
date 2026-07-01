@@ -819,7 +819,11 @@ class UhdReconcileManager:
                         self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} "
                                               f"relocate-4K (hardlink) [{rst}]")
                         self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "relocate-4k", rst)
-                if not relocated:                              # download (no shared storage / not visible)
+                    # else: relocate genuinely found no 2160p to import (probe empty AND the source has no
+                    # 2160p movieFile) → fall through to download a fresh 4K. A probe that merely TIMED OUT
+                    # never lands here — relocate falls back to the source's own movieFile and returns
+                    # 'relocating' — so a slow probe can't trigger a re-download.
+                if not relocated:                              # not shared, or genuinely no 2160p to relocate
                     if not dest_present:                       # no 4K record yet → add it (search ON)
                         ast = actuator.acquire(mv, to_inst=fourk, dest_root=dest_root,
                                                dest_profile_id=dest_pid, from_inst=std_inst).get("status")

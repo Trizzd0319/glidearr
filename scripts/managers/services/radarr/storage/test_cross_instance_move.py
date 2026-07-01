@@ -224,11 +224,36 @@ def test_relocate_drives_existing_record_without_readd():
     assert _mi_cmd(gw)["files"][0]["movieId"] == 42
 
 
-def test_relocate_not_visible_adds_nothing():
-    # the 4K instance sees NO importable file (not shared storage) → adds nothing, no import; the
-    # caller falls back to download. Adding here would duplicate the 4K record.
+_MOVIE_NO4K = dict(_MOVIE, movieFile={"id": 50, "path": "/data/media/movies/Kids/Toy Story (1995)/ts.mkv",
+                                      "quality": {"quality": {"resolution": 1080}}})   # no 2160p file
+
+
+def test_candidate_from_movie_builds_from_2160p_moviefile():
+    m, _ = _mover()
+    c = m._candidate_from_movie(_MOVIE)
+    assert c["path"] == "/data/media/movies/Kids/Toy Story (1995)/ts.mkv"
+    assert c["quality"] == {"quality": {"resolution": 2160}}
+    assert m._candidate_from_movie(_MOVIE_NO4K) is None                # sub-2160 movieFile
+    assert m._candidate_from_movie({"tmdbId": 1}) is None              # no movieFile
+
+
+def test_relocate_falls_back_to_source_moviefile_when_probe_empty():
+    # the manualimport probe is unavailable (None — e.g. it timed out under load), but the SOURCE record
+    # holds a genuine 2160p → relocate imports THAT (its own movieFile path), so a slow probe never
+    # forces a re-download.
     m, gw = _mover()                                        # gw.manualimport stays None
     res = m.relocate(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k",
+                     dest_profile_id=7, from_inst="standard", dest_id=1)
+    assert res["status"] == "relocating"
+    assert _mi_cmd(gw)["importMode"] == "copy"
+    assert _mi_cmd(gw)["files"][0]["path"] == "/data/media/movies/Kids/Toy Story (1995)/ts.mkv"
+
+
+def test_relocate_not_visible_when_probe_empty_and_source_not_2160p():
+    # probe unavailable AND the source has no 2160p → genuinely nothing to relocate → not-visible,
+    # adds nothing (only then does the caller download).
+    m, gw = _mover()                                        # gw.manualimport stays None
+    res = m.relocate(_MOVIE_NO4K, to_inst="ultra", dest_root="/data/media/movies/4k",
                      dest_profile_id=7, from_inst="standard")
     assert res["status"] == "not-visible"
     assert gw.adds == [] and gw.puts == [] and _mi_cmd(gw) is None
@@ -262,12 +287,14 @@ def test_relocate_ignores_sub_2160_and_rejected_files():
     assert _mi_cmd(gw)["files"][0]["path"] == "/a/good-2160.mkv"
 
 
-def test_relocate_not_visible_when_only_sub_2160p():
+def test_relocate_probe_sub_2160_uses_source_2160p_fallback():
+    # the probe sees only a sub-2160 file (filtered → None), but the SOURCE record holds a genuine 2160p
+    # → fall back to the source's own movieFile and import the real 2160p (not the probe's sub-4K file).
     m, gw = _seeing([dict(_CAND[0], quality={"quality": {"resolution": 1080}})])
     res = m.relocate(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k",
-                     dest_profile_id=7, from_inst="standard")
-    assert res["status"] == "not-visible"                  # no genuine 2160p → caller downloads
-    assert gw.adds == [] and _mi_cmd(gw) is None
+                     dest_profile_id=7, from_inst="standard", dest_id=1)
+    assert res["status"] == "relocating"
+    assert _mi_cmd(gw)["files"][0]["path"] == "/data/media/movies/Kids/Toy Story (1995)/ts.mkv"
 
 
 def test_relocate_skips_without_a_source_folder():

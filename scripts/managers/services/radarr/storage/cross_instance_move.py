@@ -150,14 +150,17 @@ class CrossInstanceMove:
             self._log("log_info", f"[Relocate] would hardlink-relocate '{title}' ({folder}) → {to_inst} "
                                   f"(import copy → hardlink on one fs; source 2160p untouched).")
             return {"status": "would-relocate", "title": title, "tmdb": tmdb}
-        # 1. PROBE FIRST (read-only): can the 4K instance actually SEE an importable file in the source
-        #    folder? This is the per-title shared-storage confirm. It runs BEFORE any write so that a
-        #    not-visible result adds NOTHING — the caller then downloads and adds the record itself
-        #    (adding here first would duplicate the 4K record).
-        cand = self._manual_import_candidate(to_inst, folder)
+        # 1. Resolve the ManualImport entry BEFORE any write (so a miss adds nothing — adding first would
+        #    duplicate the 4K record). Prefer the 4K instance's own manualimport probe: it confirms the
+        #    instance can SEE the file and yields the exact importable entry. BUT that probe runs mediainfo
+        #    and, under heavy reconcile load, routinely exceeds the API timeout → None. So FALL BACK to the
+        #    SOURCE record's own movieFile — we already know its path + quality and it's a genuine 2160p —
+        #    which is why a slow/timed-out probe can NEVER force a wasteful 4K re-download. If the 4K
+        #    instance genuinely can't read the path, the later ManualImport simply no-ops (it stays
+        #    file-less → the caller's uhd_has_2160 gate keeps make-before-break), so this can't lose data.
+        cand = self._manual_import_candidate(to_inst, folder) or self._candidate_from_movie(src_movie)
         if cand is None:
-            self._log("log_info", f"[Relocate] {to_inst} sees no importable file in '{folder}' — not "
-                                  f"shared storage for '{title}'; caller will download instead.")
+            self._log("log_info", f"[Relocate] no importable 2160p for '{title}' at '{folder}'.")
             return {"status": "not-visible", "title": title, "tmdb": tmdb}
         # 2. a 4K record to import into — monitored, 4K profile, NO search (we import the existing file).
         mid = dest_id
@@ -181,6 +184,19 @@ class CrossInstanceMove:
         self._log("log_success", f"[Relocate] '{title}': importing existing 2160p into {to_inst} "
                                  f"(copy → hardlink; no re-download; source stays until it retunes).")
         return {"status": "relocating", "title": title, "tmdb": tmdb}
+
+    def _candidate_from_movie(self, src_movie):
+        """Build a ManualImport ``files[]`` entry from the SOURCE record's OWN movieFile — the timeout-
+        proof fallback when the manualimport probe is unavailable (slow/timed-out under load). We already
+        know the file path + quality from the source record, and the caller only relocates a genuine
+        2160p source, so importing it directly is correct; if the 4K instance can't actually read the
+        path the ManualImport no-ops (stays file-less), so this never loses data. None if the source has
+        no 2160p movieFile."""
+        mf = src_movie.get("movieFile") or {}
+        if not mf.get("path") or not mf.get("quality") or self._file_res(src_movie) < _UHD_RES:
+            return None
+        return {"path": mf.get("path"), "quality": mf.get("quality"),
+                "languages": mf.get("languages") or [], "releaseGroup": mf.get("releaseGroup") or ""}
 
     def _manual_import_candidate(self, inst, folder):
         """GET ``manualimport`` for ``folder`` on ``inst`` and return the largest GENUINE-2160p,

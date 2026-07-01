@@ -516,12 +516,13 @@ def test_shared_storage_relocates_instead_of_downloading(monkeypatch):
     assert not any(p[0] == "standard" and "qualityProfileId" in p[1] for p in im.puts)
 
 
-def test_shared_but_file_not_visible_falls_back_to_download(monkeypatch):
-    # shared totals/roots pass the coarse probe, but the 4K instance sees NO file there (manual=None)
-    # → NO relocate/import; DOWNLOAD instead (one add, SEARCH ON), and standard is frozen.
+def test_shared_probe_unavailable_relocates_via_source_moviefile(monkeypatch):
+    # shared storage confirmed; the manualimport probe is unavailable (manual=None, e.g. it timed out
+    # under load) but standard holds a 2160p → relocate via the SOURCE movieFile, NOT a re-download.
+    # This is the regression guard for the "slow probe → 55 needless 4K downloads" incident.
     im = _xrun([_M4K], [], monkeypatch)                            # manual defaults to None
-    assert not any(c[1].get("name") == "ManualImport" for c in im.commands)
-    assert len(im.adds) == 1 and im.adds[0][1]["addOptions"] == {"searchForMovie": True}
+    assert any(c[1].get("name") == "ManualImport" for c in im.commands)     # relocated via fallback
+    assert not any(a[1].get("addOptions") == {"searchForMovie": True} for a in im.adds)  # NO download
     assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts   # standard frozen, not retuned
     assert not any(p[0] == "standard" and "qualityProfileId" in p[1] for p in im.puts)
 
