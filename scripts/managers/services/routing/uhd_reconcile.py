@@ -66,11 +66,13 @@ from scripts.managers.machine_learning.space.routing_targets import (
     proactive_4k_enabled,
     relocation_enabled,
     reorg_mode,
+    shared_storage_mode,
     uhd_remote_play_ok,
 )
 from scripts.managers.services.acquisition.gateway import ArrGateway
 from scripts.managers.services.radarr.storage.cross_instance_dedup_apply import CrossInstanceDedup
 from scripts.managers.services.radarr.storage.cross_instance_move import CrossInstanceMove
+from scripts.managers.services.radarr.storage.shared_storage import shared_storage_confirmed
 from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.size_model import profile_max_quality
 from scripts.support.utilities.space_targets import space_targets
@@ -269,9 +271,37 @@ class UhdReconcileManager:
 
         # Stage-C remote-play gate (household-global) — computed once for the whole sweep.
         crp = self._remote_play_ok()
-        for name in self._source_instances(gw, fourk):
+        # SHARED-STORAGE ROUTING: relocate the standard 2160p into the 4K instance (hardlink, no re-
+        # download) when both instances back onto one filesystem; otherwise download. Mode read once;
+        # the confirm is per source↔4K pair (they could differ), and the actuator adds a per-title
+        # "can the 4K instance actually see the file" check on top.
+        shared_mode = shared_storage_mode(self.config)
+        self._relocated = set()          # tmdbs relocated this sweep — a title on >1 source instance
+        for name in self._source_instances(gw, fourk):     # must not be re-imported into the 4K record
+            shared_ok = self._shared_storage_ok(gw, shared_mode, name, fourk)
             self._reconcile_instance(gw, actuator, name, fourk, dest_root, dest_pid,
-                                     present, hasfile, uhd_paths, uhd_res, crp, uhd_ids)
+                                     present, hasfile, uhd_paths, uhd_res, crp, uhd_ids, shared_ok)
+
+    def _shared_storage_ok(self, gw, mode, src, dst) -> bool:
+        """Does ``src`` (standard) share one backing filesystem with ``dst`` (4K) — so the 4K side can
+        hardlink-RELOCATE the existing 2160p instead of re-downloading it? ``mode`` is
+        ``routing.movies.shared_storage``: ``true``/``false`` force it; ``auto`` probes
+        (``shared_storage_confirmed``: common mount ancestor + equal backing capacity — a further
+        per-title 'can it see the file' check runs in the actuator). Logged once per source instance;
+        fail-closed to download on any probe error."""
+        if mode == "false":
+            return False
+        if mode == "true":
+            self._log("log_info", f"[UHD] shared-storage {src}→{dst}: forced ON (config) → relocate")
+            return True
+        try:
+            ok, reason = shared_storage_confirmed(gw, src, dst)
+        except Exception as e:                                # pragma: no cover - defensive
+            self._log("log_warning", f"[UHD] shared-storage probe {src}→{dst} failed ({e}) → download")
+            return False
+        self._log("log_info", f"[UHD] shared-storage {src}→{dst}: "
+                              f"{'YES → relocate' if ok else 'no → download'} ({reason})")
+        return bool(ok)
 
     def _source_instances(self, gw, fourk) -> list:
         """The HD/standard-tier instances to scan as MOVE SOURCES — where the 1080p baseline lives.
@@ -667,7 +697,7 @@ class UhdReconcileManager:
     # ── per standard instance ──────────────────────────────────────────────────
     def _reconcile_instance(self, gw, actuator, std_inst, fourk, dest_root, dest_pid,
                             present, hasfile, uhd_paths=None, uhd_res=None, can_remote_play=True,
-                            uhd_ids=None):
+                            uhd_ids=None, shared_ok=False):
         uhd_paths = uhd_paths or {}
         uhd_res = uhd_res or {}
         uhd_ids = uhd_ids or {}
@@ -741,16 +771,33 @@ class UhdReconcileManager:
             # lands. Driving the 4K side even when a record already exists fixes a stale / un-monitored 4K
             # shell that its own RSS would otherwise never grab.
             if not uhd_has_2160:
-                if not dest_present:                           # no 4K record yet → add it (search ON)
-                    ast = actuator.acquire(mv, to_inst=fourk, dest_root=dest_root,
-                                           dest_profile_id=dest_pid, from_inst=std_inst).get("status")
-                else:                                          # 4K record exists but no 2160p → drive it
-                    ast = actuator.ensure_acquiring(uhd_ids.get(tmdb), inst=fourk,
-                                                    profile_id=dest_pid).get("status")
-                if ast not in ("skip", "noop"):
-                    acted += 1
-                    self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} acquire-4K [{ast}]")
-                    self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "acquire-4k", ast)
+                # SHARED STORAGE → RELOCATE: import standard's EXISTING 2160p into the 4K instance
+                # (copy → hardlink, no re-download; source untouched). Only when the source↔4K pair
+                # shares a filesystem AND the actuator's per-title probe confirms the 4K instance can
+                # see the file — otherwise it returns a non-relocating status and we DOWNLOAD instead.
+                relocated = tmdb in self._relocated        # already relocated from another source instance
+                if shared_ok and not relocated:
+                    rst = actuator.relocate(mv, to_inst=fourk, dest_root=dest_root,
+                                            dest_profile_id=dest_pid, from_inst=std_inst,
+                                            dest_id=uhd_ids.get(tmdb)).get("status")
+                    if rst in ("relocating", "would-relocate"):
+                        relocated = True
+                        self._relocated.add(tmdb)
+                        acted += 1
+                        self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} "
+                                              f"relocate-4K (hardlink) [{rst}]")
+                        self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "relocate-4k", rst)
+                if not relocated:                              # download (no shared storage / not visible)
+                    if not dest_present:                       # no 4K record yet → add it (search ON)
+                        ast = actuator.acquire(mv, to_inst=fourk, dest_root=dest_root,
+                                               dest_profile_id=dest_pid, from_inst=std_inst).get("status")
+                    else:                                      # 4K record exists but no 2160p → drive it
+                        ast = actuator.ensure_acquiring(uhd_ids.get(tmdb), inst=fourk,
+                                                        profile_id=dest_pid).get("status")
+                    if ast not in ("skip", "noop"):
+                        acted += 1
+                        self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} acquire-4K [{ast}]")
+                        self._record_plan(mv.get("title"), tmdb, std_inst, fourk, "acquire-4k", ast)
                 # Freeze standard's 2160p (un-monitor) so Radarr won't touch it while the 4K is acquired;
                 # phase 2 re-monitors it at the 1080p baseline once the 4K copy is confirmed. The 2160p
                 # file STAYS — so the title is never file-less and the only 4K copy is never lost.

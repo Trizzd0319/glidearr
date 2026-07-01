@@ -1,17 +1,25 @@
 """
-cross_instance_move.py — DOWNLOAD-BASED dual-version actuator across two Radarr instances.
+cross_instance_move.py — dual-version actuator across two Radarr instances (relocate OR download).
 ================================================================================
 Drives the ``4k_policy=='both'`` end-state (2160p on the 4K instance + a ≤1080p baseline on the
-standard instance) using ONLY each instance's own indexers + download client — NO cross-instance file
-move. The earlier ``importMode=Move`` relocation was removed: it required a shared mount + reliable
-filesystem-move semantics that can't be guaranteed across households (unRAID ``/mnt/user`` FUSE moves
-were not durable — the moved file vanished on the next rescan), so it isn't a portable mechanism.
+standard instance). The 4K side gets its 2160p one of two ways, chosen by the caller from a
+shared-storage probe:
 
-Two independent, make-before-break actuations the caller composes per title:
+  • ``relocate`` — SHARED STORAGE: import the standard instance's EXISTING 2160p file into the 4K
+    instance with ``importMode=copy`` (Radarr hardlinks it when ``copyUsingHardlinks`` is on and both
+    ends are one filesystem; a safe local copy on a cross-disk array union). NO re-download. Uses copy,
+    NOT move, so the SOURCE file is untouched — make-before-break — until the standard record later
+    retunes to 1080p and drops its 2160p (a hardlink survives that, the data persists on the 4K side).
+    A per-title ``manualimport`` probe first confirms the 4K instance can actually SEE the source
+    folder; if it can't (→ not really shared), ``relocate`` returns ``not-visible`` and the caller
+    falls back to ``acquire``. (The earlier ``importMode=Move`` relocation was removed because a Move
+    dropped the source immediately and jammed under load; this copy/hardlink variant is safe + only
+    imports once the 4K instance proves it can read the file.)
 
-  • ``acquire`` — the 4K side gets its OWN 2160p (clone the record onto the 4K instance, monitored,
-    SEARCH ON) so it downloads ASAP. The source instance is untouched. Works on any household: it only
-    needs the 4K instance to reach indexers + a download client.
+  • ``acquire`` — NO shared storage (or the probe failed): the 4K side downloads its OWN 2160p (clone
+    the record onto the 4K instance, monitored, SEARCH ON). The source instance is untouched. Works on
+    any household: it only needs the 4K instance to reach indexers + a download client. ``ensure_
+    acquiring`` drives an existing-but-fileless 4K record the same way (profile + monitor + search).
 
   • ``retune_baseline`` — the standard side is retuned DOWN to its ≤1080p baseline profile + re-
     monitor + RescanMovie + MoviesSearch. No file move, no delete: ``movie/editor`` retunes the
@@ -19,12 +27,15 @@ Two independent, make-before-break actuations the caller composes per title:
     1080p and REPLACES the 2160p ON IMPORT. The 2160p stays on disk until the 1080p lands, so the title
     is never file-less.
 
-Both are idempotent (a record already at the 4K instance / already at the 1080p baseline is a no-op)
-and every write is gated by ``dry_run``. PURE orchestration over an ``ArrGateway`` — no config, no
+Every write is gated by ``dry_run``. PURE orchestration over an ``ArrGateway`` — no config, no
 registry; the caller supplies the instances, the 4K root + 2160p profile, and the standard ≤1080p
 baseline profile.
 """
 from __future__ import annotations
+
+from urllib.parse import quote
+
+_UHD_RES = 2160
 
 
 class CrossInstanceMove:
@@ -117,6 +128,92 @@ class CrossInstanceMove:
                                  f"monitored + searched.")
         return {"status": "acquiring"}
 
+    def relocate(self, src_movie: dict, *, to_inst: str, dest_root: str, dest_profile_id,
+                 from_inst=None, dest_id=None) -> dict:
+        """SHARED-STORAGE hardlink-relocate: import the source instance's EXISTING 2160p file into the
+        4K instance with ``importMode=copy`` (Radarr hardlinks it when copyUsingHardlinks is on and both
+        ends are one filesystem; a safe local copy on a cross-disk union). NO re-download; copy (not
+        move) leaves the SOURCE file untouched → make-before-break. Ensures a monitored 4K record to
+        import into (adds one, SEARCH OFF, if ``dest_id`` is None). A ``manualimport`` probe first
+        confirms the 4K instance can SEE the source folder — if it can't, returns ``not-visible`` so the
+        caller downloads instead. Requires the 4K instance's root folder to NOT contain the source tree
+        (Radarr refuses to import from inside its own root). dry_run-aware."""
+        tmdb = src_movie.get("tmdbId")
+        title = src_movie.get("title")
+        folder = str(src_movie.get("path") or "").replace("\\", "/").strip().rstrip("/")
+        if not folder:
+            sf = str(((src_movie.get("movieFile") or {}).get("path")) or "").replace("\\", "/").strip()
+            folder = sf.rsplit("/", 1)[0] if "/" in sf else ""
+        if tmdb is None or not folder:
+            return {"status": "skip", "title": title, "tmdb": tmdb}
+        if self.dry_run:
+            self._log("log_info", f"[Relocate] would hardlink-relocate '{title}' ({folder}) → {to_inst} "
+                                  f"(import copy → hardlink on one fs; source 2160p untouched).")
+            return {"status": "would-relocate", "title": title, "tmdb": tmdb}
+        # 1. PROBE FIRST (read-only): can the 4K instance actually SEE an importable file in the source
+        #    folder? This is the per-title shared-storage confirm. It runs BEFORE any write so that a
+        #    not-visible result adds NOTHING — the caller then downloads and adds the record itself
+        #    (adding here first would duplicate the 4K record).
+        cand = self._manual_import_candidate(to_inst, folder)
+        if cand is None:
+            self._log("log_info", f"[Relocate] {to_inst} sees no importable file in '{folder}' — not "
+                                  f"shared storage for '{title}'; caller will download instead.")
+            return {"status": "not-visible", "title": title, "tmdb": tmdb}
+        # 2. a 4K record to import into — monitored, 4K profile, NO search (we import the existing file).
+        mid = dest_id
+        if mid is None:
+            payload = self._build_dest_payload(src_movie, to_inst, dest_root, dest_profile_id,
+                                               search=False, from_inst=from_inst)
+            try:
+                created = self.gw.add(to_inst, payload)
+            except Exception as e:
+                self._log("log_warning", f"[Relocate] add to {to_inst} failed for '{title}': {e}")
+                return {"status": "failed", "title": title, "tmdb": tmdb}
+            mid = created.get("id") if isinstance(created, dict) else None
+            if mid is None:
+                return {"status": "failed", "title": title, "tmdb": tmdb}
+        else:
+            self.gw.put(to_inst, "movie/editor",
+                        {"movieIds": [mid], "qualityProfileId": dest_profile_id, "monitored": True})
+        # 3. import COPY (→ hardlink on one fs) into the 4K record; the SOURCE file is left in place.
+        cand["movieId"] = mid
+        self.gw.command(to_inst, {"name": "ManualImport", "importMode": "copy", "files": [cand]})
+        self._log("log_success", f"[Relocate] '{title}': importing existing 2160p into {to_inst} "
+                                 f"(copy → hardlink; no re-download; source stays until it retunes).")
+        return {"status": "relocating", "title": title, "tmdb": tmdb}
+
+    def _manual_import_candidate(self, inst, folder):
+        """GET ``manualimport`` for ``folder`` on ``inst`` and return the largest GENUINE-2160p,
+        non-rejected importable video file as a ManualImport ``files[]`` entry (no ``movieId`` yet —
+        the caller injects it after ensuring the record) — or None when the instance sees no eligible
+        2160p file there (it does not share the source storage, the folder is empty/unreadable, or it
+        holds only sub-4K / Radarr-rejected files). The None-path is the caller's cue to DOWNLOAD.
+        The ``resolution >= 2160`` filter keeps the caller's ``uhd_has_2160`` gate honest — relocating a
+        sub-4K file would never satisfy it, so the reconcile would re-import forever and never converge;
+        skipping ``rejections`` avoids force-importing a sample/unparsed companion."""
+        resp = self.gw.get(inst, f"manualimport?folder={quote(folder)}&filterExistingFiles=false",
+                           fallback=None)
+        if not isinstance(resp, list) or not resp:
+            return None
+        best = None
+        for it in resp:
+            if not isinstance(it, dict) or not it.get("path") or not it.get("quality"):
+                continue
+            if it.get("rejections"):                       # Radarr already refused it (sample/unparsed/…)
+                continue
+            if self._file_res({"movieFile": it}) < _UHD_RES:   # only relocate a real 2160p
+                continue
+            if best is None or (it.get("size") or 0) > (best.get("size") or 0):
+                best = it
+        if best is None:
+            return None
+        return {
+            "path": best.get("path"),
+            "quality": best.get("quality"),
+            "languages": best.get("languages") or [],
+            "releaseGroup": best.get("releaseGroup") or "",
+        }
+
     def unmonitor(self, movie_id, *, inst) -> dict:
         """Freeze a record by un-monitoring it (keeps its file; stops Radarr touching/upgrading it).
         Used to hold the standard 2160p while the 4K instance acquires its own copy. dry_run-aware."""
@@ -148,13 +245,13 @@ class CrossInstanceMove:
                 out.append(tid)
         return out
 
-    def _add_to_dest(self, src_movie, to_inst, dest_root, dest_profile_id, *, search: bool = False,
-                     from_inst=None) -> bool:
-        """Add the title to the destination, monitored, with ``searchForMovie=search`` (acquire always
-        passes True → the 4K instance downloads its own copy). Clones the source object; strips the
-        source identity + its absolute path so the destination's ``rootFolderPath`` is authoritative;
-        carries TAGS across by label (per-instance ids would be wrong) and forces the destination
-        quality profile. Returns ok."""
+    def _build_dest_payload(self, src_movie, to_inst, dest_root, dest_profile_id, *,
+                            search: bool = False, from_inst=None) -> dict:
+        """Clone the source movie into a destination ADD payload: strip the source identity + its
+        absolute path so the destination ``rootFolderPath`` is authoritative, force the destination
+        quality profile, set monitored + ``searchForMovie=search`` (acquire → True downloads;
+        relocate → False imports the existing file), and carry TAGS across by LABEL (per-instance ids
+        would be wrong; missing labels are created on the destination)."""
         payload = dict(src_movie)
         for k in ("id", "movieFile", "movieFileId", "path", "folderName"):
             payload.pop(k, None)
@@ -163,11 +260,15 @@ class CrossInstanceMove:
         payload["monitored"] = True
         payload.setdefault("minimumAvailability", "released")
         payload["addOptions"] = {"searchForMovie": bool(search)}
-        # Tags by LABEL, not the source's per-instance ids (else the destination gets mismatched or
-        # nonexistent tags). Missing labels are created on the destination.
         payload["tags"] = self._dest_tag_ids(self._src_tag_labels(src_movie, from_inst), to_inst)
+        return payload
+
+    def _add_to_dest(self, src_movie, to_inst, dest_root, dest_profile_id, *, search: bool = False,
+                     from_inst=None) -> bool:
+        """Add the title to the destination (see :meth:`_build_dest_payload`). Returns ok."""
         try:
-            return bool(self.gw.add(to_inst, payload))
+            return bool(self.gw.add(to_inst, self._build_dest_payload(
+                src_movie, to_inst, dest_root, dest_profile_id, search=search, from_inst=from_inst)))
         except Exception as e:
             self._log("log_warning", f"[Relocate] add to {to_inst} failed for "
                                      f"'{src_movie.get('title')}': {e}")

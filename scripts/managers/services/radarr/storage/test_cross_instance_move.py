@@ -14,7 +14,8 @@ from scripts.managers.services.radarr.storage.cross_instance_move import CrossIn
 
 class _GW:
     def __init__(self):
-        self.adds, self.commands, self.puts = [], [], []
+        self.adds, self.commands, self.puts, self.gets = [], [], [], []
+        self.manualimport = None                 # canned GET /manualimport response (None ⇒ sees nothing)
         # standard has two tags; ultra shares 'anime' (different id) and is MISSING 'keep-universe-mcu'
         self._tags = {"standard": [{"id": 7, "label": "keep-universe-mcu"}, {"id": 9, "label": "anime"}],
                       "ultra": [{"id": 2, "label": "anime"}]}
@@ -28,6 +29,12 @@ class _GW:
 
     def put(self, inst, endpoint, payload):
         self.puts.append((inst, endpoint, payload)); return {"ok": True}
+
+    def get(self, inst, endpoint, fallback=None):
+        self.gets.append((inst, endpoint))
+        if endpoint.startswith("manualimport"):
+            return self.manualimport if self.manualimport is not None else fallback
+        return fallback
 
     def tags(self, inst):
         return self._tags.get(inst, [])
@@ -168,6 +175,107 @@ def test_unmonitor_dry_run():
     res = m.unmonitor(1, inst="standard")
     assert res["status"] == "would-freeze"
     assert gw.puts == []
+
+
+# ── relocate (SHARED STORAGE: import the existing 2160p, copy → hardlink, no re-download) ─────────
+_CAND = [{"path": "/data/media/movies/Kids/Toy Story (1995)/ts.mkv", "size": 50_000_000_000,
+          "quality": {"quality": {"resolution": 2160, "name": "Remux-2160p"}},
+          "languages": [{"id": 1, "name": "English"}], "releaseGroup": "GRP", "movie": {"id": 500}}]
+
+
+def _seeing(cand, dry_run=False):
+    m, gw = _mover(dry_run=dry_run)
+    gw.manualimport = cand
+    return m, gw
+
+
+def _mi_cmd(gw):
+    return next((c[1] for c in gw.commands if c[1].get("name") == "ManualImport"), None)
+
+
+def test_relocate_imports_existing_into_a_new_record():
+    m, gw = _seeing(_CAND)
+    res = m.relocate(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k",
+                     dest_profile_id=7, from_inst="standard")
+    assert res["status"] == "relocating"
+    # PROBED manualimport for the source folder (derived from the movieFile path) BEFORE any write
+    assert any("manualimport" in e for _, e in gw.gets)
+    # added a 4K record with SEARCH OFF (import, not download), 4k root + 2160p profile
+    assert len(gw.adds) == 1 and gw.adds[0][0] == "ultra"
+    assert gw.adds[0][1]["addOptions"] == {"searchForMovie": False}
+    assert gw.adds[0][1]["qualityProfileId"] == 7
+    # ManualImport COPY of the existing file, bound to the new record id (500)
+    cmd = _mi_cmd(gw)
+    assert cmd and cmd["importMode"] == "copy"
+    assert cmd["files"][0]["movieId"] == 500
+    assert cmd["files"][0]["path"] == "/data/media/movies/Kids/Toy Story (1995)/ts.mkv"
+    # NEVER a Move or a delete — the source file is untouched (make-before-break)
+    assert not any(c[1].get("importMode") == "move" or "delete" in str(c).lower() for c in gw.commands)
+
+
+def test_relocate_drives_existing_record_without_readd():
+    m, gw = _seeing(_CAND)
+    res = m.relocate(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k",
+                     dest_profile_id=7, from_inst="standard", dest_id=42)
+    assert res["status"] == "relocating"
+    assert gw.adds == []                                    # existing record → no re-add
+    assert ("ultra", "movie/editor",
+            {"movieIds": [42], "qualityProfileId": 7, "monitored": True}) in gw.puts
+    assert _mi_cmd(gw)["files"][0]["movieId"] == 42
+
+
+def test_relocate_not_visible_adds_nothing():
+    # the 4K instance sees NO importable file (not shared storage) → adds nothing, no import; the
+    # caller falls back to download. Adding here would duplicate the 4K record.
+    m, gw = _mover()                                        # gw.manualimport stays None
+    res = m.relocate(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k",
+                     dest_profile_id=7, from_inst="standard")
+    assert res["status"] == "not-visible"
+    assert gw.adds == [] and gw.puts == [] and _mi_cmd(gw) is None
+
+
+def test_relocate_dry_run_writes_nothing():
+    m, gw = _seeing(_CAND, dry_run=True)
+    res = m.relocate(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k",
+                     dest_profile_id=7, from_inst="standard")
+    assert res["status"] == "would-relocate"
+    assert gw.adds == [] and gw.commands == [] and gw.puts == []
+
+
+def test_relocate_picks_the_largest_2160p_file():
+    two = [dict(_CAND[0], path="/a/small.mkv", size=1), dict(_CAND[0], path="/a/big.mkv", size=99)]
+    m, gw = _seeing(two)
+    m.relocate(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k",
+               dest_profile_id=7, from_inst="standard", dest_id=1)
+    assert _mi_cmd(gw)["files"][0]["path"] == "/a/big.mkv"
+
+
+def test_relocate_ignores_sub_2160_and_rejected_files():
+    # a BIGGER 1080p companion + a rejected 2160p + a genuine 2160p → import ONLY the real 2160p, so
+    # the caller's uhd_has_2160 gate converges (a sub-4K import would re-fire forever) and no sample lands.
+    files = [dict(_CAND[0], path="/a/big-1080.mkv", size=99, quality={"quality": {"resolution": 1080}}),
+             dict(_CAND[0], path="/a/rej-2160.mkv", size=80, rejections=[{"reason": "Sample"}]),
+             dict(_CAND[0], path="/a/good-2160.mkv", size=50)]
+    m, gw = _seeing(files)
+    m.relocate(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k",
+               dest_profile_id=7, from_inst="standard", dest_id=1)
+    assert _mi_cmd(gw)["files"][0]["path"] == "/a/good-2160.mkv"
+
+
+def test_relocate_not_visible_when_only_sub_2160p():
+    m, gw = _seeing([dict(_CAND[0], quality={"quality": {"resolution": 1080}})])
+    res = m.relocate(_MOVIE, to_inst="ultra", dest_root="/data/media/movies/4k",
+                     dest_profile_id=7, from_inst="standard")
+    assert res["status"] == "not-visible"                  # no genuine 2160p → caller downloads
+    assert gw.adds == [] and _mi_cmd(gw) is None
+
+
+def test_relocate_skips_without_a_source_folder():
+    m, gw = _seeing(_CAND)
+    res = m.relocate({"tmdbId": 862, "title": "X"}, to_inst="ultra",
+                     dest_root="/data/media/movies/4k", dest_profile_id=7, from_inst="standard")
+    assert res["status"] == "skip"
+    assert gw.adds == [] and gw.gets == [] and _mi_cmd(gw) is None
 
 
 # ── tags carried across instances by LABEL (per-instance ids must NOT be copied raw) ──

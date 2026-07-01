@@ -29,11 +29,12 @@ _U_NOFILE = {"id": 5, "tmdbId": 862, "hasFile": False}
 
 
 class _Im:
-    def __init__(self, movies, profiles=None, roots=None, free=9999.0, total=10000.0):
+    def __init__(self, movies, profiles=None, roots=None, free=9999.0, total=10000.0, manual=None):
         self._movies = movies
         self._profiles = profiles or {}
         self._roots = roots or {}
         self._free, self._total = free, total
+        self._manual = manual                 # canned GET /manualimport response (shared-storage relocate)
         self.commands, self.puts, self.adds, self.deletes, self.gets = [], [], [], [], []
 
     def disk_free_gb(self, inst): return self._free
@@ -52,6 +53,8 @@ class _Im:
         if method == "DELETE":
             self.deletes.append((name, endpoint)); return {}
         self.gets.append((name, endpoint))
+        if endpoint.startswith("manualimport"):
+            return self._manual if self._manual is not None else (fallback if fallback is not None else [])
         table = {"movie": self._movies, "qualityprofile": self._profiles, "rootfolder": self._roots}
         return table.get(endpoint, {}).get(name, fallback if fallback is not None else [])
 
@@ -477,32 +480,51 @@ def _clear_x_env(monkeypatch):
         monkeypatch.delenv(v, raising=False)
 
 
-def _xrun(std, ultra, monkeypatch, *, cfg=None, dry_run=False, gate=None, roots=None):
+def _xrun(std, ultra, monkeypatch, *, cfg=None, dry_run=False, gate=None, roots=None, manual=None):
     _clear_x_env(monkeypatch)
     im = _Im({"standard": std, "ultra": ultra},
              profiles={"standard": _STD_PROFILES, "ultra": _UHD_PROFILES},
-             roots=roots or _SHARED_ROOTS)
+             roots=roots or _SHARED_ROOTS, manual=manual)
     UhdReconcileManager(config=cfg or _xcfg(), logger=None, radarr=_Mgr(im), dry_run=dry_run,
                         global_cache=_XCache(gate)).run()
     return im
 
 
-# ── dual-version under cross_instance mode (download-based; no probe, no shared mount) ──────────
-def test_cross_instance_acquires_4k_and_freezes_standard(monkeypatch):
-    im = _xrun([_M4K], [], monkeypatch)
-    assert len(im.adds) == 1 and im.adds[0][0] == "ultra"
-    assert im.adds[0][1]["addOptions"] == {"searchForMovie": True}
+# ── dual-version: shared storage → RELOCATE (hardlink) ; else → DOWNLOAD ───────────────────────
+def test_shared_storage_relocates_instead_of_downloading(monkeypatch):
+    # standard + ultra share a filesystem (common root ancestor + equal total) AND the 4K instance
+    # can SEE standard's 2160p → RELOCATE it (ManualImport copy → hardlink), NOT re-download.
+    cand = [{"path": "/data/media/movies/standard/Toy Story (1995)/ts.mkv", "size": 50_000_000_000,
+             "quality": {"quality": {"resolution": 2160}}, "languages": [], "releaseGroup": ""}]
+    im = _xrun([_M4K], [], monkeypatch, manual=cand)
+    mi = [c for c in im.commands if c[1].get("name") == "ManualImport"]
+    assert len(mi) == 1 and mi[0][1]["importMode"] == "copy"        # import the existing file (copy)
+    assert mi[0][1]["files"][0]["movieId"] == 9000                  # bound to the added 4K record
+    assert len(im.adds) == 1 and im.adds[0][1]["addOptions"] == {"searchForMovie": False}  # no search
+    assert not any(a[1].get("addOptions") == {"searchForMovie": True} for a in im.adds)     # NO download
+    # standard's 2160p FROZEN until the 4K copy is confirmed (make-before-break), never retuned yet
+    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts
+    assert not any(p[0] == "standard" and "qualityProfileId" in p[1] for p in im.puts)
+
+
+def test_shared_but_file_not_visible_falls_back_to_download(monkeypatch):
+    # shared totals/roots pass the coarse probe, but the 4K instance sees NO file there (manual=None)
+    # → NO relocate/import; DOWNLOAD instead (one add, SEARCH ON), and standard is frozen.
+    im = _xrun([_M4K], [], monkeypatch)                            # manual defaults to None
+    assert not any(c[1].get("name") == "ManualImport" for c in im.commands)
+    assert len(im.adds) == 1 and im.adds[0][1]["addOptions"] == {"searchForMovie": True}
     assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts   # standard frozen, not retuned
     assert not any(p[0] == "standard" and "qualityProfileId" in p[1] for p in im.puts)
-    assert not any(c[1].get("name") == "DownloadedMoviesScan" for c in im.commands)
 
 
-def test_cross_instance_actuates_regardless_of_mounts(monkeypatch):
-    # download-based dual-version needs NO shared mount → disjoint mounts no longer block the acquire.
-    im = _xrun([_M4K], [], monkeypatch,
+def test_disjoint_mounts_download_no_relocate(monkeypatch):
+    # separate storage (no common root ancestor) → probe says NOT shared → download, never relocate.
+    im = _xrun([_M4K], [], monkeypatch, manual=[{"path": "/x.mkv", "size": 1,
+               "quality": {"quality": {"resolution": 2160}}}],
                roots={"standard": [{"path": "/mnt/a/movies"}], "ultra": [{"path": "/mnt/b/movies"}]})
-    assert len(im.adds) == 1 and im.adds[0][0] == "ultra"  # 4K still acquired (no mount needed)
-    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts   # standard frozen
+    assert not any(c[1].get("name") == "ManualImport" for c in im.commands)   # never relocates
+    assert len(im.adds) == 1 and im.adds[0][1]["addOptions"] == {"searchForMovie": True}  # downloads
+    assert ("standard", {"movieIds": [1], "monitored": False}) in im.puts
 
 
 def test_cross_instance_move_blocked_by_disarmed_backup(monkeypatch):

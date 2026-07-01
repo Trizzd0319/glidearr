@@ -130,6 +130,11 @@ class ArrGateway:
     def command(self, inst, payload):
         return self._req(self.resolve(inst), "command", method="POST", payload=payload)
 
+    def get(self, inst, endpoint, fallback=None):
+        """Raw GET of an arbitrary endpoint (e.g. ``manualimport?folder=…``) — mirrors
+        :meth:`put`/:meth:`command`. Not cached; the caller owns any repetition."""
+        return self._req(self.resolve(inst), endpoint, fallback=fallback)
+
     def delete(self, inst, endpoint):
         """DELETE an endpoint on the instance (e.g. ``moviefile/{id}`` to remove a FILE while keeping
         the Radarr record). Mirrors :meth:`put`/:meth:`command`; the caller owns gating."""

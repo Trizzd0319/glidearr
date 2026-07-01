@@ -16,6 +16,7 @@ from scripts.managers.machine_learning.space.routing_targets import (
     relocation_consented,
     relocation_enabled,
     reorg_mode,
+    shared_storage_mode,
     transcode_gate_enabled,
     uhd_remote_play_ok,
 )
@@ -72,6 +73,24 @@ def test_reorg_mode_reads_and_normalises():
 
 def test_reorg_mode_invalid_falls_back():
     assert reorg_mode({"routing": {"reorg_mode": "bogus"}}) == "log_only"
+
+
+# ── shared_storage_mode (relocate vs download routing) ───────────────────────
+def test_shared_storage_mode_defaults_auto():
+    assert shared_storage_mode({}) == "auto"
+    assert shared_storage_mode(None) == "auto"
+    assert shared_storage_mode({"routing": {"movies": {}}}) == "auto"
+
+
+def test_shared_storage_mode_reads_and_normalises():
+    assert shared_storage_mode({"routing": {"movies": {"shared_storage": "true"}}}) == "true"
+    assert shared_storage_mode({"routing": {"movies": {"shared_storage": "FALSE"}}}) == "false"
+    assert shared_storage_mode({"routing": {"movies": {"shared_storage": "Auto"}}}) == "auto"
+
+
+def test_shared_storage_mode_invalid_falls_back_auto():
+    assert shared_storage_mode({"routing": {"movies": {"shared_storage": "bogus"}}}) == "auto"
+    assert shared_storage_mode({"routing": {"movies": {"shared_storage": 123}}}) == "auto"
 
 
 # ── relocation_enabled (consent AND same_instance) ───────────────────────────

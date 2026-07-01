@@ -158,6 +158,35 @@ def proactive_4k_enabled(config) -> bool:
     return relocation_enabled(config) or cross_instance_move_enabled(config)
 
 
+_SHARED_STORAGE_MODES = ("auto", "true", "false")
+DEFAULT_SHARED_STORAGE_MODE = "auto"
+
+
+def shared_storage_mode(config) -> str:
+    """How the dual-version acquire gets the 4K instance its 2160p — a hardlink-RELOCATE of the
+    standard instance's EXISTING file (no re-download) vs a fresh DOWNLOAD. Reads
+    ``routing.movies.shared_storage``:
+      • ``auto`` (default) — probe (``shared_storage_confirmed``: common mount ancestor + equal
+        backing capacity, then a per-title 'can the 4K instance actually see the file' check) and
+        relocate only when both instances share one filesystem; otherwise download.
+      • ``true``  — force relocate (instances KNOWN to share storage; skip the coarse probe, the
+        per-title visibility check in the actuator still applies and falls back to download if it
+        can't see the file).
+      • ``false`` — always download (the portable default for households on separate storage).
+    Anything unrecognised falls back to ``auto``."""
+    routing = _cfg_get(config, "routing", None) or {}
+    if not isinstance(routing, dict):
+        return DEFAULT_SHARED_STORAGE_MODE
+    mv = routing.get("movies", {}) or {}
+    if not isinstance(mv, dict):
+        return DEFAULT_SHARED_STORAGE_MODE
+    try:
+        mode = str(mv.get("shared_storage", DEFAULT_SHARED_STORAGE_MODE)).strip().lower()
+    except Exception:
+        return DEFAULT_SHARED_STORAGE_MODE
+    return mode if mode in _SHARED_STORAGE_MODES else DEFAULT_SHARED_STORAGE_MODE
+
+
 def transcode_gate_enabled(config) -> bool:
     """Gate for the transcode/remote-play capability check on the 4K BONUS copy: only acquire
     the 2160p companion when a likely household device can DIRECT-PLAY it (else the 4K would
