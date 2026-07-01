@@ -499,6 +499,10 @@ def empty_config() -> dict:
                                               "opt_in_users": [], "trust_home_managed": False},
                  }},
         "mdblist": {"apikey": ""},   # opt-in: aggregated ratings + lists. apikey -> keyring.
+        # Profile titles / safe_users IGNORED across every per-user run (playlists, retention/catch-up,
+        # demand, on-deck, ratings, watchlist, this-week) EXCEPT affinity — an ignored user is dropped
+        # from the tracked roster, but the Tautulli-keyed affinity pipelines still count its watches.
+        "ignored_users": [],
         "dry_run": True,
         "notifications": {"discord": dict(_DISCORD_DEFAULTS)},
         # Phase-3 capabilities — all OFF by default; honour dry_run when enabled.

@@ -101,6 +101,62 @@ def test_persist_roster_is_pii_minimized():
     assert "rob@x.io" not in blob and "tok-secret" not in blob
 
 
+# ── ignored_users: dropped from the tracked roster (ignored everywhere EXCEPT affinity) ──
+def _bare_mgr(config):
+    m = object.__new__(PlexUsersManager)
+    m.logger = _Logger(); m.config = config; m.tracked_users = []
+    return m
+
+
+def test_ignored_users_reads_list_string_empty_and_none():
+    assert _bare_mgr({"ignored_users": ["Guest", "Kiosk"]})._ignored_users() == {"guest", "kiosk"}
+    assert _bare_mgr({"ignored_users": "Guest"})._ignored_users() == {"guest"}
+    assert _bare_mgr({"ignored_users": []})._ignored_users() == set()
+    assert _bare_mgr({})._ignored_users() == set()
+    assert _bare_mgr(None)._ignored_users() == set()             # config None tolerated
+
+
+def test_is_ignored_matches_title_or_safe_user_case_insensitive():
+    ig = {"guest"}
+    assert PlexUsersManager._is_ignored("Guest", "guest-1a2b", ig)          # by title
+    assert PlexUsersManager._is_ignored("Somebody", "guest", ig)            # by safe_user
+    assert PlexUsersManager._is_ignored("GUEST", "x", ig)                   # case-insensitive
+    assert not PlexUsersManager._is_ignored("Rob", "rob", ig)
+    assert not PlexUsersManager._is_ignored("Guest", "guest", set())        # empty set → never ignore
+
+
+def test_build_tracked_drops_ignored_user_keeps_others():
+    m = _bare_mgr({"ignored_users": ["Guest"]})
+    roster = [{"uuid": "ur", "title": "Rob", "is_admin": True},
+              {"uuid": "ug", "title": "Guest", "is_admin": False}]
+    safe = m._ensure_safe_map(roster)
+    m.user_tokens = {safe["ur"]: "t1", safe["ug"]: "t2"}         # both have usable tokens
+    idmap = {"ur": {"tautulli_username": "rob", "tautulli_user_id": 1, "rating_groups": ["household"]},
+             "ug": {"tautulli_username": "guest", "tautulli_user_id": 2, "rating_groups": ["household"]}}
+    m._build_tracked(roster, idmap)
+    assert [u["title"] for u in m.tracked_users] == ["Rob"]      # Guest gone from the consumer roster
+
+
+def test_build_tracked_without_ignored_config_keeps_everyone():
+    m = _bare_mgr({})                                            # no ignored_users → nobody dropped
+    roster = [{"uuid": "ur", "title": "Rob", "is_admin": True},
+              {"uuid": "ug", "title": "Guest", "is_admin": False}]
+    safe = m._ensure_safe_map(roster)
+    m.user_tokens = {safe["ur"]: "t1", safe["ug"]: "t2"}
+    m._build_tracked(roster, {})
+    assert {u["title"] for u in m.tracked_users} == {"Rob", "Guest"}
+
+
+def test_affinity_pipeline_never_reads_the_tracked_roster():
+    # The "ignored EXCEPT affinity" contract relies on affinity reading Tautulli's OWN user list + raw
+    # history (keyed by Tautulli username), NEVER the tracked roster we filter — so an ignored user's
+    # watches still count. Guard that invariant at the source: wiring affinity to tracked_users would
+    # silently drop the ignored user from affinity too.
+    import pathlib
+    tautulli_src = pathlib.Path(__file__).resolve().parents[2] / "tautulli" / "__init__.py"
+    assert "tracked_users" not in tautulli_src.read_text(encoding="utf-8")
+
+
 # ── token minting registers the token with the scrubber, never caches it ──────
 def test_mint_tokens_in_memory_only_and_registered():
     from scripts.support.utilities.logger.logger import LoggerManager

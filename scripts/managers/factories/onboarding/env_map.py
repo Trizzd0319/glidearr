@@ -159,6 +159,7 @@ _DOC_LEAVES = [
     ("plex.playlists.writeback.enabled", "false", "WRITES per-user playlists into Plex (create/update real playlists). Off until you opt in; ALSO requires dry_run=false"),
     ("plex.playlists.max_items", "100", "Max items per per-user playlist"),
     ("plex.playlists.exclude_users", "", "Comma-separated profile titles / safe_users to skip when building playlists"),
+    ("ignored_users", "", "Comma-separated profile titles / safe_users IGNORED across ALL per-user runs EXCEPT affinity (dropped from the tracked roster; their watches still feed the affinity signal)"),
     ("plex.playlists.recency_boost.enabled", "false", "Lift a show/saga you're caught up on to the top of Up Next the moment its freshest item lands within window_days (e.g. a finished show whose new episode just aired); applies to the TV, movie, and combined per-user ordering"),
     ("plex.playlists.fresh_arrivals.enabled", "false", "Build a per-profile 'Fresh Arrivals' playlist of genuinely-new movie acquisitions (churn-immune; off until enabled)"),
     ("plex.playlists.fresh_arrivals.acquired_window_days", "45", "How many days back counts as a 'fresh arrival' for that playlist"),

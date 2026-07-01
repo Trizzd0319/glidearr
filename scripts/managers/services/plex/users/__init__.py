@@ -335,13 +335,38 @@ class PlexUsersManager(BaseManager):
                 groups.append(gname)
         return groups or ["household"]
 
+    def _ignored_users(self) -> set:
+        """Top-level ``ignored_users`` — profile titles / safe_users to drop from the tracked roster,
+        so the user is IGNORED across every per-user run (playlists, retention/catch-up, demand,
+        on-deck, ratings, watchlist, this-week) EXCEPT affinity. Affinity is unaffected by design: the
+        genre/people affinity pipelines read Tautulli's own user list + raw history (keyed by Tautulli
+        username), never this roster, so an ignored user's watches still feed the household + per-user
+        affinity signal. List-or-string tolerant, case-insensitive (mirrors playlists.exclude_users)."""
+        raw = (self.config.get("ignored_users") if self.config else None)
+        if not raw:
+            return set()
+        if isinstance(raw, str):
+            raw = [raw]
+        return {str(x).strip().lower() for x in raw if str(x).strip()}
+
+    @staticmethod
+    def _is_ignored(title, safe_user, ignored) -> bool:
+        """True when the profile's title OR safe_user is in the ignored set (case-insensitive)."""
+        return bool(ignored) and (str(title).strip().lower() in ignored
+                                  or str(safe_user).strip().lower() in ignored)
+
     # ── tracked set + persistence ──────────────────────────────────────────────
     def _build_tracked(self, roster: list, identity_map: dict):
         safe_map = self._ensure_safe_map(roster)
+        ignored = self._ignored_users()
         for u in roster:
             safe = safe_map[u["uuid"]]
             if safe not in self.user_tokens:
                 continue  # no usable token (pin-skipped / mint failed) → not tracked
+            if self._is_ignored(u.get("title"), safe, ignored):
+                self.logger.log_info(f"[PlexUsers] '{u.get('title')}' is in ignored_users — excluded "
+                                     f"from all per-user runs (affinity still counts its watches).")
+                continue
             ident = identity_map.get(u["uuid"], {})
             self.tracked_users.append({
                 "uuid": u["uuid"],
