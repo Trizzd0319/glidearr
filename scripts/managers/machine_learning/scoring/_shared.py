@@ -380,6 +380,14 @@ def select_profile_id(
 
     ``ranked_profiles`` should be the list from ``_fetch_ranked_profiles`` (sorted
     ascending by max resolution). Returns None if no suitable profile is found.
+
+    NOTE: this deliberately does NOT consult the codec-aware brain
+    (``quality_analytics.profile_selector.choose_codec_profile``). That selector is
+    wired only into the read-only ``report_codec_routing`` preview: on this library's
+    real Tautulli data it flags 0 titles that would change codec to cut transcoding,
+    the only available swap (HEVC->H.264) costs disk, and video codec is at most a ~10%
+    slice of transcodes. Keep it preview-only until there are >=2 codec-variant profiles
+    per resolution tier to route between — wiring it here today changes nothing but cost.
     """
     if not ranked_profiles:
         return None
