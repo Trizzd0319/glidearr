@@ -349,7 +349,8 @@ def empty_config() -> dict:
         # re-graded and returns once its affinity climbs back over the floor. 0 disables the gate.
         "pilot_interactive": {"enabled": True, "recheck_days": 7, "floor_res": 720,
                               "search_no_resolution": True, "skip_hard_rejects": True,
-                              "soft_floor": True, "anime_ladder": True, "min_watchability": 20},
+                              "soft_floor": True, "anime_ladder": True, "min_watchability": 20,
+                              "report": True},
         # Legacy escape hatch (only used when pilot_floor_climb is OFF). best_tier_first ON makes a
         # stub pilot target the HIGHEST tier whose grab keeps the space reserve, diverting DOWN one
         # rung per empty run (never likelihood-gated). OFF = legacy floor-first/step-up across runs.

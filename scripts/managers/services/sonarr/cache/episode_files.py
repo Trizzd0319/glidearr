@@ -664,6 +664,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             self.report_codec_routing(instance, df)   # read-only codec preview; changes nothing
         except Exception as e:
             self.logger.log_debug(f"[CodecRoute] report failed for '{instance}': {e}")
+        try:
+            self.report_pilots_off_720(instance, df)  # read-only 720-floor audit; changes nothing
+        except Exception as e:
+            self.logger.log_debug(f"[Pilot720] report failed for '{instance}': {e}")
         return len(score_by_series)
 
     def _apply_universe_credit(self, instance: str, df) -> None:
@@ -1048,6 +1052,78 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
             if _rs is not None:
                 _rs.add_rows("sonarr", "Codec routing preview", instance, headers, table, order=37)
+        return rows
+
+    def report_pilots_off_720(self, instance: str, df=None) -> list:
+        """READ-ONLY audit: TV pilots (S01E01) whose ON-DISK file is still BELOW 720p. The policy is
+        every pilot at 720 until the series earns a watchability score; this surfaces the pilots that
+        remain sub-720 and splits genuine upgrade candidates from HELD ones (full series that merely
+        owns a 480p pilot / watched / scored / keep-tagged). Logs a count + a 'Pilots below 720' table
+        in the end-of-run summary and changes NOTHING — ``scripts/support/tools/sonarr_upgrade_pilots_720``
+        actuates. Off via ``pilot_interactive.report=false``."""
+        from collections import Counter
+
+        if not (((self.config or {}).get("pilot_interactive")) or {}).get("report", True):
+            return []
+        instance = self._resolve_instance(instance)
+        if df is None:
+            df = self.load(instance)
+        if df is None or getattr(df, "empty", True):
+            return []
+        cols = set(getattr(df, "columns", []))
+        if not {"is_pilot", "episode_file_id", "resolution", "series_id", "series_title"} <= cols:
+            return []
+
+        is_pilot = df["is_pilot"].fillna(False).astype(bool)
+        has_file = df["episode_file_id"].notna()
+        res = pd.to_numeric(df["resolution"], errors="coerce")
+        sub = df[is_pilot & has_file & res.notna() & (res >= 0) & (res < 720)].copy()
+        if sub.empty:
+            self.logger.log_info(f"[Pilot720] '{instance}': no on-disk pilots below 720p.")
+            return []
+        sub["_res"] = res[sub.index].astype(int)
+
+        # df view of episodeFileCount per series (a genuine stub owns just the pilot) + series-level
+        # watched, so a full library or a series being sampled is never counted a naive upgrade target.
+        owned_by_series = df[has_file].groupby("series_id").size().to_dict()
+        watched_sids = (set(df.loc[df["is_watched"].fillna(False).astype(bool), "series_id"])
+                        if "is_watched" in cols else set())
+
+        rows, reasons = [], Counter()
+        for _, r in sub.iterrows():
+            sid = r.get("series_id")
+            owned = int(owned_by_series.get(sid, 1))
+            score = int(r.get("watchability_score") or 0) if "watchability_score" in cols else 0
+            keep = str(r.get("keep_policy") or "") in ("keep_series", "keep_season")
+            if owned > 1:
+                status = "full-series"          # real library that merely owns a 480p pilot — never cap
+            elif sid in watched_sids:
+                status = "watched"              # being sampled → normal scoring lifts it
+            elif score >= 75:
+                status = "scored"               # earned upgrades already
+            elif keep:
+                status = "keep"
+            else:
+                status = "upgradable"
+            reasons[status] += 1
+            rows.append({"series_title": r.get("series_title"), "resolution": int(r["_res"]),
+                         "owned_files": owned, "score": score, "status": status})
+
+        held = {k: v for k, v in reasons.items() if k != "upgradable"}
+        self.logger.log_info(
+            f"[Pilot720] '{instance}': {len(rows)} on-disk pilot(s) below 720 — "
+            f"{reasons.get('upgradable', 0)} upgradable to 720, {sum(held.values())} held "
+            f"{held or {}}. Read-only audit; run sonarr_upgrade_pilots_720 to raise the upgradable ones."
+        )
+        _rank = {"upgradable": 0, "full-series": 1, "watched": 2, "scored": 3, "keep": 4}
+        rows.sort(key=lambda x: (_rank.get(x["status"], 9), x["resolution"], str(x["series_title"])))
+        headers = ["Series", "Res", "Files", "Score", "Status"]
+        table = [[str(x["series_title"])[:32], f"{x['resolution']}p", str(x["owned_files"]),
+                  str(x["score"]), x["status"]] for x in rows[:25]]
+        self.logger.log_grid(headers, table, title=f"Pilots below 720 - '{instance}' (read-only)", cap=24)
+        _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
+        if _rs is not None:
+            _rs.add_rows("sonarr", "Pilots below 720", instance, headers, table, order=38)
         return rows
 
     @staticmethod

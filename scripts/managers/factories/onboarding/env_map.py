@@ -94,6 +94,7 @@ _DOC_LEAVES = [
     ("pilot_interactive.search_no_resolution", "true", "When releases exist but report NO resolution (likely SD-only), search at the floor tier so Sonarr can grab them; false = flag UNACQUIRABLE"),
     ("pilot_interactive.skip_hard_rejects", "true", "Skip + flag a pilot when EVERY release is rejected for a profile-independent reason (size/blocklist/incomplete) a profile flip can't fix; false = search anyway"),
     ("pilot_interactive.anime_ladder", "true", "Route anime (seriesType=anime) stubs onto the [Anime] quality-profile ladder so they're never flipped onto an x265-penalising live-action profile; false = use the regular ladder"),
+    ("pilot_interactive.report", "true", "Emit the read-only 'Pilots below 720' audit each run (count + table of on-disk sub-720 pilots split into upgradable vs held: full-series/watched/scored/keep); false = silent"),
     ("acquisition.next_episode.mode", "recommended", "Next-episode prefetch tuning: recommended | customize | off (set =off to keep it disabled headlessly)"),
     ("acquisition.universe.enabled", "false", "Hybrid universe acquisition: once the household watches part of a saga (MCU, Star Trek, Arrowverse, One Chicago…), grab its remaining films (Radarr) + shows (Sonarr) in timeline order — START-first. Default off; honours dry_run + free-space band. Needs plex.playlists.universe_timeline on"),
     ("acquisition.universe.max_per_run", "5", "Per-run cap on universe backfill grabs (bypasses acquisition.max_adds_per_run / min_score — explicit intent, own budget)"),
