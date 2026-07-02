@@ -129,15 +129,21 @@ def dry_run(cfg, svc, instance="standard") -> bool:
         nz = sum(1 for fi in p.get("formatItems", []) if fi.get("score"))
         print(f"    - {p['name']:34s} (cutoff {str(cut):16s} · {nz} CF scores)")
 
+    bp_names = {p["name"] for p in bp}
+    unknown = sorted(p["name"] for p in live_qps if p["name"] not in bp_names)
     print(f"\nPLAN (dry-run — nothing changed):")
-    print(f"    DELETE  {len(live_qps)} old profiles + {len(live_cfs)} old custom formats")
+    print(f"    UPSERT  {len(bp)} blueprint profiles (PUT existing by name / POST new)")
     print(f"    INSTALL {len(install)} custom formats  "
           f"(ours={source['ours']}, trash={source['trash']}, preserved-current={source['current']})")
     print(f"    INSTALL {len(bp)} new profiles:")
     for p in bp:
         print(f"    + {p['name']:40s} (cutoff {str(p['cutoff']):16s} · lang {p['language']} · "
               f"{len(p['cf_scores'])} CF scores)")
-    print(f"    REASSIGN {n_items} {_ITEM_EP[svc]}(s) to their new profile, then drop the old ones")
+    if unknown:
+        print(f"    KEEP    {len(unknown)} live profile(s) not in the blueprint (default; pass "
+              f"--prune-unknown to delete them + reassign their items): {unknown}")
+    print(f"    REASSIGN items only when --prune-unknown drops a profile "
+          f"({n_items} {_ITEM_EP[svc]}(s) live)")
     if svc == "radarr":
         print(f"    LADDER rewrite (radarr_quality_ladder → re-resolved by name to new ids):")
         for pct, nm in _ladder_rewrite(cfg, live_qps):
@@ -256,10 +262,14 @@ def _src_name(name):
     return name
 
 
-def apply(cfg, svc, instance) -> bool:
+def apply(cfg, svc, instance, *, prune_unknown: bool = False) -> bool:
     """EXECUTE the rebuild on ONE instance. Merge-style (PUT existing names, POST new) so items are never
     left profile-less: snapshot → upsert CFs → upsert profiles (clone source items, full formatItems) →
-    reassign items off dropped profiles → delete dropped profiles → delete dropped CFs."""
+    reassign items off dropped profiles → delete dropped profiles → delete dropped CFs.
+
+    prune_unknown=False (default) KEEPS live profiles/CFs the blueprint doesn't define instead of deleting
+    them, so a hand-made cap that lives only on the instance (e.g. an [Anime] HD-720p) survives a rebuild;
+    pass prune_unknown=True for the strict "make the instance match the blueprint exactly" wipe."""
     from collections import defaultdict
     base, key = _resolve(cfg, svc, instance)
     if not (base and key):
@@ -333,10 +343,17 @@ def apply(cfg, svc, instance) -> bool:
             print(f"  ! profile {p['name']!r} failed: {body or e}")
     print(f"  profiles: {updated} updated, {created} created")
 
-    # 3. reassign items off DROPPED profiles, then delete those profiles + dropped CFs
+    # 3. reassign items off DROPPED profiles, then delete those profiles + dropped CFs.
+    # Safety: by default KEEP live profiles/CFs the blueprint doesn't define — a hand-made cap like an
+    # [Anime] HD-720p would otherwise be silently deleted and its series orphaned onto the fallback.
+    # --prune-unknown restores the strict "match the blueprint exactly" wipe.
     new_qp = {p["name"]: p["id"] for p in _get(base, key, "qualityprofile")}
     old_id_name = {p["id"]: p["name"] for p in old_qps}
-    rmap = _reassign_map(bp_names, list(cur_qp), "HD - 720p/1080p")
+    unknown = sorted(n for n in cur_qp if n not in bp_names)
+    if unknown and not prune_unknown:
+        print(f"  ⚠ KEEPING {len(unknown)} profile(s) not in the blueprint "
+              f"(pass --prune-unknown to delete): {unknown}")
+    rmap = _reassign_map(bp_names, list(cur_qp), "HD - 720p/1080p") if prune_unknown else {}
     ep = _ITEM_EP[svc]; idkey = "movieIds" if svc == "radarr" else "seriesIds"
     groups = defaultdict(list)
     for it in _get(base, key, ep):
@@ -350,20 +367,23 @@ def apply(cfg, svc, instance) -> bool:
     print(f"  reassigned {moved} {ep}(s) off dropped profiles")
 
     dp = dc = 0
-    for name, prof in cur_qp.items():
-        if name not in bp_names:
-            try:
-                _delete(base, key, f"qualityprofile/{prof['id']}"); dp += 1
-            except Exception as e:
-                print(f"  ! keep profile {name!r} ({e})")
-    for name, c in cur_cf.items():
-        if name not in install:
-            try:
-                _delete(base, key, f"customformat/{c['id']}"); dc += 1
-            except Exception as e:
-                print(f"  ! keep CF {name!r} ({e})")
+    if prune_unknown:
+        for name, prof in cur_qp.items():
+            if name not in bp_names:
+                try:
+                    _delete(base, key, f"qualityprofile/{prof['id']}"); dp += 1
+                except Exception as e:
+                    print(f"  ! keep profile {name!r} ({e})")
+        for name, c in cur_cf.items():
+            if name not in install:
+                try:
+                    _delete(base, key, f"customformat/{c['id']}"); dc += 1
+                except Exception as e:
+                    print(f"  ! keep CF {name!r} ({e})")
     print(f"  deleted {dp} old profiles + {dc} old CFs")
-    print(f"  DONE {svc}/{instance}: now {len(bp)} profiles, {len(install)} CFs. "
+    kept = 0 if prune_unknown else len(unknown)
+    print(f"  DONE {svc}/{instance}: now {len(bp) + kept} profiles "
+          f"({len(bp)} blueprint + {kept} kept), {len(install)} CFs. "
           f"(rollback: {snap.relative_to(_REPO_ROOT)})")
     return True
 
@@ -375,6 +395,8 @@ def main() -> int:
     ap.add_argument("--validate", action="store_true", help="Non-writing: prove payloads build vs the live schema.")
     ap.add_argument("--apply", action="store_true", help="EXECUTE the rebuild (requires --i-have-backups).")
     ap.add_argument("--i-have-backups", action="store_true", help="Required ack for --apply.")
+    ap.add_argument("--prune-unknown", action="store_true",
+                    help="Also delete live profiles/CFs the blueprint doesn't define (default: keep them).")
     args = ap.parse_args()
 
     cfg = ConfigLoader(CONFIG_PATH).load()
@@ -386,7 +408,7 @@ def main() -> int:
             return 2
         ok = True
         for svc in services:
-            ok = apply(cfg, svc, args.instance) and ok
+            ok = apply(cfg, svc, args.instance, prune_unknown=args.prune_unknown) and ok
         return 0 if ok else 1
 
     ok = True
