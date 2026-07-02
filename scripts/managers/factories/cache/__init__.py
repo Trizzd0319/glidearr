@@ -249,11 +249,14 @@ class GlobalCacheManager(BaseManager):
         """Compat shim for older callers."""
         return self.json_exists(key)
 
-    def set(self, key: str, data: dict, pretty: bool = True) -> bool:
-        """Compat shim for older callers."""
+    def set(self, key: str, data: dict, pretty: bool = True, compressed: bool = False) -> bool:
+        """Compat shim for older callers. Accepts ``compressed`` for parity with
+        set_json / set_with_pretty_output so callers can pass it uniformly; like
+        those siblings it is a no-op at the JSON storage layer (save_json writes a
+        plain .json), so it never changes what lands on disk."""
         if pretty:
-            return self.set_with_pretty_output(key, data, compressed=False)
-        return self.set_json(key, data, compressed=False, pretty=False)
+            return self.set_with_pretty_output(key, data, compressed=compressed)
+        return self.set_json(key, data, compressed=compressed, pretty=False)
 
     def get(self, key: str, default=None):
         """Compat: allow default= like old CacheManager."""
