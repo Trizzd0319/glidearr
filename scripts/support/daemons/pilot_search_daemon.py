@@ -334,6 +334,8 @@ def process_job(cfg: dict, job: dict, ledger: LedgerCache, dry_run: bool) -> dic
         return {"searched": [], "flagged": {}}
     if mode == "legacy_regrab":
         return _process_legacy_regrab_job(cfg, job, ledger, dry_run)
+    if mode == "pilot_720":
+        return _process_pilot_720_job(cfg, job, ledger, dry_run)
     if mode == "jit":
         return _process_jit_job(cfg, job, ledger, dry_run)
     items    = [(int(s), int(e)) for s, e in (job.get("items") or [])
@@ -503,6 +505,48 @@ def _process_legacy_regrab_job(cfg: dict, job: dict, ledger, dry_run: bool) -> d
     return result
 
 
+def _process_pilot_720_job(cfg: dict, job: dict, ledger, dry_run: bool) -> dict:
+    """Run one queued pilot-720 upgrade batch through the shared ``run_pilot_720_upgrade`` core:
+    reprofile each stub to its family 720 cap + EpisodeSearch the pilot (Sonarr upgrades in place;
+    nothing deleted). Paced chunk-by-chunk, cooperatively yielding to a pending JIT grab and resuming
+    from the ledger checkpoint. The job's items are
+    ``[{series_id, season, episode, series_title, target_profile_id, current_profile_id}, ...]``."""
+    instance = job.get("instance")
+    items = [i for i in (job.get("items") or [])
+             if isinstance(i, dict) and i.get("series_id") is not None]
+    if not instance or not items:
+        log.warning(f"Malformed pilot_720 job (instance={instance!r}, items={len(items)}) — dropping.")
+        return {}
+    try:
+        batch = int(((cfg.get("daemons", {}) or {}).get("pilot_search", {}) or {})
+                    .get("search_batch", PILOT_SEARCH_BATCH))
+    except (TypeError, ValueError):
+        batch = PILOT_SEARCH_BATCH
+    batch = max(1, batch)
+    log.info(f"Processing pilot-720 upgrade: '{instance}' — {len(items)} pilot(s), "
+             f"EpisodeSearch batch ≤{batch}.")
+    if dry_run:
+        log.info(f"[dry-run] would reprofile + upgrade-search {len(items)} pilot(s) for '{instance}'.")
+        return {}
+
+    from scripts.managers.services.sonarr.cache.pilot_720_upgrade import run_pilot_720_upgrade
+    client = SonarrClient(cfg)
+    result = run_pilot_720_upgrade(
+        make_request=client._make_request, logger=_LOG, global_cache=ledger,
+        instance=instance, items=items, search_batch=batch,
+        cooldown_days=int(job.get("cooldown_days", 7) or 7), dry_run=False,
+        # Yield the (potentially long) sweep to a freshly-queued JIT grab, then resume via checkpoint.
+        should_yield=lambda: pilot_jobs.has_higher_priority_pending("pilot_720"),
+    )
+    if result.get("yielded"):
+        log.info(f"Pilot-720 upgrade for '{instance}' yielded to a higher-priority job — re-queued.")
+        return result
+    log.info(f"Pilot-720 job done for '{instance}': {result.get('reprofiled', 0)} reprofiled, "
+             f"{result.get('searched', 0)} searched, {result.get('skipped_cooldown', 0)} skipped "
+             f"(cooldown/resume), {result.get('unresolved', 0)} unresolved.")
+    return result
+
+
 def _revert_stranded_jit_qp() -> None:
     """On daemon start, revert any series a crashed JIT job left at a bumped quality profile,
     restoring the pre-flip profile recorded in the inflight-QP store. The single-instance pid guard
@@ -603,7 +647,7 @@ def _report_dir(label: str, directory: Path, with_progress: bool = False) -> int
                         + (f", {_fmt_age(time.time() - _parse_iso(pdata.get('updated_at')))} since last"
                            if _parse_iso(pdata.get("updated_at")) else "") + "]")
         flag = "" if job else "  ⚠️ unreadable/corrupt"
-        unit = {"jit": "series", "legacy_regrab": "file(s)"}.get(mode, "stub(s)")
+        unit = {"jit": "series", "legacy_regrab": "file(s)", "pilot_720": "pilot(s)"}.get(mode, "stub(s)")
         print(f"    {inst:<18} {len(items):>7,} {unit:<7}  mode={mode}{age}{prog}{flag}")
     return total
 

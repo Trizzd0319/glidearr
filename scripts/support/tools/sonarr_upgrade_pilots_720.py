@@ -22,6 +22,12 @@ Two work groups (both handled by default so "all pilots" reach 720):
   R  reprofile+search -- current profile can grab >720  (the "not 1080" fix)
   S  search-only      -- already on a <=720 cap but the file is still sub-720 (nudge to 720)
 
+On --confirm a LARGE batch is spilled to the background pilot-search daemon (mode ``pilot_720``, gated by
+``daemons.pilot_search.{enabled,threshold}``) which reprofiles + EpisodeSearches in paced chunks,
+cooperatively yielding to time-sensitive JIT grabs and resuming from a ledger — instead of blasting
+thousands of searches into Sonarr's queue at once. A small batch (or a disabled daemon) runs inline
+through the same shared ``run_pilot_720_upgrade`` core.
+
 DRY-RUN BY DEFAULT (prints the plan, counts, exclusions, a sample); --confirm to execute. Refuses to run
 while a main.py run is active (would race the run's series cache/PUTs).
 
@@ -33,6 +39,7 @@ while a main.py run is active (would race the run's series cache/PUTs).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -44,12 +51,22 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.managers.factories.config.config_loader import ConfigLoader           # noqa: E402
-from scripts.managers.factories.daemons.daemon_paths import CONFIG_PATH            # noqa: E402
+from scripts.managers.factories.daemons import pilot_jobs                           # noqa: E402
+from scripts.managers.factories.daemons.daemon_paths import CONFIG_PATH, PILOT_SPILL_THRESHOLD  # noqa: E402
+from scripts.managers.factories.daemons.supervisor import PilotSearchDaemonSupervisor  # noqa: E402
 # Reuse arr_rebuild's HTTP helpers (generous timeout + backoff retry a busy, re-scoring Sonarr needs)
 # and force_pilot_research's run-sentinel so we never race a live main.py run.
 from scripts.support.tools.arr_rebuild import _request, _get                       # noqa: E402
 from scripts.support.tools.force_pilot_research import _run_active                 # noqa: E402
 from scripts.managers.machine_learning.acquisition.pilot_stepping import profile_max_resolution  # noqa: E402
+from scripts.managers.services.sonarr.cache.pilot_720_upgrade import run_pilot_720_upgrade  # noqa: E402
+
+
+class _ToolLog:
+    """Minimal logger the shared core + daemon supervisor expect, printing to the tool's stdout."""
+    def log_info(self, m="", *a, **k): print(m)
+    def log_warning(self, m="", *a, **k): print(m)
+    def log_debug(self, *a, **k): pass
 
 _CACHE = _REPO_ROOT / "scripts" / "support" / "cache"
 FLOOR = 720
@@ -57,8 +74,7 @@ LIVE_TARGET = "HD-720p"               # live-action 720 cap (resolved by NAME at
 ANIME_TARGET = "[Anime] HD-720p"      # anime 720 cap (x265-OK, anime-CF scored)
 FREEZE_POLICY = {"keep_series", "keep_season"}
 FREEZE_TAGS = {"keep_quality", "keep-quality", "keepquality"}
-BATCH = 200                           # series ids per editor PUT
-SEARCH_BATCH = 100                    # episode ids per EpisodeSearch command
+BATCH = 200                           # series ids per editor PUT (reprofile-only path)
 
 
 def _resolve(cfg, instance):
@@ -98,22 +114,6 @@ def _candidates(df, scored_cap):
             "episode": None if pd.isna(r.get("episode_number")) else int(r["episode_number"]),
         }
     return out
-
-
-def _pilot_episode_id(base, key, sid, season, episode):
-    """Resolve the Sonarr episode id for the series' pilot. Match the parquet's (season, episode); fall
-    back to S01E01. Returns None if it can't be resolved (skip -- never SeriesSearch)."""
-    try:
-        eps = _get(base, key, f"episode?seriesId={sid}") or []
-    except Exception:
-        return None
-    want = [(season, episode)] if season is not None and episode is not None else []
-    want.append((1, 1))
-    for s, e in want:
-        for ep in eps:
-            if ep.get("seasonNumber") == s and ep.get("episodeNumber") == e:
-                return ep.get("id")
-    return None
 
 
 def run(cfg, args) -> bool:
@@ -185,6 +185,7 @@ def run(cfg, args) -> bool:
             "sid": sid, "title": info["title"], "res": info["res"],
             "family": "anime" if is_anime else "live", "target_id": target_id,
             "cur": pid_name.get(s.get("qualityProfileId"), s.get("qualityProfileId")),
+            "cur_id": s.get("qualityProfileId"),
             "season": info["season"], "episode": info["episode"],
         }
         if cur_cap > target_cap:
@@ -207,42 +208,93 @@ def run(cfg, args) -> bool:
         print("\n(dry-run -- nothing changed. Re-run with --confirm to execute.)")
         return True
 
-    # ---- EXECUTE: reprofile group R first (so a later search can't grab >720), then EpisodeSearch ----
-    by_target = defaultdict(list)
-    for rec in plan_R:
-        by_target[rec["target_id"]].append(rec["sid"])
-    moved = 0
-    for tid, sids in by_target.items():
-        for i in range(0, len(sids), BATCH):
-            chunk = sids[i:i + BATCH]
-            _request("PUT", base, key, "series/editor",
-                     json_body={"seriesIds": chunk, "qualityProfileId": tid})
-            moved += len(chunk)
-            print(f"  ... reprofiled {moved}/{len(plan_R)} to 720 cap")
-    print(f"  OK: reprofiled {moved} series to their family 720 cap.")
-
+    # ---- EXECUTE ----
+    # --no-search: just reprofile the >720 stubs to their 720 cap now (cheap, immediate); the normal
+    # run's pass / a later --confirm queues the searches. No daemon needed for a pure reprofile.
     if args.no_search:
-        print("  (--no-search: skipped EpisodeSearch; the normal run's pass will pick them up.)")
+        by_target = defaultdict(list)
+        for rec in plan_R:
+            by_target[rec["target_id"]].append(rec["sid"])
+        moved = 0
+        for tid, sids in by_target.items():
+            for i in range(0, len(sids), BATCH):
+                chunk = sids[i:i + BATCH]
+                _request("PUT", base, key, "series/editor",
+                         json_body={"seriesIds": chunk, "qualityProfileId": tid})
+                moved += len(chunk)
+        print(f"  OK: reprofiled {moved} series to their 720 cap (--no-search: no EpisodeSearch queued).")
         return True
 
-    ep_ids, unresolved = [], 0
-    for rec in search_set:
-        eid = _pilot_episode_id(base, key, rec["sid"], rec["season"], rec["episode"])
-        if eid is None:
-            unresolved += 1
-            continue
-        ep_ids.append(eid)
-    searched = 0
-    for i in range(0, len(ep_ids), SEARCH_BATCH):
-        chunk = ep_ids[i:i + SEARCH_BATCH]
-        _request("POST", base, key, "command",
-                 json_body={"name": "EpisodeSearch", "episodeIds": chunk}, retries=1)
-        searched += len(chunk)
-        print(f"  ... queued EpisodeSearch {searched}/{len(ep_ids)}")
-    print(f"  OK: queued 720 upgrade-search for {searched} pilot(s) "
-          f"({unresolved} skipped -- episode id unresolved).")
-    print("  Sonarr upgrades 480/576 -> 720 in place; no >=720 release => existing file kept (no orphan).")
+    # The reprofile + paced EpisodeSearch both run in the shared run_pilot_720_upgrade core: spill a
+    # LARGE batch to the background pilot-search daemon (mode pilot_720 — paced chunk-by-chunk, yields
+    # to time-sensitive JIT grabs, resumable) so we never blast thousands of searches into Sonarr's
+    # queue at once. A small batch (or a disabled daemon) runs inline through the same core.
+    items = [{"series_id": rec["sid"], "season": rec["season"], "episode": rec["episode"],
+              "series_title": rec["title"], "target_profile_id": rec["target_id"],
+              "current_profile_id": rec["cur_id"]} for rec in search_set]
+    if not items:
+        print("  nothing to upgrade.")
+        return True
+    if _maybe_offload_pilot_720(cfg, args.instance, items):
+        return True
+    _inline_pilot_720(base, key, args.instance, items)
     return True
+
+
+def _daemon_cfg(cfg):
+    return ((cfg.get("daemons", {}) or {}).get("pilot_search", {}) or {})
+
+
+def _maybe_offload_pilot_720(cfg, instance, items) -> bool:
+    """Spill a large pilot-720 batch to the standalone pilot-search daemon (mode 'pilot_720') so the
+    searches drain OUT-OF-PROCESS, paced and yielding to JIT. Returns True when enqueued AND the daemon
+    is running (caller is done). False — caller runs the capped inline path — when the daemon is
+    disabled, the batch is at/below the spill threshold, or enqueue/spawn fails (the job is rolled back
+    so we never both queue AND run inline)."""
+    dcfg = _daemon_cfg(cfg)
+    if not dcfg.get("enabled", True):
+        return False
+    try:
+        threshold = int(dcfg.get("threshold", PILOT_SPILL_THRESHOLD))
+    except (TypeError, ValueError):
+        threshold = PILOT_SPILL_THRESHOLD
+    if len(items) <= max(0, threshold):
+        return False
+    try:
+        job = {"version": 1, "mode": "pilot_720", "instance": instance,
+               "items": items, "cooldown_days": 7, "run_pid": os.getpid()}
+        path = pilot_jobs.enqueue(instance, job)
+        try:
+            PilotSearchDaemonSupervisor(logger=_ToolLog()).ensure_running()
+        except Exception:
+            pilot_jobs.remove(path)          # don't orphan a job AND run inline (a double-search)
+            raise
+        print(f"  spilled {len(items)} pilot(s) to the pilot-search daemon (mode pilot_720, batch "
+              f"> {threshold}); job {path.name}, log: pilot_search_daemon.log.")
+        print("  The daemon reprofiles + EpisodeSearches in paced chunks, yielding to JIT grabs.")
+        return True
+    except Exception as e:
+        print(f"  could not offload to the daemon ({e}); running the inline path instead.")
+        return False
+
+
+def _inline_pilot_720(base, key, instance, items):
+    """Run the batch through the shared core in-process (small batch / daemon disabled)."""
+    def _mk(inst, endpoint, method="GET", payload=None, fallback=None):
+        try:
+            if method == "GET":
+                return _get(base, key, endpoint)
+            r = _request(method, base, key, endpoint, json_body=payload,
+                         retries=1 if method == "POST" else 4)
+            return (r.json() if r.content else {}) if r is not None else fallback
+        except Exception:
+            return fallback
+
+    result = run_pilot_720_upgrade(make_request=_mk, logger=_ToolLog(), global_cache=None,
+                                   instance=instance, items=items, dry_run=False)
+    print(f"  OK (inline): {result['reprofiled']} reprofiled, {result['searched']} searched, "
+          f"{result['unresolved']} unresolved.")
+    print("  Sonarr upgrades 480/576 -> 720 in place; no >=720 release => existing file kept (no orphan).")
 
 
 def _report(plan_R, plan_S, excl, args):

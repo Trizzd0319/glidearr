@@ -72,7 +72,7 @@ def _queue_path(instance: str, mode: str) -> Path:
 # BEFORE a bulk 'interactive' pilot sweep — a sweep can carry thousands of stubs and run for hours,
 # so without this it would starve a freshly-enqueued JIT grab queued behind it. Unknown modes sit
 # between JIT and the bulk sweep. Within one priority tier, oldest-first (mtime) order is preserved.
-_MODE_PRIORITY = {"jit": 0, "legacy_regrab": 1, "interactive": 2}
+_MODE_PRIORITY = {"jit": 0, "legacy_regrab": 1, "pilot_720": 2, "interactive": 2}
 _DEFAULT_MODE_PRIORITY = 1
 
 
