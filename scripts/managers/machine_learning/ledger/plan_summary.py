@@ -87,13 +87,88 @@ class PlanSummary:
                 scores += list(pd.to_numeric(df["watchability_score"], errors="coerce").dropna())
         return agg, scores
 
-    def log(self) -> dict:
+    def itemize(self, cap_per_group: int = 25) -> list:
+        """Per-title change plan from the decision ledger: one row per planned
+        action — ``[service, instance, action, title, GB, why]`` — grouped by
+        (service, instance, action) and sorted by absolute space impact within
+        each group. Groups larger than ``cap_per_group`` are truncated with a
+        ``… +N more`` row carrying the remainder's summed GB, so the grid stays
+        readable at 400+ planned deletes. Read-only; best-effort."""
+        try:
+            import pandas as pd
+        except Exception:
+            return []
+
+        out: list = []
+        for service, inst, df in self._iter_frames():
+            if "planned_action" not in df.columns:
+                continue
+            pa  = df["planned_action"]
+            sub = df[pa.notna() & (pa.astype(str) != "")].copy()
+            if sub.empty:
+                continue
+
+            if "plan_reclaim_gb" in sub.columns:
+                sub["_gb"] = pd.to_numeric(sub["plan_reclaim_gb"], errors="coerce")
+            else:
+                sub["_gb"] = float("nan")
+            sub["_absgb"] = sub["_gb"].abs().fillna(0.0)
+
+            def _title(r) -> str:
+                if service == "sonarr":
+                    t = r.get("series_title") or f"series {r.get('series_id')}"
+                    sn, en = r.get("season_number"), r.get("episode_number")
+                    try:
+                        if pd.notna(sn) and pd.notna(en):
+                            return f"{t} S{int(sn):02d}E{int(en):02d}"
+                    except (TypeError, ValueError):
+                        pass
+                    return str(t)
+                return str(r.get("title") or f"movie {r.get('movie_id')}")
+
+            for action, grp in sub.groupby(sub["planned_action"].astype(str)):
+                g     = grp.sort_values("_absgb", ascending=False)
+                shown = g.head(cap_per_group)
+                for _, r in shown.iterrows():
+                    _g = r.get("_gb")
+                    out.append([
+                        service, inst, str(action), _title(r)[:44],
+                        (f"{float(_g):+.1f}" if _g is not None and pd.notna(_g) else "-"),
+                        str(r.get("plan_reason") or "")[:48],
+                    ])
+                extra = len(g) - len(shown)
+                if extra > 0:
+                    _rem = float(g["_gb"].iloc[cap_per_group:].fillna(0).sum())
+                    out.append([service, inst, str(action),
+                                f"... +{extra} more", f"{_rem:+.1f}",
+                                f"top {cap_per_group} by GB shown"])
+        return out
+
+    def log(self, detailed: bool = False) -> dict:
         agg, scores = self.summarize()
         if not self.logger:
             return agg
         if not agg and not scores:
             self.logger.log_debug("[Plan] No decision-ledger data yet (caches empty).")
             return agg
+
+        # ── Itemized change plan (detailed / end-of-run mode) ─────────────────
+        # Rendered BEFORE the roll-up so the run closes on: every planned change
+        # → the totals ledger → the score distribution.
+        if detailed:
+            try:
+                items = self.itemize()
+                if items:
+                    # NOTE: log_grid's ``cap`` is the CELL-WIDTH truncation (chars),
+                    # not a row cap — rows are already capped per group in itemize().
+                    self.logger.log_grid(
+                        ["Svc", "Instance", "Action", "Title", "GB (+free/-use)", "Why"],
+                        items,
+                        title="Change plan — every planned action this run",
+                        cap=48,
+                    )
+            except Exception as e:
+                self.logger.log_debug(f"[Plan] itemized change plan skipped: {e}")
 
         if agg:
             rows = []

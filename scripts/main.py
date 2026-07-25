@@ -542,14 +542,11 @@ class Main(BaseManager, ComponentManagerMixin):
             summary.add_error(f"UniverseAcquire: {e}")
             self.logger.log_error(f"[Main] hybrid universe acquisition failed: {e}")
 
-        # Roll up the decision ledger (planned_action / watchability_score stamped
-        # into the Parquet caches) into one readable "what I'd do" summary — the
-        # headline value of a dry_run. Read-only, best-effort.
-        try:
-            from scripts.managers.machine_learning.plan_summary import PlanSummary
-            PlanSummary(registry=self.registry, logger=self.logger, config=self.config).log()
-        except Exception as e:
-            self.logger.log_debug(f"[Main] plan summary skipped: {e}")
+        # Decision-ledger roll-up MOVED to the end of the run (see run()'s tail,
+        # after RunSummaryManager.render): rendering it here missed every plan
+        # stamped by the later phases (routing, UHD reconcile, Phase-3
+        # acquisition), and the ledger is most useful as the closing word — the
+        # full itemized change plan followed by the totals.
 
         # ── Phase 2.6: library re-organizer (opt-in; gated) ────────────────
         # Reconciles owned media to the correct library FOLDER. Runs AFTER the space
@@ -652,6 +649,19 @@ class Main(BaseManager, ComponentManagerMixin):
                 run_summary.render(self.logger)
         except Exception as e:
             self.logger.log_warning(f"[Main] Run-summary render failed: {e}")
+
+        # Decision-ledger finale (moved from mid-run): the full itemized change
+        # plan (every planned delete/downgrade/upgrade/acquire with title,
+        # signed GB and reason), then the totals ledger, then the score
+        # distribution. Runs AFTER every phase has stamped its plans — routing,
+        # UHD reconcile and Phase-3 included — so it is the complete "what I'd
+        # do" statement of the run. Read-only, best-effort. The deletions
+        # banner below stays the literal last log block.
+        try:
+            from scripts.managers.machine_learning.plan_summary import PlanSummary
+            PlanSummary(registry=self.registry, logger=self.logger, config=self.config).log(detailed=True)
+        except Exception as e:
+            self.logger.log_debug(f"[Main] plan summary skipped: {e}")
         self._warn_if_deletions_disabled()
 
     def _start_radarr_library_prefetch(self):
