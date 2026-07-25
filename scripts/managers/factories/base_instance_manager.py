@@ -64,8 +64,10 @@ def _write_lock_for(key) -> threading.Lock:
 #
 # INVARIANTS (do not break):
 #   * Whitelist is EXACT-MATCH. Never add a volatile/action endpoint (command, queue,
-#     system/status, rootfolder, diskspace, wanted/missing, health) or any
-#     parameterized form (movie/{id}, movie/editor, series?page=..., movie?tmdbId=).
+#     system/status, wanted/missing, health) or any parameterized form
+#     (movie/{id}, movie/editor, series?page=..., movie?tmdbId=).
+#     EXCEPTION: rootfolder/diskspace live in _SPACE_GET_ENDPOINTS — same memo,
+#     60s TTL (background drift bounded) + normal write-invalidation.
 #   * A write to "movie"/"series" MUST go through *this* _make_request to invalidate.
 #     (Raw arrapi client._make_request bypasses it; today only sonarr/quality/selector
 #     writes "qualityprofile" that way — never the cached collections.)
@@ -76,6 +78,16 @@ _COLLECTION_CACHE_GEN: dict = {}        # (service, instance) -> int  (bumped on
 _COLLECTION_CACHE_GUARD = threading.Lock()
 _CACHEABLE_GET_ENDPOINTS = frozenset({"movie", "series"})
 _COLLECTION_CACHE_TTL_S = 900.0         # safety backstop only; correctness = write-invalidation
+# Space endpoints get their own SHORT-TTL tier in the same memo. They were the
+# top uncached repeat offenders (free-space is polled by acquire, JIT, pilot
+# search, storage checks and space pressure — a dozen+ times per run, each pair
+# of GETs exposed to the SQLite-busy ladder, ~30s worst case). Unlike
+# movie/series they drift in the BACKGROUND (imports land server-side without
+# any write from us), so their staleness must be bounded tightly: 60s TTL, and
+# the shared write-invalidation still drops them the moment WE mutate anything
+# on the instance (deletes → gen bump → fresh reading).
+_SPACE_GET_ENDPOINTS = frozenset({"rootfolder", "diskspace"})
+_SPACE_CACHE_TTL_S = 60.0
 
 
 def _clear_collection_cache() -> None:
@@ -292,12 +304,13 @@ class BaseInstanceManager(BaseManager, ComponentManagerMixin):
         _collection_cache_store so a write landing mid-fetch rejects the store.
         """
         key = (service, instance, endpoint)
+        ttl = _SPACE_CACHE_TTL_S if endpoint in _SPACE_GET_ENDPOINTS else _COLLECTION_CACHE_TTL_S
         with _COLLECTION_CACHE_GUARD:
             gen0  = _COLLECTION_CACHE_GEN.get((service, instance), 0)
             entry = _COLLECTION_CACHE.get(key)
             if entry is not None:
                 ts, snap = entry
-                if (time.monotonic() - ts) <= _COLLECTION_CACHE_TTL_S:
+                if (time.monotonic() - ts) <= ttl:
                     return list(snap), gen0
                 _COLLECTION_CACHE.pop(key, None)
         return None, gen0
@@ -384,7 +397,10 @@ class BaseInstanceManager(BaseManager, ComponentManagerMixin):
         # (service, instance) invalidates both its snapshots. Every cache touch is
         # best-effort — a memo failure must never break the request.
         service          = self._service_name()
-        is_cacheable_get = (method_upper == "GET" and endpoint in _CACHEABLE_GET_ENDPOINTS)
+        is_cacheable_get = (
+            method_upper == "GET"
+            and (endpoint in _CACHEABLE_GET_ENDPOINTS or endpoint in _SPACE_GET_ENDPOINTS)
+        )
         cache_gen0       = 0
         if is_cacheable_get:
             try:
