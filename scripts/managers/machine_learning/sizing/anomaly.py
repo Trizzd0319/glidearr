@@ -41,6 +41,11 @@ _CONFIG_DEFAULTS = {
     "under_ratio": DEFAULT_UNDER_RATIO,
     "min_samples": DEFAULT_MIN_SAMPLES,
     "report_limit": DEFAULT_REPORT_LIMIT,
+    # Dry-run: how many bloated candidates get a REAL interactive release search
+    # (movie GET + indexer roundtrip, ~2s blocked wall each) just to name the
+    # would-grab release in the preview. 0 (default) defers all checks — the
+    # size-anomaly grid already lists every candidate.
+    "dry_run_search_budget": 0,
 }
 
 

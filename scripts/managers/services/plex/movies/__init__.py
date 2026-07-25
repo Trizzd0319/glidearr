@@ -73,6 +73,15 @@ class PlexMoviesManager(BaseManager):
             f"[PlexMovies] {stats['movies_resolved']}/{seen} movie(s) resolved to a "
             f"ratingKey ({stats['resolution_pct']}% coverage) across "
             f"{stats['movie_sections']} movie section(s){incomplete}.")
+        for u in stats.get("unresolved_sample", []):
+            _guid = u.get("guid") or ""
+            _why = ("Plex never agent-matched this item (fix-match it in Plex)"
+                    if _guid.startswith("local://")
+                    else "guid carries no tmdb id (non-tmdb agent or unmatched)")
+            self.logger.log_info(
+                f"[PlexMovies] unresolved: '{u.get('title')}' ({u.get('year')}) "
+                f"section {u.get('section')}, ratingKey={u.get('rating_key')}, "
+                f"guid='{_guid}' — {_why}.")
         return stats
 
     # ── scan ─────────────────────────────────────────────────────────────────
@@ -86,6 +95,17 @@ class PlexMoviesManager(BaseManager):
             tmdb = self._resolve_tmdb(meta, p)
             if tmdb is None or p["rating_key"] is None:
                 stats["unresolved_no_tmdb"] += 1
+                # Name the culprit(s): a persistent "N-1 of N resolved" is almost
+                # always one specific unmatched item (guid 'local://…' = Plex never
+                # agent-matched it) or a non-tmdb agent guid. Capped sample so a
+                # cold guid_map can't flood the stats blob.
+                sample = stats.setdefault("unresolved_sample", [])
+                if len(sample) < 5:
+                    sample.append({
+                        "title": p.get("title") or "?", "year": p.get("year"),
+                        "rating_key": p.get("rating_key"), "guid": p.get("guid") or "",
+                        "section": str(key),
+                    })
                 continue
             inventory[str(int(tmdb))] = {
                 "rating_key": str(p["rating_key"]),

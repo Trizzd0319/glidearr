@@ -271,7 +271,9 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             stats["est_reclaim_gb"] = round(reclaimed, 1)
 
             if self.dry_run:
-                self.logger.log_info(
+                # debug: stamped into the decision ledger above → rendered in the
+                # end-of-run "Change plan" grid; live log keeps the summary table.
+                self.logger.log_debug(
                     f"  📉 [dry_run] Would step down '{c['title']}' ({c['n_eps']} ep, "
                     f"{c['cur_gib']:.1f}GB → {c['target_name']}, ~{c['reclaim']:.1f}GB reclaim) — {c['reason']}"
                 )

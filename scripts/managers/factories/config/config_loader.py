@@ -71,7 +71,13 @@ class ConfigLoader:
                 LoggerManager.register_secrets(self._collect_secret_values(self.raw))
             except Exception:
                 pass
-            self.logger.log_info("✅ Configuration loaded.")
+            # Boot loads the config 3× (onboarding probe, ConfigManager, Main's
+            # reload) — announce once per process at INFO, repeats at debug.
+            if not getattr(ConfigLoader, "_announced_load", False):
+                ConfigLoader._announced_load = True
+                self.logger.log_info("✅ Configuration loaded.")
+            else:
+                self.logger.log_debug("✅ Configuration re-loaded.")
         except FileNotFoundError:
             self.logger.log_error(f"❌ Config file not found: {self.config_path}")
         except json.JSONDecodeError:

@@ -549,7 +549,8 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
             cache = getattr(self, "_df_cache", None)
             if cache is not None:
                 cache[instance] = df_out.copy()
-            self.logger.log_info(
+            # debug: fired 13× per run across instances/stages — pure bookkeeping.
+            self.logger.log_debug(
                 f"Movie file cache saved for '{instance}': "
                 f"{len(df_out)} rows -> {path.name}"
             )

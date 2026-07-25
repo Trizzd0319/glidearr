@@ -153,15 +153,29 @@ class RadarrRepairStorageManager(BaseManager, ComponentManagerMixin):
                 "status":        status,
             })
 
+        # One line per DISTINCT mount reading, not per root folder — 4 roots on a
+        # shared mount used to print 4 byte-identical CRITICAL lines per instance
+        # (8 across instances). Roots grouped into one line each; the individual
+        # paths stay visible at debug.
+        _groups: dict = {}
+        for r in results:
+            _groups.setdefault((round(r["free_space_gb"], 1), r["status"]), []).append(r)
+        for (fgb, status), grp in _groups.items():
             log_fn = self.logger.log_warning if status != "ok" else self.logger.log_debug
-            total_str = f"{total_gb:.0f} GB total" if total_gb > 0 else "total n/a"
+            tg = next((g["total_space_gb"] for g in grp if g["total_space_gb"]), 0)
+            total_str = f"{tg:.0f} GB total" if tg else "total n/a"
             # "CRITICAL" here means below the configured free_space_limit floor (a reclaim policy),
             # NOT a full disk — name the floor so the line can't be misread as an emergency.
             note = f" (below {crit_gb:.0f} GB free_space_limit floor)" if status == "critical" else ""
+            _where = (f"root '{grp[0]['path']}'" if len(grp) == 1
+                      else f"{len(grp)} root folder(s), shared mount")
             log_fn(
-                f"[Storage] '{instance}' root '{path}': "
-                f"{free_gb:.1f} GB free / {total_str} — {status.upper()}{note}"
+                f"[Storage] '{instance}' {_where}: "
+                f"{fgb:.1f} GB free / {total_str} — {status.upper()}{note}"
             )
+            if len(grp) > 1:
+                self.logger.log_debug(
+                    "[Storage] grouped roots: " + ", ".join(g["path"] for g in grp))
 
         return results
 
