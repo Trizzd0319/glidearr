@@ -100,10 +100,38 @@ class SonarrCacheOwnedEpisodesManager(BaseManager):
         return rows
 
     # ── build ─────────────────────────────────────────────────────────────────
-    def build_or_refresh(self, instance: str | None = None) -> pd.DataFrame:
-        """Fetch the full owned-episode inventory and persist it. Reuses the sibling
-        ``episode_files`` warm 24h episode cache (free hits) and the ``series`` cache
-        for tvdbId — no new API surface. Always persists (read-only vs Sonarr)."""
+
+    def _fingerprint_path(self, instance: str):
+        """Sidecar next to the parquet: {series_id(str): fingerprint} captured at
+        build time — the incremental rebuild's change detector."""
+        return self._parquet_path(instance).parent / "owned_episodes.fingerprints.json"
+
+    @staticmethod
+    def _series_fingerprint(s: dict):
+        """Change signature for one series, from data the letter-bucket cache already
+        holds: title/tvdb (rename detection) + Sonarr's per-series statistics, which
+        move on every import/upgrade/delete (episodeFileCount, sizeOnDisk,
+        episodeCount). Returns None when statistics are absent — callers must treat
+        that series as ALWAYS-changed (safe: it just re-fetches)."""
+        st = s.get("statistics") or {}
+        if not st:
+            return None
+        return [s.get("title") or "", s.get("tvdbId"),
+                st.get("episodeFileCount"), st.get("sizeOnDisk"),
+                st.get("episodeCount")]
+
+    def build_or_refresh(self, instance: str | None = None, force: bool = False) -> pd.DataFrame:
+        """Build (or incrementally refresh) the owned-episode inventory and persist it.
+
+        INCREMENTAL BY DEFAULT: this used to walk all ~12k series through
+        ``_get_all_episodes`` on every run (~29–35s of per-series JSON cache reads —
+        the #1 sink after the quick-win fixes). Now a per-series fingerprint
+        (title/tvdb + Sonarr statistics) is persisted alongside the parquet; on the
+        next run only series whose fingerprint changed (or is missing/None) are
+        re-fetched, unchanged series keep their existing parquet rows, and vanished
+        series are dropped. Typical steady-state: a handful of re-fetches instead of
+        12k. ``force=True``, a missing parquet/sidecar, or any read error falls back
+        to the original full rebuild. Read-only vs Sonarr; always persists."""
         instance = self._resolve_instance(instance)
         series_cache = getattr(self.sonarr_cache, "series", None)
         ep_mgr = getattr(self.sonarr_cache, "episode_files", None)
@@ -112,31 +140,91 @@ class SonarrCacheOwnedEpisodesManager(BaseManager):
                 "[OwnedEpisodes] series/episode_files cache unavailable — skipping.")
             return pd.DataFrame(columns=COLUMNS)
 
-        series_meta = {
-            s["id"]: {"tvdb": s.get("tvdbId"), "title": s.get("title", "")}
-            for s in series_cache.iter_all_series(instance) if isinstance(s, dict) and "id" in s
-        }
-        # tqdm bar (stderr) over all series — a cold cache otherwise emits a wall of
-        # per-series fetch lines. Errors are logged but never abort the whole build.
+        series_meta: dict = {}
+        fingerprints: dict = {}
+        for s in series_cache.iter_all_series(instance):
+            if not (isinstance(s, dict) and "id" in s):
+                continue
+            sid = s["id"]
+            series_meta[sid] = {"tvdb": s.get("tvdbId"), "title": s.get("title", "")}
+            fingerprints[sid] = self._series_fingerprint(s)
+
+        # ── Incremental path: previous parquet + sidecar present and readable ──
+        prev_df, prev_fp = None, None
+        if not force:
+            try:
+                _pq = self._parquet_path(instance)
+                _fp = self._fingerprint_path(instance)
+                if _pq.exists() and _fp.exists():
+                    prev_df = pd.read_parquet(_pq)
+                    import json as _json
+                    prev_fp = _json.loads(_fp.read_text(encoding="utf-8"))
+            except Exception as e:
+                self.logger.log_warning(
+                    f"[OwnedEpisodes] incremental state unreadable ({e}) — full rebuild.")
+                prev_df, prev_fp = None, None
+
+        incremental = prev_df is not None and prev_fp is not None and not prev_df.empty
+        if incremental:
+            fetch_sids = [
+                sid for sid, fp in fingerprints.items()
+                if fp is None or prev_fp.get(str(sid)) != fp
+            ]
+        else:
+            fetch_sids = list(series_meta)
+
+        # tqdm bar (stderr) over the fetch set — a cold cache otherwise emits a wall
+        # of per-series fetch lines. Errors are logged but never abort the build.
         from scripts.support.utilities.progress.tqdm_wrapper import tqdm
         episodes_by_series: dict = {}
-        for sid in tqdm(series_meta, total=len(series_meta),
-                        desc=f"📺 Owned episodes [{instance}]", unit="series"):
+        _iter = fetch_sids
+        if len(fetch_sids) > 25:
+            _iter = tqdm(fetch_sids, total=len(fetch_sids),
+                         desc=f"📺 Owned episodes [{instance}]", unit="series")
+        for sid in _iter:
             try:
                 bucketed = ep_mgr._get_all_episodes(instance, sid) or {}   # {season: [eps]}
                 episodes_by_series[sid] = [e for eps in bucketed.values() for e in eps]
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ owned-episode fetch failed for series {sid}: {e}")
 
-        rows = self._build_owned_rows(series_meta, episodes_by_series)
-        df = pd.DataFrame(rows, columns=COLUMNS)
+        fresh_rows = self._build_owned_rows(
+            {sid: series_meta[sid] for sid in episodes_by_series if sid in series_meta},
+            episodes_by_series,
+        )
+        fresh_df = pd.DataFrame(fresh_rows, columns=COLUMNS)
+
+        if incremental:
+            # Keep rows for series that are still present AND were not re-fetched;
+            # re-fetched series are fully replaced, vanished series drop out.
+            keep_mask = (
+                prev_df["series_id"].isin(set(series_meta))
+                & ~prev_df["series_id"].isin(set(episodes_by_series))
+            )
+            df = pd.concat([prev_df[keep_mask], fresh_df], ignore_index=True)
+            kept_series = int(prev_df.loc[keep_mask, "series_id"].nunique())
+            removed = int((~prev_df["series_id"].isin(set(series_meta))).sum())
+            mode_note = (f"incremental: {len(fetch_sids)} refreshed, "
+                         f"{kept_series} kept, {removed} stale row(s) dropped")
+        else:
+            df = fresh_df
+            mode_note = f"full rebuild: {len(fetch_sids)} series fetched"
+
         if not df.empty:
             df = df.sort_values(["series_id", "season_number", "episode_number"],
                                 kind="stable").reset_index(drop=True)
         path = self._parquet_path(instance)
         df.to_parquet(path, index=False)
+        try:
+            import json as _json
+            self._fingerprint_path(instance).write_text(
+                _json.dumps({str(k): v for k, v in fingerprints.items()}),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            self.logger.log_warning(f"[OwnedEpisodes] fingerprint sidecar write failed: {e}")
         unresolved = int(df["tvdb_join_key"].isna().sum()) if not df.empty else 0
         self.logger.log_info(
             f"[OwnedEpisodes] {len(df)} owned episode(s) across {len(series_meta)} series "
-            f"→ {path.name} ({unresolved} without a tvdb join key).")
+            f"→ {path.name} ({unresolved} without a tvdb join key; {mode_note}).")
         return df
