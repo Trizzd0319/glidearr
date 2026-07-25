@@ -58,14 +58,33 @@ def recency_bonus(candidate: dict, ramp: dict, now) -> float:
     return weight * math.exp(-age_days / half_life)
 
 
+def utility_per_gb(candidate: dict, score_term: float) -> float:
+    """Retained-value-per-GB proxy for the optional utility ranking mode:
+    ``score / max(size_gb, 0.1)``. A low-score BIG file is the cheapest deletion
+    (least watchability lost per GB reclaimed) and sorts first ascending. The
+    0.1 GB floor keeps tiny files from dividing by ~0 and jumping the queue."""
+    return score_term / max(float(candidate.get("size_gb") or 0.0), 0.1)
+
+
 def select_for_target(pool: list[dict], need_gb: float, *,
                       recency_ramp: "dict | None" = None, now=None,
                       tier_size: "float | None" = None,
-                      uhd_first: bool = False) -> "tuple[list[dict], float]":
+                      uhd_first: bool = False,
+                      ranking_mode: str = "score") -> "tuple[list[dict], float]":
     """Rank the combined movie+episode pool (lowest watchability first, then lowest
     critic, then biggest file first) and greedily accumulate from the bottom until
     projected reclaim reaches ``need_gb``. Returns ``(selected, projected_gb)``.
     Pure — unit-testable without the manager graph.
+
+    ``ranking_mode`` (config ``space_delete_ranking``, DEFAULT "score" — byte-identical
+    to the historical ranking when unset):
+      * "score"          — the existing (score, critic, -size) ordering below.
+      * "utility_per_gb" — ML Stage 5b: rank ascending by score/max(size_gb, 0.1)
+        (lowest retained-value-per-GB deleted first), critic then -size as
+        tiebreakers. The recency bonus still feeds the score term; ``uhd_first``
+        still puts baseline-backed 4K bonus copies ahead of whole titles; the
+        ``tier_size`` bucketing is a score-mode concept and is ignored here.
+        Eligibility guards/shields are upstream (pool construction) and untouched.
 
     Three optional, independently default-off refinements; with ALL off the sort key is
     the exact ``(score, critic, -size)`` it has always been (byte-identical):
@@ -96,7 +115,10 @@ def select_for_target(pool: list[dict], need_gb: float, *,
         # 0 = a baseline-backed 4K bonus copy → evict first (pure reclaim); 1 = everything else.
         return 0 if (uhd_first and c.get("is_uhd_copy")) else 1
 
-    if tier_size:
+    if ranking_mode == "utility_per_gb":
+        key = lambda c: (_uhd_rank(c), utility_per_gb(c, _score_term(c)),
+                         critic_sort(c.get("critic")), -float(c.get("size_gb") or 0.0))
+    elif tier_size:
         _ts = float(tier_size)
         key = lambda c: (_uhd_rank(c), math.floor(_score_term(c) / _ts),
                          critic_sort(c.get("critic")), -float(c.get("size_gb") or 0.0))
