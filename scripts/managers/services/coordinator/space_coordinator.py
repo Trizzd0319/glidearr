@@ -120,15 +120,19 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
     def _select_for_target(cls, pool: list[dict], need_gb: float, *,
                            recency_ramp: "dict | None" = None, now=None,
                            tier_size: "float | None" = None,
-                           uhd_first: bool = False) -> tuple[list[dict], float]:
+                           uhd_first: bool = False,
+                           ranking_mode: str = "score") -> tuple[list[dict], float]:
         """Rank the combined movie+episode delete pool to the free-space target —
         delegates to the brain (space.coordinator_ranker.select_for_target). Returns
         ``(selected, projected_gb)``. ``recency_ramp``/``now`` sink a recently-watched
         file to the bottom of the order; ``tier_size`` buckets the score so the biggest
         file in the lowest tier goes first; ``uhd_first`` puts baseline-backed 4K bonus
-        copies ahead of every whole title. All default to the byte-identical ranking."""
+        copies ahead of every whole title; ``ranking_mode="utility_per_gb"`` (config
+        ``space_delete_ranking``, ML Stage 5b) ranks by score-per-GB instead of raw
+        score. All default to the byte-identical ranking."""
         return select_for_target(pool, need_gb, recency_ramp=recency_ramp, now=now,
-                                 tier_size=tier_size, uhd_first=uhd_first)
+                                 tier_size=tier_size, uhd_first=uhd_first,
+                                 ranking_mode=ranking_mode)
 
     # ── Entry point ──────────────────────────────────────────────────────────────
     @LoggerManager().log_function_entry
@@ -458,6 +462,48 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                 f"pool (currently in a user's Up Next playlist)."
             )
 
+        # ── Downgrade-first policy: credit projected downgrade reclaim ──────────
+        # Stage-1 + universe downgrades reclaim space too — it just lands LATER
+        # (profile flip now, smaller file once the re-grab imports). Deleting to
+        # cover the FULL deficit while those re-grabs are in flight over-deletes:
+        # titles are removed that the downgrades would have paid for, needlessly
+        # shrinking viewer options. So the ledger's projected downgrade reclaim is
+        # credited against the deletion target and deletions cover only the
+        # REMAINDER — still ranked lowest-watchability-first by the selector, so
+        # what must go is always the least-missed. Each run recomputes from actual
+        # free space: realized downgrades raise free and shrink the deficit;
+        # unrealized ones re-stamp and stay credited. CAVEAT: a downgrade whose
+        # smaller release never materializes keeps crediting until its stamp
+        # clears, slowing physical recovery — tune space_downgrade_credit_ratio
+        # (1.0 = full credit, 0.0 = legacy delete-covers-everything) if free space
+        # must recover faster than re-grabs land.
+        need = max(0.0, U - free)   # GB we must reclaim (deletions are the backstop)
+        try:
+            _ratio = float((self.config or {}).get("space_downgrade_credit_ratio", 1.0))
+        except (TypeError, ValueError):
+            _ratio = 1.0
+        _ratio = min(max(_ratio, 0.0), 1.0)
+        _dg_frames = list(instance_dfs.values()) + [sonarr_df]
+        _dg_gb = self._projected_downgrade_gb(_dg_frames) if _ratio > 0 else 0.0
+        _credit = min(need, _dg_gb * _ratio)
+        stats["downgrade_credit_gb"] = round(_credit, 1)
+        _covered = False
+        if _credit > 0:
+            self.logger.log_info(
+                f"[SpaceCoordinator] downgrade-first: crediting ~{_dg_gb:.0f} GB projected "
+                f"downgrade reclaim (x{_ratio:.2f}) against the {need:.0f} GB deficit — "
+                f"deletions target {max(0.0, need - _credit):.0f} GB."
+            )
+            need -= _credit
+        if need <= 0.001:
+            if _credit > 0:
+                self.logger.log_info(
+                    "[SpaceCoordinator] projected downgrades cover the whole deficit — no "
+                    "deletions this run (deletion stays the backstop if re-grabs stall)."
+                )
+                _covered = True
+            pool = []
+
         if not pool:
             self.logger.log_info("[SpaceCoordinator] no eligible delete candidates — nothing to do.")
             stats["action"] = "no_candidates"
@@ -465,7 +511,7 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         else:
             # Rank lowest watchability first, then lowest critic, then biggest file
             # first, and accumulate from the bottom until we'd reach U.
-            need = U - free   # GB we must reclaim
+            # ``need`` was computed above, net of the downgrade-first credit.
             # Optional recency weighting: a file watched in the last few days sinks to the
             # bottom of the delete order so the sweep takes cold titles first. Default-off
             # (the ramp must be enabled) → the bare watchability ranking, byte-identical.
@@ -478,9 +524,25 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                 _tier_size = float((self.config or {}).get("delete_tier_size", 0) or 0) or None
             except (TypeError, ValueError):
                 _tier_size = None
+            # Optional utility-per-GB ranking (ML Stage 5b): config
+            # ``space_delete_ranking`` = "score" (DEFAULT — byte-identical historical
+            # order) | "utility_per_gb" (lowest score-per-GB deleted first, so the
+            # target is met with the least total watchability destroyed). Unknown
+            # values fall back to "score". All guards/shields upstream are untouched.
+            _ranking_mode = str((self.config or {}).get("space_delete_ranking", "score")
+                                or "score").strip().lower()
+            if _ranking_mode not in ("score", "utility_per_gb"):
+                self.logger.log_warning(
+                    f"[SpaceCoordinator] unknown space_delete_ranking={_ranking_mode!r} "
+                    f"— using 'score'.")
+                _ranking_mode = "score"
+            if _ranking_mode == "utility_per_gb":
+                self.logger.log_info(
+                    "[SpaceCoordinator] delete ranking mode: utility_per_gb "
+                    "(lowest watchability-per-GB first).")
             selected, projected = self._select_for_target(
                 pool, need, recency_ramp=_recency_ramp, now=_now, tier_size=_tier_size,
-                uhd_first=bool(uhd_inst),
+                uhd_first=bool(uhd_inst), ranking_mode=_ranking_mode,
             )
 
             movie_picks = [c for c in selected if c.get("service") == "movie"]
@@ -541,6 +603,9 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         # standard + register the deferred 4K eviction. Runs on BOTH the deleted and the
         # no-candidates paths (a cold 4K-only film is exactly when the standard pool is empty).
         # No-op when nothing was queued (flag off → byte-identical).
+        if _covered:
+            stats["action"] = "downgrades_cover"
+
         if rehome_queue:
             stats["rehomes"] = self._execute_rehomes(rehome_queue, radarr_sp, radarr_inst, uhd_inst)
 
@@ -738,6 +803,30 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
             if v and str(v) in insts and str(v) != str(default_inst):
                 return str(v)
         return None
+
+    @staticmethod
+    def _projected_downgrade_gb(frames) -> float:
+        """Sum the decision ledger's projected downgrade reclaim — rows stamped
+        ``planned_action='downgrade'`` with a positive ``plan_reclaim_gb`` — across
+        the given DataFrames. Covers all three downgrade sources uniformly (Radarr
+        step-downs, Sonarr step-downs, universe quality downgrades): they all stamp
+        the same ledger columns. This is DEFERRED reclaim (profile flip now, smaller
+        file on import), which the downgrade-first policy credits against the
+        deletion target."""
+        total = 0.0
+        for df in frames:
+            if df is None or getattr(df, "empty", True):
+                continue
+            cols = getattr(df, "columns", [])
+            if "planned_action" not in cols or "plan_reclaim_gb" not in cols:
+                continue
+            try:
+                mask = df["planned_action"].astype(str) == "downgrade"
+                vals = pd.to_numeric(df.loc[mask, "plan_reclaim_gb"], errors="coerce")
+                total += float(vals[vals > 0].sum())
+            except Exception:
+                continue
+        return total
 
     @staticmethod
     def _baseline_survivors(df) -> frozenset:

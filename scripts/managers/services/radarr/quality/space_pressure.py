@@ -470,8 +470,64 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # a few-thousand-row library. build_movie_feature_row reads every field through
         # row.get(col) + pd.notna() coercion, so a dict row yields a byte-identical
         # MovieFeatureRow (and thus an identical score) — see features/test_movie_features.
-        return {
-            idx: self._score_row(
+        # ── Score memo (mirrors the Sonarr show-score memo): rescore only rows
+        # whose inputs changed. Context hash guards household-wide inputs; the
+        # per-row key hashes the row dict + the DAY (bounds recency drift AND
+        # daemon-credit arrival to <24h). Keyed by tmdb/file id, NOT df index
+        # (indexes shift as the library changes). Sampled parity audit shares
+        # the show memo's knob. Any miss/error → the identical scoring path.
+        import hashlib as _hl
+        import json as _json
+        import random as _rnd
+        from datetime import datetime as _dt, timezone as _tz
+
+        def _h(o) -> str:
+            try:
+                return _hl.sha1(_json.dumps(o, sort_keys=True, default=str)
+                                .encode("utf-8", "replace")).hexdigest()
+            except Exception:
+                return ""
+
+        _ctx = _h([genre_affinity, sorted(watched_tmdb_ids or []),
+                   {str(k): sorted(v) for k, v in (collection_members or {}).items()},
+                   platform_usage, transcode_stats, per_user_affinity, kids_users,
+                   adult_users, related_enabled, related_graph_cap, person_weights,
+                   person_affinity_cap, language_consumability,
+                   people_manager is not None,
+                   _dt.now(tz=_tz.utc).date().isoformat(), bool(with_breakdown)])
+        _MEMO_KEY = f"radarr/{instance}/movie_score_memo"
+        _prev: dict = {}
+        if self.global_cache and _ctx:
+            try:
+                _b = self.global_cache.get(_MEMO_KEY) or {}
+                if _b.get("ctx") == _ctx and isinstance(_b.get("rows"), dict):
+                    _prev = _b["rows"]
+            except Exception:
+                _prev = {}
+        try:
+            _audit_pct = float(((self.config or {}).get("scoring", {}) or {})
+                               .get("show_score_memo_audit_pct", 0.01) or 0.0)
+        except (TypeError, ValueError):
+            _audit_pct = 0.01
+
+        _next: dict = {}
+        out: dict = {}
+        _hits = _audited = _mismatches = 0
+        for idx, row in zip(df.index, df.to_dict("records")):
+            _rk = str(row.get("tmdb_id") or row.get("movie_file_id") or idx)
+            _sk = _h(row)
+            _hit = _prev.get(_rk) if _sk else None
+            _expect = None
+            if _hit and _hit.get("k") == _sk:
+                if _audit_pct > 0 and _rnd.random() < _audit_pct:
+                    _expect = _hit.get("v")     # fall through: rescore + compare
+                else:
+                    _v = _hit.get("v")
+                    out[idx] = (_v[0], _v[1]) if (with_breakdown and isinstance(_v, list)) else _v
+                    _next[_rk] = _hit
+                    _hits += 1
+                    continue
+            _sv = self._score_row(
                 row,
                 genre_affinity=genre_affinity,
                 watched_tmdb_ids=watched_tmdb_ids,
@@ -489,8 +545,28 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 language_consumability=language_consumability,
                 return_breakdown=with_breakdown,
             )
-            for idx, row in zip(df.index, df.to_dict("records"))
-        }
+            out[idx] = _sv
+            if _sk:
+                _next[_rk] = {"k": _sk, "v": list(_sv) if isinstance(_sv, tuple) else _sv}
+                if _expect is not None:
+                    _audited += 1
+                    _fresh = list(_sv) if isinstance(_sv, tuple) else _sv
+                    if _fresh != _expect:
+                        _mismatches += 1
+                        self.logger.log_warning(
+                            f"[SpacePressure] movie score memo parity MISMATCH for {_rk}: "
+                            f"memo={_expect!r} fresh={_fresh!r} — fresh wins; an input is "
+                            f"missing from the memo key (report this).")
+        if self.global_cache and _ctx and _next:
+            try:
+                self.global_cache.set(_MEMO_KEY, {"ctx": _ctx, "rows": _next}, pretty=False)
+            except Exception:
+                pass
+        if _hits or _audited:
+            self.logger.log_info(
+                f"[SpacePressure] movie score memo: {_hits}/{len(out)} unchanged — reused "
+                f"(rescored {len(out) - _hits}; audited {_audited}, {_mismatches} mismatch(es)).")
+        return out
 
     def _load_related_tmdb_ids(self, tmdb_id: int) -> set[int]:
         """Read this movie's daemon-cached Trakt related set (cache-only) and return
@@ -624,7 +700,10 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             plan_changed = True
 
             if self.dry_run:
-                self.logger.log_info(
+                # debug: the per-title detail is stamped into the decision ledger
+                # (line above) and rendered in the end-of-run "Change plan" grid —
+                # the live log keeps only the pass summary table.
+                self.logger.log_debug(
                     f"  📉 [dry_run] Would step down: '{title}' "
                     f"({self._fmt_bytes(_sz_f)}, {cur_qp_name} → {target_name}, ~{reclaim:.1f} GB) — {reason}"
                 )
@@ -641,22 +720,60 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 payload["qualityProfileId"] = target_id
                 self.radarr_api._make_request(instance, f"movie/{movie_id}", method="PUT", payload=payload)
 
+                # ── Realize the downgrade NOW (verify → delete → grab) ────────
+                # A profile flip + blind search NEVER reclaims: the existing file
+                # exceeds the new cutoff, so Radarr rejects every release
+                # ("cutoff met") — *arr does not downgrade files. So: one
+                # interactive search FIRST; only if a smaller release actually
+                # exists is the file deleted, then that release is grabbed by
+                # guid (a blind search fallback also works post-delete, since the
+                # cutoff-met blocker died with the file). No smaller release →
+                # the file is KEPT (a title is never traded for an empty indexer
+                # result) and the row re-probes next run.
+                _fid_row = df.at[idx, "movie_file_id"] if "movie_file_id" in df.columns else None
+                releases = self.radarr_api._make_request(
+                    instance, f"release?movieId={int(movie_id)}", fallback=None) or []
+                pick = self._pick_stepdown_release(releases, current_res=df.at[idx, "resolution"]
+                                                   if "resolution" in df.columns else None)
+                if not pick:
+                    self.logger.log_info(
+                        f"  ⏸️ '{title}': no smaller release available — file kept at "
+                        f"{cur_qp_name} (profile now {target_name}; re-probes next run).")
+                    stats["no_release"] = stats.get("no_release", 0) + 1
+                    df.at[idx, "quality_profile_id"]   = target_id
+                    df.at[idx, "quality_profile_name"] = target_name
+                    changed = True
+                    continue
+                if _fid_row is not None and pd.notna(_fid_row):
+                    self.radarr_api._make_request(
+                        instance, f"moviefile/{int(_fid_row)}", method="DELETE")
+                try:
+                    self.radarr_api._make_request(
+                        instance, "release", method="POST", fallback=None,
+                        payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId")})
+                except Exception:
+                    movie_ids_to_search.append(movie_id)   # file is gone → blind search now works
+
                 df.at[idx, "quality_profile_id"]   = target_id
                 df.at[idx, "quality_profile_name"] = target_name
                 df.at[idx, "quality_action"]       = None
                 changed = True
-                movie_ids_to_search.append(movie_id)
                 stats["downgraded"] += 1
 
+                _pick_gb = float(pick.get("size") or 0) / (1024 ** 3)
                 self.logger.log_info(
                     f"  📉 Stepped down: '{title}' "
-                    f"({self._fmt_bytes(_sz_f)}, {cur_qp_name} → {target_name}, ~{reclaim:.1f} GB) — {reason}"
+                    f"({self._fmt_bytes(_sz_f)}, {cur_qp_name} → {target_name}) — file deleted, "
+                    f"grabbed '{pick.get('title')}' ({_pick_gb:.1f} GB) — {reason}"
                 )
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ Downgrade failed for '{title}' (id={movie_id}): {e}")
                 stats["failed"] += 1
 
         if movie_ids_to_search:
+            # Fallback pool: guid grabs that errored after their file was already
+            # deleted. Blind search is EFFECTIVE for these (no file → no
+            # cutoff-met rejection → best allowed release at the new profile).
             try:
                 self.radarr_api._make_request(
                     instance, "command", method="POST",
@@ -681,6 +798,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 ["hot-universe",        stats.get('skipped_universe', 0)],
                 ["high-score protected", stats['skipped_high_score']],
                 ["recently watched",    stats['skipped_recent']],
+                ["no smaller release",  stats.get('no_release', 0)],
                 ["failed",              stats['failed']],
             ],
             title=f"[SpacePressure] {prefix}step-down pass - '{instance}' (~{stats.get('est_reclaim_gb', 0):.0f} GB reclaimed)",
@@ -692,6 +810,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 "movies protected — hot franchise/universe credit holds an untagged saga member at tier",
                 "movies protected by a high watchability score",
                 "movies skipped for a recent watch",
+                "file KEPT: no release below the current resolution — profile lowered, re-probes next run",
                 "movies whose PUT/search call errored",
             ],
         )
@@ -1043,7 +1162,10 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             title = c.get("title") or f"movie {fid}"
             self._stamp_plan(df, idx, "delete", c.get("reason") or "coordinator pool", size / (1024 ** 3))
             if effective_dry_run(self.dry_run, self.global_cache):    # also dry when backup gate disarmed
-                self.logger.log_info(f"  🗑️ [dry_run] Would delete movie: '{title}' ({self._fmt_bytes(size)})")
+                # debug: 400+ per-title lines in selection order were live-log spam —
+                # the decision ledger (stamped above) renders them sorted with GB +
+                # reason in the end-of-run "Change plan" grid.
+                self.logger.log_debug(f"  🗑️ [dry_run] Would delete movie: '{title}' ({self._fmt_bytes(size)})")
                 stats["deleted"] += 1
                 stats["bytes_freed"] += size
                 continue
@@ -1330,6 +1452,17 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             f"[SpacePressure] Scored {len(score_map)} movies for '{instance}' "
             f"(range: {min(score_map.values())}–{max(score_map.values())})"
         )
+        # ── ML snapshot append (Stage 1 — pure logging; ml.snapshots.enabled,
+        #    DEFAULT ON). Reads the score/breakdown columns just persisted above.
+        #    Fully wrapped: a snapshot failure can never affect the run.
+        try:
+            from scripts.managers.machine_learning.labels.snapshots import (
+                maybe_snapshot_movies,
+            )
+            maybe_snapshot_movies(self.config, self.global_cache, self.logger,
+                                  instance, df)
+        except Exception as e:
+            self.logger.log_debug(f"[MLSnapshot] radarr/{instance} snapshot hook failed: {e}")
         try:
             _rows = self.report_size_anomalies(instance, df)
             self.remediate_size_anomalies(instance, _rows)
@@ -1658,12 +1791,25 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     self.logger.log_warning(f"[SizeAnomaly] rescan batch failed on '{instance}': {e}")
 
         # ── re-grab bloated (acquire-then-replace: grab a right-sized release by guid) ─────
+        # Dry-run budget: each candidate costs a movie GET + an interactive indexer
+        # search (~2s of blocked wall each — profiler showed ~19s/run at 0.0 CPU)
+        # just to NAME the would-grab release in the preview. Default 0 defers the
+        # checks (the size-anomaly grid already lists every candidate); raise
+        # size_anomaly.dry_run_search_budget to sample real releases in dry runs.
+        _dry_search_budget = int(cfg.get("dry_run_search_budget", 0) or 0)
+        _dry_searched = 0
+        _dry_deferred = 0
         for r in rows:
             if r.get("action") != "regrab":
                 continue
             mid, fid = r.get("movie_id"), r.get("movie_file_id")
             if mid is None or fid is None:
                 continue
+            if eff_dry:
+                if _dry_searched >= _dry_search_budget:
+                    _dry_deferred += 1
+                    continue
+                _dry_searched += 1
             # Only re-grab MONITORED movies — replacing an unmonitored movie's file overrides a
             # deliberate opt-out (and Radarr won't keep monitoring the result).
             mv = self.radarr_api._make_request(instance, f"movie/{int(mid)}", fallback=None)
@@ -1724,6 +1870,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 stats["failed"] += 1
                 self.logger.log_warning(f"[SizeAnomaly] re-grab failed for '{r.get('title')}': {e}")
 
+        if _dry_deferred:
+            self.logger.log_info(
+                f"[SizeAnomaly] [dry_run] '{instance}': {_dry_deferred} bloated file(s) queued "
+                f"for re-grab — release checks deferred (candidates are in the size-anomaly "
+                f"grid; set size_anomaly.dry_run_search_budget>0 to sample releases inline).")
         acted = stats["rescanned"] + stats["regrabbed"]
         if acted or stats["skipped_unmonitored"] or stats["skipped_no_release"]:
             self.logger.log_info(
@@ -1733,6 +1884,38 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 f"{stats['failed']} failed."
             )
         return stats
+
+    @staticmethod
+    def _pick_stepdown_release(releases: list, current_res=None) -> "dict | None":
+        """Pick the release a step-down should grab: walk the resolution ladder
+        UP from the floor (720 → 1080) and take the first non-empty rung strictly
+        below the current file's resolution — 'no 720 found, take the next tier
+        up' — never at/above the current resolution (that would re-grab what we
+        are shrinking). Within a rung, the MEDIAN-sized release wins: the biggest
+        is often a remux-grade outlier, the smallest a fake/undersized rip.
+        Returns None when no rung has a candidate → caller keeps the file."""
+        try:
+            cur = float(current_res) if current_res is not None and current_res == current_res else None
+        except (TypeError, ValueError):
+            cur = None
+        by_rung: dict = {}
+        for r in releases or []:
+            if not isinstance(r, dict) or not r.get("guid"):
+                continue
+            res = (((r.get("quality") or {}).get("quality") or {}).get("resolution"))
+            try:
+                res = int(res)
+            except (TypeError, ValueError):
+                continue
+            if res < 720 or (cur is not None and res >= cur):
+                continue
+            if float(r.get("size") or 0) < 300 * 1024 * 1024:   # sanity floor: no 300MB "movies"
+                continue
+            by_rung.setdefault(res, []).append(r)
+        for rung in sorted(by_rung):
+            cands = sorted(by_rung[rung], key=lambda r: float(r.get("size") or 0))
+            return cands[len(cands) // 2]
+        return None
 
     @staticmethod
     def _pick_replacement_release(releases, *, expected_gb, resolution, under_ratio, over_ratio):
