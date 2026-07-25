@@ -70,11 +70,18 @@ class SonarrSeriesRetrievalFetchManager(BaseManager, ComponentManagerMixin):
     @timeit("get_series_by_id")
     def get_series_by_id(self, series_id, instance):
         resolved_instance = self.instance_manager.resolve_instance(instance)
-        for letter in list("abcdefghijklmnopqrstuvwxyz0123456789_"):
-            series_list = self.series_cache.load_letter_cache(resolved_instance, letter)
-            for s in series_list:
-                if str(s.get("id")) == str(series_id):
-                    return s
+        # Canonical indexed lookup (O(1)) — falls back to the letter-bucket scan
+        # only when the cache manager predates the index.
+        if self.series_cache and hasattr(self.series_cache, "get_cached_series_by_id"):
+            s = self.series_cache.get_cached_series_by_id(resolved_instance, str(series_id))
+            if s is not None:
+                return s
+        else:
+            for letter in list("abcdefghijklmnopqrstuvwxyz0123456789_"):
+                series_list = self.series_cache.load_letter_cache(resolved_instance, letter)
+                for s in series_list:
+                    if str(s.get("id")) == str(series_id):
+                        return s
         self.logger.log_warning(f"⚠️ Series ID {series_id} not found in cache for {resolved_instance}")
         return None
 
@@ -93,12 +100,18 @@ class SonarrSeriesRetrievalFetchManager(BaseManager, ComponentManagerMixin):
     @timeit("get_series_by_tvdb_id")
     def get_series_by_tvdb_id(self, tvdb_id: int, instance: str):
         resolved_instance = self.instance_manager.resolve_instance(instance)
-        for letter in list("abcdefghijklmnopqrstuvwxyz0123456789_"):
-            series_list = self.series_cache.load_letter_cache(resolved_instance, letter)
-            for s in series_list:
-                if str(s.get("tvdbId")) == str(tvdb_id):
-                    return s
-        self.logger.log_info(f"❌ Series with TVDB ID {tvdb_id} not found in {resolved_instance}")
+        # Canonical indexed lookup (O(1)) — fallback scan for older cache managers.
+        if self.series_cache and hasattr(self.series_cache, "get_series_by_tvdb_id"):
+            s = self.series_cache.get_series_by_tvdb_id(resolved_instance, tvdb_id)
+            if s is not None:
+                return s
+        else:
+            for letter in list("abcdefghijklmnopqrstuvwxyz0123456789_"):
+                series_list = self.series_cache.load_letter_cache(resolved_instance, letter)
+                for s in series_list:
+                    if str(s.get("tvdbId")) == str(tvdb_id):
+                        return s
+            self.logger.log_info(f"❌ Series with TVDB ID {tvdb_id} not found in {resolved_instance}")
         return None
 
     @LoggerManager().log_function_entry
@@ -193,15 +206,23 @@ class SonarrSeriesRetrievalFetchManager(BaseManager, ComponentManagerMixin):
 
         resolved = self.instance_manager.resolve_instance(instance)
         ts_handler = getattr(self.global_cache, "timestamp_handler", None)
-        cache_mgr = getattr(self.manager, "series_cache", None)
+        # One cache manager for BOTH the freshness gate and persistence.  These
+        # used to be two different attribute chains (manager.series_cache vs
+        # sonarr_cache.series): when only the latter resolved, the fetch was
+        # never persisted and the freshness timestamp never written, so the
+        # 30–60s full fetch re-ran every run despite a healthy on-disk cache.
+        cache_mgr = (
+            self.series_cache
+            or getattr(self.manager, "series_cache", None)
+            or getattr(self.sonarr_cache, "series", None)
+        )
 
         # ── Freshness gate: skip API call entirely when cache is recent ─────────
         if not force and ts_handler:
             try:
                 is_fresh = ts_handler.is_fresh("sonarr", resolved, "series_library", SERIES_CACHE_MAX_AGE)
                 if is_fresh:
-                    series_cache = getattr(self.sonarr_cache, "series", None)
-                    cached_count = series_cache.get_series_count(resolved) if series_cache else 0
+                    cached_count = cache_mgr.get_series_count(resolved) if cache_mgr else 0
                     if cached_count > 0:
                         age = ts_handler.get_age_seconds("sonarr", resolved, "series_library") or 0
                         age_h = age // 3600
@@ -211,7 +232,7 @@ class SonarrSeriesRetrievalFetchManager(BaseManager, ComponentManagerMixin):
                             f"({cached_count} series, age {age_h}h {age_m}m). "
                             f"Loading from disk — skipping live API call."
                         )
-                        return list(series_cache.iter_all_series(resolved)), True
+                        return list(cache_mgr.iter_all_series(resolved)), True
             except Exception as e:
                 self.logger.log_warning(
                     f"⚠️ Freshness check failed for '{resolved}', proceeding with API sync: {e}"

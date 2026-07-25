@@ -112,8 +112,10 @@ class SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin):
 
     def _bucket_memo_set(self, instance: str, letter: str, data: list) -> None:
         self._bucket_memo()[(instance, letter)] = data
+        self._index_invalidate(instance)  # bucket contents changed → index stale
 
     def _bucket_memo_invalidate(self, instance: str, letter: str = None) -> None:
+        self._index_invalidate(instance)  # bucket contents changed → index stale
         memo = self.__dict__.get("_bucket_memo_store")
         if not memo:
             return
@@ -122,6 +124,48 @@ class SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin):
                 memo.pop(k, None)
         else:
             memo.pop((instance, letter), None)
+
+    # ── In-memory lookup index ────────────────────────────────────────────────
+    # get_series_by_title / get_series_by_tvdb_id / get_cached_series_by_id were
+    # O(N) linear scans over every letter bucket per call (profiler: 23.4k
+    # get_series_by_id calls = 547s and 8.7k title lookups = 137s across 20
+    # runs).  The index below is built lazily in one pass over the memo'd
+    # buckets and invalidated by the same two write hooks that keep the bucket
+    # memo coherent, so every mutation path is covered automatically.
+    # NOTE: every write path (save_series_to_letter_file, rebuild, delta,
+    # remove_series, clear_letter_cache) goes through _bucket_memo_set or
+    # _bucket_memo_invalidate — do not add a write path that bypasses them.
+    # First occurrence wins on duplicate keys, matching the old first-match
+    # linear-scan order (letters a-z, 0-9, then '_').  Values are references to
+    # the same dicts held by the bucket memo — treat as read-only.
+
+    def _index_memo(self) -> dict:
+        return self.__dict__.setdefault("_index_memo_store", {})
+
+    def _index_invalidate(self, instance: str) -> None:
+        self.__dict__.get("_index_memo_store", {}).pop(instance, None)
+
+    def _series_index(self, instance: str) -> dict:
+        """Return (building if needed) {'id': …, 'title': …, 'tvdb': …} maps."""
+        idx = self._index_memo().get(instance)
+        if idx is not None:
+            return idx
+        by_id: dict[str, dict] = {}
+        by_title: dict[str, dict] = {}
+        by_tvdb: dict[str, dict] = {}
+        for s in self.iter_all_series(instance):
+            sid = s.get("id")
+            if sid is not None:
+                by_id.setdefault(str(sid), s)
+            title = s.get("title")
+            if title:
+                by_title.setdefault(str(title).lower(), s)
+            tvdb = s.get("tvdbId")
+            if tvdb is not None:
+                by_tvdb.setdefault(str(tvdb), s)
+        idx = {"id": by_id, "title": by_title, "tvdb": by_tvdb}
+        self._index_memo()[instance] = idx
+        return idx
 
     def load_letter_cache(self, instance: str, letter: str) -> list:
         memo = self._bucket_memo()
@@ -213,11 +257,7 @@ class SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin):
     @LoggerManager().log_function_entry
     @timeit("get_cached_series_by_id")
     def get_cached_series_by_id(self, instance: str, series_id: str) -> dict | None:
-        for letter in "abcdefghijklmnopqrstuvwxyz0123456789_":
-            for s in self.load_letter_cache(instance, letter):
-                if str(s.get("id")) == str(series_id):
-                    return s
-        return None
+        return self._series_index(instance)["id"].get(str(series_id))
 
     @LoggerManager().log_function_entry
     @timeit("deduplicate_series_data")
@@ -325,23 +365,20 @@ class SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin):
     @LoggerManager().log_function_entry
     @timeit("get_series_by_title")
     def get_series_by_title(self, instance: str, title: str) -> dict | None:
-        """Case-insensitive title lookup across all letter buckets."""
-        title_lower = title.lower()
-        for s in self.iter_all_series(instance):
-            if s.get("title", "").lower() == title_lower:
-                return s
-        self.logger.log_debug(f"❌ Series with title '{title}' not found in '{instance}'")
-        return None
+        """Case-insensitive title lookup via the in-memory index (O(1))."""
+        s = self._series_index(instance)["title"].get(str(title or "").lower())
+        if s is None:
+            self.logger.log_debug(f"❌ Series with title '{title}' not found in '{instance}'")
+        return s
 
     @LoggerManager().log_function_entry
     @timeit("get_series_by_tvdb_id")
     def get_series_by_tvdb_id(self, instance: str, tvdb_id: int) -> dict | None:
-        """Find a cached series by its TVDB ID."""
-        for s in self.iter_all_series(instance):
-            if str(s.get("tvdbId")) == str(tvdb_id):
-                return s
-        self.logger.log_debug(f"❌ Series with TVDB ID {tvdb_id} not found in '{instance}'")
-        return None
+        """Find a cached series by its TVDB ID via the in-memory index (O(1))."""
+        s = self._series_index(instance)["tvdb"].get(str(tvdb_id))
+        if s is None:
+            self.logger.log_debug(f"❌ Series with TVDB ID {tvdb_id} not found in '{instance}'")
+        return s
 
     @LoggerManager().log_function_entry
     @timeit("get_title_by_series_id")
