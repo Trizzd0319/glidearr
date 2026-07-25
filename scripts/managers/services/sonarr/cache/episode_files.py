@@ -575,7 +575,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 na_position="last",
             ).reset_index(drop=True)
             df_out.to_parquet(path, index=False, engine="pyarrow", compression="snappy")
-            self.logger.log_info(
+            # debug: save() fires 5-7× per run from different pipeline stages —
+            # identical bookkeeping lines that told the operator nothing new.
+            self.logger.log_debug(
                 f"💾 Episode file cache saved for '{instance}': "
                 f"{len(df_out)} rows → {path.name}"
             )
@@ -655,6 +657,28 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             f"[ShowScore] Scored {len(score_by_series)} series for '{instance}' "
             f"(range: {min(vals)}-{max(vals)})"
         )
+        # ── ML snapshot append (Stage 1 — pure logging; ml.snapshots.enabled,
+        #    DEFAULT ON). One row per SERIES from the score/breakdown just saved.
+        #    Fully wrapped: a snapshot failure can never affect the run.
+        try:
+            from scripts.managers.machine_learning.labels.snapshots import (
+                maybe_snapshot_shows,
+            )
+            _tvdb_by_series: dict = {}
+            try:
+                _series_cache = getattr(self.sonarr_cache, "series", None)
+                if _series_cache:
+                    _tvdb_by_series = {
+                        int(s["id"]): s.get("tvdbId")
+                        for s in _series_cache.iter_all_series(instance)
+                        if s.get("id") is not None
+                    }
+            except Exception:
+                _tvdb_by_series = {}
+            maybe_snapshot_shows(self.config, self.global_cache, self.logger,
+                                 instance, df, tvdb_by_series=_tvdb_by_series)
+        except Exception as e:
+            self.logger.log_debug(f"[MLSnapshot] sonarr/{instance} snapshot hook failed: {e}")
         try:
             _rows = self.report_size_anomalies(instance, df)
             self.remediate_size_anomalies(instance, _rows)
@@ -1204,10 +1228,42 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if self._maybe_offload_legacy_regrab(instance, eligible):
             return {"legacy": len(legacy), "queued": len(eligible), "offloaded": True}
 
-        # Inline: a dry-run preview OR a batch at/below the spill threshold (or the daemon's disabled).
-        # Capped so a large set that couldn't be offloaded can't block the run — the cooldown ledger
-        # makes the next run pick up where this left off.
-        cap = max(1, int(cp.get("legacy_regrab_budget", 10) or 10))
+        # Dry-run: the inline path exists to PREVIEW, but every check is a slow
+        # interactive release search (~2s of blocked wall each — ~21s/run at the
+        # default cap of 10, all of it on the main pipeline; profiler showed
+        # cpu≈0.2s of 21.4s wall). Default dry-run budget 0 skips the searches
+        # and previews the QUEUE instead (what would be checked, from data we
+        # already have); set scoring.codec_profiles.legacy_regrab_dry_run_budget
+        # > 0 to sample real availability in dry runs. Live behavior unchanged.
+        if self.dry_run:
+            cap = int(cp.get("legacy_regrab_dry_run_budget", 0) or 0)
+            if cap <= 0:
+                _rows = []
+                for r in eligible[:24]:
+                    try:
+                        _ep = (f"{r.get('series_title') or '?'} "
+                               f"S{int(r.get('season_number') or 0):02d}"
+                               f"E{int(r.get('episode_number') or 0):02d}")
+                    except (TypeError, ValueError):
+                        _ep = str(r.get("series_title") or "?")
+                    _rows.append([_ep, f"{r.get('video_codec') or '?'}/"
+                                       f"{int(r.get('resolution') or 0)}p"])
+                if _rows:
+                    self.logger.log_grid(
+                        ["Episode", "Current"], _rows,
+                        title=f"Legacy-codec re-grab queue - '{instance}' "
+                              f"(dry-run; release checks deferred to live/daemon)",
+                        cap=44)
+                self.logger.log_info(
+                    f"[LegacyRegrab] [dry_run] '{instance}': {len(legacy)} legacy-codec "
+                    f"file(s), {len(eligible)} eligible after cooldown — release "
+                    f"availability checks deferred (live run offloads to the daemon; set "
+                    f"scoring.codec_profiles.legacy_regrab_dry_run_budget>0 to sample inline).")
+                return {"legacy": len(legacy), "checked": 0, "grabbed": 0,
+                        "previewed": 0, "no_release": 0, "failed": 0,
+                        "deferred": len(eligible)}
+        else:
+            cap = max(1, int(cp.get("legacy_regrab_budget", 10) or 10))
         batch = eligible[:cap]
         result = run_legacy_regrab(
             make_request=self.sonarr_api._make_request, logger=self.logger,
@@ -1437,6 +1493,53 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 except Exception:
                     continue
 
+        # ── P10 score memo: rescore ONLY series whose inputs changed ──────────
+        # The per-series feature-build + score is ~1.8ms of pandas/Python × ~12k
+        # series (~22s/run) even when NOTHING changed since the last run. Scores
+        # are pure functions of (household context, episode rows, series object,
+        # cached credits/ratings) — so memo them: a context hash guards the
+        # household-wide inputs, a per-series key guards the rest. Any mismatch,
+        # missing memo, or error falls through to the normal scoring path, so
+        # scores are BYTE-IDENTICAL to an unmemoized run by construction (the
+        # memo only ever skips recomputing an identical result).
+        import hashlib as _hl
+        import json as _json
+
+        def _h(obj) -> str:
+            try:
+                return _hl.sha1(_json.dumps(obj, sort_keys=True, default=str)
+                                .encode("utf-8", "replace")).hexdigest()
+            except Exception:
+                return ""
+
+        _ctx_hash = _h([genre_affinity, platform_usage, transcode_stats,
+                        per_user_affinity, sorted(kids_users or []), sorted(adult_users or []),
+                        sorted(watched_tvdb_ids), related_graph_cap, person_weights,
+                        person_affinity_cap, language_consumability, ur_kwargs,
+                        sorted((k, v) for k, v in (user_show_ratings or {}).items())])
+        _MEMO_KEY = f"sonarr/{instance}/show_score_memo"
+        _memo_prev: dict = {}
+        if self.global_cache and _ctx_hash:
+            try:
+                _blob = self.global_cache.get(_MEMO_KEY) or {}
+                if _blob.get("ctx") == _ctx_hash and isinstance(_blob.get("series"), dict):
+                    _memo_prev = _blob["series"]
+            except Exception:
+                _memo_prev = {}
+        _memo_next: dict = {}
+        _memo_hits = 0
+        # Sampled parity audit: on a small fraction of memo hits, rescore anyway
+        # and compare — the tripwire for the one failure mode a memo can hide
+        # (an input missing from the key going stale silently). Mismatch → loud
+        # warning + the fresh score wins. ~1% of hits ≈ 0.2s/run.
+        import random as _rnd
+        try:
+            _audit_pct = float(((self.config or {}).get("scoring", {}) or {})
+                               .get("show_score_memo_audit_pct", 0.01) or 0.0)
+        except (TypeError, ValueError):
+            _audit_pct = 0.01
+        _audited = _audit_mismatches = 0
+
         out: dict[int, int] = {}
         fallbacks = 0
         for series_id, rows in df.groupby("series_id", sort=False):
@@ -1476,6 +1579,31 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     except Exception:
                         related_tvdb_ids = None
 
+                # Per-series memo key: vectorized row hash (C-speed) + the series
+                # object + every cache-derived input the scorer sees. 'now' is
+                # deliberately excluded — recency terms decay with wall-clock, so
+                # the memo also embeds the DAY: a date roll invalidates everything
+                # once per day (recency drift is bounded to <24h, matching the
+                # 24h cadence of the caches feeding it).
+                _skey = _h([
+                    list(pd.util.hash_pandas_object(rows, index=False).values),
+                    series_obj, credits, trakt_rating, trakt_votes, user_rating,
+                    sorted(related_tvdb_ids) if related_tvdb_ids else None,
+                    now.date().isoformat(), bool(with_breakdown),
+                ])
+                _hit = _memo_prev.get(str(sid)) if _skey else None
+                _audit_expect = None
+                if _hit and _hit.get("k") == _skey:
+                    if _audit_pct > 0 and _rnd.random() < _audit_pct:
+                        _audit_expect = _hit.get("v")   # fall through: rescore + compare
+                    else:
+                        _v = _hit.get("v")
+                        out[sid] = (tuple(_v) if isinstance(_v, list) else _v) if not with_breakdown \
+                            else (_v[0], _v[1]) if isinstance(_v, list) else _v
+                        _memo_next[str(sid)] = _hit
+                        _memo_hits += 1
+                        continue
+
                 # ML Step 3c: aggregate the episode rows + series object into a typed
                 # ShowFeatureRow at the brain boundary, then score it.
                 fr = build_show_feature_row(
@@ -1499,6 +1627,19 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     return_breakdown=with_breakdown,
                     **ur_kwargs,
                 )
+                if _skey:
+                    _sv = out[sid]
+                    _memo_next[str(sid)] = {"k": _skey,
+                                            "v": list(_sv) if isinstance(_sv, tuple) else _sv}
+                    if _audit_expect is not None:
+                        _audited += 1
+                        _fresh = list(_sv) if isinstance(_sv, tuple) else _sv
+                        if _fresh != _audit_expect:
+                            _audit_mismatches += 1
+                            self.logger.log_warning(
+                                f"[ShowScore] memo parity MISMATCH for series {sid}: "
+                                f"memo={_audit_expect!r} fresh={_fresh!r} — fresh wins; "
+                                f"an input is missing from the memo key (report this).")
             except Exception as e:
                 out[sid] = (30, {}) if with_breakdown else 30   # neutral fallback, mirrors Radarr _score_row
                 fallbacks += 1
@@ -1508,6 +1649,17 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"[ShowScore] {fallbacks}/{len(out)} series fell back to neutral 30 "
                 f"— see debug log for causes."
             )
+        if self.global_cache and _ctx_hash and _memo_next:
+            try:
+                self.global_cache.set(_MEMO_KEY, {"ctx": _ctx_hash, "series": _memo_next},
+                                      pretty=False)
+            except Exception:
+                pass
+        if _memo_hits or _audited:
+            self.logger.log_info(
+                f"[ShowScore] memo: {_memo_hits}/{len(out)} series unchanged — reused "
+                f"prior scores (rescored {len(out) - _memo_hits}; parity-audited "
+                f"{_audited}, {_audit_mismatches} mismatch(es)).")
         return out
 
     def _build_show_scoring_context(self):
@@ -3255,7 +3407,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     @timeit("_do_acquire_next_episodes")
     def _do_acquire_next_episodes(
-        self, instance: str, df: pd.DataFrame
+        self, instance: str, df: pd.DataFrame, *, season_ep_cache: dict | None = None
     ) -> dict:
         """
         For every pending-acquisition row (``next_episode=True`` and
@@ -3359,11 +3511,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             series_title = episodes[0][2]
             seasons_needed = {sn for sn, _en, _t in episodes}
 
-            # One season fetch per unique season for this series
+            # One season fetch per unique season for this series — read through the
+            # run-scoped session cache when the pipeline hands one over, so seasons
+            # already fetched by _compute_next_episodes seconds earlier are free.
             ep_map: dict[tuple[int, int], dict] = {}  # (sn, en) → sonarr ep obj
             for sn in seasons_needed:
                 try:
-                    for ep_obj in self._get_episodes_for_season(instance, sid, sn):
+                    for ep_obj in self._get_episodes_for_season(instance, sid, sn, season_ep_cache):
                         ep_map[(sn, ep_obj.get("episodeNumber"))] = ep_obj
                 except Exception as e:
                     self.logger.log_warning(
@@ -4469,7 +4623,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if df.empty:
             return stats
 
-        for col in ("pilot_search_attempts", "pilot_last_searched_at", "pilot_last_profile_id"):
+        for col in ("pilot_search_attempts", "pilot_last_searched_at", "pilot_last_profile_id",
+                    "pilot_last_planned_at"):
             if col not in df.columns:
                 df[col] = None
 
@@ -4689,6 +4844,16 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             df.at[idx, "pilot_last_searched_at"] = now_utc.isoformat()
             df.at[idx, "pilot_last_profile_id"]  = pid
 
+        def _mark_planned(idx: int) -> None:
+            # Dry-run bookkeeping ONLY: never touch pilot_search_attempts /
+            # pilot_last_searched_at / pilot_last_profile_id — those drive the
+            # live backoff + ladder state and must reflect REAL searches. The
+            # planned stamp is persisted (see the dry-run save below) so
+            # back-to-back dry-runs skip the full per-stub planning loop, while
+            # live searches ignore it entirely (a dry-run never suppresses a
+            # real search).
+            df.at[idx, "pilot_last_planned_at"] = now_utc.isoformat()
+
         # ── Series source (bulk snapshot, BOTH modes) ─────────────────────────
         # The tier DECISION (current profile + runtime) is read from a single O(1) snapshot of
         # every series — taken once from the local letter-bucketed cache (populated by the
@@ -4752,6 +4917,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 )
                 if not pilot_search_due(df.at[_i, "pilot_last_searched_at"], now_utc, _wiv):
                     continue  # interval-guarded out → won't be searched
+                if self.dry_run and not pilot_search_due(
+                    df.at[_i, "pilot_last_planned_at"], now_utc, _wiv
+                ):
+                    continue  # dry-run-planned recently → will be skipped below too
                 _warm_sids.append(_s)
             if _warm_sids:
                 self._prewarm_by_series_episode_cache(
@@ -4785,6 +4954,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 backoff=_pilot_backoff,
             )
             if not pilot_search_due(df.at[idx, "pilot_last_searched_at"], now_utc, _eff_interval):
+                stats["skipped_recent"] += 1
+                continue
+            # Dry-run throttle: a stub planned by a recent dry-run is skipped in
+            # dry-run only — LIVE searches deliberately ignore the planned stamp.
+            if self.dry_run and not pilot_search_due(
+                df.at[idx, "pilot_last_planned_at"], now_utc, _eff_interval
+            ):
                 stats["skipped_recent"] += 1
                 continue
 
@@ -4824,7 +5000,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     stats["removed_grabbing"] += 1
                     changed = True
                     continue
-                _mark_searched(idx, _stub_floor)
+                if self.dry_run:
+                    _mark_planned(idx)   # plan stamp only — live ladder state untouched
+                else:
+                    _mark_searched(idx, _stub_floor)
                 changed = True
                 if ep_id:
                     climb_items.append((sid, int(ep_id)))
@@ -5094,7 +5273,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             # saved frame contiguous. Dry-run plans the removal in the stats table but never persists.
             if drop_idxs and not self.dry_run:
                 df = df.drop(index=drop_idxs).reset_index(drop=True)
-            if changed and not self.dry_run:
+            if changed:
+                # Saved in dry-run too: the only dry-run mutation reaching the
+                # frame is pilot_last_planned_at (via _mark_planned) — committed
+                # -grab rows are dropped live-only above, and searched/attempt
+                # stamps are live-only by construction. Persisting the plan
+                # stamps lets the next dry-run skip the whole planning loop.
                 self.save(instance, df)
             _prefix = "[dry_run] " if self.dry_run else ""
             _mode = "interactive search" if interactive else "floor-first climb"
@@ -5140,10 +5324,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if self.dry_run:
             stats["searched"] = len(queued) + len(series_queued)
             for idx, _ep, pid, _t in queued:
-                _mark_searched(idx, pid)
+                _mark_planned(idx)
                 changed = True
             for idx, _sid, pid, _t in series_queued:
-                _mark_searched(idx, pid)
+                _mark_planned(idx)
                 changed = True
         else:
             for i in range(0, len(queued), EPISODE_SEARCH_CHUNK):
@@ -5178,7 +5362,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     self.logger.log_warning(f"  ⚠️ SeriesSearch failed for '{title}': {e}")
                     stats["failed"] += 1
 
-        if changed and not self.dry_run:
+        if changed:
+            # Dry-run persists ONLY pilot_last_planned_at (see _mark_planned).
             self.save(instance, df)
 
         prefix = "[dry_run] " if self.dry_run else ""
@@ -6696,6 +6881,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         files_session_cache: dict[int, list] = {}
         season_ep_cache:     dict[tuple, list] = {}  # (series_id, season) → episodes; shared across loop + pipeline
         _loop_start = time.time()
+        _last_progress = 0.0        # last progress-line emission, seconds into the loop
         _total = len(history)
 
         for _loop_i, ((series_title, season, episode), watch) in enumerate(history.items(), start=1):
@@ -6767,12 +6953,17 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     )
                     stats["skipped"] += 1
 
-            # Progress checkpoint every 25% of total entries
-            _checkpoint = max(1, _total // 4)
-            if _loop_i % _checkpoint == 0 or _loop_i == _total:
-                _elapsed = time.time() - _loop_start
-                _rate    = _loop_i / _elapsed if _elapsed > 0 else 0
-                _eta     = (_total - _loop_i) / _rate if _rate > 0 else 0
+            # Progress checkpoint — TIME-gated, not count-gated. The pass used to
+            # take 8-12s (four 25% lines earned their keep); with the O(1) lookup
+            # index it usually finishes in ~1s, where "[104/417] ETA ~0s" ×4 is
+            # pure noise. Emit only once the loop has actually been slow (>5s),
+            # then at most every 5s — the frozen-screen guard stays for genuinely
+            # slow passes (cold caches, live API misses).
+            _elapsed = time.time() - _loop_start
+            if _elapsed > 5 and (_elapsed - _last_progress) >= 5:
+                _last_progress = _elapsed
+                _rate = _loop_i / _elapsed if _elapsed > 0 else 0
+                _eta  = (_total - _loop_i) / _rate if _rate > 0 else 0
                 self.logger.log_info(
                     f"  ⏳ [{_loop_i}/{_total}] — "
                     f"{stats['updated']} updated, {stats['added']} added, {stats['skipped']} skipped — "
@@ -6800,7 +6991,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         df = self._compute_next_episodes(df, instance, files_session_cache, season_ep_cache=season_ep_cache)
         self.logger.log_info(f"[⏱️] compute_next_episodes — {time.time()-_ps:.1f}s")
 
-        acquire_stats = self._do_acquire_next_episodes(instance, df)
+        acquire_stats = self._do_acquire_next_episodes(
+            instance, df, season_ep_cache=season_ep_cache
+        )
         self.logger.log_info(f"[⏱️] acquire_next_episodes — {time.time()-_ps:.1f}s")
 
         df = self._apply_grace_period(df)
