@@ -86,16 +86,35 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
 
     # ── Data pull methods ────────────────────────────────────────────────────────
 
+    def _pull_targets(self, instance=None) -> list:
+        """Instances a pull method should touch: the one passed, or all.
+
+        Every run_*_data_pull used to loop ALL instances regardless of the
+        per-instance orchestration loop calling it — 3 instances meant 9
+        executions of every pull (O(N²)) and nine full-library JSON rewrites
+        per run. Honoring the caller's instance keeps one pull per instance;
+        ``None`` preserves the old pull-everything behavior for direct callers.
+        """
+        if instance:
+            try:
+                return [self._resolve_instance(instance)]
+            except Exception:
+                return [instance]
+        return list(self._all_instances())
+
     @LoggerManager().log_function_entry
     @timeit("run_movie_data_pull")
     def run_movie_data_pull(self, instance):
         movies_mgr = self._get_movies_manager()
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if movies_mgr and hasattr(getattr(movies_mgr, "retrieval", None), "get_all_movies"):
                 movie_list = movies_mgr.retrieval.get_all_movies(instance_name)
             else:
                 movie_list = self.radarr_api._make_request(instance_name, "movie", fallback=[]) if self.radarr_api else []
-            self.global_cache.set(f"radarr.movies.{instance_name}.full", movie_list)
+            # pretty=False: this is the whole library (~25k movie dicts on
+            # 'standard') — indent=2 both bloats the file and dominates the
+            # serialize time for a cache only ever read back by machines.
+            self.global_cache.set(f"radarr.movies.{instance_name}.full", movie_list, pretty=False)
             self.logger.log_info(f"Pulled {len(movie_list) if isinstance(movie_list, list) else 0} movies from {instance_name}")
 
     @LoggerManager().log_function_entry
@@ -106,7 +125,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
         movies_monitoring = (
             getattr(monitoring_mgr, "movies", None) if monitoring_mgr else None
         )
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if movies_monitoring and hasattr(movies_monitoring, "get_monitoring_summary"):
                 monitored, unmonitored = movies_monitoring.get_monitoring_summary(instance_name)
             else:
@@ -134,7 +153,9 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
                     "unmonitoredCount": len(unmonitored),
                 },
             }
-            self.global_cache.set(f"radarr.monitoring.{instance_name}", data)
+            # pretty=False: embeds the full movie dicts twice (monitored +
+            # unmonitored) — same whole-library serialization cost as .full.
+            self.global_cache.set(f"radarr.monitoring.{instance_name}", data, pretty=False)
             self.logger.log_info(f"Monitoring summary cached for {instance_name}")
 
     @LoggerManager().log_function_entry
@@ -143,7 +164,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
         """Pull quality profiles via RadarrQualityManager.selector."""
         quality_mgr = self._get_quality_manager()
         selector    = getattr(quality_mgr, "selector", None) if quality_mgr else None
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if selector and hasattr(selector, "get_quality_profiles"):
                 profiles = selector.get_quality_profiles(instance_name)
             else:
@@ -159,7 +180,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
     @timeit("run_tag_data_pull")
     def run_tag_data_pull(self, instance):
         """Pull tags via the Radarr API directly."""
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             tags = (
                 self.radarr_api._make_request(instance_name, "tag", fallback=[])
                 if self.radarr_api else []
@@ -173,7 +194,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
         """Pull custom formats via RadarrQualityManager.custom_formats."""
         quality_mgr  = self._get_quality_manager()
         cf_mgr       = getattr(quality_mgr, "custom_formats", None) if quality_mgr else None
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if cf_mgr and hasattr(cf_mgr, "get_custom_formats"):
                 formats = cf_mgr.get_custom_formats(instance_name)
             else:
@@ -195,7 +216,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
         """Pull disk/root-folder data via RadarrStorageManager.space."""
         storage_mgr = self._get_storage_manager()
         space_mgr   = getattr(storage_mgr, "space", None) if storage_mgr else None
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if space_mgr and hasattr(space_mgr, "get_root_folders"):
                 disk_data = space_mgr.get_root_folders(instance_name)
             else:
@@ -212,7 +233,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
         """Pull quality-definition adjustments via RadarrQualityManager.adjustments."""
         quality_mgr  = self._get_quality_manager()
         adj_mgr      = getattr(quality_mgr, "adjustments", None) if quality_mgr else None
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if adj_mgr and hasattr(adj_mgr, "get_quality_adjustments"):
                 adjustments = adj_mgr.get_quality_adjustments(instance_name)
             else:
@@ -228,7 +249,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
     def run_keywords_data_pull(self, instance):
         movies_mgr = self._get_movies_manager()
         keywords_mgr = getattr(movies_mgr, "keywords", None) if movies_mgr else None
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if keywords_mgr and hasattr(keywords_mgr, "get_keywords"):
                 keywords = keywords_mgr.get_keywords(instance_name)
                 self.global_cache.set(f"radarr.keywords.{instance_name}", keywords)
@@ -241,7 +262,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
     def run_credits_data_pull(self, instance):
         movies_mgr = self._get_movies_manager()
         credits_mgr = getattr(movies_mgr, "credits", None) if movies_mgr else None
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if credits_mgr and hasattr(credits_mgr, "get_people_and_studios"):
                 credits = credits_mgr.get_people_and_studios(instance_name)
                 self.global_cache.set(f"radarr.credits.{instance_name}", credits)
@@ -251,10 +272,10 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
 
     @LoggerManager().log_function_entry
     @timeit("run_enrichment")
-    def run_enrichment(self):
+    def run_enrichment(self, instance=None):
         movies_mgr = self._get_movies_manager()
         enrich_mgr = getattr(movies_mgr, "enrich", None) if movies_mgr else None
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if enrich_mgr and hasattr(enrich_mgr, "build_enriched_movies"):
                 enriched = enrich_mgr.build_enriched_movies(instance_name)
                 self.global_cache.set(f"radarr.movies.{instance_name}.enriched", enriched)
@@ -264,10 +285,10 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
 
     @LoggerManager().log_function_entry
     @timeit("run_dataframe_build")
-    def run_dataframe_build(self):
+    def run_dataframe_build(self, instance=None):
         movies_mgr  = self._get_movies_manager()
         df_mgr      = getattr(movies_mgr, "dataframe", None) if movies_mgr else None
-        for instance_name in self._all_instances():
+        for instance_name in self._pull_targets(instance):
             if df_mgr and hasattr(df_mgr, "build_movie_dataframe"):
                 df = df_mgr.build_movie_dataframe(instance_name)
                 self.global_cache.set(f"radarr.movies.{instance_name}.dataframe", df)
