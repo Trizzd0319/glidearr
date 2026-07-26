@@ -24,7 +24,10 @@ def resolve_franchise_entries(movies: list[dict]) -> set[int]:
     collections: dict[str, list[dict]] = defaultdict(list)
     for movie in movies:
         coll = movie.get("collection") or {}
-        coll_name = coll.get("name")
+        # Radarr v4/v5 payloads call the field 'title', v3 'name' — read both.
+        # (v4+ has NO 'name' key, which left is_franchise_entry all-False and
+        # category-1 franchise protection inert on modern instances.)
+        coll_name = coll.get("title") or coll.get("name")
         if coll_name:
             collections[coll_name].append(movie)
 

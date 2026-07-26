@@ -9,10 +9,26 @@
 
 Tag conventions (Radarr hyphenated): `keep-universe` → label `universe`; `keep-universe-mcu` → `mcu`; `keep-universe-dc` → `dc`; multiple tags captured. In the Parquet these become `keep_policy ∈ {"keep_universe", "universe"}` with a `universe_name` string (pipe-joined for multiple labels).
 
+## Membership modes (tagless universes)
+
+Historically the pass was INACTIVE unless the operator hand-created `keep-universe*` tags. Membership is now mode-aware via the top-level config key **`universe_membership`** (resolved in `quality/universe_membership.py`; stamped into the Parquet by `RadarrCacheMovieFilesManager.refresh` → `_resolve_membership_maps`; this manager consumes the Parquet rows identically in every mode):
+
+- **`"tags"` (DEFAULT)** — byte-identical to the historical behavior: membership only from Radarr tags (`classification.keep_policy`), no new log lines.
+- **`"derived"`** — tags are ignored for MEMBERSHIP; the derived sources below decide. `keep-universe*` tags are still honored for PROTECTION (the never-delete pin, with the tag-derived label kept when nothing derived covers the movie), and `keep`/`keep-movie` policies are unaffected.
+- **`"hybrid"`** — tags win where present; derived sources fill untagged movies. The intended release mode. (`keep`/`keep-movie`-tagged rows keep their policy but may gain a derived `universe_name` for grouping/saga credit.)
+
+Derived sources, in **precedence** order (per movie, first hit wins): **explicit *arr tags** (the ONLY source that can yield `keep_universe`) > **TMDB collection** (`movie.collection` — `title` on Radarr v4/v5, `name` on v3; both read) > **learned franchise maps** (`plex/playlists/kometa_franchises` — today those entries carry show members only, so this source is usually empty for movies; the optional `movies` list is read for forward-compat) > **MDBList universe lists** (`plex/playlists/universe_source`, the same cache saga credit and catch-up retention read).
+
+**Policy invariant (Robert's rule, tested):** derived membership is ALWAYS bare-universe semantics — `keep_policy="universe"`: grouping, saga credit, the universe quality ladder and downgrade-first eligibility, deletable as an absolute last resort. Only an explicit `keep-universe*` tag yields `keep_policy="keep_universe"` (NEVER deleted; quality-change only). Auto-derived data must never permanently protect content.
+
+Names are normalized consistently with the saga naming: trailing " Collection" stripped, casefolded, whitespace collapsed ("The Conjuring Collection" → "the conjuring"); placeholder labels (`PLACEHOLDER_AFFINITY` — bare "universe"/"franchise"/…) are dropped and fall through to the next source; multi-universe membership pipe-joins sorted keys ("dc|mcu").
+
+In derived/hybrid modes the movie_files refresh logs ONE line per instance (mode + membership counts by source) and stashes the counts at `radarr/<instance>/universe_membership`; `audit_universe_tags` reads that blob and reports derived counts instead of demanding tags (the tag-mismatch warnings stay tags-mode-only, since in derived modes the Parquet legitimately holds more universe rows than Radarr has tags). All other guards — the stale-tag clear, ledger-stamp scoping, the keep-universe apply coverage, dry-run plan stamping — apply to derived rows unchanged.
+
 Class attributes: `SCORE_4K_THRESHOLD = 70`, `_4K_MIN_RESOLUTION = 2000`.
 
 Public methods:
-- `audit_universe_tags(instance) -> dict` — Diagnostic. Compares universe tags/movies in live Radarr against `keep_policy=='universe'` rows in the Parquet; logs mismatches and guidance. Called automatically by `run` when `universe_count == 0`.
+- `audit_universe_tags(instance) -> dict` — Diagnostic. Compares universe tags/movies in live Radarr against `keep_policy=='universe'` rows in the Parquet; logs mismatches and guidance. Called automatically by `run` when `universe_count == 0`. Mode-aware: in derived/hybrid membership modes it reports the derived membership counts (from `radarr/<instance>/universe_membership`) instead of demanding tags, and the tag-vs-Parquet mismatch warning becomes an informational line (derived rows carry no Radarr tag).
 - `get_universe_movies(instance) -> pd.DataFrame` — Returns the Parquet rows where `keep_policy ∈ {keep_universe, universe}`.
 - `get_universe_summary(instance) -> dict` — Groups universe movies by `universe_name` (splitting on `|`) into `{label: [{title, year, quality_profile_name, quality_action, size_gb}]}`.
 - `evaluate_quality_actions(instance, free_space_gb, downgrade_threshold_gb=None, upgrade_threshold_gb=None) -> dict` — DECISION + persist. Writes `quality_action ∈ {"downgrade","upgrade",None}` into the Parquet for all universe rows based on free space vs the shared band; does NOT call the Radarr API. Returns a stats dict. **Persists even in dry_run** (so the downstream apply pass and decision ledger see the marks).
@@ -27,8 +43,8 @@ Internal helpers:
 - **Parent manager**: `RadarrQualityManager`.
 - **Submanagers loaded**: none.
 - **External API endpoints**: `GET qualityprofile`, `GET tag`, `GET movie`, `GET movie/{id}`, `PUT movie/{id}`.
-- **config keys read**: `free_space_limit` and total-drive size are consumed indirectly through `space_targets` / `disk_total_gb`; `self.config` is also passed into the brain helpers (e.g. watch-likelihood/upgrade-target config).
-- **global_cache keys**: reads `radarr.movies.{instance}.full` (used in the audit as a movie source).
+- **config keys read**: `free_space_limit` and total-drive size are consumed indirectly through `space_targets` / `disk_total_gb`; top-level `universe_membership` ("tags" default | "derived" | "hybrid") gates the audit's mode-aware messaging; `self.config` is also passed into the brain helpers (e.g. watch-likelihood/upgrade-target config).
+- **global_cache keys**: reads `radarr.movies.{instance}.full` (used in the audit as a movie source) and, in derived/hybrid modes, the membership counts blob `radarr/{instance}/universe_membership` (written by the movie_files refresh).
 - **Parquet keys**: reads/writes the movie-files Parquet columns `keep_policy`, `universe_name`, `quality_action`, `quality_profile_id`, `quality_profile_name`, plus ledger columns `planned_action`, `plan_reason`, `plan_reclaim_gb` (via the brain stamp).
 - **dry_run**: strictly resolved — `__init__` walks kwargs → parent → registry `RadarrManager` → registry `Main`, and **raises `ValueError` if it cannot find an explicit value** (refuses to default to False to avoid accidental destructive ops). Applies dry-run gating in `apply_quality_actions`.
 - **Singleton / concurrency**: standard `BaseManager` singleton; no threading.
@@ -58,12 +74,12 @@ Brain delegation (modules named, not documented here):
 
 ## In plain English
 
-Some movies are part of a box set you'd never throw away — the whole Marvel Cinematic Universe, say, or every Christopher Nolan Batman film. This manager treats those specially: it will never delete them. But when your hard drive gets full, instead of deleting an Avengers film it quietly swaps it to a smaller 1080p copy to save room; when space frees up again, it puts the 4K copy back — though it only bothers with the pricey 4K version for films the household actually rewatches. It also double-checks that the franchise tags in Radarr match what it has on record, and warns you if, say, you meant to tag the MCU but no "keep-universe-mcu" tag exists yet. In dry-run it only writes down what it *would* do.
+Some movies are part of a box set you'd never throw away — the whole Marvel Cinematic Universe, say, or every Christopher Nolan Batman film. This manager treats those specially: it will never delete them. But when your hard drive gets full, instead of deleting an Avengers film it quietly swaps it to a smaller 1080p copy to save room; when space frees up again, it puts the 4K copy back — though it only bothers with the pricey 4K version for films the household actually rewatches. It also double-checks that the franchise tags in Radarr match what it has on record, and warns you if, say, you meant to tag the MCU but no "keep-universe-mcu" tag exists yet. And you don't have to tag at all: in the "hybrid"/"derived" membership modes it recognizes franchises on its own — from TMDB's own collection info and the saga lists it already caches — and manages their quality the same way, with one crucial difference: only movies YOU explicitly tag "keep-universe" get the never-delete promise; auto-recognized franchise members can still be removed as a genuine last resort. In dry-run it only writes down what it *would* do.
 
 ## Interactions
 
 - **Parent**: `RadarrQualityManager`.
 - **Siblings**: `RadarrSpacePressureManager` (closely coupled — space-pressure downgrades a *bare* `universe` title as a last resort in the same run; the ledger-stamp scoping here is deliberately narrowed to universe-authored reasons so the two managers don't clobber each other's stamps), plus `RadarrQualityAdjustmentManager`, `RadarrCustomFormatsManager`, `RadarrFileSizesManager`, `RadarrQualitySelectorManager`.
-- **Other managers**: `RadarrCacheMovieFilesManager` (the Parquet load/save provider, looked up via the registry); `RadarrManager` / `Main` (dry_run source).
+- **Other managers**: `RadarrCacheMovieFilesManager` (the Parquet load/save provider, looked up via the registry — and, in derived/hybrid membership modes, the writer of the derived `keep_policy`/`universe_name` stamps via `quality/universe_membership.py`); `RadarrManager` / `Main` (dry_run source).
 - **Services**: `radarr_api`, `instance_manager`, `global_cache` (audit only).
 - **Brain modules** (named, not documented): `machine_learning.space.universe_quality`, `machine_learning.ledger.decision_ledger`.

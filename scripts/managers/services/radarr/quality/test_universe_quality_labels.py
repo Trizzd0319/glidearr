@@ -79,6 +79,7 @@ class _CapLogger:
     def log_grid(self, headers, rows, **k):
         self.sink["headers"] = headers
         self.sink["rows"] = rows
+    def log_table(self, *a, **k): pass   # pass-level Outcome/Count summary table
     def log_info(self, *a, **k): pass
     def log_warning(self, *a, **k): pass
     def log_debug(self, *a, **k): pass

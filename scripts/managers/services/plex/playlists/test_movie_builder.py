@@ -648,3 +648,58 @@ def test_recency_boost_lifts_freshly_acquired_movie_in_up_next():
     cfg = {"plex": {"playlists": {"recency_boost": {"enabled": True, "window_days": 30}}}}
     _mgr(c_on, config=cfg)._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
     assert _items(c_on, "rob") == ["fr", "ol"]              # recency boost lifts the fresh acquisition
+
+
+# ── movie-franchise learning: Plex universe collections → tagless universe resolver ──
+def test_movie_collection_membership_learned_persisted_and_read_by_resolver(monkeypatch):
+    """Round-trip: _plex_collection_order learns the recognised universe collection's OWNED
+    membership (guard-independent — here the ORDER map is empty because nothing proves
+    belonging) and persists it into kometa_franchises as the entries' ``movies`` list,
+    which quality/universe_membership.gather_derived_maps reads as the MOVIE franchise-map
+    source. This is exactly the standalone-member gap: no Radarr tag, no TMDB collection,
+    no mdblist list — only the operator's Plex curation knows the film."""
+    from scripts.managers.services.plex.playlists.builder import _KOMETA_FRANCHISE_KEY
+    from scripts.managers.services.radarr.quality.universe_membership import gather_derived_maps
+    cache = _Cache()
+    m = _mgr(cache=cache, config=_ON)
+    m.plex_api = _FakePlexAPI()                                          # MCU collection: [cm, iron]
+    inv = {"603": {"rating_key": "iron"}, "604": {"rating_key": "cm"}}
+    monkeypatch.setattr(m, "_universe_source", lambda: {"universes": {}})   # NO list source at all
+    order = m._plex_collection_order(inv, [{"tmdb_id": 603}, {"tmdb_id": 604}])
+    assert order == {}                                     # no tag/list proof → no saga ORDER…
+    ent = cache.get(_KOMETA_FRANCHISE_KEY)["mcu"]
+    assert ent["movies"] == [604, 603]                     # …but membership IS learned (collection order)
+    assert ent["shows"] == [] and ent["source"] == "kometa-plex"
+    maps = gather_derived_maps(cache)                      # resolver pickup
+    assert maps["franchise_maps"] == {604: {"mcu"}, 603: {"mcu"}}
+    assert maps["mdblist_maps"] == {}
+
+
+def test_movie_and_show_franchise_persists_do_not_wipe_each_other():
+    """The two learning passes write the SAME kometa_franchises catalog: the show pass
+    full-relearns shows but must preserve movie fields (incl. movie-only keys like a
+    movie-library 'mcu' it never sees); the movie pass replaces movie fields wholesale
+    but must preserve show fields."""
+    from scripts.managers.services.plex.playlists.builder import _KOMETA_FRANCHISE_KEY
+    cache = _Cache()
+    m = _mgr(cache=cache)
+    m._persist_kometa_movie_franchises(
+        {"mcu": {"display": "Marvel Cinematic Universe", "movies": [604, 603],
+                 "movie_titles": ["Captain Marvel", "Iron Man"]}})
+    m._persist_kometa_franchises(                                        # TV pass relearns SHOWS only
+        {"csi": {"display": "CSI", "shows": [601, 602], "titles": ["a", "b"],
+                 "source": "kometa-plex"}})
+    cat = cache.get(_KOMETA_FRANCHISE_KEY)
+    assert cat["csi"]["shows"] == [601, 602]
+    assert cat["mcu"]["movies"] == [604, 603] and cat["mcu"]["shows"] == []   # movie-only key survives
+
+    m._persist_kometa_movie_franchises(                                  # movie relearn: csi gains a film,
+        {"csi": {"display": "CSI", "movies": [777], "movie_titles": ["CSI: The Movie"]}})
+    cat = cache.get(_KOMETA_FRANCHISE_KEY)
+    assert cat["csi"]["shows"] == [601, 602] and cat["csi"]["movies"] == [777]   # shows preserved
+    assert "mcu" not in cat            # movie fields replaced WHOLESALE: un-relearned movie-only key drops
+
+    m._persist_kometa_franchises(                                        # show relearn keeps csi's movies
+        {"csi": {"display": "CSI", "shows": [601], "titles": ["a"], "source": "kometa-plex"}})
+    cat = cache.get(_KOMETA_FRANCHISE_KEY)
+    assert cat["csi"]["shows"] == [601] and cat["csi"]["movies"] == [777]

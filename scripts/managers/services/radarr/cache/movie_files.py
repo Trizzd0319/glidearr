@@ -396,9 +396,12 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         qq = (movie_file_quality.get("quality") or {})
         media_info = movie_file.get("mediaInfo") or {}
 
-        # Collection
+        # Collection — Radarr v4/v5 payloads name the field 'title', v3 'name'; read
+        # both (v4+ has NO 'name' key, which left collection_name all-NULL on modern
+        # instances and silently starved the collection scoring signals + saga-credit
+        # collection features that consume this column).
         coll = movie.get("collection") or {}
-        coll_name     = coll.get("name")
+        coll_name     = coll.get("title") or coll.get("name")
         coll_tmdb_id  = coll.get("tmdbId")
 
         # Genres / keywords
@@ -730,6 +733,62 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         """
         # Delegated to the brain (classification.keep_policy.build_keep_policy_map).
         return build_keep_policy_map(movies, tag_label_map)
+
+    @timeit("_resolve_membership_maps")
+    def _resolve_membership_maps(
+        self, instance: str, movies: list[dict], tag_label_map: dict
+    ) -> tuple[dict[int, str | None], dict[int, str | None]]:
+        """Mode-aware ``(keep_policy_map, universe_name_map)`` for the Parquet stamp —
+        the tagless-universe seam (quality.universe_membership).
+
+        Top-level config ``universe_membership``:
+          * "tags" (DEFAULT)  — delegates VERBATIM to ``_build_keep_policy_map`` (same
+            function, same args): byte-identical maps AND logs.
+          * "derived"/"hybrid" — untagged movies gain universe membership from TMDB
+            collections / learned franchise maps / mdblist universe lists with BARE-
+            universe policy (``keep_policy='universe'``: grouping, saga credit, the
+            universe quality ladder, downgrade-first; deletable as last resort). The
+            ``keep-universe`` never-delete pin remains EXPLICIT-TAG-ONLY — derived
+            membership can never mint ``keep_universe``. Logs ONE line per instance
+            (mode + membership counts by source) and stashes the counts blob for the
+            universe audit / future GUI.
+        """
+        # Lazy import (house pattern for cross-package reads, cf. space_pressure's
+        # universe_order readers): keeps this module's import graph unchanged.
+        from scripts.managers.services.radarr.quality.universe_membership import (
+            MODE_TAGS,
+            build_membership_maps,
+            gather_derived_maps,
+            membership_counts_key,
+            membership_mode,
+        )
+
+        mode = membership_mode(self.config)
+        if mode == MODE_TAGS:
+            return self._build_keep_policy_map(movies, tag_label_map)
+
+        derived = gather_derived_maps(self.global_cache)
+        policy_map, universe_name_map, counts = build_membership_maps(
+            movies, tag_label_map, mode=mode,
+            franchise_maps=derived["franchise_maps"],
+            mdblist_maps=derived["mdblist_maps"],
+        )
+        self.logger.log_info(
+            f"[Universe] '{instance}' membership mode={mode}: {counts['members']} universe "
+            f"member(s) — {counts['tag']} tag, {counts['collection']} TMDB collection, "
+            f"{counts['franchise']} franchise-map, {counts['mdblist']} mdblist; "
+            f"{counts['keep_universe']} keep-universe (tag-pinned, never deleted), "
+            f"{counts['bare_universe']} bare-universe (deletable last resort)."
+        )
+        if self.global_cache:
+            try:
+                self.global_cache.set(membership_counts_key(instance), counts)
+            except Exception as e:
+                self.logger.log_debug(
+                    f"[Universe] could not stash membership counts for '{instance}': {e}"
+                )
+        return policy_map, universe_name_map
+
     # ── Franchise entry resolution ───────────────────────────────────────────────
 
     @staticmethod
@@ -799,8 +858,13 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         # Watch history from Tautulli
         watch_map = self._fetch_watch_map(instance)
 
-        # Resolve keep policies, universe names + franchise entries
-        keep_policy_map, universe_name_map = self._build_keep_policy_map(movies, tag_label_map)
+        # Resolve keep policies, universe names + franchise entries. Membership is
+        # mode-aware (config universe_membership): "tags" (default) = tag-only,
+        # byte-identical; "derived"/"hybrid" also derive TAGLESS bare-universe
+        # membership from TMDB collections / franchise maps / mdblist lists.
+        keep_policy_map, universe_name_map = self._resolve_membership_maps(
+            instance, movies, tag_label_map
+        )
         franchise_ids = self._resolve_franchise_entries(movies)
 
         rows: list[dict] = []

@@ -14,6 +14,14 @@ Tag conventions supported (Radarr uses hyphens, not underscores)
     "keep-universe-dc"    → universe label "dc"
     Multiple universe tags on one movie are all captured.
 
+Tagless membership (config ``universe_membership``, see quality/universe_membership.py)
+    "tags" (DEFAULT — byte-identical): membership comes only from the tags above.
+    "derived" / "hybrid": untagged movies join universes from TMDB collections /
+    learned franchise maps / mdblist universe lists — ALWAYS with bare-"universe"
+    policy (deletable as last resort). The keep-universe never-delete pin stays
+    EXPLICIT-TAG-ONLY. Membership is stamped into the Parquet by
+    RadarrCacheMovieFilesManager.refresh; this manager consumes the rows either way.
+
 Thresholds — the SAME band as the rest of space management (space.space_targets):
     downgrade →  free below the floor T (= free_space_limit, or 25% of the total drive
                  when unset). Under pressure, universe titles help reclaim by lowering
@@ -36,6 +44,16 @@ Workflow
        Radarr, changes ``qualityProfileId``, PUTs it back, then clears the
        column.  Respects dry_run.
 
+       Live DOWNGRADES additionally REALIZE the reclaim (verify → delete →
+       guid-grab, the pattern space_pressure.run_downgrades ships): *arr never
+       downgrades an existing file (cutoff-met rejection), so a profile flip
+       alone reclaims nothing. One interactive release search first; a smaller
+       release exists → the movie file is deleted and that release grabbed by
+       guid (blind MoviesSearch fallback post-delete); no smaller release →
+       the file is KEPT, the profile stays lowered, and the row re-probes next
+       run. Applies to keep-universe titles too — it is a quality change, not
+       a title loss (the availability check guarantees a copy always exists).
+
     3. run(instance, free_space_gb, ...)
        Convenience wrapper: evaluate → apply in one call.
 """
@@ -53,11 +71,23 @@ from scripts.managers.machine_learning.space.universe_quality import (
     universe_action,
     upgrade_target,
 )
+from scripts.managers.services.radarr.quality.space_pressure import RadarrSpacePressureManager
+from scripts.managers.services.radarr.quality.universe_membership import (
+    MODE_TAGS,
+    membership_counts_key,
+    membership_mode,
+)
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
 from scripts.support.utilities.space_targets import space_targets
 from scripts.support.utilities.watch_likelihood import watch_likelihood
+
+# Reuse the SHIPPED step-down release picker (import, not copy) so this pass and
+# space_pressure.run_downgrades can never drift on what "a smaller release" means:
+# lowest rung >=720 strictly below the current file's resolution, climbing 720->1080
+# when a rung is empty, median size within the rung (rejects <300MB fakes).
+_pick_stepdown_release = RadarrSpacePressureManager._pick_stepdown_release
 
 
 class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
@@ -303,16 +333,38 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
             tag_label_map[tid]: tid for tid in uni_tag_ids
         }
 
+        # Membership mode gates the guidance below: in derived/hybrid modes missing
+        # tags are NORMAL (membership is derived tagless), so the audit reports the
+        # derived counts instead of demanding tags. Tags mode is byte-identical.
+        _mode = membership_mode(self.config)
+        _counts = {}
+        if _mode != MODE_TAGS and self.global_cache:
+            try:
+                _counts = self.global_cache.get(membership_counts_key(instance)) or {}
+            except Exception:
+                _counts = {}
+
         if not uni_tag_ids:
-            self.logger.log_warning(
-                f"[Universe] Audit: NO universe tags found in Radarr '{instance}'. "
-                f"Create tags named 'keep-universe', 'keep-universe-mcu', etc. "
-                f"and apply them to your franchise movies."
-            )
-            self.logger.log_info(
-                f"[Universe] All tags in '{instance}': "
-                + ", ".join(f"'{v}' (id={k})" for k, v in sorted(tag_label_map.items(), key=lambda x: x[1]))
-            )
+            if _mode == MODE_TAGS:
+                self.logger.log_warning(
+                    f"[Universe] Audit: NO universe tags found in Radarr '{instance}'. "
+                    f"Create tags named 'keep-universe', 'keep-universe-mcu', etc. "
+                    f"and apply them to your franchise movies."
+                )
+                self.logger.log_info(
+                    f"[Universe] All tags in '{instance}': "
+                    + ", ".join(f"'{v}' (id={k})" for k, v in sorted(tag_label_map.items(), key=lambda x: x[1]))
+                )
+            else:
+                self.logger.log_info(
+                    f"[Universe] Audit: no keep-universe* tags in Radarr '{instance}' — "
+                    f"membership mode '{_mode}' derives universes tagless: "
+                    f"{_counts.get('members', 0)} member(s) "
+                    f"({_counts.get('collection', 0)} TMDB collection, "
+                    f"{_counts.get('franchise', 0)} franchise-map, "
+                    f"{_counts.get('mdblist', 0)} mdblist). Tags stay optional overrides; "
+                    f"the keep-universe never-delete pin is tag-only."
+                )
         else:
             self.logger.log_info(
                 f"[Universe] Universe tag(s) found: "
@@ -350,7 +402,10 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                  "has_file": bool(m.get("hasFile")), "size": int(m.get("sizeOnDisk") or 0),
                  # TMDB collection name (e.g. 'The Conjuring Collection') — used to auto-split a
                  # bare-'universe' movie into its franchise when no explicit tag/hint is present.
-                 "collection": ((m.get("collection") or {}).get("name") or ""),
+                 # Radarr v4/v5 payloads call the field 'title', v3 'name' — read both (v4+ has
+                 # NO 'name' key, which left this fallback dead on modern instances).
+                 "collection": ((m.get("collection") or {}).get("title")
+                                or (m.get("collection") or {}).get("name") or ""),
                  # cutoff-unmet = an owned movie whose file is still below the profile cutoff
                  # (upgrade-eligible). Radarr exposes qualityCutoffNotMet on the movieFile
                  # sub-object (NOT the top-level movie) — same path find_cutoff_not_met reads.
@@ -424,18 +479,36 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
             )
 
         # ── Mismatch analysis ─────────────────────────────────────────────────
+        # In derived/hybrid modes the Parquet legitimately holds MORE universe rows
+        # than Radarr has tags (derived members carry no tag), so the tag-centric
+        # warnings below only apply in tags mode.
         if report["movies_in_parquet"] == 0 and report["movies_tagged_in_radarr"] == 0:
-            self.logger.log_warning(
-                f"[Universe] '{instance}': Neither Radarr tags nor Parquet rows found. "
-                "Universe quality management is inactive. "
-                "Add 'keep-universe' / 'keep-universe-mcu' tags in Radarr to enable it."
-            )
+            if _mode == MODE_TAGS:
+                self.logger.log_warning(
+                    f"[Universe] '{instance}': Neither Radarr tags nor Parquet rows found. "
+                    "Universe quality management is inactive. "
+                    "Add 'keep-universe' / 'keep-universe-mcu' tags in Radarr to enable it."
+                )
+            else:
+                self.logger.log_warning(
+                    f"[Universe] '{instance}': membership mode '{_mode}' derived no universe "
+                    f"members (no TMDB collections on owned movies, no learned franchise map, "
+                    f"no cached mdblist universe lists) and no keep-universe* tags exist. "
+                    f"Universe quality management is inactive this run."
+                )
         elif report["movies_in_parquet"] != report["movies_tagged_in_radarr"]:
-            self.logger.log_warning(
-                f"[Universe] Mismatch: {report['movies_tagged_in_radarr']} tagged in Radarr "
-                f"vs {report['movies_in_parquet']} in Parquet. "
-                f"Run movie_files.refresh() to sync the Parquet."
-            )
+            if _mode == MODE_TAGS:
+                self.logger.log_warning(
+                    f"[Universe] Mismatch: {report['movies_tagged_in_radarr']} tagged in Radarr "
+                    f"vs {report['movies_in_parquet']} in Parquet. "
+                    f"Run movie_files.refresh() to sync the Parquet."
+                )
+            else:
+                self.logger.log_info(
+                    f"[Universe] '{instance}': {report['movies_tagged_in_radarr']} tagged in "
+                    f"Radarr vs {report['movies_in_parquet']} universe row(s) in the Parquet — "
+                    f"expected in mode '{_mode}' (derived members carry no Radarr tag)."
+                )
 
         return report
 
@@ -640,6 +713,8 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
             "upgraded":          0,
             "failed":            0,
             "skipped_at_limit":  0,
+            "no_release":        0,   # live downgrades: no smaller release → file KEPT, re-probes
+            "grab_fallback":     0,   # guid grab errored post-delete → blind MoviesSearch recovered
             "dry_run":           self.dry_run,
         }
 
@@ -730,6 +805,7 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
         _res_by_pid = {p["id"]: self._profile_max_resolution(p) for p in ranked_profiles}
 
         _rows: list[list[str]] = []
+        _blind_search_ids: list[int] = []   # guid grabs that errored AFTER their file was deleted
         for idx in df.index[pending_mask]:
             title      = df.at[idx, "title"] or f"movie {df.at[idx, 'movie_id']}"
             movie_id   = df.at[idx, "movie_id"]
@@ -782,6 +858,7 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                     _cur_label,        # quality — shown ONCE for a hold (no X->X repeat)
                     _cur_profile,      # profile — unchanged, so shown once
                 ])
+                stats["skipped_at_limit"] += 1
                 changed = True
                 continue
 
@@ -830,18 +907,89 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                     method="PUT",
                     payload=movie_payload,
                 )
-                _rows.append([str(title)[:24], str(action), _from_to, _profile_from_to])
                 df.at[idx, "quality_profile_id"]   = target_id
                 df.at[idx, "quality_profile_name"] = target_name
-                df.at[idx, "quality_action"]       = None
+                changed = True
+
+                if action != "downgrade":
+                    _rows.append([str(title)[:24], str(action), _from_to, _profile_from_to])
+                    df.at[idx, "quality_action"] = None
+                    self._stamp_universe_plan(df, idx, action, target_profile)
+                    stats[stat_key] += 1
+                    continue
+
+                # ── Realize the downgrade NOW (verify → delete → guid-grab) ────────
+                # *arr NEVER downgrades an existing file (cutoff-met rejection), so
+                # the old profile-flip alone reclaimed NOTHING — universe downgrade
+                # space was phantom. Same shipped pattern as space_pressure.
+                # run_downgrades: ONE interactive release search FIRST; only when a
+                # smaller release actually exists is the file deleted, then THAT
+                # release grabbed by guid (a blind MoviesSearch fallback works
+                # post-delete — the cutoff-met blocker died with the file). No
+                # smaller release → the file is KEPT (a universe title is never
+                # traded for an empty indexer result), the profile stays lowered,
+                # counted no_release, and the row re-probes next run. keep-universe
+                # titles get the SAME treatment: this is a quality change, not a
+                # title loss — the availability check guarantees a copy always
+                # exists, so the never-delete pin (never LOSE the movie) holds.
+                _fid_row = df.at[idx, "movie_file_id"] if "movie_file_id" in df.columns else None
+                releases = self.radarr_api._make_request(
+                    instance, f"release?movieId={movie_id}", fallback=None) or []
+                pick = _pick_stepdown_release(
+                    releases,
+                    current_res=df.at[idx, "resolution"] if "resolution" in df.columns else None,
+                )
+                if not pick:
+                    self.logger.log_info(
+                        f"  ⏸️ [Universe] '{title}': no smaller release available — file "
+                        f"kept ({_cur_label}; profile now {target_name}; re-probes next run)."
+                    )
+                    _rows.append([str(title)[:24], "no_release", _cur_label, _profile_from_to])
+                    self._stamp_universe_plan(df, idx, action, target_profile)
+                    stats["no_release"] += 1
+                    continue
+                if _fid_row is not None and pd.notna(_fid_row):
+                    self.radarr_api._make_request(
+                        instance, f"moviefile/{int(_fid_row)}", method="DELETE")
+                try:
+                    self.radarr_api._make_request(
+                        instance, "release", method="POST", fallback=None,
+                        payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId")})
+                except Exception:
+                    _blind_search_ids.append(movie_id)   # file is gone → blind search now works
+
+                _rows.append([str(title)[:24], str(action), _from_to, _profile_from_to])
+                df.at[idx, "quality_action"] = None
                 self._stamp_universe_plan(df, idx, action, target_profile)
                 stats[stat_key] += 1
-                changed = True
+                _pick_gb = float(pick.get("size") or 0) / (1024 ** 3)
+                self.logger.log_info(
+                    f"  📉 [Universe] Realized downgrade: '{title}' ({_cur_profile} → "
+                    f"{target_name}) — file deleted, grabbed '{pick.get('title')}' "
+                    f"({_pick_gb:.1f} GB)."
+                )
             except Exception as e:
                 self.logger.log_warning(
                     f"[Universe] Failed to {action} '{title}' (id={movie_id}): {e}"
                 )
                 stats["failed"] += 1
+
+        if _blind_search_ids:
+            # Fallback pool: guid grabs that errored after their file was already
+            # deleted. Blind search is EFFECTIVE for these (no file → no cutoff-met
+            # rejection → best allowed release at the new, lower profile).
+            stats["grab_fallback"] = len(_blind_search_ids)
+            try:
+                self.radarr_api._make_request(
+                    instance, "command", method="POST",
+                    payload={"name": "MoviesSearch", "movieIds": _blind_search_ids},
+                )
+                self.logger.log_info(
+                    f"  🔍 [Universe] MoviesSearch fallback triggered for "
+                    f"{len(_blind_search_ids)} movie(s) whose guid grab errored."
+                )
+            except Exception as e:
+                self.logger.log_warning(f"  ⚠️ [Universe] MoviesSearch fallback failed: {e}")
 
         # Persist: real changes in a live run, OR the ledger stamps/stale-clears in
         # dry_run (plan-only — no quality_profile_id was speculatively written above).
@@ -864,10 +1012,26 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
             )
 
         prefix = "[dry_run] " if self.dry_run else ""
-        self.logger.log_info(
-            f"{prefix}[Universe] Quality action pass for '{instance}': "
-            f"{stats['downgraded']} downgraded, {stats['upgraded']} upgraded, "
-            f"{stats['skipped_at_limit']} at quality limit, {stats['failed']} failed."
+        self.logger.log_table(
+            ["Outcome", "Count"],
+            [
+                ["downgraded",         stats["downgraded"]],
+                ["upgraded",           stats["upgraded"]],
+                ["no smaller release", stats["no_release"]],
+                ["grab fallback",      stats["grab_fallback"]],
+                ["at quality limit",   stats["skipped_at_limit"]],
+                ["failed",             stats["failed"]],
+            ],
+            title=f"{prefix}[Universe] quality action pass - '{instance}'",
+            caption="Result of the universe up/downgrade pass (live downgrades realize via verify → delete → guid-grab).",
+            descriptions=[
+                "downgrades REALIZED: smaller release verified, file deleted, release grabbed (dry_run: planned only)",
+                "profiles raised toward the earned tier (Radarr's cutoff-unmet logic fetches the better file)",
+                "file KEPT: no release below the current resolution — profile lowered, re-probes next run",
+                "guid grab errored AFTER the delete — recovered by a blind MoviesSearch (file already gone)",
+                "held at the quality ladder floor/ceiling for their likelihood tier — no change possible",
+                "movies whose fetch/PUT/delete call errored",
+            ],
         )
 
         return stats

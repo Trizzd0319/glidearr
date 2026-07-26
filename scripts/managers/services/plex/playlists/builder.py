@@ -476,7 +476,13 @@ class PlexPlaylistBuilderManager(BaseManager):
         by its Radarr ``universe_name`` tag OR (tag-free) by membership in the universe's canonical
         list/bake — so a Kometa user with ZERO universe tags still gets ordering, while a film mis-filed
         in the wrong Plex collection is excluded (it's in another universe's list). ``{}`` with no Plex
-        API / no movie inventory. Secondary to the list source — honours a custom Plex curation."""
+        API / no movie inventory. Secondary to the list source — honours a custom Plex curation.
+
+        SIDE-EFFECT (movie twin of the show learning in :meth:`_plex_tv_collection_order`): each
+        recognised universe collection's OWNED membership (tmdb ids, UNFILTERED by the order guard —
+        Kometa's curation is the teacher) is learned and persisted via
+        :meth:`_persist_kometa_movie_franchises`, so the tagless universe resolver
+        (quality/universe_membership.gather_derived_maps) gains its franchise-map source for MOVIES."""
         if not self.plex_api or not movie_inventory:
             return {}
         rk_to_tmdb = self._inventory_rk_to_tmdb(movie_inventory)
@@ -489,6 +495,7 @@ class PlexPlaylistBuilderManager(BaseManager):
                                  f"({len(det['separators'])} separator collection(s); "
                                  f"{len(det['universe_keys'])} universe collection(s) recognised).")
         orders, matched = [], 0
+        learn_rows: list = []                              # (norm_title, key, display, [(tmdb, title)…])
         for d in cols:
             rk = d.get("ratingKey")
             key = collection_universe_key(d.get("title")) if rk is not None else None
@@ -501,6 +508,17 @@ class PlexPlaylistBuilderManager(BaseManager):
             except Exception:
                 continue
             child_rks = [str(c.get("ratingKey")) for c in kids if c.get("ratingKey") is not None]
+            # Learn the collection's owned MOVIE membership (tmdb-resolvable children) for the
+            # Kometa-independent persistence below. Deliberately NOT filtered by the ``allowed``
+            # order guard: learning trusts the operator's curation (same as the show learning),
+            # which is exactly what covers a standalone universe member no TMDB collection or
+            # mdblist list knows. Derived membership is never protective, so the worst case of a
+            # mis-filed film is a wrong bare-universe grouping label.
+            mem = [(t, c.get("title")) for c in kids
+                   if c.get("ratingKey") is not None
+                   and (t := rk_to_tmdb.get(str(c.get("ratingKey")))) is not None]
+            if mem:
+                learn_rows.append((_collection_norm(d.get("title")), key, d.get("title"), mem))
             # Belong-to-this-universe guard, tag-free: the Radarr ``universe_name`` tag (if any) UNIONed
             # with the universe's canonical list membership — so a tag-less Kometa install still orders,
             # and a film in the wrong Plex collection is still excluded (it's not in THIS universe's list).
@@ -514,6 +532,21 @@ class PlexPlaylistBuilderManager(BaseManager):
         if merged:
             self.logger.log_info(f"[UniverseOrder] {matched} Plex universe collection(s) → "
                                  f"{len(merged)} owned movie(s).")
+        # Persist the learned movie franchises (first-wins dedup across collections in stable
+        # title order — a film lands in ONE franchise, mirroring the show learning). Only when
+        # we actually read some — never wipe.
+        if learn_rows:
+            learned_movies: dict = {}
+            seen_tmdb: set = set()
+            for _norm, key, display, mem in sorted(learn_rows, key=lambda r: r[0] or ""):
+                ent = learned_movies.setdefault(
+                    key, {"display": display, "movies": [], "movie_titles": [], "source": "kometa-plex"})
+                for tmdb, name in mem:
+                    if tmdb not in seen_tmdb:
+                        seen_tmdb.add(tmdb)
+                        ent["movies"].append(tmdb)
+                        ent["movie_titles"].append(name or "")
+            self._persist_kometa_movie_franchises(learned_movies)
         return merged
 
     @staticmethod
@@ -610,16 +643,80 @@ class PlexPlaylistBuilderManager(BaseManager):
         source}}``) so glidearr groups them even when Kometa is later absent — Kometa as a one-time
         teacher, not a runtime dependency. ``_tv_franchise_catalog`` reads this back as a trusted overlay.
         Best-effort; the caller only invokes it with a NON-empty catalog, so a Kometa-less run never wipes
-        the learned list."""
+        the learned list.
+
+        MOVIE fields (``movies``/``movie_titles`` — written by the movie-teaching twin
+        :meth:`_persist_kometa_movie_franchises` into the SAME catalog) are PRESERVED through this
+        show-side write: a re-learned key keeps its movie lists, and a movie-only key (e.g. ``mcu``
+        learned from a MOVIE-library collection this show pass never sees) survives as a shows-empty
+        entry — so the two passes can never wipe each other's knowledge. Show semantics are otherwise
+        unchanged: keys not re-learned (and carrying no movies) still drop."""
         if not self.global_cache:
             return
         try:
-            self.global_cache.set(_KOMETA_FRANCHISE_KEY, learned)
+            prior = self._cache_get(_KOMETA_FRANCHISE_KEY, {})
+            prior = prior if isinstance(prior, dict) else {}
+            merged: dict = {}
+            for key, ent in learned.items():
+                p = prior.get(key)
+                if isinstance(p, dict) and p.get("movies"):
+                    ent = {**ent, "movies": p["movies"], "movie_titles": p.get("movie_titles") or []}
+                merged[key] = ent
+            for key, p in prior.items():                   # movie-only entries survive a show relearn
+                if key not in merged and isinstance(p, dict) and p.get("movies"):
+                    merged[key] = {"display": p.get("display"), "shows": [], "titles": [],
+                                   "source": p.get("source") or "kometa-plex",
+                                   "movies": p["movies"], "movie_titles": p.get("movie_titles") or []}
+            self.global_cache.set(_KOMETA_FRANCHISE_KEY, merged)
             self.logger.log_info(f"[UniverseOrder] learned {len(learned)} franchise(s) "
                                  f"({sum(len(v['shows']) for v in learned.values())} shows) from Kometa "
                                  f"collections (persisted for Kometa-independent grouping).")
         except Exception as e:
             self.logger.log_debug(f"[UniverseOrder] could not persist learned Kometa franchises: {e}")
+
+    def _persist_kometa_movie_franchises(self, learned) -> None:
+        """Persist MOVIE franchises learned from the operator's Plex universe collections
+        (``{key: {display, movies[tmdb], movie_titles, source}}``) into the SAME
+        ``kometa_franchises`` catalog the show pass writes — the movie-teaching twin of
+        :meth:`_persist_kometa_franchises`. The tagless universe resolver
+        (quality/universe_membership.gather_derived_maps) reads each entry's optional
+        ``movies`` list, so this write is what activates the franchise-map source for
+        MOVIES (precedence: tags > TMDB collection > these maps > mdblist; derived
+        membership is ALWAYS bare-universe — never the keep-universe pin).
+
+        MERGE semantics (mirror of the show side): show fields on existing entries are
+        preserved verbatim; movie fields are REPLACED wholesale by this learn (a deleted
+        Plex collection stops teaching on the next learn), and entries not in this learn
+        lose only their movie fields. Kometa-independent + best-effort; the caller only
+        invokes it with a NON-empty learn, so a collection-less run never wipes the
+        learned movie lists."""
+        if not self.global_cache:
+            return
+        try:
+            prior = self._cache_get(_KOMETA_FRANCHISE_KEY, {})
+            prior = prior if isinstance(prior, dict) else {}
+            merged: dict = {}
+            for key, ent in prior.items():                 # keep show knowledge; strip old movie fields
+                if not isinstance(ent, dict):
+                    continue
+                kept = {k: v for k, v in ent.items() if k not in ("movies", "movie_titles")}
+                if kept.get("shows") or key in learned:    # neither shows nor a fresh movie learn → drop
+                    merged[key] = kept
+            for key, ent in learned.items():
+                base = merged.setdefault(
+                    key, {"display": ent.get("display"), "shows": [], "titles": [],
+                          "source": "kometa-plex"})
+                base.setdefault("shows", [])
+                base.setdefault("titles", [])
+                base["movies"] = list(ent.get("movies") or [])
+                base["movie_titles"] = list(ent.get("movie_titles") or [])
+            self.global_cache.set(_KOMETA_FRANCHISE_KEY, merged)
+            self.logger.log_info(
+                f"[UniverseOrder] learned {len(learned)} movie franchise(s) "
+                f"({sum(len(v.get('movies') or []) for v in learned.values())} owned movies) from Plex "
+                f"universe collections (persisted for Kometa-independent tagless membership).")
+        except Exception as e:
+            self.logger.log_debug(f"[UniverseOrder] could not persist learned movie franchises: {e}")
 
     def _tv_franchise_maps(self, owned_eps, *, prefer_plex=False):
         """``({series_id: franchise}, {series_id: timeline_index})`` for owned series — the canonical
