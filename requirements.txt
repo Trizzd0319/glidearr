@@ -8,6 +8,7 @@ pyarrow
 tabulate
 tqdm
 prettytable
+lightbgm
 
 # Secret management — keeps API keys/tokens out of plaintext config.json.
 # Desktop: uses the OS keyring (Windows Credential Manager / macOS Keychain /
