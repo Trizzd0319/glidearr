@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import os
 import time
 from pathlib import Path
 
@@ -78,6 +79,65 @@ class TraktShowCacheManager(BaseManager, ComponentManagerMixin):
             return None
 
     # ── Public ────────────────────────────────────────────────────────────────────
+
+    #: buckets the show scorer reads — the default fingerprint set.
+    SCORER_BUCKETS = ("people", "ratings", "related")
+
+    def fingerprint(self, tvdb_id: int, buckets: "tuple | None" = None) -> tuple:
+        """Cheap identity of what this show's cached payloads WOULD return, without
+        decompressing them: ``(size, mtime_ns, fresh)`` per bucket from a single
+        ``stat()`` each.
+
+        Exists so cache-key builders (the show-score memo) can decide "unchanged"
+        for ~12k series at stat() cost instead of ~36k gzip+JSON reads. The
+        freshness flag is included because ``_read`` serves None once a payload
+        ages past the TTL — mtime alone would miss that transition. Any daemon
+        rewrite changes size/mtime, so a stale fingerprint cannot outlive a
+        refresh."""
+        out = []
+        now = time.time()
+        for b in (buckets or self.SCORER_BUCKETS):
+            try:
+                st = self._path(b, tvdb_id).stat()
+                out.append((st.st_size, st.st_mtime_ns,
+                            st.st_size > 0 and (now - st.st_mtime) <= self.ttl))
+            except OSError:
+                out.append(None)
+        return tuple(out)
+
+    def fingerprint_index(self, buckets: "tuple | None" = None) -> dict:
+        """``{bucket: {tvdb_id: (size, mtime_ns, fresh)}}`` — the same tuples
+        ``fingerprint()`` returns, but gathered with ONE ``os.scandir`` per bucket.
+
+        A per-series ``fingerprint()`` costs 3 stat() syscalls; across a 12k-series
+        library that is ~36k stats, which dominates the score pass on Windows
+        (Defender inspects each). Three directory scans replace them, after which a
+        lookup is a dict hit. Missing bucket dirs yield empty maps, so callers fall
+        back to a clean 'no cached payload' fingerprint."""
+        now = time.time()
+        suffix = ".json.gz"
+        out: dict = {}
+        for b in (buckets or self.SCORER_BUCKETS):
+            d: dict = {}
+            try:
+                with os.scandir(self._dirs[b]) as it:
+                    for e in it:
+                        if not e.name.endswith(suffix):
+                            continue
+                        try:
+                            tid = int(e.name[: -len(suffix)])
+                        except ValueError:
+                            continue
+                        try:
+                            st = e.stat()
+                        except OSError:
+                            continue
+                        d[tid] = (st.st_size, st.st_mtime_ns,
+                                  st.st_size > 0 and (now - st.st_mtime) <= self.ttl)
+            except OSError:
+                pass
+            out[b] = d
+        return out
 
     def is_fresh(self, tvdb_id: int, bucket: str = "people") -> bool:
         # A 0-byte poison file is NOT fresh — it must re-fetch, not be served as a hit.

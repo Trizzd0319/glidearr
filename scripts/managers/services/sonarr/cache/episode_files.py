@@ -1528,6 +1528,37 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 _memo_prev = {}
         _memo_next: dict = {}
         _memo_hits = 0
+        # The ONLY episode-row columns build_show_feature_row reads (mirror of
+        # show_features.py's rows[...] accesses). Hashing the whole row instead
+        # made the memo useless in practice: the pilot batch rewrites
+        # `date_added` on ~7.7k stale stubs every 48h and sync/plan passes touch
+        # more bookkeeping columns, so most series looked "changed" while their
+        # score inputs were identical (one run: 8675 needless rescores at ~18ms
+        # each). Drift in show_features' column set is caught by the sampled
+        # parity audit below.
+        _SCORE_COLS = ("air_date_utc", "audio_languages", "is_watched", "keep_policy",
+                       "last_watched_at", "resolution", "subtitles", "video_codec",
+                       "watch_count")
+        _score_cols = [c for c in _SCORE_COLS if c in df.columns]
+        # Batch both halves of the key up front — at 12k series the per-series
+        # versions were the whole cost of a 99%-hit pass (46s of stat() syscalls
+        # and pandas hashing to conclude "nothing changed"):
+        #   * ONE scandir per Trakt bucket instead of ~36k stat() calls
+        #   * ONE vectorized row hash instead of 12k hash_pandas_object calls
+        # Both degrade to the per-series path if anything goes wrong.
+        _fp_index = None
+        if show_cache:
+            try:
+                _fp_index = show_cache.fingerprint_index()
+            except Exception:
+                _fp_index = None
+        _fp_buckets = getattr(show_cache, "SCORER_BUCKETS", ("people", "ratings", "related"))
+        _row_hash = None
+        if _score_cols:
+            try:
+                _row_hash = pd.util.hash_pandas_object(df[_score_cols], index=False)
+            except Exception:
+                _row_hash = None
         # Sampled parity audit: on a small fraction of memo hits, rescore anyway
         # and compare — the tripwire for the one failure mode a memo can hide
         # (an input missing from the key going stale silently). Mismatch → loud
@@ -1551,33 +1582,24 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 series_obj = series_by_id.get(str(sid)) or {}
                 tvdb_id = series_obj.get("tvdbId")
 
-                # ── per-series I/O (kept service-side): credits + Trakt ratings +
-                #    the household show rating + the related-neighbour set ──
-                credits, trakt_rating, trakt_votes = {}, None, None
-                if tvdb_id and show_cache:
-                    try:
-                        credits = show_cache.get_people(int(tvdb_id)) or {}
-                    except Exception:
-                        credits = {}
-                    try:
-                        r = show_cache.get_ratings(int(tvdb_id)) or {}
-                        trakt_rating, trakt_votes = r.get("rating"), r.get("votes")
-                    except Exception:
-                        pass
-
                 user_rating = user_show_ratings.get(int(tvdb_id)) if tvdb_id else None
 
-                # GROUP C3 — this show's Trakt-related neighbour TVDb ids (cache-only).
-                related_tvdb_ids = None
-                if related_enabled and tvdb_id and show_cache:
+                # ── per-series cache FINGERPRINT (stat only, no decompression) ──
+                # The credits/ratings/related payloads are one gzip+JSON file EACH
+                # per series. Reading them to build the memo key meant ~36k
+                # decompressions per run even at a 98% hit rate — the memo could
+                # never save the I/O it was keyed on. Stat-based fingerprints
+                # (size+mtime+freshness) identify the same payloads at ~µs, so the
+                # reads below happen ONLY when a series actually needs rescoring.
+                _fp = None
+                if tvdb_id and _fp_index is not None:
+                    _t = int(tvdb_id)
+                    _fp = tuple(_fp_index.get(b, {}).get(_t) for b in _fp_buckets)
+                elif tvdb_id and show_cache:
                     try:
-                        related_tvdb_ids = {
-                            int((e.get("ids") or {}).get("tvdb"))
-                            for e in (show_cache.get_related(int(tvdb_id)) or [])
-                            if isinstance(e, dict) and (e.get("ids") or {}).get("tvdb")
-                        }
+                        _fp = show_cache.fingerprint(int(tvdb_id))
                     except Exception:
-                        related_tvdb_ids = None
+                        _fp = None
 
                 # Per-series memo key: vectorized row hash (C-speed) + the series
                 # object + every cache-derived input the scorer sees. 'now' is
@@ -1594,10 +1616,14 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 # exactly what the 1% parity audit exists to catch (0 mismatches
                 # in 120 audits so far).
                 _st = series_obj.get("statistics") or {}
-                _cast = (credits.get("cast") or []) if credits else []
-                _crew = (credits.get("crew") or []) if credits else []
                 _skey = _h([
-                    list(pd.util.hash_pandas_object(rows, index=False).values),
+                    # NOTE: list(...values) keeps numpy scalars so _h()'s
+                    # default=str renders them exactly as the per-group path did —
+                    # .tolist() would emit bare JSON ints and silently invalidate
+                    # every existing memo entry.
+                    (list(_row_hash.loc[rows.index].values) if _row_hash is not None
+                     else list(pd.util.hash_pandas_object(
+                         rows[_score_cols] if _score_cols else rows, index=False).values)),
                     [series_obj.get("title"), series_obj.get("tvdbId"),
                      series_obj.get("status"), series_obj.get("network"),
                      series_obj.get("certification"), series_obj.get("genres"),
@@ -1606,11 +1632,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                      (series_obj.get("ratings") or {}).get("value"),
                      _st.get("episodeFileCount"), _st.get("sizeOnDisk"),
                      _st.get("episodeCount")],
-                    [len(_cast), len(_crew),
-                     [c.get("name") for c in _cast[:5]],
-                     [c.get("name") for c in _crew[:3]]],
-                    trakt_rating, trakt_votes, user_rating,
-                    sorted(related_tvdb_ids) if related_tvdb_ids else None,
+                    _fp, user_rating,
                     now.date().isoformat(), bool(with_breakdown),
                 ])
                 _hit = _memo_prev.get(str(sid)) if _skey else None
@@ -1625,6 +1647,34 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                         _memo_next[str(sid)] = _hit
                         _memo_hits += 1
                         continue
+
+                # ── MISS: only now pay the per-series cache reads ──────────────
+                # credits + Trakt ratings + the related-neighbour set (all
+                # gzip+JSON, one file each). Deferred past the memo check above so
+                # an unchanged series costs a stat(), not three decompressions.
+                credits, trakt_rating, trakt_votes = {}, None, None
+                if tvdb_id and show_cache:
+                    try:
+                        credits = show_cache.get_people(int(tvdb_id)) or {}
+                    except Exception:
+                        credits = {}
+                    try:
+                        r = show_cache.get_ratings(int(tvdb_id)) or {}
+                        trakt_rating, trakt_votes = r.get("rating"), r.get("votes")
+                    except Exception:
+                        pass
+
+                # GROUP C3 — this show's Trakt-related neighbour TVDb ids (cache-only).
+                related_tvdb_ids = None
+                if related_enabled and tvdb_id and show_cache:
+                    try:
+                        related_tvdb_ids = {
+                            int((e.get("ids") or {}).get("tvdb"))
+                            for e in (show_cache.get_related(int(tvdb_id)) or [])
+                            if isinstance(e, dict) and (e.get("ids") or {}).get("tvdb")
+                        }
+                    except Exception:
+                        related_tvdb_ids = None
 
                 # ML Step 3c: aggregate the episode rows + series object into a typed
                 # ShowFeatureRow at the brain boundary, then score it.

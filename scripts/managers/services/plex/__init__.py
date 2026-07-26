@@ -38,7 +38,10 @@ from scripts.managers.services.plex.metadata import PlexMetadataManager
 from scripts.managers.services.plex.movies import PlexMoviesManager
 from scripts.managers.services.plex.on_deck import PlexOnDeckManager
 from scripts.managers.services.plex.playlists import PlexPlaylistsManager
-from scripts.managers.services.plex.playlists.builder import PlexPlaylistBuilderManager
+from scripts.managers.services.plex.playlists.builder import (
+    PlexPlaylistBuilderManager,
+    log_run_fetch_stats,
+)
 from scripts.managers.services.plex.playlists.combined_builder import CombinedPlaylistBuilderManager
 from scripts.managers.services.plex.playlists.movie_builder import MoviePlaylistBuilderManager
 from scripts.managers.services.plex.playlists.writeback import PlaylistWritebackManager
@@ -453,6 +456,15 @@ class PlexManager(BaseManager, ComponentManagerMixin):
                 self.playlist_writeback.run()
         except Exception as e:
             self.logger.log_error(f"[Plex] playlist write-back failed: {e}")
+
+        # ONE line reporting the phase's EXTERNAL universe fetches (Plex collection listings +
+        # children reads, mdblist list refreshes) and how many repeat calls the run-scoped memo
+        # served instead. The three builders each walk the same collections, so this is the
+        # before/after visibility for that de-duplication. Silent when nothing was fetched.
+        try:
+            log_run_fetch_stats(self.logger, self.global_cache)
+        except Exception as e:
+            self.logger.log_debug(f"[Plex] universe fetch-stats line skipped: {e}")
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _cap_enabled(self, cap: str) -> bool:

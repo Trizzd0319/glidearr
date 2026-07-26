@@ -82,6 +82,57 @@ _TV_FRANCHISE_FILES = ("tv_franchises.json", "tv_franchises.generated.json")
 # every covered universe. Overlay/extend per install via `plex.playlists.universe_timeline.universes`.
 _UNIVERSE_TIMELINE_FILE = "universe_timeline.json"
 
+# ── run-scoped EXTERNAL-FETCH memo (shared ACROSS builder instances) ─────────────────
+# The TV, MOVIE and COMBINED builders are three separate INSTANCES of this base handed the
+# SAME ``global_cache``. Each of them independently walks the operator's Plex collections
+# (one section listing + one children read per collection) and, when a universe list is
+# stale, hits mdblist — so the same EXTERNAL reads happen 2-4x per run for zero new
+# information (Plex/mdblist state does not change mid-run).
+#
+# WHERE the memo lives: ``global_cache.memory`` — the shared ``MemoryManager`` created in
+# ``GlobalCacheManager.__init__``. LIFETIME: exactly one run (one GlobalCacheManager per
+# process), in memory only, never persisted → no cross-run staleness, and a fresh run
+# always refetches. With no global_cache (or no ``.memory``) every fetch runs live, i.e.
+# byte-identical to the pre-memo behaviour. Mirrors the ``_load_owned_episodes`` memo.
+#
+# WHAT is memoized: ONLY the external fetch (the raw Plex/mdblist payload). Every LOCAL
+# computation layered on top — the owned/watchlist filtering, the belongs-to-this-universe
+# guard, the franchise maps, the Kometa learning/persist — stays per-call and unmemoized,
+# so each builder still computes against ITS OWN current state and its output is unchanged
+# (e.g. the TV pass' prefer_plex=True map and the combined pass' prefer_plex=False map keep
+# differing exactly as they do today).
+_RUN_MEMO = "plex/_run/universe"
+_FETCH_STATS_KEY = f"{_RUN_MEMO}/fetch_stats"
+
+
+def run_fetch_stats(global_cache) -> dict:
+    """The run's external-fetch counters (``{stat: n}``) from the shared in-memory memo, or
+    ``{}`` when there is no memo store / nothing was fetched. See :func:`log_run_fetch_stats`."""
+    mem = getattr(global_cache, "memory", None) if global_cache else None
+    if mem is None:
+        return {}
+    stats = mem.get(_FETCH_STATS_KEY)
+    return dict(stats) if isinstance(stats, dict) else {}
+
+
+def log_run_fetch_stats(logger, global_cache) -> None:
+    """ONE line at the end of the Plex reconcile phase reporting how many EXTERNAL universe
+    fetches the playlist builders made this run vs how many repeat calls the run-scoped memo
+    served — so the de-duplication is visible in the run log (before: the counts equal the
+    call counts; after: the fetch counts collapse and the hit counts carry the remainder).
+    Silent (no line) when nothing was fetched."""
+    stats = run_fetch_stats(global_cache)
+    if not stats:
+        return
+    logger.log_info(
+        "[UniverseOrder] external fetches this run — "
+        f"Plex section/collection listings {stats.get('collection_list_fetches', 0)} "
+        f"(+{stats.get('collection_list_hits', 0)} memo hit(s)), "
+        f"Plex collection children {stats.get('collection_children_fetches', 0)} "
+        f"(+{stats.get('collection_children_hits', 0)} memo hit(s)), "
+        f"mdblist list refreshes {stats.get('mdblist_fetches', 0)} "
+        f"(+{stats.get('mdblist_hits', 0)} memo hit(s)).")
+
 
 def _to_int(v):
     """Int-or-None — module-level so the BASE builder's universe helpers don't depend on the
@@ -380,7 +431,12 @@ class PlexPlaylistBuilderManager(BaseManager):
         fetched from the mdblist universe lists. Refreshes any STALE/never-fetched universe (TTL),
         keeping the LAST-GOOD entry on a fetch failure (a transient mdblist outage never wipes a
         working list). Returns ``{}`` when the feature is off. With no API key it serves whatever
-        was last cached (so the feature survives a key being removed)."""
+        was last cached (so the feature survives a key being removed).
+
+        Called many times per run by several builders. Only its EXTERNAL leg — the mdblist HTTP
+        fetch — is run-memoized (:meth:`_fetch_universe_list`); the cache read + merge here is
+        deliberately NOT, because :meth:`_refresh_synthetic_universes` REWRITES this same cache
+        key mid-run and every later reader must see that write."""
         if not self._universe_timeline_enabled():
             return {}
         cached = dict(self._cache_get(_UNIVERSE_SRC_KEY, {}) or {})
@@ -396,7 +452,7 @@ class PlexPlaylistBuilderManager(BaseManager):
                     continue
                 if not is_stale(fetched.get(uk), now, ttl):
                     continue
-                res = mdblist_client.list_items(key, defn)
+                res = self._fetch_universe_list(key, uk, defn)
                 if res.get("ok") and res.get("items"):
                     universes[uk] = split_list_media(res["items"], bool(defn.get("timeline", True)),
                                                      titles=res.get("titles"))
@@ -421,6 +477,20 @@ class PlexPlaylistBuilderManager(BaseManager):
             self.logger.log_info(f"[UniverseOrder] refreshed {refreshed} universe list(s) from mdblist "
                                  f"({len(universes)} cached).")
         return {"universes": universes}
+
+    def _fetch_universe_list(self, api_key: str, universe_key: str, defn: dict) -> dict:
+        """ONE mdblist list fetch (EXTERNAL HTTP), memoized for the run — the only I/O inside
+        :meth:`_universe_source`. Keyed by the universe key + the list REF fields ``list_items``
+        actually dispatches on (imdb / id / mdblist), so a re-pointed list is a different fetch.
+        mdblist state doesn't change mid-run, so a sibling builder that reaches the same STALE
+        universe reuses the response instead of re-hitting the API; the response is only ever
+        read (``split_list_media``), never mutated. Everything else in ``_universe_source``
+        (TTL staleness, the timeline re-stamp, the chronolist overlay, the cache write) is LOCAL
+        and stays per-call — it must see the ``tvfran:`` entries a sibling wrote this run."""
+        ref = f"{defn.get('imdb') or ''}|{defn.get('id') if defn.get('id') is not None else ''}|{defn.get('mdblist') or ''}"
+        return self._memo_fetch(f"{_RUN_MEMO}/mdblist/{universe_key}/{ref}",
+                                lambda: mdblist_client.list_items(api_key, defn),
+                                stat="mdblist_fetches", hit_stat="mdblist_hits")
 
     def _movie_universe_order(self, movie_inventory, owned_movies=None, *, prefer_plex=False) -> dict:
         """``{tmdb_id: position}`` saga order — MERGED from the mdblist/chronolist universe order + the
@@ -448,13 +518,56 @@ class PlexPlaylistBuilderManager(BaseManager):
         membership, _, _, _ = build_universe_maps(self._universe_source(), owned_tmdbs, {})
         return membership
 
+    # ── run-scoped external-fetch memo (see the _RUN_MEMO block at module top) ──────
+    def _run_memo(self):
+        """The SHARED in-run memo store (``global_cache.memory``) — ``None`` when there is no
+        global_cache / no memory manager, in which case every fetch below runs live exactly as
+        it did before the memo existed."""
+        return getattr(self.global_cache, "memory", None) if self.global_cache else None
+
+    def _bump_fetch_stat(self, name: str) -> None:
+        """+1 on a run-scoped external-fetch counter (rendered by :func:`log_run_fetch_stats`)."""
+        mem = self._run_memo()
+        if mem is None:
+            return
+        stats = mem.get(_FETCH_STATS_KEY)
+        stats = dict(stats) if isinstance(stats, dict) else {}
+        stats[name] = stats.get(name, 0) + 1
+        mem.set(_FETCH_STATS_KEY, stats)
+
+    def _memo_fetch(self, key: str, fetch, *, stat: str, hit_stat: str):
+        """Run-scoped memoization of ONE external fetch. ``fetch()`` is called at most once per
+        ``key`` per run and its result is shared (by reference) with every sibling builder; a
+        raising ``fetch`` is NOT memoized (it propagates to the caller's existing guard and the
+        next caller retries) — identical to today's per-call failure handling."""
+        mem = self._run_memo()
+        if mem is None:
+            return fetch()
+        if mem.exists(key):
+            self._bump_fetch_stat(hit_stat)
+            return mem.get(key)
+        val = fetch()
+        mem.set(key, val)
+        self._bump_fetch_stat(stat)
+        return val
+
     def _all_collections(self) -> list:
         """Every Plex collection across ALL library sections, as a flat list of metadata dicts.
-        Collections are PER-SECTION on PMS — the global ``/library/collections`` endpoint returns
-        nothing on modern servers — so iterate ``get_sections()`` and read each section's collections.
-        ``[]`` with no Plex API / on error."""
+        ``[]`` with no Plex API / on error.
+
+        EXTERNAL I/O, memoized for the run: this listing is pure fetch (no local state feeds it)
+        and Plex's collections don't change mid-run, so the TV/MOVIE/COMBINED builders share ONE
+        walk instead of four. Callers only READ the returned list (iterate / ``sorted``), so
+        sharing it by reference is safe."""
         if not self.plex_api:
             return []
+        return self._memo_fetch(f"{_RUN_MEMO}/collections", self._fetch_all_collections,
+                                stat="collection_list_fetches", hit_stat="collection_list_hits")
+
+    def _fetch_all_collections(self) -> list:
+        """The live listing behind :meth:`_all_collections`. Collections are PER-SECTION on PMS —
+        the global ``/library/collections`` endpoint returns nothing on modern servers — so iterate
+        ``get_sections()`` and read each section's collections."""
         try:
             secs = metadata_items(self.plex_api.get_sections())
         except Exception:
@@ -470,6 +583,23 @@ class PlexPlaylistBuilderManager(BaseManager):
                 continue
         return out
 
+    def _collection_children(self, rating_key, *, include_guids: bool = False) -> list:
+        """The member items of ONE Plex collection — the single EXTERNAL fetch behind both
+        collection readers, memoized for the run.
+
+        Keyed by ``(ratingKey, include_guids)`` so each reader still gets exactly the payload
+        shape it asked for (the SHOW reader needs the external ``Guid[]`` array, the movie reader
+        doesn't request it). Raises through to the caller's ``except``/``continue`` on failure,
+        and nothing is memoized in that case."""
+        def _fetch():
+            if include_guids:
+                return metadata_items(
+                    self.plex_api.get_collection_children(rating_key, include_guids=True))
+            return metadata_items(self.plex_api.get_collection_children(rating_key))
+        return self._memo_fetch(
+            f"{_RUN_MEMO}/children/{rating_key}/{1 if include_guids else 0}", _fetch,
+            stat="collection_children_fetches", hit_stat="collection_children_hits")
+
     def _plex_collection_order(self, movie_inventory, owned_movies=None) -> dict:
         """``{tmdb_id: position}`` from the operator's Kometa UNIVERSE Plex collections (read IN
         COLLECTION ORDER). A child film earns a saga index only if it belongs to THIS universe — proven
@@ -482,7 +612,13 @@ class PlexPlaylistBuilderManager(BaseManager):
         recognised universe collection's OWNED membership (tmdb ids, UNFILTERED by the order guard —
         Kometa's curation is the teacher) is learned and persisted via
         :meth:`_persist_kometa_movie_franchises`, so the tagless universe resolver
-        (quality/universe_membership.gather_derived_maps) gains its franchise-map source for MOVIES."""
+        (quality/universe_membership.gather_derived_maps) gains its franchise-map source for MOVIES.
+
+        I/O vs LOCAL: the only external reads are :meth:`_all_collections` and
+        :meth:`_collection_children`, both run-memoized and shared with the sibling builders.
+        Everything below them (the rk→tmdb join, the Radarr-tag/list membership guard, the order
+        merge, the learning + persist) is recomputed per call against THIS builder's owned set,
+        so two builders with different owned movies still get different orders."""
         if not self.plex_api or not movie_inventory:
             return {}
         rk_to_tmdb = self._inventory_rk_to_tmdb(movie_inventory)
@@ -504,7 +640,9 @@ class PlexPlaylistBuilderManager(BaseManager):
             try:
                 # get_collections is library-wide: TV-library universe collections (e.g. Arrowverse)
                 # also match, but their SHOW ratingKeys aren't in rk_to_tmdb so they drop to {}.
-                kids = metadata_items(self.plex_api.get_collection_children(rk))
+                # Run-memoized fetch (the children payload); everything below it is LOCAL and
+                # recomputed per call against THIS builder's owned set.
+                kids = self._collection_children(rk)
             except Exception:
                 continue
             child_rks = [str(c.get("ratingKey")) for c in kids if c.get("ratingKey") is not None]
@@ -570,7 +708,12 @@ class PlexPlaylistBuilderManager(BaseManager):
         Owned episodes are Sonarr-sourced (no Plex show ratingKey), so each child show is joined to a
         ``series_id`` by free-parsing its tvdb from the Plex ``Guid[]`` and looking it up in
         ``tvdb_to_sid``. ``({}, {})`` with no Plex API / no owned series. Secondary to the curated/list
-        source — present only to honour a custom Plex curation a Kometa user may have."""
+        source — present only to honour a custom Plex curation a Kometa user may have.
+
+        I/O vs LOCAL: the only external reads are :meth:`_all_collections` and
+        :meth:`_collection_children` (run-memoized, shared with the sibling builders). The
+        franchise-title index, the noise/Kometa gating, the tvdb→series_id join, the ordering and
+        the learning + persist all stay per-call, computed against THIS builder's ``tvdb_to_sid``."""
         if not self.plex_api or not tvdb_to_sid:
             return {}, {}
         # Recognise both UNIVERSE collections (Arrowverse, MCU…) and FRANCHISE collections (One Chicago,
@@ -600,7 +743,7 @@ class PlexPlaylistBuilderManager(BaseManager):
                 if not key:
                     continue
             try:
-                kids = metadata_items(self.plex_api.get_collection_children(rk, include_guids=True))
+                kids = self._collection_children(rk, include_guids=True)   # run-memoized fetch
             except Exception:
                 continue
             ordered, rk_to_sid, members = [], {}, []
