@@ -1585,9 +1585,31 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 # the memo also embeds the DAY: a date roll invalidates everything
                 # once per day (recency drift is bounded to <24h, matching the
                 # 24h cadence of the caches feeding it).
+                # Key cost matters at 12k series: json.dumps of the FULL series
+                # object + credits blob was ~5ms/series — the key construction
+                # outweighed the scoring it skipped (profiler: refresh_scores
+                # 77s at 98% memo hit rate). Compact fingerprints instead: the
+                # scalar fields the scorer actually consumes + head-of-list
+                # digests for credits. A deep tail edit the digest misses is
+                # exactly what the 1% parity audit exists to catch (0 mismatches
+                # in 120 audits so far).
+                _st = series_obj.get("statistics") or {}
+                _cast = (credits.get("cast") or []) if credits else []
+                _crew = (credits.get("crew") or []) if credits else []
                 _skey = _h([
                     list(pd.util.hash_pandas_object(rows, index=False).values),
-                    series_obj, credits, trakt_rating, trakt_votes, user_rating,
+                    [series_obj.get("title"), series_obj.get("tvdbId"),
+                     series_obj.get("status"), series_obj.get("network"),
+                     series_obj.get("certification"), series_obj.get("genres"),
+                     series_obj.get("seriesType"), series_obj.get("monitored"),
+                     series_obj.get("qualityProfileId"),
+                     (series_obj.get("ratings") or {}).get("value"),
+                     _st.get("episodeFileCount"), _st.get("sizeOnDisk"),
+                     _st.get("episodeCount")],
+                    [len(_cast), len(_crew),
+                     [c.get("name") for c in _cast[:5]],
+                     [c.get("name") for c in _crew[:3]]],
+                    trakt_rating, trakt_votes, user_rating,
                     sorted(related_tvdb_ids) if related_tvdb_ids else None,
                     now.date().isoformat(), bool(with_breakdown),
                 ])
