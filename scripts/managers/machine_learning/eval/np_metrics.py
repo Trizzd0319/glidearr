@@ -11,6 +11,7 @@ classics are implemented directly:
   * brier_score(y_true, p)                  mean squared error of probabilities
   * minmax_scale(x)                         [0,1] scaling (constant vector -> 0.5)
   * calibration_table(y_true, p, bins)      per-bin mean prediction vs empirical rate
+  * expected_calibration_error(y_true, p)   ECE — bin-weighted |empirical - predicted|
   * spearman_rho(a, b)                      rank correlation (average-rank ties)
   * isotonic_fit(x, y) / isotonic_predict   PAVA monotone regression — the
                                             challenger's probability calibration
@@ -88,6 +89,33 @@ def calibration_table(y_true, p, bins: int = 10) -> list[dict]:
             "watch_rate": round(float(y[sel].mean()), 4) if n else None,
         })
     return out
+
+
+def expected_calibration_error(y_true, p, bins: int = 10) -> float:
+    """ECE = sum_b (n_b / N) * |mean(y)_b - mean(p)_b| over equal-width bins.
+
+    The single-number summary of :func:`calibration_table` — the bin-count-
+    weighted mean absolute gap between predicted probability and empirical
+    rate. Same binning convention as calibration_table (equal-width on [0,1],
+    last bin right-inclusive), same NaN masking; empty bins contribute 0.
+    NaN when no valid pairs remain."""
+    y = _as1d(y_true)
+    q = _as1d(p)
+    mask = ~(np.isnan(y) | np.isnan(q))
+    y, q = y[mask], q[mask]
+    n_total = len(y)
+    if n_total == 0:
+        return float("nan")
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    ece = 0.0
+    for i in range(bins):
+        lo, hi = edges[i], edges[i + 1]
+        sel = (q >= lo) & (q < hi) if i < bins - 1 else (q >= lo) & (q <= hi)
+        n = int(sel.sum())
+        if n == 0:
+            continue
+        ece += (n / n_total) * abs(float(y[sel].mean()) - float(q[sel].mean()))
+    return float(ece)
 
 
 def _rank_average(v: np.ndarray) -> np.ndarray:
