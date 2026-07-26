@@ -9,6 +9,69 @@ in `foundation/`; adopters import from it, never reimplement.** This document is
 descriptive — nothing here changes any live score or decision; the dry-run plan
 ledger remains the parity oracle (MIGRATION.md).
 
+> **In plain words:** Glidearr scores every movie and show in a household
+> media library by how likely someone is to actually watch it, then uses the
+> scores to decide what to keep at top quality, what to shrink, and what to
+> delete when space runs low. This document is the math behind those
+> decisions, and none of it changes behavior on its own: first its output must
+> match the "parity oracle" — a recorded log of what the current system would
+> have done, the referee for whether new code behaves identically to old.
+
+## How to read this document
+
+This file serves two audiences at once. The formal layer — every formula,
+derivation, number, and caveat — is the authoritative reference for readers
+with a statistics background. Each formal passage is followed by an
+**In plain words** block restating it in everyday terms; the two layers make
+the same claims, and if they ever seem to disagree, the formula wins. Read
+whichever layer suits you — or the plain block first, so you know what a
+formula is *for*. Symbols are defined formally in §0 Notation; the glossary
+below translates every symbol, term, and product name into plain language.
+
+## Glossary
+
+One plain line per symbol or term, with a concrete example; formal definitions
+stay in §0.
+
+| term | plain meaning | example |
+|---|---|---|
+| score `s(x)`; min-max scaling | the 0–100 "how much does this household want this title" number; min-max squeezes it into [0, 1] — a unit change, not a probability | a beloved family film sits near 80; a stale impulse-add near 10 |
+| signal group `f_g(x)` / weight `w_g` | one themed bundle of evidence with a hard cap on its points; `w_g` = how much the group counts (all 1.0 today, set by hand) | actor overlap maxes out at +8 no matter how star-studded the cast |
+| threshold `τ` / quality profile | a score cutoff that changes treatment — here, the download-quality tier earned (Remux = untouched disc copy, biggest; WEBDL = streaming-grade; 720p = smallest) | score 82 → Remux 2160p; score 40 → WEBDL 1080p |
+| label `y_i` / horizon `H` | the answer key: 1 if the title was actually watched within the horizon (14 days) after scoring, else 0 | scored March 1, watched March 9 → 1; watched on day 15 → 0 |
+| `p̂` (probability estimate) | the model's claimed chance of a watch | p̂ = 0.30 means "30% chance within two weeks" |
+| base rate (prevalence) | how often watches happen at all, before any model | ≈2 per 100 title-windows here — "always say no" is 98% accurate and useless |
+| logistic function `σ(η)` / log-odds | log-odds = log(p/(1−p)), probability's raw currency; σ turns it back into a probability | log-odds 0 → 50/50; +2 → ≈88% |
+| coefficient `β` | how hard one input pushes the predicted odds up or down | "finished the whole saga" gets a positive β |
+| L2 / ridge (`λ`) | a humility penalty pulling fitted coefficients toward zero unless the data insists | keeps 38 watches from producing wild weights |
+| standardized feature `z_j` | an input rescaled to "distance from average, in spreads" so all inputs compete fairly | a ±12-point signal and a +2-point signal end up on one footing |
+| IRLS | the standard iterative recipe that fits logistic regression (repeated weighted line-fits) | how the computer actually finds the β values |
+| AP (average precision) | ranking quality: are the real watches bunched at the top of the sorted list? | random ordering scores ≈ the 2% base rate; skill is a multiple of that |
+| Brier score | average of (claimed probability − outcome)² — smaller is better | claiming 97% on a never-watched title costs ≈0.94; an honest 20% costs 0.04 |
+| calibration / ECE | calibration = do claimed probabilities match reality (a calibrated "30%" comes true 3 times in 10); ECE = the average claimed-vs-actual gap, bucket by bucket | "of everything it called 70%, did about 70% happen?" |
+| isotonic regression (PAVA) | recalibration assuming only "higher score → at least as likely", read off history | turns "score 97" into "about 20%", if that's what actually happened |
+| Platt scaling | the two-parameter alternative that force-fits an S-curve; not used here | wrong shape for a hand-built, capped score |
+| temporal split / leakage | train on the past, grade strictly on the future — never a shuffle; leakage = the answer sneaking into training | studying a title's March row, then being quizzed on its April row |
+| hazard `h_b`; at-risk `r_b`, events `d_b` | the chance the next watch lands in week `b` given none yet: `d_b` watches out of `r_b` gaps still waiting when the week began | 40 still waiting, 10 watched → hazard 0.25 |
+| censoring (right-) | an observation cut short before the event — meaning "not yet", never "never" | 9 quiet days since the last watch: the next may still come |
+| residual watch probability; gap `g` | chance of a watch in the next `H` days, given `g` quiet days since the last one | "10 silent days in: still a 12% chance this fortnight" |
+| empirical Bayes / prior strength `k` | blending a title's thin record with its group's; `k` = events needed before its own record dominates | one lonely watch borrows from the franchise; a 20-rewatch comfort film speaks for itself |
+| `U`, `T` | free-space targets: recover to `U`; don't delete until free space falls under `T` | "if under the floor, reclaim back up to the target" |
+| value `v` / value density `ρ` | what keeping a file is worth, and that worth per gigabyte | a 60 GB file at 60 points: 1 point/GB; a 4 GB file at 40 points: 10 |
+| knapsack problem | choosing items under a size limit so the least value is lost | freeing 300 GB by deleting the least-missed files |
+| downgrade credit `r` | how much of a planned quality-shrink's freed space counts against the delete target | shrinks will free 200 GB → delete 200 GB less |
+| multiplier `m_g` | a fitted weight rescaled so the strongest group = 1.0, matching today's hand-weight units | "quality deserves 1.0; studios about 0.2" |
+| GBT challenger (shadow / observe-only) | many tiny decision trees added into one model; it predicts and logs, but nothing acts on its output | `challenger_p` is stamped into records no decision reads |
+| Spearman `ρ_s` | agreement between two rankings; 1.0 = identical order | hand score vs challenger ordering the same library |
+| `n_pos` | the number of actual watches available to learn from | 38 movie positives so far — the whole answer key |
+| effect size `δ`; α, power | how big a true effect is, in standardized units; α = tolerated false-alarm rate, power = chance of catching the effect | the 87-watch figure: spot δ = 0.3 with 5% false alarms, 80% catch rate |
+| SE (standard error) | the ± wobble on an estimate from limited data | a hazard from under 40 gaps wobbles about ±0.09 |
+| quantile | the value below which a given fraction of the data falls | the 25% density quantile marks the cheapest quarter of the library |
+| VC dimension | a formal measure of how much a model class can memorize | used in §10 to show generic guarantees say nothing at n = 931 |
+| Radarr / Sonarr / Plex / Tautulli / Trakt | the household stack: movie and TV library managers, the server people watch through (Up Next = its "recommended next" row), the watch logger, a ratings service | Tautulli's log is the source of all ≈931 watch events used here |
+| snapshot | one saved row per title per scoring run: score, evidence breakdown, and later its outcome | the training data everything in this document feeds on |
+| parity oracle / dry-run ledger | a recorded log of what current code would do, used as the referee before any change goes live | new math must reproduce the ledger before touching a real decision |
+
 ## 0 Notation
 
 | symbol | meaning |
@@ -34,6 +97,9 @@ ledger remains the parity oracle (MIGRATION.md).
 | `m_g` | suggested weight multiplier `β_g / max_k |β_k|` |
 | AP, BS, ECE, `ρ_s` | average precision, Brier score, expected calibration error, Spearman rho |
 
+> **In plain words:** The compact symbol key for the formulas below; the
+> glossary above says the same things in everyday language.
+
 ## 1 The production model — hand-weighted linear utility
 
 The live watchability score is a linear utility over independently-capped
@@ -49,6 +115,12 @@ referenced by `foundation.linear_utility`, **not** rewired: the movie engine
 (same form, gentler A4 knobs), shared tables/helpers in `scoring/_shared.py`,
 and the cache-row adapters `features/movie_features.py` / `features/show_features.py`.
 
+> **In plain words:** A title's score is a sum of point bonuses and penalties:
+> "the household finished the last two entries in this saga" adds points,
+> "it's in a language nobody here speaks" subtracts them. Each evidence group
+> has a ceiling, so one loud signal can never drown out the rest — and any
+> score can be broken back down into exactly the evidence that produced it.
+
 Signal groups and per-signal caps (movie engine):
 
 | group | role | signals (cap) |
@@ -60,6 +132,13 @@ Signal groups and per-signal caps (movie engine):
 | E Audience Alignment | right content for the right viewers | E1 kids alignment (+6), E2 adult alignment (+4), E3 library fit (+4) |
 | F Content Quality | external quality/recency evidence | F1 critic consensus (+20 — the strongest single positive), F2 popularity (+2), F3 recency (+2) |
 | G Penalties | negative evidence | G1 language (−8, file-aware), G2 abandoned (−10), G3 panned (−5), G4 not-yet-available (−5) |
+
+> **In plain words:** Seven kinds of evidence: what you've explicitly told the
+> system (A), whose work the household keeps watching (B), whether it completes
+> a set — you own 4 of the 6 films in a saga (C), whether your gear can play it
+> smoothly (D), whether it fits who lives in the house (E), what critics
+> thought (F), and strikes against — abandoned mid-watch, panned, wrong
+> language (G). Critic consensus (+20) stands alone at the top.
 
 Threshold policy: the score maps to a quality profile through the ladder
 `QUALITY_PROFILE_THRESHOLDS` / `score_to_profile` (`scoring/_shared.py`),
@@ -76,6 +155,12 @@ i.e. a step function τ → profile:
 
 Every τ is hand-set today; §9 maps each to the formula that could derive it.
 
+> **In plain words:** The score decides how good a copy of each title to keep:
+> the highest scores earn the full untouched-disc 4K file, middling scores a
+> solid streaming-quality copy, the lowest the small 720p version. Every
+> cutoff is a hand-picked educated guess today; §9 lists the formula that
+> could eventually derive each one from data.
+
 ## 2 Labels — what the score is measured against
 
 `labels/labeling.build_labels` (Stage 1b) defines, per snapshot row `i`:
@@ -88,6 +173,12 @@ Qualifying: movies — Tautulli event joined `rating_key → tmdb`
 `grandparent_title` match, `percent_complete ≥ 50` (continued engagement, not
 per-episode completion).
 
+> **In plain words:** A "yes" label means someone genuinely watched the title
+> within 14 days of scoring — a movie played (nearly) to the end, or a series
+> episode watched at least halfway, since for series the question is "still
+> engaged?", not "finished?". This answer key is what every measurement in
+> the rest of the document is graded against.
+
 **Maturation is right-censoring.** A snapshot younger than `H` cannot yet be a
 trustworthy negative — the household may still watch it inside the window. Such
 rows carry `label_mature = false` and are excluded by default (`--include-immature`
@@ -95,10 +186,21 @@ opts in, with provisional-negative semantics). This is the same censoring logic
 §6 applies to inter-watch gaps: absence of an event before the observation
 boundary is *no information*, not a zero.
 
+> **In plain words:** A title scored 5 days ago cannot fairly be called "not
+> watched" — the household still has 9 days left in its window, and labeling
+> it a no now would be grading the exam before the student finished. Young
+> rows sit out until their 14 days elapse. The same principle — silence so
+> far is not a no — powers the survival math in §6.
+
 **Implicit negatives.** `recommended_not_watched` = the entity was in the Up
 Next plan at snapshot time (`in_up_next`) and was not watched within `H` — the
 system recommended it and the household declined. These are the highest-value
 negatives: they were shown, not merely available.
+
+> **In plain words:** The most valuable "no" is a title the app actually put
+> on screen in the household's recommendation row — and two weeks passed
+> without a play. Not "they never saw it"; "they saw it and passed" — the
+> most instructive feedback a recommender can collect.
 
 ## 3 Evaluation theory
 
@@ -115,6 +217,13 @@ system acts on (what gets kept, upgraded, acquired first) — moves ROC-AUC
 negligibly while it moves AP a lot. AP weights exactly the operating region.
 NaN with zero positives; the tools say so rather than inventing numbers.
 
+> **In plain words:** Average precision asks: when the app sorts the library
+> best-first, are the actual watches bunched at the top? About 2 titles in
+> 100 get watched in a window, so a shuffled ranking scores ≈0.02 and skill
+> is read as a multiple of that floor. It beats the better-known ROC-AUC here
+> because the app only ever acts on the top of the list — and the top of the
+> list is nearly all AP measures.
+
 **Brier score** (`foundation.brier_score`): `BS = (1/N) Σ (p_i − y_i)²`, a
 strictly proper scoring rule (in expectation minimized only by the true
 probability — hedged forecasts can't game it). Murphy decomposition:
@@ -127,6 +236,13 @@ At 2% prevalence the all-zeros forecast already scores ≈ 0.02: compare against
 that, not 0. Forward validation computes Brier on the *min-max-scaled score* —
 the score is not a probability, so this is a calibration diagnostic, not a loss.
 
+> **In plain words:** The Brier score averages (claimed chance − what
+> happened)²: claiming 97% on a title nobody watched costs ≈0.94; an honest
+> 20% costs 0.04. "Strictly proper" means it cannot be gamed — the expected
+> penalty is smallest when you report what you truly believe. One trap at
+> this rarity: "0% for everything" already scores ≈0.02, so a model must beat
+> that number, not zero.
+
 **Expected calibration error** (`foundation.expected_calibration_error`, in
 `eval/np_metrics`): over equal-width probability bins,
 
@@ -136,12 +252,24 @@ the score is not a probability, so this is a calibration diagnostic, not a loss.
 one-number summary of `calibration_table`'s reliability diagram, in probability
 units. Binned estimates are noisy at small n; read alongside per-bin counts.
 
+> **In plain words:** ECE checks honesty bucket by bucket: gather every
+> prediction near 70%, ask whether about 70% came true, and average the gaps.
+> An ECE of 0.01 means claims honest to within a point; 0.39 means the
+> numbers are decoration, not probabilities. Sparse buckets make the check
+> itself noisy — hence the per-bucket counts printed beside it.
+
 **Temporal split, always.** Snapshots are monthly rows of the *same titles*: a
 random split places one title's March row in train and its April row in test —
 twin leakage that inflates every metric. Temporal splits (`train < split-date ≤ test`)
 also respect that the household drifts and that deployment is forward
 prediction by construction. Degenerate splits degrade to clearly-labeled
 in-sample evaluation with warnings (`ml_forward_validation`, `ml_weight_refit`).
+
+> **In plain words:** Train on the past, grade on the future — never a
+> shuffled mix. The same movie appears month after month, so a random shuffle
+> lets the model study a title's March row and get quizzed on its April row:
+> a copy of the exam. Splitting by date closes that door and matches the real
+> job, which is always "predict what happens next".
 
 ## 4 Weight refit — logistic regression on the signal groups
 
@@ -154,6 +282,13 @@ on train-standardized signals `z_j = (x_j − μ_j)/σ_j` (`foundation.standardi
 population moments, zero-variance columns dropped — equivalently mapped to 0,
 which under ridge earns exactly β=0). Standardization makes the L2 penalty
 shrink heterogeneous columns (±12 completion vs +2 recency) comparably.
+
+> **In plain words:** This stage asks: if real watch outcomes chose how much
+> each evidence group should count, what would they pick? The tool is
+> logistic regression — the workhorse "evidence in, probability out" model.
+> Every signal is first rescaled onto a common footing so big- and
+> small-point signals compete fairly, and a built-in humility penalty (the
+> ridge) drags every fitted weight toward zero unless the data pushes back.
 
 Estimation maximizes the penalized log-likelihood (intercept unpenalized):
 
@@ -171,6 +306,13 @@ ridge keeps `XᵀWX + λI` invertible under the near-separable, rarely-firing
 signal columns this dataset actually has, trading a small bias toward 0 for a
 large variance cut — the right trade at `n_pos ≪ 100`.
 
+> **In plain words:** The fitting procedure is a loop of ordinary weighted
+> line-fits that provably lands on the single best answer — no "almost right"
+> traps. The ridge also keeps the arithmetic stable for signals that fired
+> only a handful of times, at the price of slightly understating strong
+> effects. Under 100 watches, a little bias for a lot of stability is the
+> right deal.
+
 Reporting: per-point effect `w_j = β_j/σ_j` (log-odds per raw score point),
 then multipliers (`foundation.suggested_weight_multipliers`):
 
@@ -180,6 +322,13 @@ normalized so the strongest group reads 1.0 — directly comparable to today's
 implicit 1.0 per group; negative means the group's points correlate with *not*
 watching. Scale-free in λ and n. **Never applied**; the scorers stay hand-edited.
 
+> **In plain words:** The output is a comparison table, not a control knob:
+> each group's fitted influence is rescaled so the strongest reads 1.0 — the
+> units of today's hand-set weights. A 0.5 reads "the data thinks this
+> deserves half its current weight"; a negative sign, "points here lean
+> toward *not* watching". Nothing applies automatically; a human reads the
+> table and decides.
+
 **The `n_pos < 100` caveat, quantified.** With standardized features the
 information about each β is carried by events: `SE(β_j) ≳ 1/√n_pos` (before
 inflation from inter-signal correlation). Power sketch: detecting a per-point
@@ -187,6 +336,13 @@ effect of standardized size δ = 0.3 at α = 0.05 with 80% power needs
 `n_pos ≈ ((1.96 + 0.84)/δ)² ≈ 87` events — the origin of the 100-positive gate.
 Below it, multipliers are directional at best, and a sign flip on a group that
 fired < ~30 times is noise (the tool prints exactly this caveat).
+
+> **In plain words:** This formula is why the app refuses to redraw its
+> weights from a dozen data points: confidence grows only with the count of
+> actual watches, and roughly 87 are needed before even a large effect can
+> be reliably *detected* — never mind measured. Below that the table is a
+> rumor: ordering suggestive, magnitudes noise, and a sign flip on a
+> rarely-firing group means nothing.
 
 ## 5 Calibration — isotonic regression (PAVA)
 
@@ -205,6 +361,14 @@ Prediction interpolates between block breakpoints and clamps flat at the ends
 (no extrapolated probabilities). Fit on the *temporal validation window*, never
 on train (a model is optimistically miscalibrated on its own training data).
 
+> **In plain words:** A score of 97 does not mean a 97% chance of a watch —
+> the score ranks titles; it does not state odds. Isotonic regression repairs
+> that with one assumption only: higher score should never mean *lower*
+> chance. It averages away any stretch where the actual watch rate runs
+> backwards and reads probabilities off history — "titles scoring around here
+> got watched about 20% of the time, so say 20%". The repair is fit on later,
+> held-out data — every model flatters itself on its own training data.
+
 **Why not Platt scaling at this n.** Platt fits `σ(a·s + b)` — two parameters,
 assuming the score's miscalibration is sigmoid-shaped (logit-linear in `s`).
 The hand score is a bounded, capped sum of heterogeneous bumps with threshold
@@ -215,6 +379,14 @@ system already commits to. The cost (isotonic can overfit tiny windows, one
 block per run of outcomes) is contained by the validation-window fit, end
 clamping, and reading ECE next to bin counts. At our n both methods are rough;
 monotonicity is the weaker, safer assumption.
+
+> **In plain words:** The popular alternative, Platt scaling, force-fits one
+> specific S-shaped curve — fine when the miscalibration really has that
+> shape. Our hand-built score is a pile of capped bonuses full of jumps and
+> plateaus; imposing an S-curve would bend the probabilities exactly where
+> reality is stepwise. Isotonic assumes only "more score, no less likely" —
+> the one promise the ranking already makes — the safer of two rough options
+> at this data size.
 
 ## 6 Survival — when does the next watch come?
 
@@ -233,6 +405,13 @@ asserting an event. Dropping censored gaps instead would bias hazards upward.
 Each `ĥ_b` is a binomial proportion: unbiased given `r_b`, variance
 `ĥ_b(1−ĥ_b)/r_b` — thin tails are noisy, so the report prints at-risk counts.
 
+> **In plain words:** The machinery medical studies use for "time until the
+> event", pointed at "days until the household's next watch": for each week
+> since the last watch, of the titles that reached it still unwatched, what
+> fraction got watched during it? A title still waiting is neither dropped
+> nor counted as a never — it is "survived this far, verdict pending", which
+> is how you avoid concluding people rewatch faster than they do.
+
 Residual watch probability (`foundation.residual_watch_probability` →
 `survival.residual_probability_from_hazard`), the product-limit complement:
 
@@ -242,6 +421,13 @@ over buckets covered by `(g, g+H]`; `frac_b` scales a partially-covered
 bucket linearly; beyond the fitted curve the last bucket's hazard extends flat.
 Having survived `g` days costs nothing extra — conditioning just starts the
 product at `g`, which is the point of the hazard parameterization.
+
+> **In plain words:** "Chance of a watch in the next two weeks, given ten
+> quiet days already": multiply the chances of surviving each remaining week
+> unwatched, take one minus the product. The quiet days are not a penalty to
+> repay — they just move the starting line, so the multiplication begins at
+> the week you are actually in. That convenience is the whole reason to work
+> in hazards.
 
 **Empirical-Bayes pooling** (`foundation.empirical_bayes_pool` →
 `survival.blend_hazards`): title (≥3 events) → franchise/collection pool →
@@ -257,6 +443,13 @@ implementation applies ONE `w` per curve from the entity's event count rather
 than per-bucket at-risk weighting — a deliberate small-n simplification. A
 sparse title borrows almost everything from its pool; a much-rewatched title
 speaks for itself.
+
+> **In plain words:** A movie watched once has almost no history of its own,
+> so it borrows: first from its franchise ("this household re-runs its
+> favorite sagas every few months"), then from the household overall. With
+> k = 5 as the entry fee, a title with one watch counts its own history 1/6
+> and its group's 5/6; past five watches its own record starts to dominate.
+> A comfort film rewatched twenty times speaks almost entirely for itself.
 
 **The measured finding and what it justifies.** On the household history
 (n≈931 events), ~86% of completed inter-watch gaps end within the first 7-day
@@ -275,6 +468,14 @@ follow from that shape:
 * **Resumption = hazard spike** — a new watch resets `g` to 0, jumping the
   entity back into the high-hazard regime; re-protection/re-upgrade should key
   on that reset rather than on score recomputation lag.
+
+> **In plain words:** The measured shape is blunt: when a title gets watched
+> again, about 86% of the time it happens within a week of the previous
+> watch. So: spend quality-upgrade bandwidth in that week, because acting
+> later mostly buys nothing; let a watched file's protection lapse when its
+> current odds of another watch drop low, not after a fixed day count; and
+> when a dormant title suddenly plays, re-protect it on the spot — the clock
+> has reset into the high-odds week.
 
 ## 7 Decision theory — space reclamation as constrained optimization
 
@@ -301,12 +502,25 @@ by score alone and is byte-identical to the historical order). Today `v` = the
 watchability score; with a calibrated model it becomes `p̂·v` — true expected
 utility per GB (§9).
 
+> **In plain words:** When the disk runs low the question is "which files can
+> we lose while destroying the least value?" — the textbook knapsack problem.
+> The near-perfect shortcut: rate every file in value per gigabyte, delete
+> from the cheapest end — a 60 GB pristine copy untouched for two years is
+> worth far less per gigabyte than a 4 GB file the kids replay weekly. The
+> greedy sort lands within one file of the best possible selection.
+
 **Downgrade vs delete.** A downgrade reclaims `ΔGB` (quality delta) at cost
 `p̂·Δv` (utility of the lost quality tier) and is non-destructive — the title
 survives and the flip is restorable. A deletion reclaims the whole file at
 cost `p̂·v`. Per GB reclaimed, downgrades are typically cheaper *and*
 reversible, so Stage 1 runs both downgrade passes first, and Stage-2 deletion
 is floor-gated (`free < T`) for hysteresis.
+
+> **In plain words:** Before deleting anything, shrink. Swapping a giant
+> pristine file for a good streaming-quality copy frees most of the space,
+> keeps the title watchable, and can be undone; deletion frees the rest but
+> is final. So both shrink passes run first, and deletion only arms once free
+> space actually crosses the red line.
 
 **Downgrade-first credit.** Downgrade reclaim lands later (profile flip now,
 smaller file when the re-grab imports). Deleting to cover the full deficit
@@ -323,6 +537,14 @@ free space, so realized downgrades shrink the deficit itself; a stalled
 re-grab keeps crediting until its stamp clears (the documented caveat on the
 config knob).
 
+> **In plain words:** A shrink frees its space late — the smaller replacement
+> must finish downloading before the big file goes. Deleting to cover the
+> whole shortfall while shrinks are in flight would free too much, so
+> expected shrink savings are subtracted from the delete target up front,
+> like counting an incoming paycheck before deciding how much furniture to
+> sell. Landed savings leave the books automatically each run; the known wart
+> is that a stalled re-download keeps its credit until its stamp clears.
+
 ## 8 The challenger — shadow GBT
 
 Stage 4 trains an additive-tree model
@@ -337,16 +559,33 @@ honest probability. Observe-only by construction: the runtime hook can only
 log divergence and stamp `challenger_p` into snapshot rows; nothing downstream
 reads it (`challenger/gbt_shadow.py`, `ml_train_challenger`).
 
+> **In plain words:** The challenger is a small machine-learned model —
+> hundreds of tiny decision trees added together — trained on the same
+> evidence plus a little context, then calibrated so its output is an honest
+> probability. Kept deliberately small because the dataset is small, and
+> deliberately powerless: it writes predictions into the record, nothing that
+> touches the library ever reads them — a trainee forecasting on paper.
+
 **Promotion criterion:** forward ΔAP > 0 — the challenger must beat the
 production score's average precision on matured, strictly-forward windows,
 sustained across windows, before it can be *considered* for any decision
 surface. There is deliberately no auto-promotion path; today the criterion is
 a measurement, not a switch.
 
+> **In plain words:** The challenger earns consideration only by beating the
+> hand-built score at ranking *future* watches, repeatedly, on data neither
+> has seen. Even then nothing flips automatically — clearing the bar starts
+> a conversation, not a switchover.
+
 **Divergence diagnostics:** Spearman `ρ_s(score, challenger_p)`
 (`foundation.spearman_rho`) plus the top-10 rank disagreements, logged per run
 — where the learned model and the hand model disagree is exactly where labels
 accumulate the most informative evidence.
+
+> **In plain words:** Each run also logs where the two models most disagree
+> about the ranking. Those rows are the interesting ones: whichever model
+> turns out to be right, the eventual watched-or-not outcome teaches the most
+> exactly where the two part ways.
 
 ## 9 Adoption roadmap — hand-set constants that become derived quantities
 
@@ -364,6 +603,13 @@ bypassing the parity oracle.
 | EB prior strength `k = 5` | marginal-likelihood (empirical-Bayes proper) fit on held-out gaps | §6 `empirical_bayes_pool` |
 | `delete_recency_ramp` half-life (30d exp decay) | `1 − residual-P` directly (the ramp is an exponential proxy for it) | §6 `residual_watch_probability` |
 | `space_downgrade_credit_ratio = 1.0` | measured realization rate of projected downgrade reclaim | §7 `downgrade_credit` |
+
+> **In plain words:** Everything in the left column is a number a human
+> picked — protect watched files for a fixed number of days, delete below a
+> chosen score. The right columns name the formula that could compute each
+> value from the household's own data once enough exists. The discipline is
+> the order: measure first, derive second, and let a derived value drive only
+> after it has proven itself against the recorded referee ledger.
 
 ## 10 Data-regime constraints — why classical statistics is the ceiling
 
@@ -390,6 +636,15 @@ That bounds model capacity from above:
   strong EB pooling, univariate AUC-PRs, and an L2 logistic refit are not the
   fallback — they are the correct estimators for this n.
 
+> **In plain words:** The entire history is about 931 watch events — only ~54
+> usable movie watches — a count-carefully problem: at roughly one
+> trustworthy fitted number per 10–20 real events, a ~25-signal model sits at
+> the edge and anything fancier is pure memorization. Worst-case theoretical
+> guarantees are so loose here they say nothing, so honesty comes from
+> procedure: penalized fits, grading only on the future, refusing to fit on
+> nothing. At this data size the simple estimators are not a stopgap — they
+> *are* the better ones.
+
 ## 11 Measured results (2026-07-26) — the theory above, priced by experiment
 
 The simulation harness (`ml_simulate.py`, seeds 42/7) and the truncated-replay
@@ -403,6 +658,14 @@ estimator has *earned*, not just what it promises.
   It is the absolute minimum, direction-only, largest-effects-only. The inverse
   square is the operative constraint: δ = 0.15 needs ≈350, δ = 0.10 needs ≈780.
   Hence the 100/300/1000 ladder in §10.
+
+  > **In plain words:** "How many real watches before the weight refit is
+  > worth believing?" has a stock answer: about 7.85 divided by the square
+  > of the effect size you hope to spot — ≈87 for large, obvious effects,
+  > the origin of the 100-watch gate, and even that only buys *detection*.
+  > The square is the punchline: halving the effect size quadruples the
+  > watches required, hence the 100 / 300 / 1000 ladder.
+
 * **The magnitude noise floor, measured.** With planted multipliers
   [1.0, 0.75, 0.45, 0.25, 0, 0] and `n_pos ≈ 1000`, the refit returned
   [1.0, 0.98, 0.66, 0.29, 0.21, −0.10]: rank order perfect (Spearman ≥ 0.98),
@@ -411,15 +674,42 @@ estimator has *earned*, not just what it promises.
   per-group: a group with 25 fires is a tiny sub-sample regardless of total
   n_pos (the real-data `B2_director −1.000` on 25 fires is the canonical
   forbidden sign-flip specimen).
+
+  > **In plain words:** In a rehearsal with planted, known-true weights and
+  > ~1000 simulated watches, the refit got the *order* of importance
+  > essentially perfect, but sizes wobbled ±0.2 — including a 0.21 weight
+  > conjured for a signal whose true weight was exactly zero. A ghost that
+  > size at ten times our real data means wobble near ±0.6 at 100 watches.
+  > And a group that fired only 25 times is starving no matter the total —
+  > the real data's director signal reading −1.000 on 25 firings is the
+  > textbook "do not believe this" specimen.
+
 * **Hazard recovery.** Planted vs recovered household hazard agreed to
   max |ĥ−h*| = 0.044 over buckets with at_risk ≥ 40; the product identity is
   directly verifiable in the report (`1 − (1−0.333)(1−0.256) = 0.504` = the
   printed residual at gap 0). Buckets with at_risk < 40 carry SE ≈ 0.09 and are
   excluded from tolerance for that reason.
+
+  > **In plain words:** Same rehearsal, survival side: the recovered
+  > next-watch curve matched the planted truth within about 4 percentage
+  > points wherever at least 40 gaps were still in play, and the printed
+  > numbers check by hand — weekly hazards of 33.3% and 25.6% compose to
+  > exactly the 50.4% two-week probability the report shows. Thinner weeks
+  > sit outside the tolerance; their sampling noise alone is ±9 points.
+
 * **Calibration, quantified** (§5). Treating the min-max-scaled score as a
   probability: ECE ≈ 0.39. Raw GBT margin: ≈0.019. After isotonic: **≈0.0016**.
   Ranking quality and probability honesty are separable properties; isotonic
   buys the second without touching the first.
+
+  > **In plain words:** Treat the raw 0–100 score as a probability and it
+  > lies badly — claims and reality diverge by 39 points on average, the
+  > regime where a bin claiming ~97% delivers watches ~20% of the time. The
+  > challenger's raw output is far more honest (about two points off), and
+  > after the isotonic repair claims match reality to about a sixth of a
+  > point. Ranking well and stating honest odds are different skills;
+  > calibration buys the second without disturbing the first.
+
 * **The challenger's surplus is interactions** (§8). Planted first-watch truth
   was linear-logistic in sig_*, yet the GBT scored AP 0.36 vs the linear
   refit's 0.14 — because its feature set includes context columns
@@ -428,6 +718,15 @@ estimator has *earned*, not just what it promises.
   On the refit's own features the GBT could at best match it. This is the
   precise mechanism by which the challenger may beat the linear scorer on real
   data — and forward ΔAP remains the only admissible judge.
+
+  > **In plain words:** The rehearsal's truth was deliberately built so a
+  > straight-line model could learn it perfectly — and the tree model still
+  > won 0.36 to 0.14, not by magic but by side information: it could see
+  > "watched before", which combined with the other signals picks out likely
+  > rewatchers — a *combination* the straight-line form cannot express. That
+  > is the honest mechanism by which a challenger might beat the hand score
+  > on real data too; the only verdict that counts is still future data.
+
 * **Backfill provenance** (§2 amendment). Truncated-replay snapshots
   (`ml_backfill_snapshots.py`) reconstruct x_t from history strictly < t with
   library membership via Radarr `added ≤ t`; credits/metadata are today's state
@@ -435,3 +734,12 @@ estimator has *earned*, not just what it promises.
   every tool unless `--include-backfill`. First real-household readings, under
   those caveats: n_pos = 38 @ 14d, current hand-tuned scorer AP ≈ 4.6× random
   lift. Directional, not evidence — the prospective store is the only judge.
+
+  > **In plain words:** Rather than wait months for labels, history was
+  > replayed: each past week, titles were rescored using only what was known
+  > before that week, then graded against the watches that followed. The
+  > replay is imperfect in known ways — today's cast lists leak backward,
+  > past deletions are invisible — so reconstructed rows are tagged and
+  > quarantined unless explicitly requested. First reading: 38 positives,
+  > with the hand-tuned score ranking ~4.6× better than chance. Encouraging,
+  > not evidence — only watches recorded going forward count as proof.
