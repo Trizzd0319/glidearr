@@ -115,6 +115,9 @@ def print_report(report: dict) -> None:
         m = block["metrics"]
         print(f"\n── {svc}  (n={m['n']}, positives={m['n_pos']}, "
               f"base rate={m['base_rate']})")
+        if m.get("n_by_source"):
+            print(f"   rows by source: {m['n_by_source']}   "
+                  "(backfill rows carry known leakage — see warnings)")
         print(f"   AUC-PR: {m['auc_pr']}   (lift over random: "
               f"{m['auc_pr_lift_over_base']}x)")
         print(f"   Brier (min-max score as P): {m['brier_minmax_score']}")
@@ -143,6 +146,10 @@ def main(argv=None) -> int:
     ap.add_argument("--include-immature", action="store_true",
                     help="also evaluate rows whose horizon has not fully elapsed "
                          "(their negatives are provisional)")
+    ap.add_argument("--include-backfill", action="store_true",
+                    help="also evaluate source='backfill' snapshot rows "
+                         "(ml_backfill_snapshots truncated-replay reconstructions "
+                         "with KNOWN leakage; default: excluded)")
     ap.add_argument("--bins", type=int, default=10)
     ap.add_argument("--cache-base", default=None,
                     help="override the global cache base dir (tests)")
@@ -159,6 +166,28 @@ def main(argv=None) -> int:
               f"{base / 'ml' / 'snapshots'} — run the pipeline once with "
               "ml.snapshots.enabled (default ON) to collect the first batch.")
         return 1
+
+    # ── provenance gate: backfilled rows are OPT-IN (--include-backfill) ──────
+    src = snaps["source"] if "source" in snaps.columns \
+        else pd.Series("prospective", index=snaps.index)
+    rows_by_source = {str(k): int(v) for k, v in src.value_counts(dropna=False).items()}
+    n_backfill = rows_by_source.get("backfill", 0)
+    if args.include_backfill:
+        if n_backfill:
+            warnings.append(
+                f"--include-backfill: rows by source {rows_by_source} — backfilled "
+                "rows are TRUNCATED-REPLAY reconstructions with KNOWN leakage "
+                "(credits_today, metadata_today, deletions_unknown); every metric "
+                "mixing them is directional, not evidence.")
+    elif n_backfill:
+        snaps = snaps[src != "backfill"].reset_index(drop=True)
+        warnings.append(
+            f"{n_backfill} backfill snapshot row(s) EXCLUDED (default; pass "
+            "--include-backfill to evaluate them).")
+        if snaps.empty:
+            print(f"  ⚠ {warnings[-1]}")
+            print("Only backfill snapshots exist — nothing prospective to evaluate.")
+            return 1
 
     labeled = build_labels(snaps, base, horizon_days=args.horizon_days)
     n_immature = int((~labeled["label_mature"]).sum())
@@ -203,6 +232,8 @@ def main(argv=None) -> int:
         "split_date": args.split_date,
         "horizon_days": args.horizon_days,
         "instance": args.instance,
+        "include_backfill": bool(args.include_backfill),
+        "rows_by_source": rows_by_source,
         "snapshot_days": sorted(eval_df["snapshot_date"].astype(str).unique().tolist()),
         "warnings": warnings,
         "services": {},
@@ -212,6 +243,9 @@ def main(argv=None) -> int:
         if sdf.empty:
             continue
         metrics = evaluate_window(sdf, bins=args.bins)
+        if args.include_backfill and "source" in sdf.columns:
+            metrics["n_by_source"] = {
+                str(k): int(v) for k, v in sdf["source"].value_counts(dropna=False).items()}
         if metrics["n_pos"] < 100:
             warnings.append(
                 f"{svc}: only {metrics['n_pos']} positive label(s) — every metric "

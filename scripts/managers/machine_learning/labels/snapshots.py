@@ -31,6 +31,16 @@ Row schema (one row per entity per snapshot):
                     snapshot time. Always False for shows (no tmdb plan set).
     challenger_p    Stage-4 shadow GBT P(watch) — None unless
                     scoring.ml_challenger.enabled AND a trained model exists.
+    source          PROVENANCE: "prospective" (live run — the default the row
+                    builders stamp) or "backfill" (reconstructed after the fact
+                    by scripts/support/tools/ml_backfill_snapshots.py). Parquets
+                    written before this column existed are read as "prospective"
+                    (load_snapshots normalizes) — backfilled rows can therefore
+                    NEVER silently masquerade as organic ones.
+    reconstruction_version / leakage_flags
+                    backfill-only provenance detail (None on prospective rows):
+                    the replay algorithm version and a comma-joined list of the
+                    known leakage channels baked into the reconstruction.
 
 Config gate: ``ml.snapshots.enabled`` (DEFAULT TRUE — this is pure logging).
 Every entry point is fully wrapped: a snapshot failure can NEVER affect the run,
@@ -52,6 +62,17 @@ import pandas as pd
 
 SNAPSHOT_SUBDIR = ("ml", "snapshots")
 _DEDUP_KEYS = ["snapshot_date", "instance", "entity_id"]
+
+# Provenance defaults stamped on every row the LIVE row builders emit. The
+# backfill tool overrides them (source="backfill", reconstruction_version=1,
+# leakage_flags="credits_today,..."), so consumers can always split on `source`.
+SOURCE_PROSPECTIVE = "prospective"
+SOURCE_BACKFILL = "backfill"
+_PROVENANCE_DEFAULTS = {
+    "source": SOURCE_PROSPECTIVE,
+    "reconstruction_version": None,
+    "leakage_flags": None,
+}
 
 
 # ── small pure helpers ────────────────────────────────────────────────────────
@@ -169,6 +190,7 @@ def build_movie_snapshot_rows(df: pd.DataFrame, instance: str,
             "in_up_next": tmdb in up_next,
             "challenger_p": None,
         }
+        row.update(_PROVENANCE_DEFAULTS)
         row.update(flatten_breakdown(rec.get("watchability_breakdown")))
         rows.append(row)
     return rows
@@ -251,6 +273,7 @@ def build_show_snapshot_rows(df: pd.DataFrame, instance: str,
             "in_up_next": False,   # no tmdb-keyed Up Next plan set for shows (v1)
             "challenger_p": None,
         }
+        row.update(_PROVENANCE_DEFAULTS)
         row.update(flatten_breakdown(breakdown_raw))
         rows.append(row)
     return rows
@@ -308,7 +331,12 @@ def load_snapshots(base_dir, services=("radarr", "sonarr"),
                    instance: "str | None" = None) -> pd.DataFrame:
     """Read every month partition for *services* into one DataFrame (offline
     tools' entry point). Missing dirs/unreadable partitions are skipped.
-    Optionally filter to one instance."""
+    Optionally filter to one instance.
+
+    READ-TOLERANT provenance: partitions written before the ``source`` column
+    existed load with ``source`` filled to "prospective" (they were, by
+    construction — the backfill tool always stamps "backfill"), so consumers can
+    unconditionally split/filter on ``source``."""
     frames: list = []
     for service in services:
         d = snapshot_dir(base_dir, service)
@@ -325,6 +353,10 @@ def load_snapshots(base_dir, services=("radarr", "sonarr"),
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", FutureWarning)
         df = pd.concat(frames, ignore_index=True)
+    if "source" not in df.columns:
+        df["source"] = SOURCE_PROSPECTIVE
+    else:
+        df["source"] = df["source"].fillna(SOURCE_PROSPECTIVE).replace("", SOURCE_PROSPECTIVE)
     if instance and "instance" in df.columns:
         df = df[df["instance"] == instance].reset_index(drop=True)
     return df

@@ -162,6 +162,9 @@ def print_block(service: str, block: dict) -> None:
           f"n={block['n']} (train {block['n_train']} / test {block['n_test']}), "
           f"positives={block['n_pos_total']}, l2={block['l2']}, "
           f"converged={block['converged']}")
+    if block.get("n_by_source"):
+        print(f"   rows by source: {block['n_by_source']}   "
+              "(backfill rows carry known leakage — see warnings)")
     print(f"   AUC-PR on eval window — current score: {block['auc_pr_current_score']}   "
           f"refit linear score: {block['auc_pr_refit_score']}")
     print(f"   {'signal group':<28} {'current':>8} {'fitted':>8} {'perpoint':>10} {'fires':>6}")
@@ -184,6 +187,10 @@ def main(argv=None) -> int:
     ap.add_argument("--service", choices=["radarr", "sonarr", "both"], default="both")
     ap.add_argument("--instance", default=None)
     ap.add_argument("--include-immature", action="store_true")
+    ap.add_argument("--include-backfill", action="store_true",
+                    help="also fit on source='backfill' snapshot rows "
+                         "(ml_backfill_snapshots truncated-replay reconstructions "
+                         "with KNOWN leakage; default: excluded)")
     ap.add_argument("--cache-base", default=None)
     ap.add_argument("--no-write", action="store_true")
     args = ap.parse_args(argv)
@@ -197,6 +204,29 @@ def main(argv=None) -> int:
         print(f"No snapshots found under {base / 'ml' / 'snapshots'} — run the "
               "pipeline once with ml.snapshots.enabled (default ON) first.")
         return 1
+
+    # ── provenance gate: backfilled rows are OPT-IN (--include-backfill) ──────
+    src = snaps["source"] if "source" in snaps.columns \
+        else pd.Series("prospective", index=snaps.index)
+    rows_by_source = {str(k): int(v) for k, v in src.value_counts(dropna=False).items()}
+    n_backfill = rows_by_source.get("backfill", 0)
+    if args.include_backfill:
+        if n_backfill:
+            warnings.append(
+                f"--include-backfill: rows by source {rows_by_source} — backfilled "
+                "rows are TRUNCATED-REPLAY reconstructions with KNOWN leakage "
+                "(credits_today, metadata_today, deletions_unknown); the fitted "
+                "multipliers below are directional suggestions, not evidence.")
+    elif n_backfill:
+        snaps = snaps[src != "backfill"].reset_index(drop=True)
+        warnings.append(
+            f"{n_backfill} backfill snapshot row(s) EXCLUDED (default; pass "
+            "--include-backfill to fit on them).")
+        if snaps.empty:
+            print(f"  ⚠ {warnings[-1]}")
+            print("Only backfill snapshots exist — nothing prospective to fit.")
+            return 1
+
     labeled = build_labels(snaps, base, horizon_days=args.horizon_days)
     if not args.include_immature:
         mature = labeled[labeled["label_mature"]]
@@ -212,6 +242,8 @@ def main(argv=None) -> int:
         "horizon_days": args.horizon_days,
         "l2": args.l2,
         "instance": args.instance,
+        "include_backfill": bool(args.include_backfill),
+        "rows_by_source": rows_by_source,
         "applied": False,   # this tool NEVER applies anything
         "how_to_read": ("fitted_multiplier is relative per-point evidence, "
                         "normalized so the strongest group = 1.0 (today every "
@@ -229,6 +261,10 @@ def main(argv=None) -> int:
             continue
         block = refit_service(sdf, args.split_date, args.l2, warnings, svc)
         if block:
+            if args.include_backfill and "source" in sdf.columns:
+                block["n_by_source"] = {
+                    str(k): int(v)
+                    for k, v in sdf["source"].value_counts(dropna=False).items()}
             report["services"][svc] = block
             print_block(svc, block)
     for w in warnings:

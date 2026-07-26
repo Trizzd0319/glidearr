@@ -61,6 +61,10 @@ def main(argv=None) -> int:
     ap.add_argument("--instance", default=None)
     ap.add_argument("--include-immature", action="store_true",
                     help="train on rows whose horizon has not elapsed (noisy negatives)")
+    ap.add_argument("--include-backfill", action="store_true",
+                    help="also train on source='backfill' snapshot rows "
+                         "(ml_backfill_snapshots truncated-replay reconstructions "
+                         "with KNOWN leakage; default: excluded)")
     ap.add_argument("--rounds", type=int, default=400, help="max boosting rounds")
     ap.add_argument("--early-stopping", type=int, default=30)
     ap.add_argument("--cache-base", default=None)
@@ -81,6 +85,28 @@ def main(argv=None) -> int:
         print(f"No snapshots found under {base / 'ml' / 'snapshots'} — run the "
               "pipeline once with ml.snapshots.enabled (default ON) first.")
         return 1
+
+    # ── provenance gate: backfilled rows are OPT-IN (--include-backfill) ──────
+    if "source" in snaps.columns:
+        rows_by_source = {str(k): int(v)
+                          for k, v in snaps["source"].value_counts(dropna=False).items()}
+    else:
+        rows_by_source = {"prospective": int(len(snaps))}
+    n_backfill = rows_by_source.get("backfill", 0)
+    if args.include_backfill:
+        if n_backfill:
+            print(f"WARNING: --include-backfill — rows by source {rows_by_source}; "
+                  "backfilled rows are TRUNCATED-REPLAY reconstructions with KNOWN "
+                  "leakage (credits_today, metadata_today, deletions_unknown) — the "
+                  "trained shadow model inherits that leakage.")
+    elif n_backfill:
+        snaps = snaps[snaps["source"] != "backfill"].reset_index(drop=True)
+        print(f"NOTE: {n_backfill} backfill snapshot row(s) EXCLUDED "
+              "(default; pass --include-backfill to train on them).")
+        if snaps.empty:
+            print("Only backfill snapshots exist — nothing prospective to train on.")
+            return 1
+
     labeled = build_labels(snaps, base, horizon_days=args.horizon_days)
     if not args.include_immature:
         mature = labeled[labeled["label_mature"]]

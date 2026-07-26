@@ -6,13 +6,19 @@ only default-ON piece is pure logging (snapshot appends); every behavioral surfa
 is config-gated DEFAULT-OFF, consistent with the dry-run decision-ledger parity
 oracle (see MIGRATION.md).
 
+The math behind every stage — formulas, derivations, estimator properties, and
+the constants-to-derived-quantities roadmap — is formalized in
+[MATH_FOUNDATION.md](MATH_FOUNDATION.md) (canonical implementations: `foundation/`).
+
 All artifacts live under the global cache base dir (`scripts/support/cache/`):
 
 ```
 ml/
   snapshots/{radarr,sonarr}/{YYYY-MM}.parquet    Stage 1 — append-only score snapshots
+                                                 (rows carry source= prospective|backfill)
   reports/forward_validation_{date}.json         Stage 2
   reports/suggested_weights_{date}.json          Stage 3 (informational — never applied)
+  reports/backfill_snapshots_{date}.json         Stage 1 backfill (truncated replay)
   reports/survival_{date}.json                   Stage 5a
   models/gbt_challenger_{service}.txt|.calib.json  Stage 4 (observe-only model)
 ```
@@ -46,6 +52,25 @@ summed size, modal resolution, any-watched, modal planned_action).
 
 **Failure isolation.** The service hooks call `maybe_snapshot_movies/shows`, which
 never raise; any failure logs one debug line and the run proceeds untouched.
+
+### Stage 1 backfill — truncated replay (`scripts/support/tools/ml_backfill_snapshots.py`)
+
+Reconstructs weekly historical snapshots (movies only) so the real watch history
+becomes labels immediately instead of waiting a horizon per week: history events
+are truncated to the prefix strictly before each grid date `t`, the household
+state (title-joined watch stats, genre affinity, watched-tmdb set, C4 person
+weights) is recomputed from that prefix, and every movie whose Radarr `added`
+date is `<= t` is rescored through the REAL `score_movie` call path with TODAY'S
+movie metadata/credits — the known, documented leakage. Every row is stamped
+`source="backfill"`, `reconstruction_version`, `leakage_flags`
+(`credits_today,metadata_today,deletions_unknown[,no_added_date]`); prospective
+rows default `source="prospective"` and pre-provenance parquets load as
+prospective. The grid is hard-capped below the earliest prospective
+snapshot_date, so the two populations can never collide in the writer's dedupe.
+The offline consumers (`ml_forward_validation` / `ml_weight_refit` /
+`ml_train_challenger`) EXCLUDE backfill rows unless `--include-backfill` is
+passed — and then print/persist source-split counts plus a leakage warning.
+Writes only `ml/snapshots` + `ml/reports`.
 
 ## Stage 2 — Forward-validation harness
 
@@ -118,6 +143,36 @@ curve with at-risk counts, residual-probability table, top rewatched titles).
   utility mode. All eligibility guards/shields live upstream in pool
   construction and are untouched.
 
+## Simulation harness (`scripts/support/tools/ml_simulate.py`)
+
+End-to-end parameter-recovery check: plants a KNOWN ground truth (per-signal-group
+weights β\*, a discrete-time rewatch hazard h\*, a synthetic ~500-title library),
+simulates weeks of household behaviour from exactly those parameters (daily
+snapshots through the real `labels/snapshots.py` writer; Tautulli-shaped
+`history/all.json`, `owned_inventory.json`, `tmdb_completions.json`, Up Next tmdb
+sets), runs the real chain (labeling → forward validation → weight refit →
+survival) against a **throwaway cache dir**, and asserts recovery: fitted
+multipliers rank-correlate with β\* (planted zeros fit near zero), refit AUC-PR
+beats a shuffled-label baseline, the pooled hazard matches h\* within tolerance,
+the calibration table is monotone-ish, and a 1-week run leaves the refit
+refusing (the `n_pos < 100` power gate — MATH_FOUNDATION §4's ~87-event sketch).
+It refuses to run against the real cache and defaults to a temp dir
+(`--cache-base` to override); exit 0 only when every assertion passes.
+When lightgbm is installed the harness also exercises the Stage-4 challenger
+end-to-end — `ml_train_challenger` against the sim cache on the same temporal
+split, AP/calibration floors on the forward test window (competence checks,
+not a superiority test — the planted first-watch truth is linear in `sig_*`,
+and any AP surplus over the refit comes from context features like
+`watched_before` that the linear refit does not use), and the
+`attach_challenger_p` shadow hook — and marks those assertions SKIP (still
+exit 0) when it is not.
+
+**Scope caveat:** the harness validates that the pipeline *can recover known
+parameters from data shaped like ours* — it does NOT substitute for real
+household data. Fitted weights for production must come from organic watches
+accumulated in the real snapshots, and the deterministic hand-weighted scorer
+remains the shipping default regardless of what the simulation recovers.
+
 ---
 
 ## Config flags (all of them)
@@ -134,21 +189,31 @@ No other stage has a runtime surface. The CLIs are read-only over the cache
 ## CLI usage
 
 ```bash
+python scripts/support/tools/ml_backfill_snapshots.py [--grid-days 7] \
+    [--horizon-days 14] [--instance standard] [--start YYYY-MM-DD] [--end YYYY-MM-DD] \
+    [--config PATH] [--dry-run] [--no-write]
+
 python scripts/support/tools/ml_forward_validation.py [--split-date YYYY-MM-DD] \
     [--horizon-days 14] [--service radarr|sonarr|both] [--instance NAME] \
-    [--include-immature] [--bins 10] [--no-write]
+    [--include-immature] [--include-backfill] [--bins 10] [--no-write]
 
 python scripts/support/tools/ml_weight_refit.py [--split-date YYYY-MM-DD] [--l2 1.0] \
-    [--horizon-days 14] [--service ...] [--include-immature] [--no-write]
+    [--horizon-days 14] [--service ...] [--include-immature] [--include-backfill] \
+    [--no-write]
 
 python scripts/support/tools/ml_train_challenger.py [--split-date YYYY-MM-DD] \
-    [--horizon-days 14] [--service ...] [--rounds 400] [--early-stopping 30]
+    [--horizon-days 14] [--service ...] [--include-backfill] [--rounds 400] \
+    [--early-stopping 30]
 
 python scripts/support/tools/ml_survival_report.py [--bucket-days 7] [--max-days 364] \
     [--k 5.0] [--horizon 14] [--min-pct 50] [--top 6] [--no-write]
+
+python scripts/support/tools/ml_simulate.py [--seed 42] [--weeks 8] [--titles 500] \
+    [--target-rate 0.04] [--cache-base PATH] [--keep-cache] [--power-gate-only]
 ```
 
-All four accept `--cache-base PATH` to point at a test cache.
+All five accept `--cache-base PATH` to point at a test cache (for `ml_simulate`
+it is the sim's throwaway output dir — the tool hard-refuses the real cache).
 
 ## Honest data-regime caveats
 
