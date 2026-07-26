@@ -1886,13 +1886,17 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         return stats
 
     @staticmethod
-    def _pick_stepdown_release(releases: list, current_res=None) -> "dict | None":
+    def _pick_stepdown_release(releases: list, current_res=None,
+                               min_size_bytes: int = 300 * 1024 * 1024) -> "dict | None":
         """Pick the release a step-down should grab: walk the resolution ladder
         UP from the floor (720 → 1080) and take the first non-empty rung strictly
         below the current file's resolution — 'no 720 found, take the next tier
         up' — never at/above the current resolution (that would re-grab what we
         are shrinking). Within a rung, the MEDIAN-sized release wins: the biggest
         is often a remux-grade outlier, the smallest a fake/undersized rip.
+        ``min_size_bytes`` is the fake/undersized sanity floor — default 300 MiB
+        (no 300MB "movies"); the Sonarr episode step-down passes a smaller floor
+        (a legit 720p episode can be well under 300 MiB).
         Returns None when no rung has a candidate → caller keeps the file."""
         try:
             cur = float(current_res) if current_res is not None and current_res == current_res else None
@@ -1909,7 +1913,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 continue
             if res < 720 or (cur is not None and res >= cur):
                 continue
-            if float(r.get("size") or 0) < 300 * 1024 * 1024:   # sanity floor: no 300MB "movies"
+            if float(r.get("size") or 0) < min_size_bytes:   # sanity floor (movies: no 300MB "movies")
                 continue
             by_rung.setdefault(res, []).append(r)
         for rung in sorted(by_rung):

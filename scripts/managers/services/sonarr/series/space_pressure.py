@@ -3,15 +3,32 @@ SonarrSpacePressureManager — Stage-1 TV downgrade under space pressure
 =====================================================================
 The Sonarr twin of ``RadarrSpacePressureManager.run_downgrades`` (Phase 3 of the
 cross-service space plan). When free space is in the pressure band (free < U),
-downgrade the lowest-watchability SERIES to HD-720p and trigger a re-grab, freeing
+downgrade the lowest-watchability SERIES to HD-720p and REALIZE the reclaim, freeing
 space BEFORE anything is deleted. Non-destructive and reversible (you keep the
 show, just at a lower quality).
+
+*arr never downgrades an existing file (a file above the new profile's cutoff →
+"cutoff met" → every release rejected), so the old live path — PUT the series
+profile + SeriesSearch and hope — reclaimed NOTHING (TV step-down space was
+phantom). The live branch now mirrors the shipped movie/universe realize at
+EPISODE-FILE granularity: after the profile PUT, each owned file above the target
+resolution gets ONE interactive ``release?episodeId=`` search (the shared
+``_pick_stepdown_release`` ladder picker, imported from the Radarr manager, with an
+episode-sized fake floor); a pick exists → DELETE ``episodefile/{fid}`` then POST
+the guid grab; grab error → post-delete blind ``EpisodeSearch`` fallback (chunked —
+effective once the file is gone, since the cutoff-met blocker died with it); no
+pick → file KEPT (a title is never traded for an empty indexer result), profile
+stays lowered, counted ``no_release``, re-probes next run. An inline cap
+(``tv_downgrade_realize_cap``, default 15) bounds the slow interactive searches per
+pass; files over the cap re-qualify next run while still oversized (the planner
+re-picks their series from file resolutions, not the profile).
 
 Differences from the Radarr movie template:
   * SERIES-level — episode_files.parquet is per-episode, but watchability_score is
     per-series (broadcast onto every row by refresh_scores). We group by series_id,
     score once per series, change the SERIES qualityProfileId (PUT series/{id}),
-    and stamp the plan on every episode row of that series.
+    and stamp the plan on every episode row of that series. The REALIZE step then
+    walks the series' owned episode files individually.
   * Reads the already-broadcast ``watchability_score`` column (Phase 2) — it does
     NOT recompute scores.
   * Adds a recently-AIRED guard (no Radarr analog): never downgrade a series with an
@@ -35,10 +52,16 @@ from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.ledger.decision_ledger import stamp
 from scripts.managers.machine_learning.space.downgrade_planner import plan_series_downgrades
+from scripts.managers.services.radarr.quality.space_pressure import RadarrSpacePressureManager
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
 from scripts.support.utilities.space_targets import space_targets
+
+# The step-down release picker is SHARED with the movie/universe realize paths —
+# imported, not copied (same ladder semantics: rungs >= 720 strictly below the current
+# resolution, 720 -> 1080 climb, median size in a rung, undersized fakes rejected).
+_pick_stepdown_release = RadarrSpacePressureManager._pick_stepdown_release
 
 
 class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
@@ -51,6 +74,11 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
     DEFAULT_SCORE_CEILING = 20    # tv_space_pressure_score_ceiling default (0-100 scale)
     DEFAULT_RUNTIME_MIN  = 45.0   # fallback per-episode runtime when unknown
     KEEP_TAGS = frozenset({"keep_series", "keep_season", "keep_universe", "keep_forever"})
+    DEFAULT_REALIZE_CAP  = 15     # tv_downgrade_realize_cap default — episode files searched+replaced
+                                  # inline per pass (interactive searches are slow); rest defers
+    SEARCH_CHUNK         = 100    # episodeIds per blind EpisodeSearch fallback command (Sonarr accepts a list)
+    STEPDOWN_MIN_RELEASE_BYTES = 50 * 1024 * 1024   # episode fake/undersized floor for the shared picker
+                                  # (movies use 300 MiB; a legit 720p episode can be far smaller)
 
     def __init__(self, logger=None, config=None, global_cache=None,
                  validator=None, registry=None, **kwargs):
@@ -126,6 +154,18 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         except (TypeError, ValueError):
             return float(self.DEFAULT_SCORE_CEILING)
 
+    def _realize_cap(self) -> int:
+        """Inline per-pass budget of episode files REALIZED (interactive-searched and, when
+        a smaller release exists, deleted + re-grabbed). Interactive searches are slow
+        (seconds each), so the pass bounds them; files over the cap are counted
+        ``deferred`` and re-qualify next run while still oversized (the planner re-picks
+        their series from file resolutions). 0 = profile flips only, nothing realized."""
+        try:
+            v = int((self.config or {}).get("tv_downgrade_realize_cap", self.DEFAULT_REALIZE_CAP))
+        except (TypeError, ValueError):
+            return int(self.DEFAULT_REALIZE_CAP)
+        return max(0, v)
+
     def _get_episode_files_manager(self):
         try:
             return self.registry.get("manager", "SonarrCacheEpisodeFilesManager")
@@ -178,6 +218,125 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
     # NOTE: the _max_ts helper moved to the brain (space.downgrade_planner) in ML Step 7c.
 
+    # ── Realize helpers (episode-file granularity) ────────────────────────────────
+
+    @staticmethod
+    def _iter_stepdown_file_rows(df, cand, target_res: int) -> list:
+        """The candidate series' owned episode files ABOVE the step-down target
+        resolution — ``(idx, fid, res, size_bytes, season, episode)`` tuples, largest
+        file first (the inline cap spends its budget on the biggest reclaim), one tuple
+        per physical file (a multi-episode file yields only its first backing row)."""
+        out, seen = [], set()
+        for idx in (cand.get("indices") or []):
+            if idx not in df.index:
+                continue
+            fid = df.at[idx, "episode_file_id"] if "episode_file_id" in df.columns else None
+            if fid is None or pd.isna(fid):
+                continue
+            fid = int(fid)
+            if fid in seen:
+                continue
+            try:
+                res = int(df.at[idx, "resolution"]) if "resolution" in df.columns else 0
+            except (TypeError, ValueError):
+                continue
+            if res <= int(target_res):
+                continue
+            size = df.at[idx, "size_bytes"] if "size_bytes" in df.columns else None
+            size = float(size) if size is not None and pd.notna(size) else 0.0
+            if size <= 0:
+                continue
+            sn = df.at[idx, "season_number"] if "season_number" in df.columns else None
+            en = df.at[idx, "episode_number"] if "episode_number" in df.columns else None
+            seen.add(fid)
+            out.append((idx, fid, res, size, sn, en))
+        out.sort(key=lambda t: -t[3])
+        return out
+
+    def _realize_stepdown_files(self, instance: str, df, ef, cand, target_res: int,
+                                fid_rowcount: dict, *, budget: int,
+                                fallback_eids: list, stats: dict) -> int:
+        """Realize ONE candidate series' step-down at episode-file granularity
+        (verify → delete → guid-grab; the series profile was already PUT down).
+
+        Per file above ``target_res``: resolve the Sonarr episode id (the episode-files
+        manager's cached ``_get_episode_id``), run ONE interactive ``release?episodeId=``
+        search, and pick with the shared ladder picker. A pick → DELETE the episode file
+        then POST the guid grab; a grab error/soft-reject → the file is already gone, so
+        the episode id joins the blind ``EpisodeSearch`` fallback pool (effective
+        post-delete: the cutoff-met blocker died with the file). No pick → file KEPT,
+        counted ``no_release`` (profile stays lowered; re-probes next run). Multi-episode
+        files are never realized (a single-episode replacement would orphan the
+        siblings). ``budget`` is the shared inline cap; files over it count ``deferred``.
+        Mutates ``stats`` and ``fallback_eids``; returns the remaining budget."""
+        sid = cand["sid"]
+        for idx, fid, res, size, sn, en in self._iter_stepdown_file_rows(df, cand, target_res):
+            label = (f"'{cand['title']}' S{int(sn):02d}E{int(en):02d}"
+                     if (sn is not None and pd.notna(sn) and en is not None and pd.notna(en))
+                     else f"'{cand['title']}' fid={fid}")
+            if fid_rowcount.get(fid, 1) > 1:
+                stats["skipped_multi_ep"] += 1
+                self.logger.log_info(
+                    f"  ⏸️ {label}: file backs {fid_rowcount[fid]} episodes — kept (a "
+                    f"single-episode replacement would orphan the siblings).")
+                continue
+            if budget <= 0:
+                stats["deferred"] += 1
+                continue
+            if sn is None or en is None or pd.isna(sn) or pd.isna(en):
+                stats["failed"] += 1
+                continue
+            try:
+                eid = ef._get_episode_id(instance, int(sid), int(sn), int(en))
+            except Exception:
+                eid = None
+            if not eid:
+                self.logger.log_warning(
+                    f"  ⚠️ {label}: could not resolve the Sonarr episode id — file kept.")
+                stats["failed"] += 1
+                continue
+            budget -= 1
+            releases = self.sonarr_api._make_request(
+                instance, f"release?episodeId={int(eid)}", fallback=None) or []
+            pick = _pick_stepdown_release(releases, current_res=res,
+                                          min_size_bytes=self.STEPDOWN_MIN_RELEASE_BYTES)
+            if not pick:
+                stats["no_release"] += 1
+                self.logger.log_info(
+                    f"  ⏸️ {label}: no smaller release available — file kept at {res}p "
+                    f"(profile now {cand['target_name']}; re-probes next run).")
+                continue
+            try:
+                self.sonarr_api._make_request(instance, f"episodefile/{fid}", method="DELETE")
+            except Exception as e:
+                stats["failed"] += 1
+                self.logger.log_warning(f"  ⚠️ {label}: episode-file delete failed — file kept: {e}")
+                continue
+            # The file is gone from disk from here on: the reclaim is REAL regardless of
+            # which grab path (guid or blind fallback) restores the smaller copy.
+            stats["realized"] += 1
+            stats["realized_reclaim_gb"] += size / (1024 ** 3)
+            grabbed = False
+            try:
+                _res = self.sonarr_api._make_request(
+                    instance, "release", method="POST", fallback=None,
+                    payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId")})
+                # _make_request returns None on a soft rejection (release no longer
+                # grabbable / indexer down) WITHOUT raising — the file is already gone,
+                # so a soft-reject must fall back too (mirrors legacy_regrab's check).
+                grabbed = _res is not None
+            except Exception:
+                grabbed = False
+            if not grabbed:
+                fallback_eids.append(int(eid))
+                stats["grab_fallback"] += 1
+                continue
+            _pick_gb = float(pick.get("size") or 0) / (1024 ** 3)
+            self.logger.log_info(
+                f"  📉 {label}: file deleted ({size / (1024 ** 3):.2f}GB @{res}p), grabbed "
+                f"'{pick.get('title')}' ({_pick_gb:.2f}GB) — step-down realized.")
+        return budget
+
     # ── Stage 1: downgrade to HD-720p ─────────────────────────────────────────────
 
     @LoggerManager().log_function_entry
@@ -196,6 +355,13 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             "skipped_recent":    0,
             "skipped_already":   0,
             "failed":            0,
+            # ── realize accounting (live only; dry_run leaves these at 0) ──
+            "realized":            0,     # episode files actually deleted + replaced
+            "realized_reclaim_gb": 0.0,   # REAL GB freed (sum of deleted file sizes)
+            "no_release":          0,     # no smaller release existed → file KEPT
+            "grab_fallback":       0,     # guid grab failed → blind EpisodeSearch (file already gone)
+            "deferred":            0,     # over the inline cap → next run
+            "skipped_multi_ep":    0,     # file backs several episodes → never single-grabbed
         }
 
         ef = self._get_episode_files_manager()
@@ -255,7 +421,23 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             return stats
 
         # Apply each per-series step-down target (the planner already spread to ~need_gb).
-        ids_to_search: list[int] = []
+        # fallback_eids collects episodes whose guid grab failed AFTER their file was
+        # deleted — a blind EpisodeSearch is effective for exactly those (the cutoff-met
+        # blocker died with the file). realize_budget is the shared inline cap across all
+        # candidate series this pass.
+        fallback_eids: list[int] = []
+        realize_budget = self._realize_cap()
+        # How many episode rows each file backs — a multi-episode file is never replaced
+        # by a single-episode grab (it would orphan the siblings).
+        fid_rowcount: dict = {}
+        if "episode_file_id" in df.columns:
+            try:
+                fid_rowcount = {
+                    int(k): int(v)
+                    for k, v in df["episode_file_id"].dropna().value_counts().items()
+                }
+            except Exception:
+                fid_rowcount = {}
         plan_changed = changed = False
         reclaimed = 0.0
 
@@ -288,28 +470,48 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     continue
                 payload["qualityProfileId"] = c["target_id"]
                 self.sonarr_api._make_request(instance, f"series/{c['sid']}", method="PUT", payload=payload)
-                ids_to_search.append(c["sid"])
                 changed = True
                 stats["downgraded"] += 1
                 self.logger.log_info(
                     f"  📉 Stepped down '{c['title']}' ({c['n_eps']} ep, {c['cur_gib']:.1f}GB → "
-                    f"{c['target_name']}, ~{c['reclaim']:.1f}GB) — {c['reason']}"
+                    f"{c['target_name']}, ~{c['reclaim']:.1f}GB projected) — {c['reason']}"
+                )
+                # REALIZE: the profile flip alone reclaims nothing (Sonarr will not
+                # replace a file that already exceeds the new cutoff). Walk this
+                # series' oversized files: verify a smaller release exists → delete →
+                # grab it. Bounded by the shared inline budget.
+                # Target resolution comes from the planner's chosen profile (the
+                # candidate carries the profile dict, not a bare resolution); fall
+                # back to the pass's 720p floor if the profile can't be read.
+                _t_res = self._profile_max_resolution(c.get("target_profile")) or floor_resolution
+                realize_budget = self._realize_stepdown_files(
+                    instance, df, ef, c, int(_t_res),
+                    fid_rowcount, budget=realize_budget,
+                    fallback_eids=fallback_eids, stats=stats,
                 )
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ Downgrade failed for '{c['title']}' (id={c['sid']}): {e}")
                 stats["failed"] += 1
 
-        # ── trigger re-grab at the new (lower) profile, one SeriesSearch per series ──
-        for sid in ids_to_search:
+        # ── blind-search fallback pool (chunked) ──────────────────────────────────
+        # ONLY for episodes whose guid grab failed after their file was deleted. The
+        # old blanket per-series SeriesSearch is gone: with the file still present it
+        # was rejected as cutoff-met (the phantom-reclaim bug), and once the file IS
+        # deleted the targeted grab above already handles the replacement.
+        for i in range(0, len(fallback_eids), self.SEARCH_CHUNK):
+            _batch = fallback_eids[i:i + self.SEARCH_CHUNK]
             try:
                 self.sonarr_api._make_request(
                     instance, "command", method="POST",
-                    payload={"name": "SeriesSearch", "seriesId": sid},
+                    payload={"name": "EpisodeSearch", "episodeIds": _batch},
                 )
             except Exception as e:
-                self.logger.log_warning(f"  ⚠️ SeriesSearch trigger failed for series {sid}: {e}")
-        if ids_to_search:
-            self.logger.log_info(f"  🔍 SeriesSearch triggered for {len(ids_to_search)} series")
+                self.logger.log_warning(
+                    f"  ⚠️ Blind EpisodeSearch fallback failed for {len(_batch)} episode(s): {e}")
+        if fallback_eids:
+            self.logger.log_info(
+                f"  🔍 Blind EpisodeSearch fallback for {len(fallback_eids)} episode(s) "
+                f"whose guid grab did not take (files already removed).")
 
         if plan_changed or changed:
             ef.save(instance, df)
@@ -320,7 +522,13 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             ["Outcome", "Count"],
             [
                 ["stepped down",     stats["downgraded"]],
-                ["reclaim GB",       stats["est_reclaim_gb"]],
+                ["projected GB",     stats["est_reclaim_gb"]],
+                ["files realized",   stats["realized"]],
+                ["realized GB",      round(stats["realized_reclaim_gb"], 2)],
+                ["no smaller release", stats["no_release"]],
+                ["grab fallback",    stats["grab_fallback"]],
+                ["deferred (cap)",   stats["deferred"]],
+                ["multi-episode file", stats["skipped_multi_ep"]],
                 ["candidates",       stats["candidates"]],
                 ["score over ceil",  stats["skipped_high_score"]],
                 ["keep-tagged",      stats["skipped_protected"]],
@@ -337,7 +545,13 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     "and why.",
             descriptions=[
                 "series whose profile was stepped down a tier",
-                "estimated space reclaimed by the step-downs",
+                "planner's projected reclaim once every oversized file is replaced",
+                "episode files ACTUALLY deleted + re-grabbed smaller this pass",
+                "REAL space freed now (sum of the deleted files) — the rest lands as files replace",
+                "files KEPT: no release below the current resolution — re-probes next run",
+                "grab did not take; file already removed, blind EpisodeSearch queued",
+                f"files over the inline cap ({self._realize_cap()}/pass) — next run picks them up",
+                "files backing several episodes — never single-grabbed (would orphan siblings)",
                 "series the planner picked as candidates",
                 "series skipped for watchability score over the ceiling",
                 "series skipped because keep-tagged",
