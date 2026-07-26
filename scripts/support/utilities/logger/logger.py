@@ -457,6 +457,33 @@ class LoggerManager:
             shutil.copyfileobj(sf, df)
         os.remove(source)
 
+    # Locals conventionally holding the resolved *arr instance name across the
+    # codebase, in lookup priority. Only simple token-shaped strings qualify —
+    # the shape filter keeps paths/URLs/titles that happen to share these names
+    # out of the prefix.
+    _INSTANCE_LOCALS = ("resolved_instance", "instance", "resolved", "inst", "instance_name")
+    _INSTANCE_TOKEN = re.compile(r"^[A-Za-z0-9_-]{1,24}$")
+
+    @classmethod
+    def _instance_suffix(cls, frame, max_hops: int = 3) -> str:
+        """Best-effort ':instance' suffix for the log prefix: walk the caller
+        frame (and a few parents, so thin _log/_banner helpers still resolve)
+        looking for a conventional instance-name local. Empty string when no
+        relevant instance is in scope — the prefix stays exactly as before."""
+        try:
+            f = frame
+            for _ in range(max_hops):
+                if f is None:
+                    break
+                for name in cls._INSTANCE_LOCALS:
+                    v = f.f_locals.get(name)
+                    if isinstance(v, str) and cls._INSTANCE_TOKEN.match(v):
+                        return f":{v}"
+                f = f.f_back
+        except Exception:
+            pass
+        return ""
+
     def _log_json(self, logger, level, message, extra=None):
         # Grab the name of the caller function two frames up
         caller = inspect.stack()[2]
@@ -465,6 +492,10 @@ class LoggerManager:
         class_name = class_context.__class__.__name__ if class_context else None
 
         full_method = f"{class_name}.{method_name}" if class_name else method_name
+        # Append the in-scope *arr instance when one is resolvable, e.g.
+        # [RadarrSpacePressureManager.run_downgrades:standard] — multi-instance
+        # passes (no single instance local) keep the bare prefix.
+        full_method += self._instance_suffix(caller.frame)
         prefixed_message = self._present(f"[{full_method}] {message}")
 
         log_entry = {
