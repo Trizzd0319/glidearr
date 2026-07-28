@@ -1,0 +1,477 @@
+diff --git a/scripts/managers/factories/base_instance_manager.py b/scripts/managers/factories/base_instance_manager.py
+index 949135e..0abeea3 100644
+--- a/scripts/managers/factories/base_instance_manager.py
++++ b/scripts/managers/factories/base_instance_manager.py
+@@ -64,8 +64,10 @@ def _write_lock_for(key) -> threading.Lock:
+ #
+ # INVARIANTS (do not break):
+ #   * Whitelist is EXACT-MATCH. Never add a volatile/action endpoint (command, queue,
+-#     system/status, rootfolder, diskspace, wanted/missing, health) or any
+-#     parameterized form (movie/{id}, movie/editor, series?page=..., movie?tmdbId=).
++#     system/status, wanted/missing, health) or any parameterized form
++#     (movie/{id}, movie/editor, series?page=..., movie?tmdbId=).
++#     EXCEPTION: rootfolder/diskspace live in _SPACE_GET_ENDPOINTS — same memo,
++#     60s TTL (background drift bounded) + normal write-invalidation.
+ #   * A write to "movie"/"series" MUST go through *this* _make_request to invalidate.
+ #     (Raw arrapi client._make_request bypasses it; today only sonarr/quality/selector
+ #     writes "qualityprofile" that way — never the cached collections.)
+@@ -76,6 +78,16 @@ _COLLECTION_CACHE_GEN: dict = {}        # (service, instance) -> int  (bumped on
+ _COLLECTION_CACHE_GUARD = threading.Lock()
+ _CACHEABLE_GET_ENDPOINTS = frozenset({"movie", "series"})
+ _COLLECTION_CACHE_TTL_S = 900.0         # safety backstop only; correctness = write-invalidation
++# Space endpoints get their own SHORT-TTL tier in the same memo. They were the
++# top uncached repeat offenders (free-space is polled by acquire, JIT, pilot
++# search, storage checks and space pressure — a dozen+ times per run, each pair
++# of GETs exposed to the SQLite-busy ladder, ~30s worst case). Unlike
++# movie/series they drift in the BACKGROUND (imports land server-side without
++# any write from us), so their staleness must be bounded tightly: 60s TTL, and
++# the shared write-invalidation still drops them the moment WE mutate anything
++# on the instance (deletes → gen bump → fresh reading).
++_SPACE_GET_ENDPOINTS = frozenset({"rootfolder", "diskspace"})
++_SPACE_CACHE_TTL_S = 60.0
+ 
+ 
+ def _clear_collection_cache() -> None:
+@@ -292,12 +304,13 @@ class BaseInstanceManager(BaseManager, ComponentManagerMixin):
+         _collection_cache_store so a write landing mid-fetch rejects the store.
+         """
+         key = (service, instance, endpoint)
++        ttl = _SPACE_CACHE_TTL_S if endpoint in _SPACE_GET_ENDPOINTS else _COLLECTION_CACHE_TTL_S
+         with _COLLECTION_CACHE_GUARD:
+             gen0  = _COLLECTION_CACHE_GEN.get((service, instance), 0)
+             entry = _COLLECTION_CACHE.get(key)
+             if entry is not None:
+                 ts, snap = entry
+-                if (time.monotonic() - ts) <= _COLLECTION_CACHE_TTL_S:
++                if (time.monotonic() - ts) <= ttl:
+                     return list(snap), gen0
+                 _COLLECTION_CACHE.pop(key, None)
+         return None, gen0
+@@ -384,7 +397,10 @@ class BaseInstanceManager(BaseManager, ComponentManagerMixin):
+         # (service, instance) invalidates both its snapshots. Every cache touch is
+         # best-effort — a memo failure must never break the request.
+         service          = self._service_name()
+-        is_cacheable_get = (method_upper == "GET" and endpoint in _CACHEABLE_GET_ENDPOINTS)
++        is_cacheable_get = (
++            method_upper == "GET"
++            and (endpoint in _CACHEABLE_GET_ENDPOINTS or endpoint in _SPACE_GET_ENDPOINTS)
++        )
+         cache_gen0       = 0
+         if is_cacheable_get:
+             try:
+diff --git a/scripts/managers/services/radarr/orchestration/__init__.py b/scripts/managers/services/radarr/orchestration/__init__.py
+index 80031c2..b4603ad 100644
+--- a/scripts/managers/services/radarr/orchestration/__init__.py
++++ b/scripts/managers/services/radarr/orchestration/__init__.py
+@@ -86,16 +86,35 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+ 
+     # ── Data pull methods ────────────────────────────────────────────────────────
+ 
++    def _pull_targets(self, instance=None) -> list:
++        """Instances a pull method should touch: the one passed, or all.
++
++        Every run_*_data_pull used to loop ALL instances regardless of the
++        per-instance orchestration loop calling it — 3 instances meant 9
++        executions of every pull (O(N²)) and nine full-library JSON rewrites
++        per run. Honoring the caller's instance keeps one pull per instance;
++        ``None`` preserves the old pull-everything behavior for direct callers.
++        """
++        if instance:
++            try:
++                return [self._resolve_instance(instance)]
++            except Exception:
++                return [instance]
++        return list(self._all_instances())
++
+     @LoggerManager().log_function_entry
+     @timeit("run_movie_data_pull")
+     def run_movie_data_pull(self, instance):
+         movies_mgr = self._get_movies_manager()
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if movies_mgr and hasattr(getattr(movies_mgr, "retrieval", None), "get_all_movies"):
+                 movie_list = movies_mgr.retrieval.get_all_movies(instance_name)
+             else:
+                 movie_list = self.radarr_api._make_request(instance_name, "movie", fallback=[]) if self.radarr_api else []
+-            self.global_cache.set(f"radarr.movies.{instance_name}.full", movie_list)
++            # pretty=False: this is the whole library (~25k movie dicts on
++            # 'standard') — indent=2 both bloats the file and dominates the
++            # serialize time for a cache only ever read back by machines.
++            self.global_cache.set(f"radarr.movies.{instance_name}.full", movie_list, pretty=False)
+             self.logger.log_info(f"Pulled {len(movie_list) if isinstance(movie_list, list) else 0} movies from {instance_name}")
+ 
+     @LoggerManager().log_function_entry
+@@ -106,7 +125,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+         movies_monitoring = (
+             getattr(monitoring_mgr, "movies", None) if monitoring_mgr else None
+         )
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if movies_monitoring and hasattr(movies_monitoring, "get_monitoring_summary"):
+                 monitored, unmonitored = movies_monitoring.get_monitoring_summary(instance_name)
+             else:
+@@ -134,7 +153,9 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+                     "unmonitoredCount": len(unmonitored),
+                 },
+             }
+-            self.global_cache.set(f"radarr.monitoring.{instance_name}", data)
++            # pretty=False: embeds the full movie dicts twice (monitored +
++            # unmonitored) — same whole-library serialization cost as .full.
++            self.global_cache.set(f"radarr.monitoring.{instance_name}", data, pretty=False)
+             self.logger.log_info(f"Monitoring summary cached for {instance_name}")
+ 
+     @LoggerManager().log_function_entry
+@@ -143,7 +164,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+         """Pull quality profiles via RadarrQualityManager.selector."""
+         quality_mgr = self._get_quality_manager()
+         selector    = getattr(quality_mgr, "selector", None) if quality_mgr else None
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if selector and hasattr(selector, "get_quality_profiles"):
+                 profiles = selector.get_quality_profiles(instance_name)
+             else:
+@@ -159,7 +180,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+     @timeit("run_tag_data_pull")
+     def run_tag_data_pull(self, instance):
+         """Pull tags via the Radarr API directly."""
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             tags = (
+                 self.radarr_api._make_request(instance_name, "tag", fallback=[])
+                 if self.radarr_api else []
+@@ -173,7 +194,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+         """Pull custom formats via RadarrQualityManager.custom_formats."""
+         quality_mgr  = self._get_quality_manager()
+         cf_mgr       = getattr(quality_mgr, "custom_formats", None) if quality_mgr else None
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if cf_mgr and hasattr(cf_mgr, "get_custom_formats"):
+                 formats = cf_mgr.get_custom_formats(instance_name)
+             else:
+@@ -190,7 +211,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+         """Pull disk/root-folder data via RadarrStorageManager.space."""
+         storage_mgr = self._get_storage_manager()
+         space_mgr   = getattr(storage_mgr, "space", None) if storage_mgr else None
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if space_mgr and hasattr(space_mgr, "get_root_folders"):
+                 disk_data = space_mgr.get_root_folders(instance_name)
+             else:
+@@ -207,7 +228,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+         """Pull quality-definition adjustments via RadarrQualityManager.adjustments."""
+         quality_mgr  = self._get_quality_manager()
+         adj_mgr      = getattr(quality_mgr, "adjustments", None) if quality_mgr else None
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if adj_mgr and hasattr(adj_mgr, "get_quality_adjustments"):
+                 adjustments = adj_mgr.get_quality_adjustments(instance_name)
+             else:
+@@ -223,7 +244,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+     def run_keywords_data_pull(self, instance):
+         movies_mgr = self._get_movies_manager()
+         keywords_mgr = getattr(movies_mgr, "keywords", None) if movies_mgr else None
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if keywords_mgr and hasattr(keywords_mgr, "get_keywords"):
+                 keywords = keywords_mgr.get_keywords(instance_name)
+                 self.global_cache.set(f"radarr.keywords.{instance_name}", keywords)
+@@ -236,7 +257,7 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+     def run_credits_data_pull(self, instance):
+         movies_mgr = self._get_movies_manager()
+         credits_mgr = getattr(movies_mgr, "credits", None) if movies_mgr else None
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if credits_mgr and hasattr(credits_mgr, "get_people_and_studios"):
+                 credits = credits_mgr.get_people_and_studios(instance_name)
+                 self.global_cache.set(f"radarr.credits.{instance_name}", credits)
+@@ -246,10 +267,10 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+ 
+     @LoggerManager().log_function_entry
+     @timeit("run_enrichment")
+-    def run_enrichment(self):
++    def run_enrichment(self, instance=None):
+         movies_mgr = self._get_movies_manager()
+         enrich_mgr = getattr(movies_mgr, "enrich", None) if movies_mgr else None
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if enrich_mgr and hasattr(enrich_mgr, "build_enriched_movies"):
+                 enriched = enrich_mgr.build_enriched_movies(instance_name)
+                 self.global_cache.set(f"radarr.movies.{instance_name}.enriched", enriched)
+@@ -259,10 +280,10 @@ class RadarrOrchestrationManager(BaseManager, ComponentManagerMixin):
+ 
+     @LoggerManager().log_function_entry
+     @timeit("run_dataframe_build")
+-    def run_dataframe_build(self):
++    def run_dataframe_build(self, instance=None):
+         movies_mgr  = self._get_movies_manager()
+         df_mgr      = getattr(movies_mgr, "dataframe", None) if movies_mgr else None
+-        for instance_name in self._all_instances():
++        for instance_name in self._pull_targets(instance):
+             if df_mgr and hasattr(df_mgr, "build_movie_dataframe"):
+                 df = df_mgr.build_movie_dataframe(instance_name)
+                 self.global_cache.set(f"radarr.movies.{instance_name}.dataframe", df)
+diff --git a/scripts/managers/services/sonarr/cache/episode_files.py b/scripts/managers/services/sonarr/cache/episode_files.py
+index 91a0549..d9fb92c 100644
+--- a/scripts/managers/services/sonarr/cache/episode_files.py
++++ b/scripts/managers/services/sonarr/cache/episode_files.py
+@@ -3599,7 +3599,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
+         if df.empty:
+             return stats
+ 
+-        for col in ("pilot_search_attempts", "pilot_last_searched_at", "pilot_last_profile_id"):
++        for col in ("pilot_search_attempts", "pilot_last_searched_at", "pilot_last_profile_id",
++                    "pilot_last_planned_at"):
+             if col not in df.columns:
+                 df[col] = None
+ 
+@@ -3789,6 +3790,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
+             if not pilot_search_due(df.at[idx, "pilot_last_searched_at"], now_utc, _eff_interval):
+                 stats["skipped_recent"] += 1
+                 continue
++            # Dry-run throttle: planned stamps are persisted by dry-runs (see
++            # _mark_planned below) so back-to-back dry-runs skip the full
++            # per-stub planning loop. LIVE searches deliberately ignore
++            # pilot_last_planned_at — a dry-run must never suppress a real one.
++            if self.dry_run and not pilot_search_due(
++                df.at[idx, "pilot_last_planned_at"], now_utc, _eff_interval
++            ):
++                stats["skipped_recent"] += 1
++                continue
+ 
+             # ── Series object: dry-run uses the O(1) snapshot; live fetches fresh
+             #    per stub so the profile PUT writes against current state ─────────
+@@ -4015,13 +4025,19 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
+             df.at[idx, "pilot_last_searched_at"] = now_utc.isoformat()
+             df.at[idx, "pilot_last_profile_id"]  = pid
+ 
++        def _mark_planned(idx: int) -> None:
++            # Dry-run bookkeeping ONLY: never touch pilot_search_attempts /
++            # pilot_last_searched_at / pilot_last_profile_id — those drive the
++            # live backoff + tier-descend state and must reflect real searches.
++            df.at[idx, "pilot_last_planned_at"] = now_utc.isoformat()
++
+         if self.dry_run:
+             stats["searched"] = len(queued) + len(series_queued)
+             for idx, _ep, pid, _t in queued:
+-                _mark_searched(idx, pid)
++                _mark_planned(idx)
+                 changed = True
+             for idx, _sid, pid, _t in series_queued:
+-                _mark_searched(idx, pid)
++                _mark_planned(idx)
+                 changed = True
+         else:
+             for i in range(0, len(queued), EPISODE_SEARCH_CHUNK):
+@@ -4056,7 +4072,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
+                     self.logger.log_warning(f"  ⚠️ SeriesSearch failed for '{title}': {e}")
+                     stats["failed"] += 1
+ 
+-        if changed and not self.dry_run:
++        if changed:
++            # Saved in dry-run too: the ONLY dry-run mutation in this method is
++            # pilot_last_planned_at (via _mark_planned), and persisting it is
++            # the point — it lets the next dry-run skip the ~9k-stub planning
++            # loop (profiler: 26s/run) instead of re-grading everything.
+             self.save(instance, df)
+ 
+         prefix = "[dry_run] " if self.dry_run else ""
+diff --git a/scripts/managers/services/sonarr/cache/series.py b/scripts/managers/services/sonarr/cache/series.py
+index 3ef3a2d..0c12c24 100644
+--- a/scripts/managers/services/sonarr/cache/series.py
++++ b/scripts/managers/services/sonarr/cache/series.py
+@@ -112,8 +112,10 @@ class SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin):
+ 
+     def _bucket_memo_set(self, instance: str, letter: str, data: list) -> None:
+         self._bucket_memo()[(instance, letter)] = data
++        self._index_invalidate(instance)  # bucket contents changed → index stale
+ 
+     def _bucket_memo_invalidate(self, instance: str, letter: str = None) -> None:
++        self._index_invalidate(instance)  # bucket contents changed → index stale
+         memo = self.__dict__.get("_bucket_memo_store")
+         if not memo:
+             return
+@@ -123,6 +125,48 @@ class SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin):
+         else:
+             memo.pop((instance, letter), None)
+ 
++    # ── In-memory lookup index ────────────────────────────────────────────────
++    # get_series_by_title / get_series_by_tvdb_id / get_cached_series_by_id were
++    # O(N) linear scans over every letter bucket per call (profiler: 23.4k
++    # get_series_by_id calls = 547s and 8.7k title lookups = 137s across 20
++    # runs).  The index below is built lazily in one pass over the memo'd
++    # buckets and invalidated by the same two write hooks that keep the bucket
++    # memo coherent, so every mutation path is covered automatically.
++    # NOTE: every write path (save_series_to_letter_file, rebuild, delta,
++    # remove_series, clear_letter_cache) goes through _bucket_memo_set or
++    # _bucket_memo_invalidate — do not add a write path that bypasses them.
++    # First occurrence wins on duplicate keys, matching the old first-match
++    # linear-scan order (letters a-z, 0-9, then '_').  Values are references to
++    # the same dicts held by the bucket memo — treat as read-only.
++
++    def _index_memo(self) -> dict:
++        return self.__dict__.setdefault("_index_memo_store", {})
++
++    def _index_invalidate(self, instance: str) -> None:
++        self.__dict__.get("_index_memo_store", {}).pop(instance, None)
++
++    def _series_index(self, instance: str) -> dict:
++        """Return (building if needed) {'id': …, 'title': …, 'tvdb': …} maps."""
++        idx = self._index_memo().get(instance)
++        if idx is not None:
++            return idx
++        by_id: dict[str, dict] = {}
++        by_title: dict[str, dict] = {}
++        by_tvdb: dict[str, dict] = {}
++        for s in self.iter_all_series(instance):
++            sid = s.get("id")
++            if sid is not None:
++                by_id.setdefault(str(sid), s)
++            title = s.get("title")
++            if title:
++                by_title.setdefault(str(title).lower(), s)
++            tvdb = s.get("tvdbId")
++            if tvdb is not None:
++                by_tvdb.setdefault(str(tvdb), s)
++        idx = {"id": by_id, "title": by_title, "tvdb": by_tvdb}
++        self._index_memo()[instance] = idx
++        return idx
++
+     def load_letter_cache(self, instance: str, letter: str) -> list:
+         memo = self._bucket_memo()
+         key  = (instance, letter)
+@@ -213,11 +257,7 @@ class SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin):
+     @LoggerManager().log_function_entry
+     @timeit("get_cached_series_by_id")
+     def get_cached_series_by_id(self, instance: str, series_id: str) -> dict | None:
+-        for letter in "abcdefghijklmnopqrstuvwxyz0123456789_":
+-            for s in self.load_letter_cache(instance, letter):
+-                if str(s.get("id")) == str(series_id):
+-                    return s
+-        return None
++        return self._series_index(instance)["id"].get(str(series_id))
+ 
+     @LoggerManager().log_function_entry
+     @timeit("deduplicate_series_data")
+@@ -325,23 +365,20 @@ class SonarrCacheSeriesManager(BaseManager, ComponentManagerMixin):
+     @LoggerManager().log_function_entry
+     @timeit("get_series_by_title")
+     def get_series_by_title(self, instance: str, title: str) -> dict | None:
+-        """Case-insensitive title lookup across all letter buckets."""
+-        title_lower = title.lower()
+-        for s in self.iter_all_series(instance):
+-            if s.get("title", "").lower() == title_lower:
+-                return s
+-        self.logger.log_debug(f"❌ Series with title '{title}' not found in '{instance}'")
+-        return None
++        """Case-insensitive title lookup via the in-memory index (O(1))."""
++        s = self._series_index(instance)["title"].get(str(title or "").lower())
++        if s is None:
++            self.logger.log_debug(f"❌ Series with title '{title}' not found in '{instance}'")
++        return s
+ 
+     @LoggerManager().log_function_entry
+     @timeit("get_series_by_tvdb_id")
+     def get_series_by_tvdb_id(self, instance: str, tvdb_id: int) -> dict | None:
+-        """Find a cached series by its TVDB ID."""
+-        for s in self.iter_all_series(instance):
+-            if str(s.get("tvdbId")) == str(tvdb_id):
+-                return s
+-        self.logger.log_debug(f"❌ Series with TVDB ID {tvdb_id} not found in '{instance}'")
+-        return None
++        """Find a cached series by its TVDB ID via the in-memory index (O(1))."""
++        s = self._series_index(instance)["tvdb"].get(str(tvdb_id))
++        if s is None:
++            self.logger.log_debug(f"❌ Series with TVDB ID {tvdb_id} not found in '{instance}'")
++        return s
+ 
+     @LoggerManager().log_function_entry
+     @timeit("get_title_by_series_id")
+diff --git a/scripts/managers/services/sonarr/series/retrieval/fetch.py b/scripts/managers/services/sonarr/series/retrieval/fetch.py
+index 0730b2a..fd6047d 100644
+--- a/scripts/managers/services/sonarr/series/retrieval/fetch.py
++++ b/scripts/managers/services/sonarr/series/retrieval/fetch.py
+@@ -70,11 +70,18 @@ class SonarrSeriesRetrievalFetchManager(BaseManager, ComponentManagerMixin):
+     @timeit("get_series_by_id")
+     def get_series_by_id(self, series_id, instance):
+         resolved_instance = self.instance_manager.resolve_instance(instance)
+-        for letter in list("abcdefghijklmnopqrstuvwxyz0123456789_"):
+-            series_list = self.series_cache.load_letter_cache(resolved_instance, letter)
+-            for s in series_list:
+-                if str(s.get("id")) == str(series_id):
+-                    return s
++        # Canonical indexed lookup (O(1)) — falls back to the letter-bucket scan
++        # only when the cache manager predates the index.
++        if self.series_cache and hasattr(self.series_cache, "get_cached_series_by_id"):
++            s = self.series_cache.get_cached_series_by_id(resolved_instance, str(series_id))
++            if s is not None:
++                return s
++        else:
++            for letter in list("abcdefghijklmnopqrstuvwxyz0123456789_"):
++                series_list = self.series_cache.load_letter_cache(resolved_instance, letter)
++                for s in series_list:
++                    if str(s.get("id")) == str(series_id):
++                        return s
+         self.logger.log_warning(f"⚠️ Series ID {series_id} not found in cache for {resolved_instance}")
+         return None
+ 
+@@ -93,12 +100,18 @@ class SonarrSeriesRetrievalFetchManager(BaseManager, ComponentManagerMixin):
+     @timeit("get_series_by_tvdb_id")
+     def get_series_by_tvdb_id(self, tvdb_id: int, instance: str):
+         resolved_instance = self.instance_manager.resolve_instance(instance)
+-        for letter in list("abcdefghijklmnopqrstuvwxyz0123456789_"):
+-            series_list = self.series_cache.load_letter_cache(resolved_instance, letter)
+-            for s in series_list:
+-                if str(s.get("tvdbId")) == str(tvdb_id):
+-                    return s
+-        self.logger.log_info(f"❌ Series with TVDB ID {tvdb_id} not found in {resolved_instance}")
++        # Canonical indexed lookup (O(1)) — fallback scan for older cache managers.
++        if self.series_cache and hasattr(self.series_cache, "get_series_by_tvdb_id"):
++            s = self.series_cache.get_series_by_tvdb_id(resolved_instance, tvdb_id)
++            if s is not None:
++                return s
++        else:
++            for letter in list("abcdefghijklmnopqrstuvwxyz0123456789_"):
++                series_list = self.series_cache.load_letter_cache(resolved_instance, letter)
++                for s in series_list:
++                    if str(s.get("tvdbId")) == str(tvdb_id):
++                        return s
++            self.logger.log_info(f"❌ Series with TVDB ID {tvdb_id} not found in {resolved_instance}")
+         return None
+ 
+     @LoggerManager().log_function_entry
+@@ -193,15 +206,23 @@ class SonarrSeriesRetrievalFetchManager(BaseManager, ComponentManagerMixin):
+ 
+         resolved = self.instance_manager.resolve_instance(instance)
+         ts_handler = getattr(self.global_cache, "timestamp_handler", None)
+-        cache_mgr = getattr(self.manager, "series_cache", None)
++        # One cache manager for BOTH the freshness gate and persistence.  These
++        # used to be two different attribute chains (manager.series_cache vs
++        # sonarr_cache.series): when only the latter resolved, the fetch was
++        # never persisted and the freshness timestamp never written, so the
++        # 30–60s full fetch re-ran every run despite a healthy on-disk cache.
++        cache_mgr = (
++            self.series_cache
++            or getattr(self.manager, "series_cache", None)
++            or getattr(self.sonarr_cache, "series", None)
++        )
+ 
+         # ── Freshness gate: skip API call entirely when cache is recent ─────────
+         if not force and ts_handler:
+             try:
+                 is_fresh = ts_handler.is_fresh("sonarr", resolved, "series_library", SERIES_CACHE_MAX_AGE)
+                 if is_fresh:
+-                    series_cache = getattr(self.sonarr_cache, "series", None)
+-                    cached_count = series_cache.get_series_count(resolved) if series_cache else 0
++                    cached_count = cache_mgr.get_series_count(resolved) if cache_mgr else 0
+                     if cached_count > 0:
+                         age = ts_handler.get_age_seconds("sonarr", resolved, "series_library") or 0
+                         age_h = age // 3600
+@@ -211,7 +232,7 @@ class SonarrSeriesRetrievalFetchManager(BaseManager, ComponentManagerMixin):
+                             f"({cached_count} series, age {age_h}h {age_m}m). "
+                             f"Loading from disk — skipping live API call."
+                         )
+-                        return list(series_cache.iter_all_series(resolved)), True
++                        return list(cache_mgr.iter_all_series(resolved)), True
+             except Exception as e:
+                 self.logger.log_warning(
+                     f"⚠️ Freshness check failed for '{resolved}', proceeding with API sync: {e}"

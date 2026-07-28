@@ -1,0 +1,90 @@
+<svg width="1024" height="1024" viewBox="0 0 680 680" role="img" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<title>Glidearr anime mascot bot icon</title>
+<desc>A chibi anime assistant with large glossy teal-violet eyes, teal hair, headphones with play-button earcups, a star hair clip and sparkles, on a round indigo badge with a play emblem on the chest.</desc>
+<defs>
+<radialGradient id="bgGrad" cx="50%" cy="40%" r="68%"><stop offset="0" stop-color="#39326f"/><stop offset="1" stop-color="#15122c"/></radialGradient>
+<linearGradient id="hair" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#7df0e3"/><stop offset="0.55" stop-color="#34ccbf"/><stop offset="1" stop-color="#1eae9f"/></linearGradient>
+<linearGradient id="hairLock" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#2bbcb0"/><stop offset="1" stop-color="#168b81"/></linearGradient>
+<linearGradient id="iris" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#69e6ff"/><stop offset="0.5" stop-color="#4aa6ff"/><stop offset="1" stop-color="#8a5cf0"/></linearGradient>
+<clipPath id="badge"><circle cx="340" cy="340" r="332"/></clipPath>
+<clipPath id="eyeL"><ellipse cx="286" cy="360" rx="40" ry="50"/></clipPath>
+<clipPath id="eyeR"><ellipse cx="394" cy="360" rx="40" ry="50"/></clipPath>
+<g id="spk"><path d="M0,-11 Q2,-2 11,0 Q2,2 0,11 Q-2,2 -11,0 Q-2,-2 0,-11 Z"/></g>
+<g id="star5"><path d="M0,-20 L4.7,-6.47 L19.02,-6.18 L7.61,2.47 L11.76,16.18 L0,8 L-11.76,16.18 L-7.61,2.47 L-19.02,-6.18 L-4.7,-6.47 Z"/></g>
+</defs>
+
+<circle cx="340" cy="340" r="332" fill="url(#bgGrad)"/>
+
+<g clip-path="url(#badge)">
+<use xlink:href="#spk" transform="translate(150,182) scale(1.4)" fill="#9af6ec" opacity="0.8"/>
+<use xlink:href="#spk" transform="translate(545,205) scale(1.1)" fill="#bdf5ee" opacity="0.7"/>
+<use xlink:href="#spk" transform="translate(122,478) scale(1.0)" fill="#9af6ec" opacity="0.6"/>
+<use xlink:href="#spk" transform="translate(560,455) scale(1.3)" fill="#bdf5ee" opacity="0.7"/>
+
+<path d="M214,300 C150,360 150,475 198,524 C208,470 238,416 252,356 Z" fill="url(#hairLock)"/>
+<path d="M466,300 C530,360 530,475 482,524 C472,470 442,416 428,356 Z" fill="url(#hairLock)"/>
+
+<path d="M308,486 L308,540 Q340,556 372,540 L372,486 Z" fill="#f0c0a0"/>
+<path d="M250,548 C262,520 418,520 430,548 C476,566 486,648 486,690 L194,690 C194,648 204,566 250,548 Z" fill="#2a2350"/>
+<path d="M250,548 C262,520 418,520 430,548" fill="none" stroke="#46e0d0" stroke-width="5" opacity="0.85"/>
+<circle cx="340" cy="628" r="30" fill="#15122c" stroke="#46e0d0" stroke-width="3"/>
+<path d="M331,612 L331,644 L359,628 Z" fill="#46e0d0"/>
+
+<ellipse cx="340" cy="352" rx="156" ry="166" fill="#ffe2c9"/>
+
+<path d="M252,300 C212,332 202,420 218,474 C238,420 272,360 286,320 Z" fill="url(#hair)"/>
+<path d="M428,300 C468,332 478,420 462,474 C442,420 408,360 394,320 Z" fill="url(#hair)"/>
+
+<path d="M184,300 C176,196 252,150 340,150 C428,150 504,196 496,300 C440,256 240,256 184,300 Z" fill="url(#hair)"/>
+<path d="M300,250 C306,294 324,312 340,312 C356,312 374,294 380,250 C352,262 328,262 300,250 Z" fill="url(#hair)"/>
+<path d="M226,256 C232,292 250,308 264,306 C268,298 270,278 276,258 C258,266 242,264 226,256 Z" fill="url(#hair)"/>
+<path d="M454,256 C448,292 430,308 416,306 C412,298 410,278 404,258 C422,266 438,264 454,256 Z" fill="url(#hair)"/>
+<path d="M250,188 C300,170 384,170 432,190" fill="none" stroke="#c4f6ef" stroke-width="9" stroke-linecap="round" opacity="0.55"/>
+
+<ellipse cx="286" cy="360" rx="40" ry="50" fill="#ffffff"/>
+<g clip-path="url(#eyeL)">
+<circle cx="286" cy="376" r="38" fill="url(#iris)"/>
+<circle cx="286" cy="376" r="38" fill="none" stroke="#5a33c4" stroke-width="4"/>
+<circle cx="286" cy="380" r="17" fill="#1a1330"/>
+<circle cx="271" cy="356" r="12" fill="#ffffff"/>
+<circle cx="298" cy="394" r="6" fill="#ffffff" opacity="0.85"/>
+</g>
+<path d="M247,350 C254,320 318,320 325,350" fill="none" stroke="#241a4e" stroke-width="10" stroke-linecap="round"/>
+<path d="M247,350 L232,335 L251,348 Z" fill="#241a4e"/>
+
+<ellipse cx="394" cy="360" rx="40" ry="50" fill="#ffffff"/>
+<g clip-path="url(#eyeR)">
+<circle cx="394" cy="376" r="38" fill="url(#iris)"/>
+<circle cx="394" cy="376" r="38" fill="none" stroke="#5a33c4" stroke-width="4"/>
+<circle cx="394" cy="380" r="17" fill="#1a1330"/>
+<circle cx="379" cy="356" r="12" fill="#ffffff"/>
+<circle cx="406" cy="394" r="6" fill="#ffffff" opacity="0.85"/>
+</g>
+<path d="M355,350 C362,320 426,320 433,350" fill="none" stroke="#241a4e" stroke-width="10" stroke-linecap="round"/>
+<path d="M433,350 L448,335 L429,348 Z" fill="#241a4e"/>
+
+<ellipse cx="240" cy="420" rx="30" ry="15" fill="#ff96ac" opacity="0.65"/>
+<ellipse cx="440" cy="420" rx="30" ry="15" fill="#ff96ac" opacity="0.65"/>
+
+<path d="M336,398 Q340,404 344,398" fill="none" stroke="#e0a07f" stroke-width="2.5" stroke-linecap="round"/>
+<path d="M322,432 Q332,446 340,435 Q348,446 358,432" fill="none" stroke="#c2566f" stroke-width="5" stroke-linecap="round"/>
+
+<path d="M180,332 C180,150 500,150 500,332" fill="none" stroke="#2a2350" stroke-width="20" stroke-linecap="round"/>
+<path d="M180,332 C180,166 500,166 500,332" fill="none" stroke="#46e0d0" stroke-width="5" stroke-linecap="round" opacity="0.85"/>
+<rect x="150" y="322" width="72" height="96" rx="26" fill="#2a2350"/>
+<circle cx="186" cy="370" r="30" fill="#15122c" stroke="#46e0d0" stroke-width="3"/>
+<path d="M177,354 L177,386 L205,370 Z" fill="#46e0d0"/>
+<rect x="458" y="322" width="72" height="96" rx="26" fill="#2a2350"/>
+<circle cx="494" cy="370" r="30" fill="#15122c" stroke="#46e0d0" stroke-width="3"/>
+<path d="M485,354 L485,386 L513,370 Z" fill="#46e0d0"/>
+
+<use xlink:href="#star5" transform="translate(250,298) scale(1.0)" fill="#ffd24a" stroke="#e0a72f" stroke-width="2"/>
+<use xlink:href="#spk" transform="translate(260,290) scale(0.45)" fill="#ffffff"/>
+
+<use xlink:href="#spk" transform="translate(470,250) scale(0.8)" fill="#ffffff" opacity="0.9"/>
+<use xlink:href="#spk" transform="translate(214,236) scale(0.7)" fill="#ffffff" opacity="0.85"/>
+</g>
+
+<circle cx="340" cy="340" r="328" fill="none" stroke="#0e0b24" stroke-width="8"/>
+<circle cx="340" cy="340" r="312" fill="none" stroke="#46e0d0" stroke-width="3" opacity="0.4"/>
+</svg>

@@ -68,3 +68,5 @@ scripts/support/profiles/trash/
 
 # Pre-apply profile snapshots (auto-backup written before a rebuild applies) — generated.
 scripts/support/profiles/**/_pre_apply_snapshot/
+
+scripts/support/tools/_acquire_preview_snapshots/
