@@ -9,6 +9,7 @@ from scripts.managers.machine_learning.likelihood.watch_likelihood import (
     resolution_cap_for_likelihood,
     watch_likelihood,
 )
+from scripts.managers.machine_learning.thresholds.registry import get_threshold
 from scripts.managers.machine_learning.space.upgrade_planner import (
     active_series_candidates,
     aggregate_series_signals,
@@ -296,6 +297,14 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
                 "watch_count":        info.get("watch_count", 0),
                 "watchability_score": info.get("watchability_score", 0),
                 "universe_credit":    info.get("universe_credit", 0),
+                # REQUIRED since watch_count counts WATCHES, not plays: a series whose
+                # only plays were sub-threshold samples now has watch_count 0, and
+                # without the "it was played" bit it would read UNTOUCHED
+                # (untouched_base + score) instead of ABANDONED (ceiling 25) — i.e. a
+                # sampled series could earn a HIGHER resolution cap than a watched one.
+                # Every candidate reaching here has a latest_watch by construction
+                # (active_series_candidates gates on it), so this is always populated.
+                "last_watched_at":    info.get("latest_watch"),
             }, config=self.config)
             cap_res = resolution_cap_for_likelihood(likelihood, config=self.config)
             best    = capped_target(raw_profiles, is_anime=is_anime_series, max_res=cap_res)
@@ -457,8 +466,19 @@ class SonarrSeriesQualityManager(BaseManager, ComponentManagerMixin):
                 return int((self.config or {}).get(key, default))
             except (TypeError, ValueError):
                 return default
-        promote_threshold = _int_cfg("series_monitor_score_threshold", 35)
-        demote_floor      = _int_cfg("series_demote_score_threshold", 20)
+        # Both band edges read through the calibrated-threshold registry; in the
+        # default mode="shadow" each returns the literal below unchanged.
+        promote_threshold = get_threshold("series_monitor", self.config,
+                                          _int_cfg("series_monitor_score_threshold", 35),
+                                          logger=getattr(self, "logger", None))
+        # NOTE the asymmetry, and do not "fix" it: the DEMOTE floor was re-anchored
+        # 20 -> 17 when Group D v2 translated the score axis, but the MONITOR threshold
+        # above stays at 35. They act on different populations — the monitor gate is
+        # crossed only by file-owning series (zero stubs reach 35 either way), while the
+        # demote floor sweeps the whole series list. See registry.py's delete block.
+        demote_floor      = get_threshold("series_demote", self.config,
+                                          _int_cfg("series_demote_score_threshold", 17),
+                                          logger=getattr(self, "logger", None))
         dwell_days        = max(0, _int_cfg("series_demote_dwell_days", 2))
 
         # ── Per-series score + watched flag from the parquet (refresh_scores ran just before us) ──

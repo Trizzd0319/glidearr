@@ -103,7 +103,9 @@ def test_percentile_mode():
     # DEFAULT (absolute) ignores the percentile column and uses the score.
     _check("default absolute -> uses score not pct", profile_id_for_likelihood(watch_likelihood({"watchability_percentile": 100, "watchability_score": 0})) == 3)
     # Percentile mode with no column -> falls back to absolute (score-based).
-    _check("percentile mode, no column -> absolute fallback", watch_likelihood({"watchability_score": 5}, config=PCT) == 17.0)
+    # untouched_base + score*gain = 25 + 5 (base RE-ANCHORED 12 -> 25 with Group D v2 —
+    # see the "AXIS ANCHOR" block in machine_learning/likelihood/watch_likelihood.py).
+    _check("percentile mode, no column -> absolute fallback", watch_likelihood({"watchability_score": 5}, config=PCT) == 30.0)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,7 @@ from scripts.managers.machine_learning.acquisition.next_episode_planner import (
     series_budget_multiplier,
 )
 from scripts.managers.machine_learning.likelihood.watch_likelihood import series_universe_credits
+from scripts.managers.machine_learning.thresholds.registry import get_threshold
 from scripts.managers.services.plex.playlists.universe_order import tv_group_maps_from_series
 from scripts.managers.machine_learning.acquisition.pilot_stepping import (
     choose_lowest_available_tier,
@@ -80,6 +81,22 @@ from scripts.managers.machine_learning.lifecycle.grace_policy import (
 from scripts.managers.machine_learning.lifecycle.household_watch import (
     resolve_household_watch,
 )
+from scripts.managers.machine_learning.lifecycle.viewer_retention import (
+    account_facts,
+    episode_ordinal,
+    merge_state,
+    resolve_retention_config,
+    series_protected_from_states,
+    watched_by_tautulli,
+)
+from scripts.managers.machine_learning.lifecycle.restore_policy import (
+    RELEASE_FIELDS,
+    episode_key,
+    ledger_releases,
+    match_release,
+    merge_ledger_entry,
+    release_record,
+)
 from scripts.managers.machine_learning.lifecycle.stale_prune_policy import (
     restore_cooldown_active,
 )
@@ -96,9 +113,13 @@ from scripts.support.utilities.watch_likelihood import (
     resolution_cap_for_likelihood,
     watch_likelihood,
 )
+from scripts.managers.machine_learning.space.downgrade_planner import (
+    DEFAULT_FLOOR_RESOLUTION as DOWNGRADE_FLOOR_RESOLUTION,
+)
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
 from scripts.support.utilities.space_targets import (
-    coordinator_owns_deletion, deletions_disabled_reason, deletions_enabled, space_targets,
+    coordinator_owns_deletion, deletions_disabled_reason, deletions_enabled,
+    exhaustive_downgrade, space_targets,
 )
 
 
@@ -106,9 +127,41 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     PILOT_BATCH_SIZE  = None   # max *unwatched* series per enrichment run (None = unlimited)
     CACHE_MAX_AGE     = 172_800  # 48 hours
+    # ── stale-stub herd control ───────────────────────────────────────────────
+    # Stubs created together (cold start) expire together, and re-checking one
+    # refreshes its timestamp — so the whole cohort re-expires together forever:
+    # a ~7.7k-series, ~77s serial API spike every 48h. Two dampers:
+    #   * JITTER spreads each series' effective TTL deterministically over
+    #     [TTL, TTL*(1+PCT)] by series id, so the cohort fans out instead of
+    #     firing as one block. Deterministic (not random) so a series' due-time
+    #     is stable across runs rather than re-rolled every pass.
+    #   * CAP bounds how many stale stubs are re-checked per run, OLDEST FIRST.
+    #     Deferred stubs keep their old timestamp, so they stay due and are
+    #     picked up next run — FIFO, nothing starves.
+    PILOT_STALE_TTL_JITTER_PCT = 0.25   # 48h → up to 60h, spread by series id
+    PILOT_STALE_RECHECK_CAP    = 2000   # per run; config: pilot_stale_recheck_cap (0 = unlimited)
     GRACE_HOURS       = 3        # keep a watched file available this long before deletion
     RECENT_AIR_DAYS   = 30       # never delete an episode that aired within this many days
     PREFETCH_HOURS    = 3.0      # target runtime budget of upcoming episodes to pre-acquire per series
+    # ── per-viewer retention (lifecycle.viewer_retention) ─────────────────────
+    # Its knobs are REAL CONFIG KEYS ("episode_retention"), unlike the three class
+    # constants above, for two reasons. (1) They are household preferences, not
+    # physics: GRACE_HOURS/RECENT_AIR_DAYS/PREFETCH_HOURS are "how long is a
+    # sensible buffer" defaults nobody has ever needed to tune, while the backward
+    # buffer and the horizon encode how a specific household watches TV — Robert
+    # named 2 and 14 as *his* numbers and asked for them to be tunable. (2) They
+    # gate DELETION, so they must be auditable from config.json and settable
+    # headlessly (.env / unraid template) without editing source. The two parquet
+    # columns below carry the per-run verdict so the three duplicated guard layers
+    # (grace marking, whole-file protected set, delete-time defence-in-depth) all
+    # read the SAME decision instead of each re-deriving it from history.
+    _RETENTION_COLS = ("retention_hold", "retention_hold_by")
+
+    # Durable per-(account, series) resume state. The Tautulli history it is derived
+    # from is VOLATILE (tautulli/history/all is overwritten hourly and Tautulli
+    # prunes its own DB), so the positions are merged forward here — see
+    # _apply_viewer_retention.
+    _VIEWER_POSITIONS_KEY = "sonarr/{inst}/viewer_positions"
     PILOT_MIN_WATCHABILITY = 20.0  # interactive-search a stub pilot only when its (affinity-driven)
                                    # watchability_score is >= this OR not yet graded — so the daemon
                                    # samples the shows the household is plausibly interested in, not
@@ -651,6 +704,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             self._apply_universe_credit(instance, df)
         except Exception as e:
             self.logger.log_debug(f"[Universe] credit pass skipped for '{instance}': {e}")
+        # Group-A5 DELETE SHIELD, broadcast per-series onto every episode row exactly like
+        # the score above — so ``guards.build_protected_file_ids`` (which is pure pandas
+        # over this frame) and the delete-time defence-in-depth both read the same verdict.
+        # Non-destructive; all-False when the term is disabled or nothing is watchlisted.
+        _tvdb_by_series = self._tvdb_by_series(instance)
+        try:
+            self._apply_watchlist_shield(df, _sid_num, _tvdb_by_series)
+        except Exception as e:
+            self.logger.log_debug(f"[Intent] watchlist shield skipped for '{instance}': {e}")
         self.save(instance, df)
         vals = list(score_by_series.values())
         self.logger.log_info(
@@ -664,17 +726,6 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             from scripts.managers.machine_learning.labels.snapshots import (
                 maybe_snapshot_shows,
             )
-            _tvdb_by_series: dict = {}
-            try:
-                _series_cache = getattr(self.sonarr_cache, "series", None)
-                if _series_cache:
-                    _tvdb_by_series = {
-                        int(s["id"]): s.get("tvdbId")
-                        for s in _series_cache.iter_all_series(instance)
-                        if s.get("id") is not None
-                    }
-            except Exception:
-                _tvdb_by_series = {}
             maybe_snapshot_shows(self.config, self.global_cache, self.logger,
                                  instance, df, tvdb_by_series=_tvdb_by_series)
         except Exception as e:
@@ -693,6 +744,75 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_debug(f"[Pilot720] report failed for '{instance}': {e}")
         return len(score_by_series)
+
+    def _tvdb_by_series(self, instance: str) -> dict:
+        """``{series_id: tvdb_id}`` from the cached Sonarr series list.
+
+        Hoisted out of the ML-snapshot hook so the Group-A5 watchlist shield (which keys on
+        TVDb id, the id every intent feed carries) and the snapshot share ONE map built once
+        per refresh. Empty dict on any failure — both callers degrade to "no tvdb known"."""
+        try:
+            _series_cache = getattr(self.sonarr_cache, "series", None)
+            if not _series_cache:
+                return {}
+            return {int(s["id"]): s.get("tvdbId")
+                    for s in _series_cache.iter_all_series(instance)
+                    if s.get("id") is not None}
+        except Exception:
+            return {}
+
+    def _apply_watchlist_shield(self, df, sid_num, tvdb_by_series) -> int:
+        """Broadcast ``watchlist_hold`` / ``watchlist_hold_by`` per SERIES onto every episode row.
+
+        The TV twin of ``radarr/quality/space_pressure._apply_watchlist_shield`` — see that
+        docstring for why the shield exists and why it expires on the watchlister's own
+        dormancy rather than on the age of the listing. Broadcast per-series (like the score
+        and the universe credit) because the intent feeds speak SERIES, while every delete
+        guard on this side speaks EPISODE FILE: ``guards.build_protected_file_ids`` collapses
+        the column to file ids so a multi-episode file backing a held series survives whole.
+
+        Returns the number of held series. All-False when the shield is disabled, nothing is
+        watchlisted, or no watchlister resolves to an active account."""
+        from scripts.managers.machine_learning.scoring._shared import intent_hold_active
+        from scripts.managers.services._intent_index import gather_intent_index
+
+        df["watchlist_hold"] = False
+        df["watchlist_hold_by"] = None
+        wl = ((self.config or {}).get("scoring", {}) or {}).get("watchlist_intent", {}) or {}
+        shield = (wl.get("shield") or {}) if isinstance(wl, dict) else {}
+        if not (bool(wl.get("enabled", True)) and bool(shield.get("enabled", True))):
+            return 0
+        try:
+            dormancy = float(shield.get("dormancy_window_days", 90))
+        except (TypeError, ValueError):
+            dormancy = 90.0
+        index = (gather_intent_index(self.global_cache, self.config,
+                                     logger=getattr(self, "logger", None)) or {}).get("shows") or {}
+        if not index or not tvdb_by_series:
+            return 0
+        now = datetime.now(tz=timezone.utc)
+        held_by: dict = {}
+        for sid, tvdb in tvdb_by_series.items():
+            if tvdb is None:
+                continue
+            try:
+                entry = index.get(int(tvdb))
+            except (TypeError, ValueError):
+                continue
+            if not entry or not intent_hold_active(entry, now, dormancy_days=dormancy):
+                continue
+            held_by[int(sid)] = ", ".join(entry.get("members") or ()) or "watchlist"
+        if not held_by:
+            return 0
+        _mask = sid_num.map(lambda s: (int(s) in held_by) if pd.notna(s) else False).astype(bool)
+        df.loc[_mask, "watchlist_hold"] = True
+        df["watchlist_hold_by"] = sid_num.map(
+            lambda s: held_by.get(int(s)) if pd.notna(s) else None).astype(object)
+        self.logger.log_info(
+            f"[Intent] watchlist shield: {len(held_by)} series held from deletion "
+            f"({int(_mask.sum())} episode row(s); released after {dormancy:.0f}d of "
+            f"watchlister dormancy).")
+        return len(held_by)
 
     def _apply_universe_credit(self, instance: str, df) -> None:
         """Broadcast a per-series ``universe_credit`` column onto every episode row: borrowed
@@ -1423,6 +1543,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         from scripts.managers.machine_learning.features.show_features import (
             build_show_feature_row, score_show_features,
         )
+        # Group-D device matrix: the shipped cold-start prior plus whatever the operator
+        # added under scoring.device_capabilities. Resolved ONCE for the whole pass.
+        from scripts.managers.machine_learning.scoring._shared import (
+            resolve_device_capabilities,
+        )
+        device_capabilities = resolve_device_capabilities(self.config)
 
         (genre_affinity, platform_usage, transcode_stats,
          per_user_affinity, kids_users, adult_users) = self._build_show_scoring_context()
@@ -1480,6 +1606,29 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         _aff_raw = self.global_cache.get("people_matrix/affinity") if self.global_cache else None
         person_weights, person_affinity_cap = resolve_person_affinity_inputs(self.config, _aff_raw)
 
+        # GROUP A5 — explicit watchlist intent (config.scoring.watchlist_intent), the TV
+        # twin of the movie path and the same shared gather, so movies and shows can never
+        # disagree about what the household asked for. Shows are where the DATED half bites:
+        # Plex's union is undated, but Trakt's show watchlist carries a real ``listed_at``.
+        # cap forced to 0.0 (byte-identical) when disabled or nothing is watchlisted.
+        from scripts.managers.machine_learning.scoring._shared import resolve_intent_inputs
+        from scripts.managers.services._intent_index import (
+            gather_intent_index, intent_memo_fingerprint,
+        )
+        _intent_all = gather_intent_index(self.global_cache, self.config,
+                                          logger=getattr(self, "logger", None))
+        (intent_index, intent_cap,
+         intent_half_life, intent_floor) = resolve_intent_inputs(self.config,
+                                                                 _intent_all.get("shows"))
+        intent_now = datetime.now(tz=timezone.utc)
+
+        # GROUP D v2 (config.scoring.device_fit_v2, DEFAULT ON) — the household transcode
+        # profile, built ONCE for the pass and shared by every series. None → the legacy
+        # D1/D2/D3 bonus terms, byte-identical. The TV twin of the Radarr path; both read
+        # the same two Tautulli buckets, so movies and shows can never disagree about
+        # what this household transcodes for.
+        transcode_profile = self._build_transcode_profile(platform_usage)
+
         watched_tvdb_ids: set[int] = set()
         if related_enabled and "is_watched" in df.columns:
             for _wsid, _wrows in df.groupby("series_id", sort=False):
@@ -1512,11 +1661,40 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             except Exception:
                 return ""
 
+        # SCORER_REVISION: see the twin comment in radarr/quality/space_pressure. The
+        # memo is keyed on inputs, which do not change when the scoring CODE does; the
+        # revision token turns a scoring change into exactly one full rescore instead
+        # of an indefinitely stale memo.
+        from scripts.managers.machine_learning.scoring._shared import SCORER_REVISION
         _ctx_hash = _h([genre_affinity, platform_usage, transcode_stats,
                         per_user_affinity, sorted(kids_users or []), sorted(adult_users or []),
                         sorted(watched_tvdb_ids), related_graph_cap, person_weights,
                         person_affinity_cap, language_consumability, ur_kwargs,
-                        sorted((k, v) for k, v in (user_show_ratings or {}).items())])
+                        sorted((k, v) for k, v in (user_show_ratings or {}).items()),
+                        # The operator's Group-D device overrides. The SHIPPED matrix
+                        # moves only with SCORER_REVISION, but an edit to
+                        # scoring.device_capabilities changes D1/D2/D3 without changing
+                        # any other input — so it has to be part of the key or the memo
+                        # keeps serving scores from the old device table.
+                        ((self.config or {}).get("scoring", {}) or {}).get("device_capabilities"),
+                        # Group-D v2: a per-PASS household input that lives outside the
+                        # per-series data, so it belongs in the CONTEXT hash — otherwise
+                        # a shift in the observed cause mix keeps serving old scores.
+                        (transcode_profile.memo_key() if transcode_profile is not None else None),
+                        # Group-A5: the watchlist index is a per-PASS household input that
+                        # ``_SCORE_COLS`` below cannot see — it lists episode-row columns,
+                        # and the watchlist lives outside the parquet entirely. Without this
+                        # line, adding a series to your watchlist would never invalidate its
+                        # memoized score and A5 would silently do nothing. Only the
+                        # score-relevant fields are digested (intent_memo_fingerprint), so a
+                        # cosmetic union change does not force a needless full rescore.
+                        # The DECAY knobs ride with the cap for the same reason: they are
+                        # config, not row data, and they move every DATED title's A5
+                        # without moving one column ``_SCORE_COLS`` can see. TV is where
+                        # this bites hardest — Trakt's show watchlist is the dated feed.
+                        intent_cap, intent_half_life, intent_floor,
+                        intent_memo_fingerprint(_intent_all),
+                        SCORER_REVISION])
         _MEMO_KEY = f"sonarr/{instance}/show_score_memo"
         _memo_prev: dict = {}
         if self.global_cache and _ctx_hash:
@@ -1536,9 +1714,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # score inputs were identical (one run: 8675 needless rescores at ~18ms
         # each). Drift in show_features' column set is caught by the sampled
         # parity audit below.
-        _SCORE_COLS = ("air_date_utc", "audio_languages", "is_watched", "keep_policy",
-                       "last_watched_at", "resolution", "subtitles", "video_codec",
-                       "watch_count")
+        # Group-D v2 added six more columns to build_show_feature_row's reads
+        # (audio_codec/audio_channels/video_bitrate/size_bytes/runtime_seconds/
+        # relative_path). They MUST be here: the memo would otherwise miss a codec or
+        # bitrate change and keep serving a stale transcode-risk penalty. Drift in
+        # show_features' column set is still caught by the sampled parity audit below.
+        _SCORE_COLS = ("air_date_utc", "audio_channels", "audio_codec", "audio_languages",
+                       "is_watched", "keep_policy", "last_watched_at", "relative_path",
+                       "resolution", "runtime_seconds", "size_bytes", "subtitles",
+                       "video_bitrate", "video_codec", "watch_count")
         _score_cols = [c for c in _SCORE_COLS if c in df.columns]
         # Batch both halves of the key up front — at 12k series the per-series
         # versions were the whole cost of a 99%-hit pass (46s of stat() syscalls
@@ -1688,6 +1872,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     genre_affinity=genre_affinity,
                     platform_usage=platform_usage,
                     transcode_stats=transcode_stats,
+                    device_capabilities=device_capabilities,
+                    transcode_profile=transcode_profile,
                     per_user_affinity=per_user_affinity,
                     kids_users=kids_users,
                     adult_users=adult_users,
@@ -1695,6 +1881,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     related_graph_cap=related_graph_cap,
                     person_weights=person_weights,
                     person_affinity_cap=person_affinity_cap,
+                    intent_index=intent_index,
+                    intent_cap=intent_cap,
+                    intent_now=intent_now,
+                    intent_half_life_days=intent_half_life,
+                    intent_stale_floor=intent_floor,
                     language_consumability=language_consumability,
                     return_breakdown=with_breakdown,
                     **ur_kwargs,
@@ -1732,7 +1923,82 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"[ShowScore] memo: {_memo_hits}/{len(out)} series unchanged — reused "
                 f"prior scores (rescored {len(out) - _memo_hits}; parity-audited "
                 f"{_audited}, {_audit_mismatches} mismatch(es)).")
+        if with_breakdown:
+            self._report_group_d(
+                [v[1] for v in out.values() if isinstance(v, tuple) and len(v) == 2],
+                instance, transcode_profile)
         return out
+
+    def _build_transcode_profile(self, platform_usage: dict | None):
+        """The household Group-D-v2 transcode profile, or None (→ the legacy D1/D2/D3
+        terms). The exact twin of the Radarr helper — same buckets, same settings, so
+        the movie and show paths cannot disagree about what this household transcodes
+        for. Any failure, or a household with no evidence at all, returns None."""
+        try:
+            from scripts.managers.machine_learning.scoring.device_fit import (
+                build_transcode_profile, resolve_device_fit,
+            )
+            from scripts.managers.machine_learning.scoring._shared import (
+                resolve_device_capabilities,
+            )
+            settings = resolve_device_fit(self.config)
+            if not settings.enabled:
+                return None
+            gc = self.global_cache
+            return build_transcode_profile(
+                platform_usage=platform_usage,
+                stream_decisions=(gc.get("tautulli/stream_decisions") if gc else None),
+                transcode_fingerprint=(gc.get("tautulli/transcode_fingerprint") if gc else None),
+                capabilities=resolve_device_capabilities(self.config),
+                settings=settings,
+                preferred_languages=((self.config or {}).get("preferred_languages") or ["en"]),
+            )
+        except Exception as e:
+            self.logger.log_debug(f"[ShowScore] device_fit_v2 profile unavailable: {e}")
+            return None
+
+    def _report_group_d(self, breakdowns, instance: str, profile) -> None:
+        """Log the pass's Group-D distribution — the regression guard. See the twin in
+        radarr/quality/space_pressure.py for why this exists (v1 collapsed to a
+        near-constant in silence and invalidated every absolute threshold).
+
+        TV SPLITS THE REPORT: 7,600 of this library's 11,973 series own no episode file,
+        and a file-less stub is neutral 0.0 BY DESIGN. Reporting only the pooled figure
+        would show a 65%-at-mode 'constant' that is nothing of the sort, so the
+        file-owning subset — the population the ladder and the delete floor are anchored
+        on — is reported separately and is the one the guard fires on."""
+        try:
+            from scripts.managers.machine_learning.scoring.device_fit import summarise_group_d
+            vals = []
+            for bd in breakdowns:
+                if not isinstance(bd, dict):
+                    continue
+                vals.append(bd.get("D4_transcode_risk", 0.0)
+                            + bd.get("D1_device_capability", 0.0)
+                            + bd.get("D2_transcode_avoidance", 0.0)
+                            + bd.get("D3_platform_ceiling", 0.0))
+            allv = summarise_group_d(vals)
+            if not allv["n"]:
+                return
+            # A stub scores exactly 0.0 under v2; under v1 it scored a flat +2.0.
+            neutral = 0.0 if profile is not None else 2.0
+            owners = summarise_group_d([v for v in vals if round(v, 2) != neutral])
+            mode = "v2 risk-penalty" if profile is not None else "v1 legacy bonus"
+            self.logger.log_info(
+                f"[ShowScore] '{instance}' Group D ({mode}): all {allv['n']} series mean "
+                f"{allv['mean']:+.2f} sd {allv['sd']:.2f}, {allv['distinct']} distinct; "
+                f"file-owning {owners['n']} mean {owners['mean']:+.2f} sd {owners['sd']:.2f} "
+                f"mode {owners['mode']:+.2f} @ {owners['share_at_mode']:.1%}, "
+                f"{owners['distinct']} distinct.")
+            if owners["n"] >= 50 and (owners["share_at_mode"] >= 0.75 or owners["distinct"] <= 2):
+                self.logger.log_warning(
+                    f"[ShowScore] '{instance}' Group D is behaving as a CONSTANT on the "
+                    f"file-owning population ({owners['share_at_mode']:.0%} share one value, "
+                    f"{owners['distinct']} distinct) — no ranking information, and every "
+                    f"absolute threshold anchored on the score is drifting. This is the "
+                    f"exact regression scoring/device_fit.py was written to prevent.")
+        except Exception:
+            pass
 
     def _build_show_scoring_context(self):
         """Pull the affinity / device / per-user context shared with the movie
@@ -1825,8 +2091,18 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         """Return EPISODE delete-candidates (one per episode_file_id) for the
         coordinator's pool: rows already marked_for_deletion (watched + grace
         expired) whose file isn't whole-file-guarded. Each dict carries the
-        per-series watchability_score, size, file id, series id + episode coords."""
+        per-series watchability_score, size, file id, series id + episode coords.
+
+        DELETE-ELIGIBILITY INVARIANT (``space_exhaustive_downgrade``, DEFAULT ON): a file may
+        enter the pool ONLY when its resolution is AT or BELOW the 720p floor — nothing left to
+        shrink. Files above the floor are excluded and counted as ``skipped_downgradable`` (also
+        published on ``self.last_skipped_downgradable`` for the coordinator's log), so the TV
+        step-down pass must shrink them to the floor before they can ever be deleted. An unknown
+        resolution counts as at-floor (the downgrade planner treats it as nothing-to-step, so it
+        would otherwise be undeletable forever)."""
         out: list[dict] = []
+        self.last_skipped_downgradable = 0
+        self.last_skipped_unscored = 0
         if df is None:
             df = self.load(instance)
         if df is None or df.empty or "episode_file_id" not in df.columns or "marked_for_deletion" not in df.columns:
@@ -1856,6 +2132,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"yielding NO delete candidates this cycle (fail-safe): {e}"
             )
             return out
+        # "Deletion is the true last resort": only at/below-720p files may be deleted.
+        _floor_gate = exhaustive_downgrade(self.config)
+        _held_downgradable = 0
+        _held_unscored = 0    # rows refresh_scores hasn't reached yet -> deferred, not deleted
         seen: set[int] = set()
         for idx in df.index[marked]:
             fid = df.at[idx, "episode_file_id"]
@@ -1864,10 +2144,28 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             fid = int(fid)
             if fid in protected or fid in seen:
                 continue
+            _res = df.at[idx, "resolution"] if "resolution" in df.columns else None
+            if _floor_gate:
+                try:
+                    if _res is not None and pd.notna(_res) and int(_res) > DOWNGRADE_FLOOR_RESOLUTION:
+                        _held_downgradable += 1
+                        seen.add(fid)   # one count per FILE, not per backing episode row
+                        continue        # still shrinkable → NOT delete-eligible
+                except (TypeError, ValueError):
+                    pass                # unreadable resolution → treated as at-floor
+            # UNSCORED -> DEFERRED. The old ``... else 5`` handed a row with no score a
+            # literal point on the score axis, which silently changed meaning when Group D
+            # v2 translated that axis. This now matches the whole-column guard above
+            # ("won't delete on fallback scores") for the partial case. Counted + logged.
+            # Full reasoning: machine_learning/space/downgrade_planner.row_score.
+            sc = df.at[idx, "watchability_score"] if "watchability_score" in df.columns else None
+            if sc is None or not pd.notna(sc):
+                _held_unscored += 1
+                seen.add(fid)   # one count per FILE, not per backing episode row
+                continue
             seen.add(fid)
             size = float(df.at[idx, "size_bytes"]) if ("size_bytes" in df.columns and pd.notna(df.at[idx, "size_bytes"])) else 0.0
-            sc = df.at[idx, "watchability_score"] if "watchability_score" in df.columns else None
-            score = int(sc) if pd.notna(sc) else 5
+            score = int(sc)
             sid = df.at[idx, "series_id"]
             sn = df.at[idx, "season_number"] if "season_number" in df.columns else None
             en = df.at[idx, "episode_number"] if "episode_number" in df.columns else None
@@ -1878,8 +2176,26 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 "series_id": int(sid) if pd.notna(sid) else None,
                 "season": int(sn) if pd.notna(sn) else None,
                 "episode": int(en) if pd.notna(en) else None,
+                "resolution": int(_res) if (_res is not None and pd.notna(_res)) else None,
                 "title": f"{title} S{int(sn):02d}E{int(en):02d}" if (pd.notna(sn) and pd.notna(en)) else str(title),
             })
+        self.last_skipped_unscored = _held_unscored
+        if _held_unscored:
+            self.logger.log_warning(
+                f"[EpisodeFiles] '{instance}': {_held_unscored} episode file(s) DEFERRED from the delete "
+                f"pool — no watchability_score yet, and a file is never deleted on a guessed score. They "
+                f"re-qualify as soon as refresh_scores reaches them; a count that persists across runs "
+                f"means the scorer is skipping those rows."
+            )
+        self.last_skipped_downgradable = _held_downgradable
+        if _held_downgradable:
+            self.logger.log_info(
+                f"[EpisodeFiles] '{instance}': {_held_downgradable} episode file(s) EXCLUDED from the "
+                f"delete pool — still above the {DOWNGRADE_FLOOR_RESOLUTION}p floor, so there is quality "
+                f"left to shrink (skipped_downgradable). Deletion is the true last resort."
+                + ("" if out else " The pool is EMPTY for exactly this reason — nothing is at the "
+                                  "floor yet, so nothing is deletable.")
+            )
         return out
 
     @timeit("delete_selected_episode_files")
@@ -1938,6 +2254,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             if pd.notna(sid) and pd.notna(sn) and pd.notna(en):
                 ent = restore_add.setdefault(str(int(sid)), {"episodes": [], "ts": now.isoformat()})
                 ent["episodes"].append([int(sn), int(en)])
+                # RELEASE IDENTITY (ledger v2): record WHICH release we are removing
+                # so the restore can ask for that one back instead of firing a blind
+                # search. Everything here is already on this row — no indexer lookup,
+                # and no guid (it would be stale long before the restore fires).
+                _rr = release_record({f: df.at[idx, f] for f in RELEASE_FIELDS
+                                      if f in df.columns})
+                _ek = episode_key(sn, en)
+                if _rr and _ek:
+                    ent.setdefault("releases", {})[_ek] = _rr
             if fid in done:   # multi-ep file already handled
                 continue
             done.add(fid)
@@ -1974,13 +2299,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 dset = self.global_cache.get(dkey)
                 dset = dset if isinstance(dset, dict) else {}
                 for sk, ent in restore_add.items():
-                    cur = dset.get(sk) if isinstance(dset.get(sk), dict) else {"episodes": [], "ts": ent["ts"]}
-                    have = {tuple(x) for x in cur.get("episodes", [])}
-                    for se in ent["episodes"]:
-                        if tuple(se) not in have:
-                            cur.setdefault("episodes", []).append(se)
-                    cur["ts"] = ent["ts"]
-                    dset[sk] = cur
+                    # merge_ledger_entry tolerates BOTH schema versions on either
+                    # side: a v1 record already on disk (episodes + ts, no releases)
+                    # keeps working and simply gains a releases map from here on.
+                    dset[sk] = merge_ledger_entry(dset.get(sk), ent)
                 self.global_cache.set(dkey, dset)
             except Exception as e:
                 # These episode files are already deleted; failing to record them
@@ -2023,12 +2345,14 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     @timeit("restore_recovered_episode_deletions")
     def restore_recovered_episode_deletions(self, instance: str) -> dict:
         """Re-acquire previously coordinator-deleted episodes whose series'
-        watchability_score has recovered above owned_restore_score_threshold:
+        watchability_score has recovered above ``tv_restore_score_threshold`` (17):
         re-monitor the episodes + trigger EpisodeSearch. Mirrors Radarr's
-        restore_recovered_deletions. Tracked in ``sonarr/{inst}/deleted_episodes``."""
+        restore_recovered_deletions — but NOT its threshold: that twin scores on a
+        different axis and keeps ``owned_restore_score_threshold`` (20). Tracked in
+        ``sonarr/{inst}/deleted_episodes``."""
         instance = self._resolve_instance(instance)
         stats = {"tracked": 0, "restored": 0, "still_low": 0, "cooling": 0,
-                 "dropped": 0, "deferred": 0, "failed": 0}
+                 "dropped": 0, "deferred": 0, "failed": 0, "targeted": 0}
         if self.sonarr_api is None or self.global_cache is None:
             return stats
         now = datetime.now(tz=timezone.utc)
@@ -2037,10 +2361,23 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         dset = dset if isinstance(dset, dict) else {}
         if not dset:
             return stats
+        # ``tv_restore_score_threshold``, NOT Radarr's ``owned_restore_score_threshold``.
+        # This leg reads the PERSISTED ``watchability_score`` column (axis V2 — Group D v2's
+        # transcode-risk penalty is live in it), while the Radarr twin
+        # (repair/anomaly.py::restore_recovered_deletions) re-scores raw Radarr dicts on an
+        # axis Group D v2 never reached. One key could not be correct for both, so it was
+        # split; the key here is also welded to a different hysteresis partner — these
+        # episodes were deleted by the COORDINATOR under ``tv_space_pressure_score_ceiling``
+        # (17), not by anomaly.py's demote floor (20). Deletion is ``score < ceiling`` and
+        # restore is ``score > floor``, so floor == ceiling == 17 is thrash-free (a series at
+        # exactly 17 is neither deleted nor restored). Full rationale + the measured
+        # two-axis gap: machine_learning/thresholds/registry.py's delete block.
         try:
-            restore_floor = int(self.config.get("owned_restore_score_threshold", 20) if self.config else 20)
+            restore_floor = int(self.config.get("tv_restore_score_threshold", 17) if self.config else 17)
         except (TypeError, ValueError):
-            restore_floor = 20
+            restore_floor = 17
+        restore_floor = get_threshold("series_restore", self.config, restore_floor,
+                                      logger=getattr(self, "logger", None))
         try:
             restore_min_age = int(self.config.get("owned_restore_min_age_days", 0) if self.config else 0)
         except (TypeError, ValueError):
@@ -2086,6 +2423,16 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             want = set(coords)
             ep_ids = [e.get("id") for e in eps
                       if (e.get("seasonNumber"), e.get("episodeNumber")) in want and e.get("id")]
+            # episode id -> the release identity recorded when this episode was
+            # deleted (ledger v2). Empty for a v1 record → every episode below takes
+            # the blind-search path, exactly as before.
+            recorded_by_eid: dict = {}
+            _rel_map = ledger_releases(ent)
+            if _rel_map:
+                for e in eps:
+                    _ek = episode_key(e.get("seasonNumber"), e.get("episodeNumber"))
+                    if _ek and e.get("id") and _ek in _rel_map:
+                        recorded_by_eid[e["id"]] = _rel_map[_ek]
             if not ep_ids:
                 # Coords didn't resolve — could be a transient API miss, a series
                 # mid-refresh, or ids regenerated. Do NOT silently drop the record
@@ -2115,7 +2462,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             if self.dry_run:
                 self.logger.log_info(
                     f"  [dry_run] Would RESTORE series {sid} (score {score} > {restore_floor}): "
-                    f"re-monitor + EpisodeSearch {len(ep_ids)} ep(s)"
+                    f"re-monitor + search {len(ep_ids)} ep(s)"
+                    + (f" ({len(recorded_by_eid)} with a recorded release to target)"
+                       if recorded_by_eid else " (blind search — no recorded release)")
                 )
                 stats["restored"] += 1
                 keep[sk] = ent   # still deleted in reality → keep tracking
@@ -2123,10 +2472,25 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             try:
                 self.sonarr_api._make_request(instance, "episode/monitor", method="PUT",
                                               payload={"episodeIds": ep_ids, "monitored": True})
-                self.sonarr_api._make_request(instance, "command", method="POST",
-                                              payload={"name": "EpisodeSearch", "episodeIds": ep_ids})
+                # TARGETED first, blind for the remainder. Every episode we recorded a
+                # release identity for gets ONE interactive search; if that reveals the
+                # recorded release (or a close-enough sibling — see
+                # restore_policy.match_release) we grab exactly it. Anything that
+                # doesn't match falls through to the original blind EpisodeSearch, so
+                # a missing or stale scene_name can never block a restore.
+                targeted = self._targeted_restore(instance, sid, recorded_by_eid)
+                stats["targeted"] += len(targeted)
+                blind_ids = [e for e in ep_ids if e not in targeted]
+                if blind_ids:
+                    self.sonarr_api._make_request(
+                        instance, "command", method="POST",
+                        payload={"name": "EpisodeSearch", "episodeIds": blind_ids})
                 stats["restored"] += 1
-                self.logger.log_info(f"  Restored series {sid}: re-monitored + searched {len(ep_ids)} ep(s)")
+                self.logger.log_info(
+                    f"  Restored series {sid}: re-monitored {len(ep_ids)} ep(s) — "
+                    f"{len(targeted)} grabbed on the recorded release, "
+                    f"{len(blind_ids)} blind-searched"
+                )
             except Exception as e:
                 self.logger.log_warning(f"  Episode restore failed for series {sid}: {e}")
                 stats["failed"] += 1
@@ -2136,6 +2500,53 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         except Exception:
             pass
         return stats
+
+    def _targeted_restore(self, instance: str, sid: int, recorded_by_eid: dict) -> set:
+        """Re-grab the SPECIFIC releases recorded at delete time. Returns the set of
+        episode ids actually grabbed; every id NOT in that set must be blind-searched
+        by the caller.
+
+        ONE interactive ``GET /release?episodeId=`` per episode that has a recorded
+        identity (the same primitive ``legacy_regrab`` / ``pilot_interactive`` /
+        ``space_pressure`` already use), then ``POST /release`` with the chosen
+        release's guid + indexerId. The MATCH decision is pure
+        (``restore_policy.match_release``); this is only the I/O.
+
+        FAIL-OPEN EVERYWHERE. A search that errors, returns nothing, or reveals no
+        release matching what we recorded leaves that episode out of the returned
+        set → the caller blind-searches it. So a stale scene_name, a dead indexer,
+        or a rewritten ledger degrades the restore to exactly the old behaviour and
+        never blocks it."""
+        grabbed: set = set()
+        if not recorded_by_eid or self.sonarr_api is None:
+            return grabbed
+        for eid, recorded in recorded_by_eid.items():
+            try:
+                releases = self.sonarr_api._make_request(
+                    instance, f"release?episodeId={int(eid)}", fallback=None)
+            except Exception as e:
+                self.logger.log_debug(f"  [Restore] interactive search failed for ep {eid}: {e}")
+                continue
+            best = match_release(releases if isinstance(releases, list) else [], recorded)
+            if not best or not best.get("guid"):
+                self.logger.log_debug(
+                    f"  [Restore] no release matching the recorded "
+                    f"'{recorded.get('scene_name') or recorded.get('release_group') or '?'}' "
+                    f"for ep {eid} — falling back to a blind search.")
+                continue
+            try:
+                res = self.sonarr_api._make_request(
+                    instance, "release", method="POST", fallback=None,
+                    payload={"guid": best.get("guid"), "indexerId": best.get("indexerId")})
+            except Exception as e:
+                self.logger.log_debug(f"  [Restore] targeted grab errored for ep {eid}: {e}")
+                continue
+            if res is not None:
+                grabbed.add(eid)
+                self.logger.log_info(
+                    f"  🎯 Restored ep {eid} on its recorded release: "
+                    f"{str(best.get('title'))[:64]}")
+        return grabbed
 
     # ── Schema normalisation ────────────────────────────────────────────────────
 
@@ -2167,6 +2578,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             "season_number":         season_number if season_number is not None else raw.get("seasonNumber"),
             "episode_number":        episode_number,
             "is_pilot":              is_pilot,
+            # ``watch_count`` counts WATCHES, not plays (the caller's aggregate already
+            # applied lifecycle.watched_definition), so this stays the derivation it
+            # always was and now means what Plex/Tautulli mean.
             "is_watched":                watch_count > 0,
             "next_episode":              False,
             "watch_count":               watch_count,
@@ -3207,16 +3621,26 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 _ahw = df.at[idx, "all_household_watched"]
                 household_blocked = bool(pd.notna(_ahw) and not bool(_ahw))
 
+            # Per-viewer retention: this episode sits inside some account's
+            # [position − backward_buffer, position + pace × horizon] interval.
+            # Stamped by _apply_viewer_retention (which owns the history + the
+            # position sidecar); absent column = legacy frame → not held.
+            viewer_protected = False
+            if "retention_hold" in df.columns:
+                _vh = df.at[idx, "retention_hold"]
+                viewer_protected = bool(pd.notna(_vh) and bool(_vh))
+
             decision = episode_grace_decision(
                 is_pilot=is_pilot, is_next=is_next, is_watched=df.at[idx, "is_watched"],
                 has_last_watched=bool(lw), fid_protected=fid_protected,
                 keep_series=keep_series, keep_season_current=keep_season_current,
                 recent_aired=recent_aired, household_blocked=household_blocked,
+                viewer_protected=viewer_protected,
             )
             if decision == "clear":     # pilot/next/protected/keep/recent/household — never mark
                 df.at[idx, "marked_for_deletion"] = False
                 continue
-            if decision == "skip":      # not watched / no last-watched — leave as-is
+            if decision == "skip":      # watched but no last-watched stamp — leave as-is
                 continue
 
             # ── Mark: anchor on the latest household watch when set, else last_watched_at,
@@ -3729,6 +4153,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             "skipped_keep":         0,
             "skipped_recent_air":   0,
             "skipped_household":    0,
+            "skipped_retention":    0,     # rows inside a viewer's retention interval
+            "skipped_watchlist":    0,     # rows whose SERIES a still-active member watchlisted
             "skipped_shared_file":  0,     # rows skipped because a multi-ep sibling is guarded
             "skipped_no_file":      0,
             "coalesced_multiep":    0,     # extra rows sharing an already-handled file id
@@ -3892,6 +4318,45 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     stats["skipped_household"] += 1
                     continue
 
+            # ── PER-VIEWER RETENTION GUARD (secondary / defence-in-depth) ───────
+            # Mirrors the clear-guard in _apply_grace_period. Catches rows marked in
+            # a previous run (before the rule existed, or before a viewer's position
+            # moved back over them) and any row whose hold was recomputed after the
+            # grace pass. ``retention_hold_by`` names the viewer so the hold is
+            # auditable rather than anonymous.
+            if "retention_hold" in df.columns:
+                _vh = df.at[idx, "retention_hold"]
+                if pd.notna(_vh) and bool(_vh):
+                    _by = df.at[idx, "retention_hold_by"] if "retention_hold_by" in df.columns else None
+                    _by = str(_by) if (_by is not None and pd.notna(_by)) else "a viewer"
+                    self.logger.log_warning(
+                        f"  🛡️ RETENTION GUARD: '{title}' {sn_str}{en_str} is inside "
+                        f"{_by}'s watch interval — clearing deletion flag, skipping."
+                    )
+                    df.at[idx, "marked_for_deletion"] = False
+                    stats["skipped_retention"] += 1
+                    continue
+
+            # ── WATCHLIST INTENT GUARD (secondary / defence-in-depth) ──────────
+            # The Group-A5 twin of the retention guard above. Catches rows marked in a
+            # previous run (before the shield existed, or before somebody added the series
+            # to a watchlist) — the whole-file set is rebuilt per run, but a row already
+            # carrying ``marked_for_deletion`` from an earlier pass never re-enters the
+            # grace decision. ``watchlist_hold_by`` names the member so the hold is
+            # auditable rather than anonymous.
+            if "watchlist_hold" in df.columns:
+                _wh = df.at[idx, "watchlist_hold"]
+                if pd.notna(_wh) and bool(_wh):
+                    _by = df.at[idx, "watchlist_hold_by"] if "watchlist_hold_by" in df.columns else None
+                    _by = str(_by) if (_by is not None and pd.notna(_by)) else "the household"
+                    self.logger.log_warning(
+                        f"  🛡️ WATCHLIST GUARD: '{title}' {sn_str}{en_str} is on "
+                        f"{_by}'s watchlist — clearing deletion flag, skipping."
+                    )
+                    df.at[idx, "marked_for_deletion"] = False
+                    stats["skipped_watchlist"] += 1
+                    continue
+
             fid = df.at[idx, "episode_file_id"]
             if pd.isna(fid):
                 stats["skipped_no_file"] += 1
@@ -3984,6 +4449,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     ["keep-policy guard",  stats["skipped_keep"]],
                     ["recent-air guard",   stats["skipped_recent_air"]],
                     ["household guard",    stats["skipped_household"]],
+                    ["retention guard",    stats["skipped_retention"]],
+                    ["watchlist guard",    stats["skipped_watchlist"]],
                     ["shared-file guard",  stats["skipped_shared_file"]],
                     ["no file id",         stats["skipped_no_file"]],
                     ["multi-ep coalesced", stats["coalesced_multiep"]],
@@ -3998,6 +4465,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     "files kept: keep_series / keep_season tag",
                     "files kept: episode aired too recently",
                     "files kept: a household member has not watched",
+                    "files kept: inside a viewer's position/pace retention interval",
+                    "files kept: a still-active member has this series watchlisted",
                     "files kept: file shared by another tracked episode",
                     "rows skipped: no Sonarr episode file id",
                     "extra rows folded into one multi-episode file delete",
@@ -4155,13 +4624,37 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
         aggregated: dict[tuple, dict] = defaultdict(
             lambda: {
+                # WATCHES, not plays: only rows that clear the bar
+                # (lifecycle.watched_definition.play_is_watched — Tautulli's own
+                # ``watched_status``, else ``percent_complete >= watched_threshold.percent``)
+                # count here, so ``is_watched = watch_count > 0`` means what Plex and
+                # Tautulli show the household and a 30-second sample no longer starts
+                # the grace clock or buys an engagement floor.
                 "watch_count": 0,
+                # RAW play tally (every history row). Never persisted — it exists so the
+                # sync log can say "N plays, M watches" and the drop is visible rather
+                # than silent.
+                "plays": 0,
+                # Threshold-FREE playback facts. ``percent_complete`` is the partial-view
+                # signal watch_likelihood grades started/abandoned off; ``last_watched_at``
+                # is "when was this last played" and also carries the "was this tried at
+                # all?" bit for a play Tautulli reported at 0%. Thresholding either would
+                # drop a sub-threshold play onto the UNTOUCHED branch, where abandoning a
+                # show would RAISE its quality target. See watched_definition's docstring.
                 "last_watched_at": None,
                 "percent_complete": 0,
                 "per_user": {},  # username → latest ISO-8601 timestamp (or None if no date)
+                # username → {"at": latest ISO, "watched": bool} where ``watched`` is the
+                # same per-row verdict ``watch_count`` is built from. Feeds the per-viewer
+                # retention rule (lifecycle.viewer_retention) and the household gate. NOT a
+                # second application of the bar: this is a per-(account, series) aggregation
+                # of the same admitted plays, and it never reads ``is_watched`` back.
+                "per_user_watch": {},
             }
         )
+        _watch_pct = self._retention_cfg()["watched_percent"]
         total_raw_entries = 0
+        _sub_threshold = 0
 
         for instance_name, instance_config in instance_configs.items():
             try:
@@ -4212,7 +4705,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
                 key = (title, int(season), int(episode))
                 rec = aggregated[key]
-                rec["watch_count"] += 1
+                # THE BAR, applied ONCE per history row and reused for the per-user
+                # verdict below so the two can never disagree.
+                _is_watch = watched_by_tautulli(
+                    entry.get("watched_status"), pct, threshold_pct=_watch_pct)
+                rec["plays"] += 1
+                if _is_watch:
+                    rec["watch_count"] += 1
+                else:
+                    _sub_threshold += 1
                 rec["percent_complete"] = max(rec["percent_complete"], pct or 0)
                 if played:
                     ts = datetime.fromtimestamp(int(played), tz=timezone.utc).isoformat()
@@ -4222,19 +4723,37 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 # Track per-user timestamps for household watch-state resolution
                 _user = str(entry.get("user") or "")
                 if _user:
-                    if played:
-                        _uts = datetime.fromtimestamp(int(played), tz=timezone.utc).isoformat()
+                    _uts = (datetime.fromtimestamp(int(played), tz=timezone.utc).isoformat()
+                            if played else None)
+                    if _uts:
                         _prev = rec["per_user"].get(_user)
                         if _prev is None or _uts > _prev:
                             rec["per_user"][_user] = _uts
                     elif _user not in rec["per_user"]:
                         rec["per_user"][_user] = None  # watched but no date recorded
 
+                    # Per-viewer retention + the household gate: the SAME per-row
+                    # verdict ``watch_count`` is built from (computed once above).
+                    _pw = rec["per_user_watch"].setdefault(
+                        _user, {"at": None, "watched": False})
+                    if _uts and (_pw["at"] is None or _uts > _pw["at"]):
+                        _pw["at"] = _uts
+                    if _is_watch:
+                        _pw["watched"] = True
+
         result = dict(aggregated)
+        _watched_eps = sum(1 for v in result.values() if v["watch_count"] > 0)
         self.logger.log_info(
             f"📊 Tautulli aggregation complete: {len(result)} unique episode(s) "
             f"from {total_raw_entries} raw entries across "
             f"{len(instance_configs)} instance(s)"
+        )
+        # The bar's effect, stated out loud every run: an operator who tightens or
+        # loosens watched_threshold.percent can see exactly what it cost.
+        self.logger.log_info(
+            f"   ▸ watched bar ≥{_watch_pct:g}% (or Tautulli watched_status=1): "
+            f"{_watched_eps}/{len(result)} episode(s) count as WATCHED; "
+            f"{_sub_threshold} sub-threshold play(s) recorded as sampled only"
         )
         return result
 
@@ -4281,6 +4800,17 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         Reads ``rating_groups.household.members`` — the same config key used
         by the Tautulli group-completion logic.  Returns an empty list when the
         key is absent (disables household-watch gating entirely).
+
+        SUPERSEDED — LEAVE THIS EMPTY. ``rating_groups`` is absent from the live
+        config, so this returns ``[]`` and the household gate is inert. That is
+        deliberate: :meth:`_apply_viewer_retention` (per-account position + pace,
+        ``machine_learning/lifecycle/viewer_retention.py``) now answers the same
+        question — "does someone still need this?" — without a hand-maintained
+        roster and with a bounded, self-expiring hold. Populating
+        ``rating_groups.household.members`` would DOUBLE-GUARD: this gate holds
+        every episode any member hasn't finished, FOREVER, on top of the retention
+        interval. Tune ``episode_retention`` instead. See the note at the top of
+        ``lifecycle/household_watch.py``.
         """
         return (
             (((self.config or {})
@@ -4288,6 +4818,23 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             .get("household") or {})
             .get("members", [])
         )
+
+    @staticmethod
+    def _watched_per_user(watch: dict) -> dict:
+        """``{account: latest ISO}`` restricted to accounts that actually WATCHED the
+        episode — the ``per_user`` shape the household resolver expects, filtered by
+        the same bar ``watch_count`` is built from.
+
+        ``per_user`` itself stays threshold-free (it answers "who has TOUCHED this",
+        which is what the JIT grab grid's 'For' column wants); the household gate
+        answers "has the household WATCHED this", so it reads this view instead.
+        Falls back to raw ``per_user`` when ``per_user_watch`` is absent — a history
+        dict built by an older code path, or a hand-rolled test fixture, must not
+        silently resolve to "nobody watched it"."""
+        pw = (watch or {}).get("per_user_watch")
+        if not isinstance(pw, dict) or not pw:
+            return (watch or {}).get("per_user", {}) or {}
+        return {u: st.get("at") for u, st in pw.items() if (st or {}).get("watched")}
 
     @staticmethod
     def _resolve_household_watch_state(
@@ -4301,10 +4848,295 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         """
         return resolve_household_watch(per_user, household_members, quorum=quorum)
 
+    # ── Per-viewer retention helpers ────────────────────────────────────────────
+    # The rule that supersedes the (inert) household gate: protect each ACCOUNT's
+    # [position − backward_buffer, position + pace × horizon] window on every series
+    # it watches. Decision + arithmetic live in the brain
+    # (machine_learning.lifecycle.viewer_retention); this side owns the Tautulli
+    # history, the title→series_id resolution, the parquet stamp and the durable
+    # position sidecar.
+
+    def _retention_cfg(self) -> dict:
+        """The normalised ``episode_retention`` knobs. ON by default — the current
+        behaviour (mark 3 h after ANYONE watches, no backward cushion, no
+        second-viewer protection) is the bug this rule exists to fix, so an opt-in
+        default would leave every install broken."""
+        return resolve_retention_config(self.config)
+
+    def _retention_ignored_users(self) -> set:
+        """Lower-cased ``ignored_users`` — the same roster exclusion every other
+        per-user pass honours (an ignored account must not pin disk)."""
+        return {str(u).strip().lower() for u in ((self.config or {}).get("ignored_users") or [])}
+
+    def _load_viewer_positions(self, instance: str) -> dict:
+        """The durable ``{account: {series_id: state}}`` sidecar (best-effort {})."""
+        if not self.global_cache:
+            return {}
+        try:
+            got = self.global_cache.get(self._VIEWER_POSITIONS_KEY.format(inst=instance))
+            return got if isinstance(got, dict) else {}
+        except Exception:
+            return {}
+
+    @timeit("_apply_viewer_retention")
+    def _apply_viewer_retention(
+        self, df: "pd.DataFrame", history: dict, instance: str
+    ) -> "tuple[pd.DataFrame, dict]":
+        """Stamp the per-viewer retention verdict onto ``retention_hold`` /
+        ``retention_hold_by`` and persist each account's resume state.
+
+        WHY A COLUMN AND NOT A LIVE PREDICATE
+        -------------------------------------
+        This codebase deliberately duplicates every delete guard across three
+        layers (grace marking, the whole-file protected set, the delete-time
+        defence-in-depth block). Only the first has the Tautulli history in scope —
+        the coordinator's ``build_delete_candidates`` / ``delete_selected_episode_files``
+        run from a bare parquet load. Materialising the verdict as a column is how
+        ``all_household_watched`` already solves exactly this, and it keeps the
+        three layers reading ONE decision instead of three re-derivations that can
+        drift.
+
+        WHY A DURABLE SIDECAR
+        ---------------------
+        ``tautulli/history/all`` is regenerated hourly and Tautulli prunes its own
+        database; the live ``get_history`` pull is likewise a window, not an
+        archive. If a viewer's plays age out, recomputing from scratch would drop
+        their position to None and silently release everything the rule was
+        holding — a mass delete caused by an upstream retention setting. The
+        sidecar merges positions forward monotonically
+        (``viewer_retention.merge_state``) so the guard degrades to "hold the last
+        known resume point" instead of "hold nothing".
+
+        WHAT "TWO EPISODES BACK" MEANS
+        ------------------------------
+        The interval is an INDEX span into the series' sorted ordinal list, and that
+        list is built from THIS FRAME. The frame tracks pilots + watched +
+        next_episode rows (``_do_cleanup_non_essential`` drops the rest), so the
+        buffer walks the episodes the cache can actually delete — "two deletable
+        episodes back", not "two episodes back in the show". On a sparsely-owned
+        series those can be far apart in ordinal terms; the COUNT of files held is
+        what bounds disk, and that stays exactly ``backward_buffer``.
+
+        Returns ``(df, stats)``; never raises (a guard that crashes must not take
+        the sync down, and the columns default to "not held" only when the rule is
+        explicitly disabled — see the except clause)."""
+        stats = {"enabled": False, "accounts": 0, "series": 0, "held_rows": 0,
+                 "intervals": 0, "dormant": 0}
+        for col in self._RETENTION_COLS:
+            if col not in df.columns:
+                df[col] = None
+            if df[col].dtype != object:
+                df[col] = df[col].astype(object)
+        # Recomputed from scratch every run: a stale hold from a previous run must
+        # never outlive the history that justified it.
+        df["retention_hold"] = False
+        df["retention_hold_by"] = None
+
+        cfg = self._retention_cfg()
+        if not cfg["enabled"]:
+            self.logger.log_info(
+                "[Retention] episode_retention disabled — per-viewer holds OFF "
+                "(legacy grace behaviour: delete 3h after any watch)."
+            )
+            return df, stats
+        stats["enabled"] = True
+        if df.empty:
+            return df, stats
+
+        try:
+            return self._apply_viewer_retention_inner(df, history, instance, cfg, stats)
+        except Exception as e:
+            # FAIL-SAFE: an exception leaves every row un-held, which would EXPAND
+            # the delete pool. Refuse that: mark every WATCHED row as held for this
+            # run so the pass can only be more conservative than before, and shout.
+            try:
+                _w = df["is_watched"].infer_objects(copy=False).fillna(False).astype(bool)
+                df.loc[_w, "retention_hold"] = True
+                df.loc[_w, "retention_hold_by"] = "fail-safe (retention build failed)"
+                stats["held_rows"] = int(_w.sum())
+            except Exception:
+                pass
+            self.logger.log_error(
+                f"[Retention] per-viewer retention build FAILED for '{instance}': {e} "
+                f"— holding every watched row this run (fail-safe); nothing new will "
+                f"be marked for deletion until the build succeeds."
+            )
+            return df, stats
+
+    def _apply_viewer_retention_inner(self, df, history, instance, cfg, stats):
+        now = datetime.now(tz=timezone.utc)
+
+        # ── title → series_id, from the parquet itself (zero API calls) ──────────
+        # The watched rows were written with the TAUTULLI title, so this map is the
+        # exact inverse of how history reached the frame; the Sonarr series cache is
+        # only consulted for titles the parquet has never seen.
+        title_to_sid: dict[str, int] = {}
+        _sid_num = pd.to_numeric(df["series_id"], errors="coerce")
+        for _i in df.index:
+            _t = df.at[_i, "series_title"]
+            _s = _sid_num.at[_i]
+            if pd.notna(_t) and pd.notna(_s):
+                title_to_sid.setdefault(str(_t).strip().lower(), int(_s))
+
+        # ── per (account, series) plays from this run's Tautulli history ─────────
+        ignored = self._retention_ignored_users()
+        plays: dict[tuple, list] = defaultdict(list)
+        for (title, season, episode), watch in (history or {}).items():
+            sid = title_to_sid.get(str(title or "").strip().lower())
+            if sid is None:
+                continue
+            ordinal = episode_ordinal(season, episode)
+            if ordinal is None:
+                continue
+            for account, rec in (watch.get("per_user_watch") or {}).items():
+                if not account or str(account).strip().lower() in ignored:
+                    continue
+                plays[(str(account), sid)].append({
+                    "ordinal": ordinal,
+                    "at": (rec or {}).get("at"),
+                    "watched": bool((rec or {}).get("watched")),
+                })
+
+        # ── merge with the durable sidecar (position is monotonic) ───────────────
+        prior = self._load_viewer_positions(instance)
+        merged: dict[str, dict] = {}      # account -> {str(sid): state}
+        for (account, sid), pl in plays.items():
+            state = merge_state(((prior.get(account) or {}).get(str(sid))),
+                                account_facts(pl, cfg=cfg))
+            if state:
+                merged.setdefault(account, {})[str(sid)] = state
+        # Accounts/series present ONLY in the sidecar (history aged out) keep their
+        # remembered resume point — the whole reason the sidecar exists.
+        _carried = 0
+        for account, by_sid in (prior or {}).items():
+            if str(account).strip().lower() in ignored or not isinstance(by_sid, dict):
+                continue
+            for sid_key, state in by_sid.items():
+                if not isinstance(state, dict):
+                    continue
+                if sid_key in merged.get(account, {}):
+                    continue
+                merged.setdefault(account, {})[sid_key] = state
+                _carried += 1
+
+        # ── per-series ordinal universe from the parquet ─────────────────────────
+        _sn = pd.to_numeric(df["season_number"], errors="coerce")
+        _en = pd.to_numeric(df["episode_number"], errors="coerce")
+        row_ordinal = _sn * 10_000 + _en
+        order_by_sid: dict[int, set] = defaultdict(set)
+        for _i in df.index:
+            _s, _o = _sid_num.at[_i], row_ordinal.at[_i]
+            if pd.notna(_s) and pd.notna(_o):
+                order_by_sid[int(_s)].add(int(_o))
+
+        # ── the rule ─────────────────────────────────────────────────────────────
+        states_by_sid: dict[int, dict] = defaultdict(dict)
+        for account, by_sid in merged.items():
+            for sid_key, state in by_sid.items():
+                try:
+                    states_by_sid[int(sid_key)][account] = state
+                except (TypeError, ValueError):
+                    continue
+
+        holds_by_sid: dict[int, dict] = {}
+        all_intervals: list[dict] = []
+        for sid, states in states_by_sid.items():
+            holds, intervals = series_protected_from_states(
+                states, order_by_sid.get(sid, ()), now, cfg=cfg)
+            if holds:
+                holds_by_sid[sid] = holds
+            for rec in intervals:
+                rec["series_id"] = sid
+            all_intervals.extend(intervals)
+
+        # ── stamp the frame ──────────────────────────────────────────────────────
+        held = 0
+        for _i in df.index:
+            _s, _o = _sid_num.at[_i], row_ordinal.at[_i]
+            if pd.isna(_s) or pd.isna(_o):
+                continue
+            by = holds_by_sid.get(int(_s), {}).get(int(_o))
+            if not by:
+                continue
+            df.at[_i, "retention_hold"] = True
+            df.at[_i, "retention_hold_by"] = ", ".join(by)
+            held += 1
+
+        # ── persist the sidecar ──────────────────────────────────────────────────
+        if self.global_cache:
+            _pkey = self._VIEWER_POSITIONS_KEY.format(inst=instance)
+            try:
+                self.global_cache.set(_pkey, {a: dict(b) for a, b in merged.items()})
+            except Exception as e:
+                # Non-fatal: this run's holds already used the merged state; only the
+                # NEXT run loses the memory, and it will rebuild from live history.
+                self.logger.log_warning(
+                    f"[Retention] could not persist viewer positions ({_pkey}): {e}")
+
+        stats.update({
+            "accounts": len(merged),
+            "series": len(holds_by_sid),
+            "held_rows": held,
+            "intervals": len(all_intervals),
+            "dormant": sum(1 for r in all_intervals if r.get("dormant")),
+            "carried": _carried,
+        })
+        self._log_viewer_retention(instance, cfg, all_intervals, stats, df)
+        return df, stats
+
+    def _log_viewer_retention(self, instance, cfg, intervals, stats, df) -> None:
+        """One summary line + a per-(account, series) table on the run summary, so a
+        hold is always attributable to a named viewer and a position."""
+        self.logger.log_info(
+            f"[Retention] per-viewer holds for '{instance}': {stats['held_rows']} row(s) "
+            f"across {stats['series']} series from {stats['intervals']} (account, series) "
+            f"interval(s) — {stats['dormant']} dormant (>{cfg['dormant_days']}d: position + "
+            f"{cfg['backward_buffer']} back, no forward reach), {stats['accounts']} account(s), "
+            f"{stats.get('carried', 0)} carried from the position sidecar. "
+            f"back={cfg['backward_buffer']} horizon={cfg['horizon_days']}d "
+            f"watched>={cfg['watched_percent']}%"
+        )
+        _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
+        if _rs is None or not intervals:
+            return
+        titles: dict[int, str] = {}
+        if "series_title" in df.columns:
+            _s = pd.to_numeric(df["series_id"], errors="coerce")
+            for _i in df.index:
+                if pd.notna(_s.at[_i]):
+                    titles.setdefault(int(_s.at[_i]), str(df.at[_i, "series_title"]))
+        rows = []
+        for rec in sorted(intervals, key=lambda r: (-r.get("episodes", 0), str(r["account"]))):
+            rows.append([
+                str(titles.get(rec.get("series_id"), rec.get("series_id"))),
+                str(rec["account"]),
+                rec["position_label"],
+                f"{rec['pace']:.2f}/d" if rec.get("pace") is not None else "n/a",
+                "dormant" if rec.get("dormant") else f"+{rec.get('forward', 0)}",
+                (f"{rec.get('lo_label')}–{rec.get('hi_label')}"
+                 if rec.get("lo_label") else "—"),
+                str(rec.get("span", 0)),
+            ])
+        _rs.add_rows("sonarr", "Per-viewer retention", instance,
+                     ["Series", "Viewer", "Position", "Pace", "Reach", "Held", "Eps"],
+                     rows, order=35)
+
     # ── Public: pilot batch ─────────────────────────────────────────────────────
 
     @LoggerManager().log_function_entry
     @timeit("run_pilot_batch")
+    def _pilot_stale_cap(self) -> int:
+        """Max stale pilot stubs re-checked per run (0/negative → unlimited).
+        Config ``pilot_stale_recheck_cap``; default PILOT_STALE_RECHECK_CAP.
+        Bounds the 48h cohort spike — deferred stubs stay due (FIFO)."""
+        try:
+            v = (self.config or {}).get("pilot_stale_recheck_cap",
+                                        self.PILOT_STALE_RECHECK_CAP)
+            v = int(v)
+        except (TypeError, ValueError):
+            v = self.PILOT_STALE_RECHECK_CAP
+        return v if v and v > 0 else 0
+
     def run_pilot_batch(
         self,
         instance: str,
@@ -4363,20 +5195,45 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
             if not stub_rows.empty and "date_added" in stub_rows.columns:
                 _da = pd.to_datetime(stub_rows["date_added"], utc=True, errors="coerce")
-                _fresh = _da >= stale_cutoff
+                # Per-series TTL jitter (deterministic in the series id) so a
+                # cold-start cohort stops expiring as one block. A NaT/absent
+                # timestamp yields NaN age → not fresh → stale, exactly as the
+                # plain cutoff comparison did.
+                _age_s = (now - _da).dt.total_seconds()
+                _sid_f = pd.to_numeric(stub_rows["series_id"], errors="coerce").fillna(0)
+                _ttl_s = self.CACHE_MAX_AGE * (
+                    1.0 + (_sid_f.astype("int64").abs() % 1000) / 1000.0
+                    * float(self.PILOT_STALE_TTL_JITTER_PCT)
+                )
+                _fresh = _age_s < _ttl_s
                 fresh_stub_ids: set[int] = set(
                     stub_rows.loc[_fresh, "series_id"].dropna().astype(int)
                 )
                 stale_stub_ids: set[int] = set(
                     stub_rows.loc[~_fresh, "series_id"].dropna().astype(int)
                 )
+                # Cap the re-check batch, oldest (most overdue) first; the rest
+                # keep their timestamps and remain due next run.
+                _cap = self._pilot_stale_cap()
+                if _cap and len(stale_stub_ids) > _cap:
+                    _stale_rows = stub_rows.loc[~_fresh].assign(_age=_age_s[~_fresh])
+                    _keep = set(
+                        _stale_rows.sort_values("_age", ascending=False)
+                        ["series_id"].dropna().astype(int).head(_cap)
+                    )
+                    deferred_stub_ids = stale_stub_ids - _keep
+                    stale_stub_ids = _keep
+                else:
+                    deferred_stub_ids = set()
             else:
                 fresh_stub_ids = set()
+                deferred_stub_ids = set()
                 stale_stub_ids = set(
                     stub_rows["series_id"].dropna().astype(int)
                 ) if not stub_rows.empty else set()
         else:
             real_pilot_ids = fresh_stub_ids = stale_stub_ids = set()
+            deferred_stub_ids = set()
             stub_rows = pd.DataFrame(columns=self.SCHEMA_COLUMNS)
 
         # Build a fast sid→row_index map for stale stubs so we can update
@@ -4388,12 +5245,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 if pd.notna(sid_s) and int(sid_s) in stale_stub_ids:
                     stale_stub_idx[int(sid_s)] = idx_s
 
-        _total_stubs  = len(fresh_stub_ids) + len(stale_stub_ids)
+        _total_stubs  = len(fresh_stub_ids) + len(stale_stub_ids) + len(deferred_stub_ids)
         self.logger.log_info(
             f"📂 Loaded episode_files.parquet for '{instance}': "
             f"{len(df)} rows — {len(real_pilot_ids)} real pilot(s), "
             f"{len(fresh_stub_ids)} fresh stub(s) (skipped), "
             f"{len(stale_stub_ids)} stale stub(s) (will re-check)"
+            + (f", {len(deferred_stub_ids)} deferred past the "
+               f"{self._pilot_stale_cap()}/run cap (oldest first; next run picks them up)"
+               if deferred_stub_ids else "")
         )
 
         # Series with Tautulli watch history — process first, no cap
@@ -4406,9 +5266,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             if not df.empty else set()
         )
 
-        # skip_ids = real pilots + fresh stubs.  Stale stubs are NOT skipped
-        # so they get re-queried and potentially upgraded to real pilot rows.
-        skip_ids   = real_pilot_ids | fresh_stub_ids
+        # skip_ids = real pilots + fresh stubs (+ stale stubs deferred past this
+        # run's re-check cap).  Non-deferred stale stubs are NOT skipped so they
+        # get re-queried and potentially upgraded to real pilot rows.
+        skip_ids   = real_pilot_ids | fresh_stub_ids | deferred_stub_ids
         pending_all = [s for s in all_series if s.get("id") and int(s["id"]) not in skip_ids]
         pending_watched = [s for s in pending_all if int(s["id"]) in watched_ids]
         pending_other   = [s for s in pending_all if int(s["id"]) not in watched_ids]
@@ -4682,6 +5543,22 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         ---------------
         Only re-searches series whose last attempt was >= PILOT_SEARCH_INTERVAL_H
         hours ago (default 24 h) to avoid hammering indexers every run.
+
+        Dry-run contract
+        ----------------
+        A dry-run performs ZERO Sonarr writes (no command POST, no profile PUT, no
+        worker spawn / daemon offload) and never drops a row. It DOES save the
+        parquet, but the only columns it may write are the PLAN-only pair
+        ``pilot_last_planned_at`` + ``pilot_planned_profile_id`` (the tier the run
+        WOULD have grabbed at) — stamped by ``_mark_planned``. Persisting them lets
+        back-to-back dry-runs skip the whole per-stub planning loop.
+
+        The LIVE-state columns ``pilot_search_attempts`` / ``pilot_last_searched_at``
+        / ``pilot_last_profile_id`` are written ONLY by a real search
+        (``_mark_searched``). This split is the anti-influence invariant: the plan
+        columns are read exclusively under a ``self.dry_run`` guard, so a dry-run can
+        neither suppress the next live search (interval guard) nor re-aim it (the
+        ladder reads ``pilot_last_profile_id`` as ``last_pid``).
         """
         PILOT_SEARCH_INTERVAL_H = 24
         instance = self._resolve_instance(instance)
@@ -4695,8 +5572,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if df.empty:
             return stats
 
+        # Two disjoint column families:
+        #   LIVE state   — pilot_search_attempts / pilot_last_searched_at / pilot_last_profile_id.
+        #                  Written ONLY by a real search (_mark_searched); read by the backoff +
+        #                  interval guard and by the ladder (last_pid → next_pilot_profile*).
+        #   PLAN-only    — pilot_last_planned_at / pilot_planned_profile_id. Written ONLY by a
+        #                  dry-run (_mark_planned); read ONLY under a `self.dry_run` guard, so a
+        #                  dry-run can never steer or suppress the next LIVE run.
         for col in ("pilot_search_attempts", "pilot_last_searched_at", "pilot_last_profile_id",
-                    "pilot_last_planned_at"):
+                    "pilot_last_planned_at", "pilot_planned_profile_id"):
             if col not in df.columns:
                 df[col] = None
 
@@ -4716,6 +5600,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                                   .get("min_watchability", self.PILOT_MIN_WATCHABILITY)))
         except (TypeError, ValueError):
             _pilot_floor = self.PILOT_MIN_WATCHABILITY
+        _pilot_floor = get_threshold("pilot_min_watchability", self.config,
+                                     _pilot_floor, logger=getattr(self, "logger", None))
         if _pilot_floor > 0 and "watchability_score" in df.columns:
             _keep = pilot_watchability_keep(df["watchability_score"], _pilot_floor)
             _gated_out = int((stub_mask & ~_keep).sum())
@@ -4916,15 +5802,20 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             df.at[idx, "pilot_last_searched_at"] = now_utc.isoformat()
             df.at[idx, "pilot_last_profile_id"]  = pid
 
-        def _mark_planned(idx: int) -> None:
+        def _mark_planned(idx: int, pid) -> None:
             # Dry-run bookkeeping ONLY: never touch pilot_search_attempts /
             # pilot_last_searched_at / pilot_last_profile_id — those drive the
-            # live backoff + ladder state and must reflect REAL searches. The
-            # planned stamp is persisted (see the dry-run save below) so
-            # back-to-back dry-runs skip the full per-stub planning loop, while
-            # live searches ignore it entirely (a dry-run never suppresses a
-            # real search).
-            df.at[idx, "pilot_last_planned_at"] = now_utc.isoformat()
+            # live backoff + ladder state and must reflect REAL searches (a
+            # dry-run that wrote pilot_last_profile_id would be fed back in as
+            # `last_pid` and steer the NEXT LIVE run's tier).
+            # ``pid`` is the tier this run WOULD have grabbed, recorded on the
+            # PLAN-only mirror column so the dry-run preview/memo can still show
+            # (and assert) the tier decision. Both plan stamps are persisted (see
+            # the dry-run save below) so back-to-back dry-runs skip the full
+            # per-stub planning loop, while live code reads NEITHER of them (a
+            # dry-run can never suppress, nor re-aim, a real search).
+            df.at[idx, "pilot_last_planned_at"]    = now_utc.isoformat()
+            df.at[idx, "pilot_planned_profile_id"] = pid
 
         # ── Series source (bulk snapshot, BOTH modes) ─────────────────────────
         # The tier DECISION (current profile + runtime) is read from a single O(1) snapshot of
@@ -5073,7 +5964,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     changed = True
                     continue
                 if self.dry_run:
-                    _mark_planned(idx)   # plan stamp only — live ladder state untouched
+                    # plan stamps only (incl. the tier this run WOULD grab at) —
+                    # live ladder/backoff state untouched
+                    _mark_planned(idx, _stub_floor)
                 else:
                     _mark_searched(idx, _stub_floor)
                 changed = True
@@ -5346,11 +6239,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             if drop_idxs and not self.dry_run:
                 df = df.drop(index=drop_idxs).reset_index(drop=True)
             if changed:
-                # Saved in dry-run too: the only dry-run mutation reaching the
-                # frame is pilot_last_planned_at (via _mark_planned) — committed
-                # -grab rows are dropped live-only above, and searched/attempt
-                # stamps are live-only by construction. Persisting the plan
-                # stamps lets the next dry-run skip the whole planning loop.
+                # Saved in dry-run too: the only dry-run mutations reaching the
+                # frame are the PLAN-only columns pilot_last_planned_at +
+                # pilot_planned_profile_id (via _mark_planned) — committed-grab
+                # rows are dropped live-only above, and searched/attempt/last-
+                # profile stamps are live-only by construction. Persisting the
+                # plan stamps lets the next dry-run skip the whole planning loop.
                 self.save(instance, df)
             _prefix = "[dry_run] " if self.dry_run else ""
             _mode = "interactive search" if interactive else "floor-first climb"
@@ -5396,10 +6290,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if self.dry_run:
             stats["searched"] = len(queued) + len(series_queued)
             for idx, _ep, pid, _t in queued:
-                _mark_planned(idx)
+                _mark_planned(idx, pid)
                 changed = True
             for idx, _sid, pid, _t in series_queued:
-                _mark_planned(idx)
+                _mark_planned(idx, pid)
                 changed = True
         else:
             for i in range(0, len(queued), EPISODE_SEARCH_CHUNK):
@@ -5435,7 +6329,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     stats["failed"] += 1
 
         if changed:
-            # Dry-run persists ONLY pilot_last_planned_at (see _mark_planned).
+            # Dry-run persists ONLY the PLAN columns pilot_last_planned_at +
+            # pilot_planned_profile_id (see _mark_planned).
             self.save(instance, df)
 
         prefix = "[dry_run] " if self.dry_run else ""
@@ -6982,11 +7877,17 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 df.at[row_idx, "watch_count"]    = watch["watch_count"]
                 df.at[row_idx, "last_watched_at"] = watch["last_watched_at"]
                 df.at[row_idx, "percent_complete"] = watch["percent_complete"]
-                df.at[row_idx, "is_watched"]      = True
+                # ``is_watched`` is DERIVED, never asserted: this used to be a bare
+                # ``True`` (having ANY history row made the file watched), which is the
+                # bug the bar removes. Recomputed every sync, so a row whose only play
+                # was a sample flips back to False on the first run after the change.
+                df.at[row_idx, "is_watched"]      = bool(watch["watch_count"] > 0)
                 # Recompute household watch state on every sync so a newly-added
-                # watcher is reflected immediately rather than waiting for TTL.
+                # watcher is reflected immediately rather than waiting for TTL. Fed the
+                # WATCHED-only per-user view: "has the household watched this" must mean
+                # the same thing as is_watched, or the gate holds files on samples.
                 _all_hh, _hh_ts = self._resolve_household_watch_state(
-                    watch.get("per_user", {}), household_members, quorum=_hh_quorum
+                    self._watched_per_user(watch), household_members, quorum=_hh_quorum
                 )
                 df.at[row_idx, "all_household_watched"]     = _all_hh
                 df.at[row_idx, "household_last_watched_at"] = _hh_ts
@@ -7000,7 +7901,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 )
                 if file_rec:
                     _all_hh, _hh_ts = self._resolve_household_watch_state(
-                        watch.get("per_user", {}), household_members, quorum=_hh_quorum
+                        self._watched_per_user(watch), household_members, quorum=_hh_quorum
                     )
                     row = self._normalise(
                         raw=file_rec,
@@ -7067,6 +7968,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             instance, df, season_ep_cache=season_ep_cache
         )
         self.logger.log_info(f"[⏱️] acquire_next_episodes — {time.time()-_ps:.1f}s")
+
+        # Per-viewer retention MUST run before the grace pass: it stamps the
+        # retention_hold column the grace clear-guard (and the whole-file protected
+        # set, and the delete-time defence-in-depth block) all read.
+        df, retention_stats = self._apply_viewer_retention(df, history, instance)
+        stats["retention_held"] = retention_stats.get("held_rows", 0)
+        self.logger.log_info(f"[⏱️] viewer_retention — {time.time()-_ps:.1f}s")
 
         df = self._apply_grace_period(df)
         self.logger.log_info(f"[⏱️] apply_grace_period — {time.time()-_ps:.1f}s")

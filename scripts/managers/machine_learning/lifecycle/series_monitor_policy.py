@@ -7,7 +7,10 @@ it) and climbers come back. The scoring (watchability), the Sonarr ``series/edit
 global_cache dwell clock are I/O kept in the manager; only the side-effect-free routing lives here.
 
 HYSTERESIS (anti-flap, the same shape as the 4K demote): promote at ``promote_threshold`` (default
-35), demote only below ``demote_floor`` (default 20). The [demote_floor, promote_threshold) band is
+35), demote only below ``demote_floor`` (default 17 — re-anchored from 20 when Group D v2 translated
+the persisted watchability axis; the promote threshold deliberately did NOT move, because it gates
+the file-less STUB population, which barely shifted. See machine_learning/thresholds/registry.py's
+delete block for the two-axis table). The [demote_floor, promote_threshold) band is
 STICKY — a series there keeps its current monitored state, so a score wobbling near the line never
 flaps. An optional per-series DWELL (``dwell_days``) requires the score to stay below the floor for N
 days before unmonitoring, absorbing a transient dip.

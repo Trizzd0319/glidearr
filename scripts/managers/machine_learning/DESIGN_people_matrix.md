@@ -111,12 +111,13 @@ Built per the user's "full default-off feature" choice. 60+ tests, brain_purity 
 - **P1** `services/trakt/people_matrix.py::TraktPeopleMatrixManager` — reads the daemon people
   buckets via the existing cache managers, builds the forward map, caches it (gz + global_cache
   `people_matrix/forward`), logs coverage. `PEOPLE_MATRIX_PATH`/`PEOPLE_AFFINITY_PATH` in
-  `daemon_paths`. Wired into `main.py` after Radarr, gated `people_matrix.enabled` (config block
-  added, **default false**).
+  `daemon_paths`. Wired into `main.py` after Radarr, gated `people_matrix.enabled` (**default TRUE**
+  as of the C4 activation — it was default-false, and the config schema never even defined the key,
+  so the build never ran and C4 was dead in every deployment).
 - **P2** pure `aggregate_person_affinity` (genre_affinity.py) + `person_affinity_score` (_shared.py,
   id-keyed, separate from `affinity_topk`). Manager `build()` also computes the household weights
   from the C3 watched-set (Trakt history + Tautulli completions) → `people_matrix/affinity`.
-- **P3** Group-**C4** term in `score_movie`/`score_show` (`person_weights`, `person_affinity_cap=0.0`);
+- **P3** Group-**C4** term in `score_movie`/`score_show` (`person_weights`, `person_affinity_cap`);
   reads the title's ids from the `credits` dict already passed. **cap=0.0 default → plan_summary
   byte-identical** (verified: existing golden scores unchanged; C4 integration test asserts it).
 - **P5** acquisition `people_affinity` signal (scorer, `_WEIGHTS` 0.0 → byte-identical total) + co-cast

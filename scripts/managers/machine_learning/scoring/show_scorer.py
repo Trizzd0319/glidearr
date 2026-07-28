@@ -21,6 +21,12 @@ clamp to [0, 100].  Two things change for television:
   * GROUP C — Collection / Universe is 0: shows have no native collection
     concept (franchise value already flows through keep-tags in Group A).
 
+  * GROUP D — Device / Playback Fit is the SAME two-path term as the movie
+    scorer's: with a ``transcode_profile`` (``scoring.device_fit_v2``, default
+    ON) it is a single NEGATIVE ``D4_transcode_risk`` and D1/D2/D3 report 0.0;
+    without one it is the legacy +6/+5/+4 bonus trio, byte-for-byte.
+    See scoring/device_fit.py for the measurement that motivated the change.
+
 Shared device/transcode/cert constants, the affinity helper and the
 score->profile mapping live in ``scoring/_shared.py``; this scorer and the movie
 scorer both import them from there, so the two engines can never drift and
@@ -40,20 +46,87 @@ from datetime import datetime, timezone
 # engines share one definition of every symbol and neither reads from the other.
 from scripts.managers.machine_learning.scoring._shared import (
     QUALITY_PROFILE_THRESHOLDS,           # noqa: F401  (re-exported for callers/shim)
-    _DEVICE_RESOLUTION_CEILING,
+    _DEVICE_CAPABILITIES,                 # noqa: F401  (re-exported for callers/shim)
+    _DEVICE_RESOLUTION_CEILING,           # noqa: F401  (re-exported for back-compat readers)
+    INTENT_HALF_LIFE_DAYS,
+    INTENT_STALE_FLOOR,
     _KIDS_CERTS,
     _TRANSCODE_FRIENDLY_CODECS,
     affinity_topk as _affinity,
+    codec_transcode_prior,
+    device_resolution_ceiling,
     normalize_lang,
     person_affinity_score,
     related_graph_affinity,
     score_to_profile,                     # noqa: F401  (re-exported for callers/shim)
     select_profile_id,
     user_rating_score,
+    watchlist_intent_score,
 )
 # Group-C4 reads the series' people-by-role from the SAME credits dict the scorer
 # already receives (route_people, keyed on tmdb_person_id). Pure brain→brain import.
 from scripts.managers.machine_learning.people_matrix.build import route_people
+
+
+# ── Group D v1 (LEGACY) ───────────────────────────────────────────────────────
+
+def _score_group_d_legacy(breakdown, platform_usage, transcode_stats,
+                          target_resolution, video_codec, device_capabilities) -> None:
+    """The v1 Group-D bonus terms, LIFTED VERBATIM out of ``score_show``.
+
+    Reachable whenever no ``transcode_profile`` is supplied (``scoring.device_fit_v2``
+    off, no household transcode evidence, or a legacy caller). Byte-for-byte identical to
+    the pre-v2 code; extracted only so the two paths sit side by side. Writes D1/D2/D3
+    into *breakdown*; the caller adds them to the score."""
+    # D1  Primary device resolution capability  (+6)
+    d1 = 0.0
+    if platform_usage and target_resolution:
+        primary_platform = max(platform_usage, key=platform_usage.get, default="")
+        # Most-specific match against the capability matrix ("Roku Ultra" -> 2160,
+        # bare "Roku" -> the conservative 1080). See _shared.resolve_device_capability.
+        device_ceil = device_resolution_ceiling(primary_platform, device_capabilities)
+        if device_ceil is not None:
+            if target_resolution <= device_ceil:
+                d1 = 6.0 if target_resolution == device_ceil else 3.0
+            else:
+                d1 = -2.0
+    breakdown["D1_device_capability"] = d1
+
+    # D2  Transcode avoidance  (+5)
+    # OBSERVED transcodes dominate; the device matrix is the prior for a codec with no
+    # observed history (AV1 can never reach the direct-play rung — Plex transcodes it
+    # regardless of hardware decode). Mirrors score_movie's D2 exactly.
+    d2 = 0.0
+    vcodec = video_codec or ""
+    if vcodec and transcode_stats is not None:
+        codec_transcoded = any(
+            vcodec.lower() in pair.lower() for pair in (transcode_stats or {})
+        )
+        if not codec_transcoded:
+            d2 = codec_transcode_prior(vcodec, platform_usage, device_capabilities)
+        elif vcodec.lower() in _TRANSCODE_FRIENDLY_CODECS:
+            d2 = 2.0
+    elif vcodec in ("", None):
+        d2 = 2.0
+    breakdown["D2_transcode_avoidance"] = d2
+
+    # D3  Platform resolution ceiling (all devices)  (+4)
+    d3 = 0.0
+    if platform_usage and target_resolution:
+        total_plays = sum(platform_usage.values()) or 1
+        capable_plays = 0
+        for platform, plays in platform_usage.items():
+            ceil_ = device_resolution_ceiling(platform, device_capabilities)
+            if ceil_ is not None and target_resolution <= ceil_:
+                capable_plays += plays
+        capable_pct = capable_plays / total_plays
+        if capable_pct >= 0.75:
+            d3 = 4.0
+        elif capable_pct >= 0.5:
+            d3 = 2.0
+        elif capable_pct >= 0.25:
+            d3 = 1.0
+    breakdown["D3_platform_ceiling"] = d3
 
 
 def score_show(
@@ -66,6 +139,17 @@ def score_show(
     max_episode_watch_count: int = 0,             # most-rewatched episode
     keep_policy: str | None = None,               # keep_series | keep_season | keep_universe | ...
     user_rating: float | None = None,             # household Trakt show rating 0-10
+    # A5 — explicit watchlist intent. ``intent_entry`` is this series' entry from
+    # next_watch.build_intent_index (keyed on tvdb id); ``intent_now`` is the run-stable
+    # clock the staleness decay measures against. cap DEFAULT 0.0 → the term contributes
+    # 0.0 → byte-identical until a caller opts in (the C4 pattern). The two decay knobs
+    # default to the module constants — the service passes the CONFIG values through
+    # _shared.resolve_intent_inputs (scoring.watchlist_intent.half_life_days/stale_floor).
+    intent_entry: dict | None = None,
+    intent_cap: float = 0.0,
+    intent_now=None,
+    intent_half_life_days: float = INTENT_HALF_LIFE_DAYS,
+    intent_stale_floor: float = INTENT_STALE_FLOOR,
     # ── GROUP B — Household Affinity ──────────────────────────────────────────
     genre_affinity: dict | None = None,
     credits: dict | None = None,                  # {cast:[...], crew:[...]} from TraktShowCacheManager
@@ -74,6 +158,21 @@ def score_show(
     transcode_stats: dict | None = None,
     target_resolution: int | None = None,
     video_codec: str | None = None,               # representative (modal) codec for the series
+    device_capabilities: dict | None = None,      # platform -> DeviceCapability; None = shipped table
+    # ── GROUP D v2 — transcode risk (scoring.device_fit_v2) ───────────────────
+    # ``transcode_profile`` IS the switch — None (every legacy caller) keeps the v1
+    # D1/D2/D3 bonuses byte-identical. The rest are the SERIES-level aggregates of the
+    # episode files (modal codec/audio, max resolution, median bitrate, union of
+    # subtitle/audio languages) built by features/show_features.
+    transcode_profile=None,
+    video_bitrate: float | None = None,
+    size_bytes: float | None = None,
+    runtime_seconds: float | None = None,
+    audio_codec: str | None = None,
+    audio_channels: float | None = None,
+    audio_languages: str | None = None,
+    subtitles: str | None = None,
+    container: str | None = None,                 # already-extracted extension ("mkv")
     # ── GROUP E — Audience Alignment ──────────────────────────────────────────
     per_user_affinity: dict | None = None,
     kids_users: list[str] | None = None,
@@ -130,7 +229,7 @@ def score_show(
     score: float = 0.0
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # GROUP A — Household Intent  (max 25) — RECENCY + BREADTH
+    # GROUP A — Household Intent  (max 33) — RECENCY + BREADTH + EXPLICIT INTENT
     # ═══════════════════════════════════════════════════════════════════════════
 
     # A1  keep_policy tag  (+15)
@@ -201,6 +300,20 @@ def score_show(
     )
     score += a4
     breakdown["A4_user_rating"] = a4
+
+    # A5  Watchlist intent  (+ intent_cap, DEFAULT 0.0 → byte-identical)
+    # The movie scorer's twin, same helper, same grading — see the longer note on
+    # movie_scorer's A5. TV is where the DATED half of the signal actually bites: Plex's
+    # union is undated, but Trakt's show watchlist carries a real ``listed_at`` reaching
+    # back to 2020, so a series somebody meant to start six years ago and never did decays
+    # to the stale floor instead of scoring like this week's addition.
+    a5 = 0.0
+    if intent_cap > 0 and intent_entry:
+        a5 = watchlist_intent_score(intent_entry, intent_cap, now=intent_now,
+                                    half_life_days=intent_half_life_days,
+                                    stale_floor=intent_stale_floor)
+    score += a5
+    breakdown["A5_intent"] = a5
 
     # ═══════════════════════════════════════════════════════════════════════════
     # GROUP B — Household Affinity  (max 20)
@@ -275,66 +388,45 @@ def score_show(
     breakdown["C4_person_affinity"] = c4
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # GROUP D — Device / Playback Fit  (max 15)
+    # GROUP D — Device / Playback Fit
     # ═══════════════════════════════════════════════════════════════════════════
-
-    # D1  Primary device resolution capability  (+6)
-    d1 = 0.0
-    if platform_usage and target_resolution:
-        primary_platform = max(platform_usage, key=platform_usage.get, default="")
-        primary_key = primary_platform.lower().strip()
-        device_ceil = None
-        for dev_key, ceil in _DEVICE_RESOLUTION_CEILING.items():
-            if dev_key in primary_key or primary_key in dev_key:
-                device_ceil = ceil
-                break
-        if device_ceil is not None:
-            if target_resolution <= device_ceil:
-                d1 = 6.0 if target_resolution == device_ceil else 3.0
-            else:
-                d1 = -2.0
-    score += d1
-    breakdown["D1_device_capability"] = d1
-
-    # D2  Transcode avoidance  (+5)
-    d2 = 0.0
-    vcodec = video_codec or ""
-    if vcodec and transcode_stats is not None:
-        codec_transcoded = any(
-            vcodec.lower() in pair.lower() for pair in (transcode_stats or {})
+    # Identical two-path shape to score_movie: a supplied ``transcode_profile`` (i.e.
+    # scoring.device_fit_v2 on) means ONE negative D4 term and D1/D2/D3 at 0.0; None
+    # means the v1 bonus terms below, byte-for-byte. See scoring/device_fit.py.
+    #
+    # TV NOTE — the STUB population. 7,600 of this library's 11,973 series own no episode
+    # file at all (pilot stubs). Under v1 they collected a flat +2.0 from D2's "unknown
+    # codec" branch; under v2 they score exactly 0.0, because a title with no file has no
+    # playback facts to be risky about. That is the intended "unmeasurable → neutral"
+    # rule, and it is a −2 translation of the whole stub distribution — see the comment
+    # on ``pilot_min_watchability`` in machine_learning/thresholds/registry.py.
+    if transcode_profile is not None:
+        from scripts.managers.machine_learning.scoring.device_fit import device_fit_penalty
+        d4, _d_detail = device_fit_penalty(
+            transcode_profile,
+            resolution=target_resolution,
+            video_codec=video_codec,
+            video_bitrate=video_bitrate,
+            size_bytes=size_bytes,
+            runtime_seconds=runtime_seconds,
+            audio_codec=audio_codec,
+            audio_channels=audio_channels,
+            audio_languages=audio_languages,
+            subtitles=subtitles,
+            container=container,
         )
-        if not codec_transcoded:
-            d2 = 5.0
-        elif vcodec.lower() in _TRANSCODE_FRIENDLY_CODECS:
-            d2 = 2.0
-    elif vcodec in ("", None):
-        d2 = 2.0
-    score += d2
-    breakdown["D2_transcode_avoidance"] = d2
-
-    # D3  Platform resolution ceiling (all devices)  (+4)
-    d3 = 0.0
-    if platform_usage and target_resolution:
-        total_plays = sum(platform_usage.values()) or 1
-        capable_plays = 0
-        for platform, plays in platform_usage.items():
-            pkey = platform.lower().strip()
-            ceil_ = next(
-                (c for k, c in _DEVICE_RESOLUTION_CEILING.items()
-                 if k in pkey or pkey in k),
-                None,
-            )
-            if ceil_ is not None and target_resolution <= ceil_:
-                capable_plays += plays
-        capable_pct = capable_plays / total_plays
-        if capable_pct >= 0.75:
-            d3 = 4.0
-        elif capable_pct >= 0.5:
-            d3 = 2.0
-        elif capable_pct >= 0.25:
-            d3 = 1.0
-    score += d3
-    breakdown["D3_platform_ceiling"] = d3
+        score += d4
+        breakdown["D1_device_capability"] = 0.0
+        breakdown["D2_transcode_avoidance"] = 0.0
+        breakdown["D3_platform_ceiling"] = 0.0
+        breakdown["D4_transcode_risk"] = d4
+    else:
+        _score_group_d_legacy(breakdown, platform_usage, transcode_stats,
+                              target_resolution, video_codec, device_capabilities)
+        score += (breakdown["D1_device_capability"]
+                  + breakdown["D2_transcode_avoidance"]
+                  + breakdown["D3_platform_ceiling"])
+        breakdown["D4_transcode_risk"] = 0.0
 
     # ═══════════════════════════════════════════════════════════════════════════
     # GROUP E — Audience Alignment  (max 10)
@@ -522,6 +614,7 @@ def score_to_sonarr_profile_id(
     score: int,
     ranked_profiles: list[dict],
     target_resolution: int | None = None,
+    ladder=None,
 ) -> int | None:
     """Select a Sonarr quality-profile id for *score* (Phase 3 downgrade helper).
 
@@ -530,4 +623,4 @@ def score_to_sonarr_profile_id(
     Sonarr/Radarr profile-id selection can never drift. Sonarr quality profiles
     share the Radarr items/quality/resolution shape, hence one selector.
     """
-    return select_profile_id(score, ranked_profiles, target_resolution)
+    return select_profile_id(score, ranked_profiles, target_resolution, ladder)

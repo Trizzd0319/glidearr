@@ -15,6 +15,7 @@ from scripts.managers.factories.mixins.component_manager import ComponentManager
 from scripts.managers.machine_learning.classification.keep_policy import resolve_keep_policy
 from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
 from scripts.managers.machine_learning.space.dual_version import DEFAULT_UHD_SCORE, pick_hd_profile
+from scripts.managers.machine_learning.thresholds.registry import get_threshold
 from scripts.managers.machine_learning.lifecycle.monitor_policy import (
     release_available,
     triage_action,
@@ -507,7 +508,8 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         Policy (config ``owned_monitor_policy``, default "watchability"):
           watchability — monitor a movie iff it is keep/universe-tagged, OR has been
                          watched, OR scores >= ``owned_monitor_score_threshold``
-                         (default 35). Everything else stays unmonitored. A movie whose
+                         (schema default 30; the literal below is the config-absent
+                         fallback). Everything else stays unmonitored. A movie whose
                          Trakt credits aren't cached yet (affinity unknown) is DEFERRED
                          — left unmonitored — so a household favourite isn't skipped
                          before the enrichment daemon fills its data; the next run
@@ -537,6 +539,8 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                             if self.config else 35)
         except (TypeError, ValueError):
             threshold = 35
+        threshold = get_threshold("movie_monitor", self.config, threshold,
+                                  logger=getattr(self, "logger", None))
 
         # ── off: leave everything exactly as the user set it ─────────────────────
         if policy == "off":
@@ -751,8 +755,8 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                                its score recovers — see restore_recovered_deletions.
 
         Anti-bias / anti-churn safeguards:
-          * Hysteresis — promote at owned_monitor_score_threshold (35); act only below
-            the demote floor (20). The 20-35 band is sticky → no flapping.
+          * Hysteresis — promote at owned_monitor_score_threshold (30); act only below
+            the demote floor (20). The 20-30 band is sticky → no flapping.
           * One per-movie clock (global_cache) tracks "continuously below floor since";
             it RESETS the instant the score recovers to >= floor.
           * Hard guards — keep/universe-tagged OR ever-watched movies are never touched.
@@ -778,7 +782,20 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
                 return int(self.config.get(key, default) if self.config else default)
             except (TypeError, ValueError):
                 return default
+        # ── 20, NOT 17. DO NOT "RE-ANCHOR" THIS TO MATCH space_pressure. ──────────
+        # This pass scores through ``_score_owned``, which calls ``score_movie`` on the RAW
+        # Radarr dict with NO ``transcode_profile`` — so Group D v2's transcode-risk penalty
+        # is unreachable here and this axis was NOT translated by SCORER_REVISION 4. (The
+        # v1 branch it does take gets no ``platform_usage``/``target_resolution``/
+        # ``video_codec`` either, so D1 = D3 = 0.0 and D2 sits on its flat +2.0
+        # unknown-codec branch — before AND after the change.) Measured on this library:
+        # the anomaly axis has mean 7.4 / max 36, the persisted axis mean 9.3 / max 58, and
+        # they agree on only ~84% of delete-eligibility calls. A 17 here would tighten a
+        # floor against a distribution that never moved. See registry.py's delete block for
+        # the full two-axis table and for why threading a profile in here does NOT fix it.
         floor          = _int("owned_demote_score_threshold", 20)
+        floor          = get_threshold("movie_demote", self.config, floor,
+                                       logger=getattr(self, "logger", None))
         unmonitor_days = _int("owned_demote_dwell_days", 30)
         delete_days    = _int("owned_delete_dwell_days", 90)
         # HARD SAFETY GATE folded into delete_enabled: with no operator-set
@@ -1112,7 +1129,8 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
     def restore_recovered_deletions(self, instance: str) -> dict:
         """
         Re-acquire movies previously deleted by the prune pass whose score has
-        recovered above owned_restore_score_threshold (default 20): re-monitor +
+        recovered above owned_restore_score_threshold (default 20 — AXIS LEGACY, see
+        the block comment on the literal below): re-monitor +
         trigger a search so Radarr re-downloads. Tracked in global_cache
         ``radarr/<instance>/demote_deleted``; entries drop when restored, when the
         movie regains a file by other means, or when it leaves Radarr.
@@ -1129,10 +1147,21 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             return stats
 
         now = datetime.now(timezone.utc)
+        # 20, NOT 17 — same AXIS LEGACY reasoning as demote_stale_monitored's floor (this
+        # pass scores through the same ``_score_owned``), plus a hard mechanical constraint:
+        # this is the hysteresis PARTNER of ``owned_demote_score_threshold``. Deletion fires
+        # at ``score < demote_floor`` and restore at ``score > restore_floor``, so dropping
+        # this below the demote floor opens a band (e.g. 17 vs 20 -> scores 18-19) in which
+        # every movie is deleted one run and re-acquired the next, forever
+        # (``owned_restore_min_age_days`` defaults to 0, so nothing damps it). The two move
+        # together or not at all. NOTE the Sonarr twin no longer shares this key — it reads
+        # ``tv_restore_score_threshold`` because it sits on the OTHER axis; see registry.py.
         try:
             restore_floor = int(self.config.get("owned_restore_score_threshold", 20) if self.config else 20)
         except (TypeError, ValueError):
             restore_floor = 20
+        restore_floor = get_threshold("movie_restore", self.config, restore_floor,
+                                      logger=getattr(self, "logger", None))
         try:
             restore_min_age = int(self.config.get("owned_restore_min_age_days", 0) if self.config else 0)
         except (TypeError, ValueError):
@@ -1268,7 +1297,15 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         Inputs pulled from global_cache so no extra API calls needed.
         """
         WATCH_THRESHOLD    = 60   # score ≥ this → actively search (0-100 scale)
-        UNMONITOR_BELOW    = 20   # score < this → unmonitor
+        # The unmonitor floor is routed through the calibrated-threshold registry
+        # (thresholds/registry): in the default mode="shadow" this returns the 20
+        # below verbatim. 20, NOT 17 — this pass scores through ``_score_owned``, the
+        # AXIS LEGACY path that Group D v2 never reached, so it was deliberately left
+        # where it was when the persisted-axis family was re-anchored (registry.py's
+        # delete block). WATCH_THRESHOLD is deliberately NOT routed — it is the middle
+        # rung of a three-way route, not a binary cutoff (see the `movie_search` note).
+        UNMONITOR_BELOW    = get_threshold("movie_unmonitor", self.config, 20,
+                                           logger=getattr(self, "logger", None))
 
         instance = self._resolve_instance(instance)
         stats = {
@@ -1331,6 +1368,11 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             uhd_threshold = int(_routing_movies.get("4k_dual_min_score") or DEFAULT_UHD_SCORE)
         except (TypeError, ValueError):
             uhd_threshold = DEFAULT_UHD_SCORE
+        # The one UHD gate that compares the WATCHABILITY score (the quantity the
+        # calibrator is fit on) — the resolver's acquisition score and
+        # uhd_reconcile's watch_likelihood are different scales and stay literal.
+        uhd_threshold = get_threshold("uhd_dual", self.config, uhd_threshold,
+                                      logger=getattr(self, "logger", None))
 
         # ── Standard-baseline rehome (the 4K-instance demote completion) ──────────────
         # When a 4K-instance missing title is unmonitored because it doesn't warrant 4K, acquire its

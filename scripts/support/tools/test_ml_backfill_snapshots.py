@@ -216,7 +216,14 @@ def test_backfill_truncation_added_dates_and_provenance(env):
 
     # provenance on EVERY row
     assert (df["source"] == "backfill").all()
-    assert (df["reconstruction_version"] == 1).all()
+    # Tracks the constant rather than pinning a literal: the version has to MOVE
+    # whenever the reconstruction's semantics change (it went 1 -> 2 with the global
+    # watched bar, which made title_watch_map count WATCHES instead of plays), and a
+    # hard-coded 1 would have to be edited every time — i.e. it would stop testing
+    # anything. What matters is that every row carries the CURRENT version.
+    from scripts.support.tools.ml_backfill_snapshots import RECONSTRUCTION_VERSION
+    assert RECONSTRUCTION_VERSION >= 2       # the watched-bar bump landed
+    assert (df["reconstruction_version"] == RECONSTRUCTION_VERSION).all()
     assert df["leakage_flags"].str.startswith(
         "credits_today,metadata_today,deletions_unknown").all()
 

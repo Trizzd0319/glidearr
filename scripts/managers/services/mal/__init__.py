@@ -101,10 +101,16 @@ class MALManager(BaseManager, ComponentManagerMixin):
         start = node.get("start_season", {}) or {}
         genres = [g.get("name") for g in (node.get("genres") or []) if isinstance(g, dict) and g.get("name")]
         mean = node.get("mean")
+        # ROUTE ON MAL'S OWN ``media_type``, not on the assumption that everything MAL
+        # knows about is a series. This was hardcoded to "show", which sent every anime
+        # FILM to Sonarr — where it can never match a series row, so it was silently
+        # unacquirable and unresolvable. MAL's ``movie`` is the only value that is not
+        # Sonarr-shaped; ``tv``/``ona``/``ova``/``special``/``music`` all are.
+        media_type = "movie" if str(node.get("media_type") or "").lower() == "movie" else "show"
         return {
             "title": node.get("title"),
             "year": start.get("year"),
-            "type": "show",
+            "type": media_type,
             "ids": {"trakt": None, "tvdb": None, "tmdb": None, "imdb": None, "mal": node.get("id")},
             "genres": genres or ["anime"],
             "rating": mean,

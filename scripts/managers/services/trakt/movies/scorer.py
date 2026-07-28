@@ -12,6 +12,7 @@ from __future__ import annotations
 from scripts.managers.machine_learning.scoring.movie_scorer import *  # noqa: F401,F403
 from scripts.managers.machine_learning.scoring.movie_scorer import (  # noqa: F401
     QUALITY_PROFILE_THRESHOLDS,
+    _DEVICE_CAPABILITIES,
     _DEVICE_RESOLUTION_CEILING,
     _KIDS_CERTS,
     _TRANSCODE_FRIENDLY_CODECS,

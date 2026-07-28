@@ -19,7 +19,10 @@ from __future__ import annotations
 import pandas as pd
 
 from scripts.managers.machine_learning.contracts.feature_rows import ShowFeatureRow
-from scripts.managers.machine_learning.scoring._shared import preferred_language_available
+from scripts.managers.machine_learning.scoring._shared import (
+    intent_decay_kwargs as _intent_decay_kwargs,
+    preferred_language_available,
+)
 from scripts.managers.machine_learning.scoring.show_scorer import score_show
 
 
@@ -40,6 +43,34 @@ def _max_int(col) -> "int | None":
     try:
         s = pd.to_numeric(col, errors="coerce").dropna()
         return int(s.max()) if len(s) else None
+    except Exception:
+        return None
+
+
+def _median_pos(col) -> "float | None":
+    """Median of the STRICTLY POSITIVE values in a column, or None when there are none.
+
+    The Group-D v2 aggregate for bitrate/size: median rather than max so one oversized
+    special (or a 4K bonus episode) cannot speak for a whole series, and positive-only so
+    the 93% of episode rows that report ``video_bitrate = 0`` do not drag the median of
+    the rows that do report one to zero."""
+    try:
+        s = pd.to_numeric(col, errors="coerce").dropna()
+        s = s[s > 0]
+        return float(s.median()) if len(s) else None
+    except Exception:
+        return None
+
+
+def _modal_container(col) -> "str | None":
+    """Most-common file extension across the series' episode paths ("mkv"/"mp4")."""
+    from scripts.managers.machine_learning.scoring.device_fit import container_from_path
+    try:
+        exts = [container_from_path(p) for p in col.dropna().tolist()]
+        exts = [e for e in exts if e]
+        if not exts:
+            return None
+        return max(set(exts), key=exts.count)
     except Exception:
         return None
 
@@ -110,6 +141,20 @@ def build_show_feature_row(
     target_resolution = _max_int(rows["resolution"]) if "resolution" in rows.columns else None
     language_consumable_fraction = _consumable_fraction(rows)
 
+    # ── GROUP D v2 — series-level playback aggregate ──────────────────────────
+    # Modal for the categoricals (what a typical episode of this series IS), median for
+    # the continuous ones. Every one of these is None on a pilot STUB — no episode file,
+    # no playback facts — which is exactly why a stub's Group D is 0.0 under v2 rather
+    # than the flat +2.0 the v1 "unknown codec" branch handed out.
+    def _col(name):
+        return rows[name] if name in rows.columns else None
+
+    _ac = _col("audio_codec")
+    _ach = _col("audio_channels")
+    _al = _col("audio_languages")
+    _sub = _col("subtitles")
+    _path = _col("relative_path")
+
     latest_air = None
     if "air_date_utc" in rows.columns:
         air = pd.to_datetime(rows["air_date_utc"], utc=True, errors="coerce").dropna()
@@ -132,6 +177,14 @@ def build_show_feature_row(
         max_episode_watch_count=max_wc,
         video_codec=video_codec,
         target_resolution=target_resolution,
+        video_bitrate=_median_pos(_col("video_bitrate")) if _col("video_bitrate") is not None else None,
+        size_bytes=_median_pos(_col("size_bytes")) if _col("size_bytes") is not None else None,
+        runtime_seconds=_median_pos(_col("runtime_seconds")) if _col("runtime_seconds") is not None else None,
+        audio_codec=_modal_str(_ac) if _ac is not None else None,
+        audio_channels=_median_pos(_ach) if _ach is not None else None,
+        audio_languages=_modal_str(_al) if _al is not None else None,
+        subtitles=_modal_str(_sub) if _sub is not None else None,
+        container=_modal_container(_path) if _path is not None else None,
         latest_air_date=latest_air,
         user_rating=user_rating,
         sonarr_rating=sonarr_rating,
@@ -149,6 +202,10 @@ def score_show_features(
     genre_affinity: dict,
     platform_usage: dict | None = None,
     transcode_stats: dict | None = None,
+    device_capabilities: dict | None = None,
+    # GROUP D v2 — the household transcode profile, built ONCE per pass. None (the
+    # default) → score_show takes the legacy D1/D2/D3 path, byte-identical.
+    transcode_profile=None,
     per_user_affinity: dict | None = None,
     kids_users: list | None = None,
     adult_users: list | None = None,
@@ -156,6 +213,17 @@ def score_show_features(
     related_graph_cap: float = 4.0,
     person_weights: dict | None = None,
     person_affinity_cap: float = 0.0,
+    # GROUP A5 — the household's forward-intent index, {tvdb_id: entry} from
+    # next_watch.build_intent_index, built ONCE per pass by the service. cap DEFAULT 0.0 →
+    # A5 contributes 0.0 → byte-identical until a caller opts in.
+    intent_index: dict | None = None,
+    intent_cap: float = 0.0,
+    intent_now=None,
+    # The A5 staleness knobs (scoring.watchlist_intent.half_life_days / stale_floor),
+    # resolved once per pass by _shared.resolve_intent_inputs. None → the scorer's own
+    # module-constant defaults, i.e. byte-identical for any caller that omits them.
+    intent_half_life_days: float | None = None,
+    intent_stale_floor: float | None = None,
     ur_slope: float = 1.5,
     ur_pos_cap: float = 8.0,
     ur_neg_cap: float = -3.0,
@@ -167,7 +235,9 @@ def score_show_features(
     library context. Byte-identical to the marshalling previously inline in
     episode_files._build_show_score_map. ``person_weights``/``person_affinity_cap`` feed
     Group-C4 (cast/crew taste overlap); cap DEFAULT 0.0 → C4 is byte-identical until the
-    caller opts in (episode_files gates it on config + a built people-matrix)."""
+    caller opts in (episode_files gates it on config + a built people-matrix).
+    ``intent_index``/``intent_cap`` feed Group-A5 (explicit watchlist intent) on the same
+    terms — the index is keyed on TVDb id, so the lookup is the feature row's own id."""
     show = {
         "genres": list(fr.genres),
         "network": fr.network,
@@ -190,6 +260,22 @@ def score_show_features(
         transcode_stats=transcode_stats,
         target_resolution=fr.target_resolution,
         video_codec=fr.video_codec,
+        # None = the shipped cold-start capability matrix; a caller with config in hand
+        # passes _shared.resolve_device_capabilities(config) to honour
+        # scoring.device_capabilities.
+        device_capabilities=device_capabilities,
+        # GROUP D v2 — profile is the switch; the rest are the series-level aggregates.
+        # The show path passes the already-extracted ``container`` (a series has many
+        # paths, so the modal extension is resolved during aggregation, not per call).
+        transcode_profile=transcode_profile,
+        video_bitrate=fr.video_bitrate,
+        size_bytes=fr.size_bytes,
+        runtime_seconds=fr.runtime_seconds,
+        audio_codec=fr.audio_codec,
+        audio_channels=fr.audio_channels,
+        audio_languages=fr.audio_languages,
+        subtitles=fr.subtitles,
+        container=fr.container,
         per_user_affinity=per_user_affinity,
         kids_users=kids_users,
         adult_users=adult_users,
@@ -201,6 +287,12 @@ def score_show_features(
         watched_tvdb_ids=watched_tvdb_ids,
         person_weights=person_weights,
         person_affinity_cap=person_affinity_cap,
+        intent_entry=(intent_index or {}).get(fr.tvdb_id),
+        intent_cap=intent_cap,
+        intent_now=intent_now,
+        # Omit rather than forward None: score_show's defaults ARE the module constants,
+        # and passing None would make float(None) raise inside the decay.
+        **_intent_decay_kwargs(intent_half_life_days, intent_stale_floor),
         # File-aware G1 is OPT-IN (oracle-mover): only pass the per-episode consumable
         # fraction when the caller enables it; otherwise None → score_show falls back to
         # the legacy household-language penalty → byte-identical.

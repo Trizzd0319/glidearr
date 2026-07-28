@@ -61,9 +61,14 @@ _DOC_LEAVES = [
     ("free_space_limit", "2500", "Minimum free space (GB) to keep per disk"),
     ("deletions_consent", "false", "REQUIRED to allow DELETING media files (DESTRUCTIVE; with free_space_limit it arms space reclamation). Off = scoring/profiles/playlists only, pause acquisition at the floor"),
     ("owned_monitor_policy", "watchability", "Monitor owned movies by: watchability | all | off"),
-    ("owned_monitor_score_threshold", "35", "Min watchability score (0-100) to monitor an owned movie"),
+    ("owned_monitor_score_threshold", "30", "Min watchability score (0-100) to monitor an owned movie"),
     ("owned_demote_enabled", "true", "Prune owned movies that stay low-watchability (unmonitor then delete)"),
-    ("owned_demote_score_threshold", "20", "Demote floor (hysteresis vs the 35 monitor threshold)"),
+    # 20, NOT the 17 the space-pressure ceilings below carry. This pass scores through
+    # repair/anomaly.py::_score_owned (no transcode_profile → Group D v2 never reaches it),
+    # so its axis was not translated by SCORER_REVISION 4 and its floor was not re-anchored.
+    # It is also the hysteresis partner of owned_restore_score_threshold — they move together
+    # or a movie in the gap flaps. See machine_learning/thresholds/registry.py's delete block.
+    ("owned_demote_score_threshold", "20", "Demote floor (hysteresis vs the 30 monitor threshold)"),
     ("owned_demote_dwell_days", "30", "Days below the floor before unmonitoring"),
     ("owned_delete_enabled", "true", "DELETE the file after a longer sustained low-watchability window"),
     ("owned_delete_dwell_days", "90", "Days below the floor before deleting the file (restorable)"),
@@ -73,10 +78,14 @@ _DOC_LEAVES = [
     ("space_pressure_headroom_ratio", "0.10", "Pressure band above free_space_limit (0.10 = up to +10%)"),
     ("space_pressure_delete_enabled", "true", "Delete lowest-rated movies to free space below free_space_limit"),
     ("space_pressure_include_unwatched", "true", "Allow deleting unwatched low-watchability movies under pressure"),
-    ("space_pressure_score_ceiling", "20", "Max watchability score eligible for space-pressure deletion (unwatched)"),
+    # 17: these two read the PERSISTED watchability_score column, the axis Group D v2
+    # translated down ~13 points (SCORER_REVISION 4). Re-anchored from 20 to preserve the
+    # selectivity that was actually reviewed — see machine_learning/thresholds/registry.py.
+    ("space_pressure_score_ceiling", "17", "Max watchability score eligible for space-pressure deletion (unwatched)"),
     ("space_coordinator_enabled", "false", "Centralise movie+TV deletion into one ranked pool (downgrade both, then delete)"),
     ("tv_downgrade_enabled", "true", "Allow downgrading low-watchability series to 720p under space pressure"),
-    ("tv_space_pressure_score_ceiling", "20", "Max series watchability score eligible for TV space deletion"),
+    ("tv_space_pressure_score_ceiling", "17", "Max series watchability score eligible for TV space deletion"),
+    ("tv_restore_score_threshold", "17", "Re-acquire coordinator-deleted episodes once their series' score recovers above this (Sonarr twin of owned_restore_score_threshold; separate key because it reads the persisted score axis)"),
     ("large_file_gb", "30", "Flag movies larger than this (GB) in the storage report"),
     ("backup_before_destructive", "true", "Native Radarr/Sonarr backup before any destructive change (real runs); on failure the run degrades to dry-run"),
     ("backup_deep_validate", "false", "Also CRC-check the downloaded backup zip (only when the *arr /backup route isn't UI-auth-gated; else creation is size-verified)"),
@@ -101,6 +110,18 @@ _DOC_LEAVES = [
     ("acquisition.universe.cold_start", "false", "false = extend only sagas the household has already watched ≥1 member of; true = also cold-start universes you own none of (aggressive). NOTE: true is coordinator-pending (Phase 7) — currently inert, always extend-only"),
     ("acquisition.universe.movies", "true", "Acquire unowned FILM members of an engaged saga via Radarr"),
     ("acquisition.universe.tv", "true", "Acquire unowned SHOW members of an engaged saga via Sonarr"),
+    # Per-viewer episode retention (lifecycle.viewer_retention) — ON by default. The
+    # behaviour it replaces is a bug (an episode is delete-eligible 3h after ANYONE
+    # watched it, with no backward cushion and no protection for a viewer further
+    # behind), so this ships enabled and is turned OFF, not on.
+    ("episode_retention.enabled", "true", "Per-VIEWER episode retention (ON by default): each account holds [position − backward_buffer, position + pace × horizon_days] on every series it watches; an episode inside ANY account's window is never marked for deletion. false = legacy behaviour (delete 3h after ANYONE watched it, no backward cushion, no protection for a viewer further behind)"),
+    ("episode_retention.backward_buffer", "2", "Episodes kept BEHIND each viewer's furthest-watched episode — the rewatch cushion ('in case the viewer wants to go backwards'). Counted in real episodes, so it crosses a season boundary correctly. 0 = hold only the resume point itself"),
+    ("episode_retention.horizon_days", "14", "How many days of each viewer's measured pace to protect AHEAD of their position ('if someone will approach the episode within a decent timeframe, don't delete it')"),
+    ("episode_retention.pace_window_days", "30", "Window used to measure a viewer's episodes/day on a series. Anchored on THAT VIEWER'S last play, not on today, so a paused viewer keeps the pace they were actually going at"),
+    ("episode_retention.default_pace", "1.0", "Episodes/day assumed when pace is undefined (a viewer with a single play on the series). A viewer one episode in is at their most likely to continue"),
+    ("episode_retention.dormant_days", "", "Days with no play on a series before that viewer stops projecting FORWARD (position + backward_buffer are still held). BLANK = inherit acquisition.next_episode.recency_gate.cold_days (90) so 'cold' has one definition; set a number to split the two"),
+    ("episode_retention.watched_percent", "85", "LEGACY ALIAS of watched_threshold.percent — kept so an existing config keeps working. Set watched_threshold.percent instead; it wins when both are present"),
+    ("watched_threshold.percent", "85", "WHAT COUNTS AS WATCHED, system-wide. A play counts as a WATCH when Tautulli's own per-row watched_status says so (its verdict always wins — it already reflects the threshold configured in Tautulli/Plex), else when percent_complete >= this. Drives is_watched/watch_count in BOTH the movie and episode caches, the 3h grace clock, the A2/A3 engagement+rewatch signals, the watch_likelihood engagement floors and the per-viewer retention intervals. 0 = the old behaviour where a 30-second sample counted as a watch and queued the file for deletion"),
     ("saga_retention.enabled", "false", "Catch-up (trailing-viewer) retention: never delete a saga title a behind viewer still needs to reach (the gate = viewers who WATCHED or WATCHLISTED any saga member, derived from data — no hardcoded users). At the free-space floor held titles are DOWNGRADED not deleted. Default off → legacy deletion unchanged"),
     ("saga_retention.dormancy_window_days", "90", "Drop a viewer from a saga's gate after this many days of no saga activity (the primary disk-safety knob; prevents an abandoned saga pinning disk forever)"),
     ("saga_retention.completion_threshold", "0.8", "A play reaching this fraction counts as a 'meaningful watch' = engaged with the saga"),
@@ -127,7 +148,7 @@ _DOC_LEAVES = [
     ("cross_instance_dedup_consent", "false", "Allow the cross-instance reconcile to DELETE the worse copy when both instances own a title (the better copy is kept); needs routing.reorg_mode=cross_instance + the backup gate; off by default"),
     ("routing.reorg_mode", "log_only", "Library re-organizer for owned media: off | log_only | same_instance (MOVES files between root folders) | cross_instance (MOVES files between instances + dedup)"),
     ("routing.movies.4k_policy", "both", "Movie 4K policy when a DISTINCT 4K Radarr exists: both | uhd_only | hd_only"),
-    ("routing.movies.4k_dual_min_score", "70", "Min watchability score to keep BOTH a 4K and an HD copy of a movie"),
+    ("routing.movies.4k_dual_min_score", "75", "Min watchability score to keep BOTH a 4K and an HD copy of a movie (0 = unset → the shipped DEFAULT_UHD_SCORE, which is also 75)"),
     ("routing.movies.anime_policy", "dedicated", "Anime movie routing: dedicated (anime folder) | standard"),
     ("routing.movies.kids_bucket_enabled", "false", "Route kid-safe movies to the kids movie folder"),
     ("routing.tv.anime_policy", "series_type_plus_folder", "Anime series routing: series_type_plus_folder | folder_only | off"),
@@ -175,6 +196,13 @@ _DOC_LEAVES = [
     ("plex.playlists.this_week_in_history.timezone", "", "IANA timezone that pins the household week, e.g. America/New_York (blank = PMS/local)"),
     ("plex.playlists.this_week_in_history.opt_in_users", "", "Comma-separated profile titles/keys to build the shelf for (blank + enabled = all tracked users)"),
     ("plex.playlists.this_week_in_history.trust_home_managed", "false", "When a managed profile's library grant can't be resolved, default it to ALL libraries (still age-gated) instead of an empty shelf"),
+    ("plex.playlists.hidden_gems.enabled", "false", "Build a per-profile 'Hidden Gems' shelf of movies you OWN, have NEVER played, and that match your taste — ranked on a TASTE-ONLY score (engagement signals excluded, so it surfaces the backlog instead of re-ranking favourites); off until enabled"),
+    ("plex.playlists.hidden_gems.size", "25", "How many picks a Hidden Gems shelf holds"),
+    ("plex.playlists.hidden_gems.max_per_franchise", "2", "Max picks from one collection/universe, so a single saga can't fill the shelf (0 = no cap)"),
+    ("plex.playlists.hidden_gems.max_per_person", "3", "Max picks sharing one credited director/lead actor (0 = no cap)"),
+    ("plex.playlists.hidden_gems.window_days", "30", "Days a Hidden Gems pick has to be played before it counts as a miss — also how long it stays off the shelf after being shown (one knob, so a play is never ambiguous between two recommendations)"),
+    ("plex.playlists.hidden_gems.play_min_pct", "85", "Completion percentage that counts as 'played' when scoring a Hidden Gems pick — keep it equal to the watched-set floor (85) or a successful pick will keep re-surfacing"),
+    ("plex.playlists.hidden_gems.opt_in_users", "", "Comma-separated profile titles/keys to build the Hidden Gems shelf for (blank + enabled = all tracked users)"),
     ("tvdb.api", "<secret>", "SECRET — optional"),
     ("mal.client_id", "<secret>", "SECRET — optional"),
     ("mal.client_secret", "<secret>", "SECRET — optional"),

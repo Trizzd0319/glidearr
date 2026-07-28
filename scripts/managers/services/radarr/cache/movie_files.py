@@ -39,6 +39,10 @@ from scripts.managers.machine_learning.classification.franchise import (
 )
 from scripts.managers.machine_learning.classification.keep_policy import build_keep_policy_map
 from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
+from scripts.managers.machine_learning.lifecycle.watched_definition import (
+    play_is_watched,
+    resolve_watched_percent,
+)
 from scripts.managers.machine_learning.lifecycle.grace_policy import (
     grace_mark,
     grace_window_multiplier,
@@ -219,6 +223,134 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         if self.radarr_api and hasattr(self.radarr_api, "resolve_instance"):
             return self.radarr_api.resolve_instance(instance)
         return instance or "default"
+
+    def _all_instances(self) -> "list[str]":
+        """Every configured Radarr instance name (empty when unresolvable)."""
+        api = self.radarr_api
+        if api is not None and hasattr(api, "get_all_radarr_apis"):
+            try:
+                return list(api.get_all_radarr_apis().keys())
+            except Exception:
+                pass
+        try:
+            cfg = self.config or {}
+            names = list((cfg.get("radarr_instances") or {}).keys())
+            if names:
+                return names
+        except Exception:
+            pass
+        return []
+
+    # ── Cross-instance mirrors (one physical file, two Radarr records) ──────────
+
+    @staticmethod
+    def _movie_file_size(movie: dict):
+        """The movie's file size in bytes, or None when it has no file."""
+        if not movie.get("hasFile"):
+            return None
+        size = (movie.get("movieFile") or {}).get("size")
+        try:
+            return int(size) if size else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _movie_file_resolution(movie: dict) -> int:
+        q = (((movie.get("movieFile") or {}).get("quality") or {}).get("quality") or {})
+        try:
+            return int(q.get("resolution") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _authoritative_instance(self, resolution: int, instances: "list[str]") -> str:
+        """Which instance SHOULD own a file of this resolution, given
+        ``radarr_instances_categorized`` ({"720p": …, "1080p": …, "4K": …}).
+
+        A 2160p file belongs on the instance categorised "4K"; anything below belongs on
+        the 1080p/720p instance. When the categorised instance is not in the group at all
+        (or there is no categorisation), fall back to the alphabetically-first name — an
+        arbitrary but DETERMINISTIC choice, which is what matters: every instance's
+        refresh must reach the same verdict, or two runs would each drop the other's row
+        and the title would vanish entirely."""
+        cats = {}
+        try:
+            cats = (self.config or {}).get("radarr_instances_categorized") or {}
+        except Exception:
+            cats = {}
+        want = None
+        if isinstance(cats, dict):
+            if resolution >= 2160:
+                want = cats.get("4K") or cats.get("4k") or cats.get("2160p")
+            else:
+                want = cats.get("1080p") or cats.get("720p")
+        if want and want in instances:
+            return want
+        return sorted(instances)[0]
+
+    def _mirrored_tmdb_ids(self, instance: str, movies: "list[dict]") -> set:
+        """tmdb ids whose file on THIS instance is a byte-identical mirror of a copy
+        ANOTHER Radarr instance holds, and for which this instance is NOT the
+        authoritative holder — i.e. rows that would double-count one physical file.
+
+        WHY THESE EXIST (root cause). ``routing.movies.4k_policy == "both"`` drives
+        ``CrossInstanceMove.relocate``, which imports the standard instance's existing
+        2160p into the 4K instance with ``importMode=copy`` — on the shared storage the
+        flow is gated on, Radarr HARDLINKS it. That is deliberate make-before-break: the
+        source file stays until the standard record's ``retune_baseline`` grabs a ≤1080p
+        replacement. Until that grab lands (and for a title with no 1080p release
+        available, that is indefinitely), BOTH instances legitimately report
+        ``hasFile=True`` for what is ONE file on disk. ``refresh`` is a faithful
+        per-instance mirror of Radarr with no cross-instance view, so it wrote both rows
+        at full size and every space consumer — greenfield accounting, the delete pool's
+        reclaim estimate, storage summaries — counted the bytes twice. Worse, the
+        redundant row advertises reclaim that deleting it cannot deliver: unlinking one
+        of two hardlinks frees nothing.
+
+        THE GUARD AGAINST FALSE POSITIVES: only BYTE-IDENTICAL sizes qualify. A genuine
+        dual-version holding (a 2160p on the 4K instance + a real 1080p baseline on the
+        standard one) has two different sizes and is never touched — on this library
+        that is 37 of the 43 standard/ultra overlaps.
+
+        FAIL-SAFE: if another instance's movie list is not cached, that instance is
+        simply not considered — an unknown neighbour can never cause a row to be
+        dropped. Reads only ``radarr.movies.<inst>.full`` from global_cache (already
+        populated by run_movie_data_pull), so this costs no API calls.
+        """
+        others = [i for i in self._all_instances() if i and i != instance]
+        if not others or not self.global_cache:
+            return set()
+
+        mine: dict = {}
+        for m in movies:
+            tmdb, size = m.get("tmdbId"), self._movie_file_size(m)
+            if tmdb and size:
+                mine[int(tmdb)] = (size, self._movie_file_resolution(m))
+        if not mine:
+            return set()
+
+        holders: dict = {}          # tmdb -> {size: [instance, ...]}
+        for other in others:
+            try:
+                lst = self.global_cache.get(f"radarr.movies.{other}.full") or []
+            except Exception:
+                continue
+            for m in lst:
+                tmdb, size = m.get("tmdbId"), self._movie_file_size(m)
+                if not tmdb or not size:
+                    continue
+                tmdb = int(tmdb)
+                if tmdb in mine and mine[tmdb][0] == size:
+                    holders.setdefault(tmdb, {}).setdefault(size, []).append(other)
+
+        mirrors: set = set()
+        for tmdb, by_size in holders.items():
+            size, resolution = mine[tmdb]
+            group = sorted(set(by_size.get(size, [])) | {instance})
+            if len(group) < 2:
+                continue
+            if self._authoritative_instance(resolution, group) != instance:
+                mirrors.add(tmdb)
+        return mirrors
 
     # ── Path helpers ─────────────────────────────────────────────────────────────
 
@@ -439,7 +571,9 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         cf = movie_file.get("customFormats") or []
         cf_names = "|".join(f.get("name", "") for f in cf if f.get("name"))
 
-        # Watch data
+        # Watch data. ``watch_count`` counts WATCHES, not plays (``_fetch_watch_map``
+        # already applied lifecycle.watched_definition), so this derivation now means
+        # what Plex and Tautulli mean — identical to the Sonarr episode path.
         watch_count     = watch_data.get("watch_count", 0)
         last_watched_at = watch_data.get("last_watched_at")
         pct_complete    = watch_data.get("percent_complete")
@@ -659,9 +793,19 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                     k: v for k, v in tautulli_config.items() if isinstance(v, dict)
                 }
 
+            # WATCHES, not plays — the same bar the Sonarr episode path applies
+            # (lifecycle.watched_definition.play_is_watched: Tautulli's own
+            # ``watched_status``, else ``percent_complete >= watched_threshold.percent``).
+            # The two producers used to inline the SAME threshold-free ``+= 1``; they now
+            # share one definition so a movie and an episode cannot disagree about what
+            # "watched" means. ``percent_complete`` / ``last_watched_at`` stay
+            # threshold-free (raw playback facts — see watched_definition's docstring).
+            _watch_pct = resolve_watched_percent(self.config)
             aggregated: dict[str, dict] = defaultdict(
-                lambda: {"watch_count": 0, "last_watched_at": None, "percent_complete": 0}
+                lambda: {"watch_count": 0, "plays": 0,
+                         "last_watched_at": None, "percent_complete": 0}
             )
+            _sub_threshold = 0
 
             for inst_name, inst_config in instance_configs.items():
                 try:
@@ -692,14 +836,26 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                     if not title:
                         continue
                     rec = aggregated[title]
-                    rec["watch_count"] += 1
+                    rec["plays"] += 1
+                    if play_is_watched(entry, threshold_pct=_watch_pct):
+                        rec["watch_count"] += 1
+                    else:
+                        _sub_threshold += 1
                     rec["percent_complete"] = max(rec["percent_complete"], pct or 0)
                     if played:
                         ts = datetime.fromtimestamp(int(played), tz=timezone.utc).isoformat()
                         if rec["last_watched_at"] is None or ts > rec["last_watched_at"]:
                             rec["last_watched_at"] = ts
 
-            return dict(aggregated)
+            out = dict(aggregated)
+            if out:
+                _watched = sum(1 for v in out.values() if v["watch_count"] > 0)
+                self.logger.log_info(
+                    f"📊 Tautulli movie watch map: watched bar ≥{_watch_pct:g}% (or "
+                    f"watched_status=1) — {_watched}/{len(out)} title(s) count as WATCHED; "
+                    f"{_sub_threshold} sub-threshold play(s) recorded as sampled only"
+                )
+            return out
         except Exception as e:
             self.logger.log_debug(f"Tautulli watch map unavailable: {e}")
             return {}
@@ -867,9 +1023,28 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         )
         franchise_ids = self._resolve_franchise_entries(movies)
 
+        # Cross-instance mirrors: one physical (hardlinked) file surfaced by two Radarr
+        # records. The non-authoritative side is SKIPPED so the parquet stops advertising
+        # bytes that do not exist and reclaim that deleting cannot deliver. Because
+        # refresh is a full rebuild, previously-written mirror rows self-heal out of the
+        # parquet on this very pass — no hand-editing, no migration.
+        mirror_tmdbs: set = set()
+        try:
+            mirror_tmdbs = self._mirrored_tmdb_ids(instance, movies)
+        except Exception as e:
+            self.logger.log_debug(f"[MovieFiles] mirror detection skipped for '{instance}': {e}")
+        stats["cross_instance_mirrors"] = 0
+        mirror_bytes = 0
+
         rows: list[dict] = []
         for movie in movies:
             if not movie.get("hasFile"):
+                continue
+
+            _tmdb = movie.get("tmdbId")
+            if _tmdb and int(_tmdb) in mirror_tmdbs:
+                stats["cross_instance_mirrors"] += 1
+                mirror_bytes += self._movie_file_size(movie) or 0
                 continue
 
             mid = movie.get("id")
@@ -905,6 +1080,13 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
             row["instance"] = instance
             rows.append(row)
             stats["rows_built"] += 1
+
+        if stats["cross_instance_mirrors"]:
+            self.logger.log_info(
+                f"[MovieFiles] '{instance}': skipped {stats['cross_instance_mirrors']} "
+                f"cross-instance mirror row(s) ({self._fmt_bytes(mirror_bytes)}) — same tmdb, "
+                f"byte-identical file already counted on the instance that owns that "
+                f"resolution tier. Dual-version copies (differing sizes) are unaffected.")
 
         if rows:
             df_new = pd.DataFrame(rows, columns=self.SCHEMA_COLUMNS)
@@ -983,7 +1165,7 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
             if decision == "clear":     # franchise / franchise-file / keep — never mark
                 df.at[idx, "marked_for_deletion"] = False
                 continue
-            if decision == "skip":      # not watched / no last-watched — leave as-is
+            if decision == "skip":      # watched but no last-watched stamp — leave as-is
                 continue
 
             row_td = grace_td

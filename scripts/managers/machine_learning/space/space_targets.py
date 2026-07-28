@@ -139,6 +139,49 @@ def deletions_disabled_reason(config) -> str:
     return ""
 
 
+# ── "deletion is the true last resort" policy knobs ──────────────────────────────
+# DEFAULT_REGRAB_CAP bounds the re-grab storm an exhaustive pass can queue: every
+# realized step-down deletes a file and queues a smaller replacement, so an unbounded
+# exhaustive pass over a large library would ask the indexers for thousands of releases
+# in one run. Items over the cap KEEP their files and re-qualify next run (and, being
+# still above the floor, stay excluded from deletion).
+DEFAULT_REGRAB_CAP = 200
+
+
+def exhaustive_downgrade(config) -> bool:
+    """``space_exhaustive_downgrade`` — DEFAULT **True**: downgrade EVERYTHING that can
+    still be downgraded before anything is deleted.
+
+    When on:
+      * the downgrade planners drop the watchability-score CEILING as an eligibility
+        filter and no longer stop the spread at a partial ``need_gb`` — every title above
+        the 720p floor becomes a candidate, still ordered ASCENDING by watchability so the
+        least-valued shrinks first. Every other guard (keep tags, keep-universe,
+        hot-universe credit, recently watched, recently aired, at/below floor,
+        multi-episode files) is untouched;
+      * the delete pools accept ONLY items already AT or BELOW the 720p floor, so a title
+        with anything left to shrink can never be deleted — deletion becomes reachable only
+        once the downgrade pool is exhausted;
+      * the step-down release picker may fall BELOW 720 for a title with no >=720 release.
+
+    Set to false to restore the historical behaviour byte-for-byte (score-ceiling
+    eligibility, spread stops at need_gb, delete pool ignores resolution, picker hard-floors
+    at 720)."""
+    return bool(_cfg_get(config, "space_exhaustive_downgrade", True))
+
+
+def downgrade_regrab_cap(config) -> int:
+    """``space_downgrade_max_regrabs_per_run`` — max REALIZED downgrades (file deleted +
+    smaller replacement queued) an exhaustive pass may perform, default
+    ``DEFAULT_REGRAB_CAP`` (200). <= 0 disables the cap (unbounded). Only consulted in
+    exhaustive mode; the legacy path has no per-run movie cap and keeps none."""
+    try:
+        v = int(_cfg_get(config, "space_downgrade_max_regrabs_per_run", DEFAULT_REGRAB_CAP))
+    except (TypeError, ValueError):
+        return DEFAULT_REGRAB_CAP
+    return v
+
+
 def coordinator_owns_deletion(config) -> bool:
     """True when the cross-service space coordinator owns ALL deletion, so the
     per-service legacy delete paths (Radarr space-pressure delete, movie_files

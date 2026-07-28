@@ -34,15 +34,25 @@ The result is a single number that drives, downstream:
 
 ### Score → quality-profile tier
 
-| Score | Profile tier | Meaning |
-|------:|--------------|---------|
-| 0–19 | SD / WEB-DL 480p | background noise, no interest signal |
-| 20–34 | HD-720p | some interest, standard streaming quality |
-| 35–49 | WEBDL-1080p | good affinity, direct-play friendly |
-| 50–59 | Bluray-1080p | household watched / affinity content |
-| 60–69 | Remux-1080p | strong affinity, active collection |
-| 70–79 | Remux-2160p HDR | franchise/universe + device supports 4K |
-| 80–100 | Remux-2160p DV | full household intent + keep policy |
+The rungs are **CALIBRATED to this household's real distribution**, not invented — they are
+the p97 / p98 / p99 / p99.5 / p99.9 percentiles of the **file-owning** title population
+(6,449 titles) under Group D v2. They move whenever the score axis does; see the derivation
+table on `_shared.QUALITY_PROFILE_THRESHOLDS`, and override with `scoring.quality_ladder`.
+
+| Score | Percentile | Profile tier | Meaning |
+|------:|-----------:|--------------|---------|
+| 0–24 | — | HD-720p | floor; SD is absorbed into 720p |
+| 25–28 | p97 | WEBDL-1080p | good affinity |
+| 29–32 | p98 | Bluray-1080p | household watched / affinity content |
+| 33–37 | p99 | Remux-1080p | strong affinity, active collection |
+| 38–49 | p99.5 | Remux-2160p | 4K entry |
+| 50–100 | p99.9 | Remux-2160p | the household's very top tier |
+
+> ⚠ The 4K entry rung admits 34 titles against the 67 the household keeps at 2160p today;
+> the rung that reproduces its own curation is p99 (33). Documented, deliberate, and
+> overridable — see the constant's comment. The ladder only PROPOSES a tier: actual 4K
+> acquisition is still gated by `watch_likelihood.uhd_cutoff` (75) and
+> `routing.movies.4k_dual_min_score` (75), which live on a different scale.
 
 When `return_breakdown=True`, the scorer additionally returns a per-group `breakdown` dict
 (`{"A1_keep_policy": 15.0, ..., "_total_raw": 71.25, "_total_final": 71}`); the score is
@@ -55,9 +65,10 @@ When `return_breakdown=True`, the scorer additionally returns a per-group `break
 Point values below are the **actual coded contributions** (a few module header comments
 quote stale per-group maxima; the tables here reflect the function body).
 
-### GROUP A — Household Intent — *“do they want this?”*  (budget ≈ 25)
+### GROUP A — Household Intent — *“do they want this?”*  (budget ≈ 33)
 
-The strongest positive signal: explicit curation and actual viewing behaviour.
+The strongest positive signal: explicit curation, actual viewing behaviour, and — since
+`SCORER_REVISION 5` — an explicit *statement* of intent.
 
 | ID | Signal | Points | Trigger |
 |----|--------|-------:|---------|
@@ -65,6 +76,27 @@ The strongest positive signal: explicit curation and actual viewing behaviour.
 | **A2** | completion rate | +12 … −6 | ≥ threshold (≈0.9) → +12; ≥0.75 → +6; ≥0.5 → +2; ≥0.2 → −3; >0 → −6; =0 → 0 |
 | **A3** | rewatch count | +8 / +5 / +2 | watched ≥3× → 8; ==2 → 5; ==1 → 2 |
 | **A4** | user Trakt rating | +10 … −ve | linear: 0 at 5/10, +10 at 10/10, negative below 5 (`user_rating_score`) |
+| **A5** | watchlist intent | +8 max | `cap × source × recency × members` (`watchlist_intent_score`). Source reuses the acquisition scorer’s own feed ranking (watchlist/plan-to-watch 1.00 > suggestions 0.65 > seasonal 0.55); members 0.60 solo, +0.12 each, full at five; recency decays only feeds carrying a real `listed_at` (Trakt does, Plex’s union does not). A solo Plex watchlisting scores **4.8**. |
+
+> **A5 is the scorecard’s only EXPLICIT-intent term.** Every other signal *infers* whether
+> the household wants a title from behaviour; this one reads a statement of it. It also
+> **shields the title from deletion** while the member who asked is still an active viewer
+> (`intent_hold_active`, 90-day dormancy — the same window `saga_retention` uses), because
+> +4.8 alone cannot lift a weak-taste title over the 17 delete ceiling and deleting
+> something the household explicitly asked for is the one deletion that is never
+> defensible. It is also the one Group-A signal the **Hidden Gems** taste score admits:
+> owned + watchlisted + never played is the highest-value reminder that shelf can produce.
+
+> **One human is one watchlister.** A5 grades by *distinct household members*, so the app
+> has to know which Plex/Tautulli account the Trakt (and MAL) lists belong to —
+> `trakt.household_member`, falling back to `trakt.username`. Get it wrong and the same
+> person counts twice on every title they listed in two places (0.60 → 0.72 of the cap),
+> **and** a Trakt/MAL-only title has no Tautulli activity to anchor its shield to, so
+> `intent_hold_active` fails closed and the shield silently never fires.
+
+> **The decay is configurable:** `scoring.watchlist_intent.half_life_days` (365) and
+> `stale_floor` (0.25) drive `intent_recency_factor` through `resolve_intent_inputs`, and
+> both ride in the score memos’ context hash so editing one actually rescores.
 
 > **📽️ Example** — *The Princess Bride* in a household that adores it: tagged `keep_forever` → **A1 +15**, finished every viewing → **A2 +12**, rewatched 5× → **A3 +8**, rated 10/10 on Trakt → **A4 +10**. A film someone started and bailed on at 15% instead takes **A2 −6**, with no keep tag and no rating — and it trips the G2 penalty below.
 
@@ -96,24 +128,100 @@ upgrade tier — higher).
 | **C1** | collection completeness | +8 / +5 / +2 | siblings in the same collection watched: ≥75% → 8; ≥50% → 5; ≥25% → 2 |
 | **C2** | universe siblings | +4 / +2.5 / +1 | franchise/universe siblings watched: ≥5 → 4; ≥2 → 2.5; ≥1 → 1 |
 | **C3** | related-graph affinity | up to +`related_graph_cap` (≈4) | Trakt-related neighbours the household has watched — generalises C1/C2 onto the similarity graph ("people like me") |
+| **C4** | person affinity | up to +`scoring.person_affinity.cap` (**8**) | the title's cast/crew vs the household's person-affinity vector, keyed on `tmdb_person_id` (immune to name-spelling drift). Weighted per credit by ROLE (lead/director 1.0 → editor 0.2), by BILLING ORDER within the cast, and by how hard the household ENGAGED with the titles that person worked on |
+
+C4's cap is **8**, matching C1: "this is by people you keep coming back to" is as strong
+a keep signal as "you are most of the way through this collection". It stays inert (cap
+forced to 0.0) until the people-matrix has been built — which now happens every run from
+the Radarr relational credits table, covering all seven credited roles (cast, director,
+writer, producer, composer, cinematographer, editor).
 
 > **📽️ Example** — having watched *The Fellowship of the Ring* and *The Return of the King*, the still-unwatched *The Two Towers* is lifted by **C1 +8** (collection ≥75% watched). Five MCU films watched lifts the next Marvel release by **C2 +4**. *The Princess Bride*'s mostly-watched Trakt-related swashbucklers add **C3** up to +4. A true standalone in no collection scores **0** here.
 
 *TV difference:* GROUP C is **0** for shows — TV has no native collection concept;
 franchise value flows through keep-tags in Group A instead.
 
-### GROUP D — Device / Playback Fit — *“will it play cleanly?”*  (budget ≈ 15)
+### GROUP D — Device / Playback Fit — *“will it transcode?”*  (budget 0 to −15 — a PENALTY)
 
 | ID | Signal | Points | Trigger |
 |----|--------|-------:|---------|
-| **D1** | primary-device capability | +6 / +3 / −2 | primary device's resolution ceiling vs target: at ceiling → 6; below → 3; above (needs downscale) → −2 |
-| **D2** | transcode avoidance | +5 / +2 | no known transcode events for the codec → 5; transcode-friendly codec → 2; unknown codec → 2 |
-| **D3** | platform resolution ceiling | +4 / +2 / +1 | share of plays from devices that support the target resolution: ≥75% → 4; ≥50% → 2; ≥25% → 1 |
+| **D4** | transcode risk | 0 … −15 | `−magnitude × Σ_cause weight × risk(title)` — the probability this title makes the household's Plex transcode, weighted by the causes it is OBSERVED to transcode for |
+| **D1/D2/D3** | *(v1 legacy)* | 0 | reachable with `scoring.device_fit_v2: false`, which restores the old +6/+5/+4 bonuses byte-for-byte |
 
-> **📽️ Example** — a 4K HEVC remux of *The Princess Bride* on a household whose primary device is an **Apple TV 4K** earns **D1 +6** (plays natively at the device ceiling) and **D2 +5** (HEVC never transcodes there). The same 4K file in a home whose main screen is a **1080p Roku** takes **D1 −2** (it would have to downscale).
+**Why the group inverted.** v1 was three bonuses for *"the household's devices can play
+this"*. That question's answer is YES for essentially every modern device × file
+combination, so on real data **1,840 of 1,997 movies (92%) scored EXACTLY 12.0** — sd 1.92,
+the entire tail being 66 titles at 8.0, 43 at 5.0 and 38 at 1.0. For the median movie that
+was 12 of 21 points: **57% of the whole score carrying no ranking information**, compressing
+the useful range and silently invalidating every absolute threshold anchored on it. v2 asks
+the question that actually varies — *will it transcode?* — and scores it the way Group G
+scores its penalties: direct play is ~0 (the expectation, not an achievement), likely
+transcode is negative.
 
-D1/D3 depend only on the household's `platform_usage` + the `target_resolution` being
-evaluated (not on the individual title), so they're effectively household-constant per pass.
+**The five causes, weighted by observation.** From this household's 133 ground-truth
+per-stream decisions (`tautulli/stream_decisions`), classified by the same function the
+operator-facing transcode-cause report uses:
+
+| Cause | Observed | What the per-title risk reads |
+|-------|---------:|-------------------------------|
+| audio | 38.3% | `audio_codec` + `audio_channels` vs each device's `direct_play_audio` / `max_audio_channels`, play-weighted. DTS on a Samsung TV, 5.1 in a browser. |
+| bitrate / resolution | 36.1% | the union of (a) play-share of devices whose ceiling is below the file's resolution and (b) a bitrate ramp from a per-resolution reference to 2.5× it, split LAN/WAN at the observed remote share |
+| subtitle | 14.3% | subtitle TRACK COUNT (more tracks → likelier the auto-selected one is image-based → burn-in → full video transcode), raised to near-certain when the file has NO preferred-language audio (subs on every play) and halved in MP4/AVI (text subs are rendered, not burned) |
+| video codec | 11.3% | `1 − codec_direct_play_share` — v1's entire question, now **one input at its measured weight** |
+| container | ~0% | file extension; MP4 free, MKV a cheap remux, the AVI/WMV/VOB family a full transcode. Never the PRIMARY cause here, so it is smoothed to ~1.6% rather than zero |
+
+Weights are blended with a shipped cold-start prior by empirical-Bayes shrinkage
+(`w = n/(n+60)`), so **n = 0 returns the prior bit-identically** and a fresh install is a
+documented cold start rather than a fit to nothing. Below 10 classified decisions the
+observation is ignored outright. `tautulli/transcode_fingerprint` supplies the household
+base rate (14.1% here) and the remote share (5.4%) that scales the bandwidth half.
+
+**Calibration check.** The per-title risks are built bottom-up from file facts and device
+capabilities and are never shown the base rate; their library mean still lands at 16.8%
+against the 14.1% the household actually experiences.
+
+**Unmeasurable ≠ safe.** An axis whose input is missing is RENORMALISED out of the weighted
+sum — never scored as zero risk. A title with no file facts at all (a Sonarr pilot **stub**)
+scores a hard **0.0**, and a household with no recognised device *and* no observed decisions
+gets no profile at all, which falls back to the v1 path its behaviour was already calibrated
+against. Neither case is ever a free bonus — that specific mistake (v1's "we have never seen
+this transcode, therefore +5") is what the whole redesign removes.
+
+**The device capability matrix** (`_shared._DEVICE_CAPABILITIES`) now has an audio half:
+`platform → (max_resolution, direct-play video codecs, direct-play audio codecs, max audio
+channels)`. Audio is assigned by CLASS (browser / mobile / TV-streamer / desktop-HTPC) so a
+policy change lands in one place; a device in the video table with no audio class is a test
+failure, not a silent fallback. Two things the matrix deliberately encodes:
+
+* **A bare family name is conservative.** "Roku" could be a 1080p Express and "Fire TV" a
+  Stick Lite, so those families resolve to 1080; only a name-matched 4K SKU ("Roku Ultra",
+  "Fire TV Stick 4K", "Chromecast Ultra") claims 2160. Matching prefers the **most
+  specific** entry, so a model name is never shadowed by its family.
+* **AV1 is never direct-play, on any device.** Nvidia Shield, recent Roku Ultra / Streaming
+  Stick 4K, Fire TV Stick 4K/4K Max and Chromecast with Google TV all have AV1 hardware
+  decode — but **Plex transcodes AV1 to HEVC/H.264 on virtually every client regardless**,
+  so an AV1 file is a transcode risk on this stack and must never score as safe. (HEVC is
+  the mirror case: it direct-plays broadly, but Plex cannot direct *stream* it — it is
+  direct play or a full transcode, which is why Plex Web on Chrome/Firefox/Edge is excluded
+  while Safari is not.) Legacy codecs (XviD/DivX, MPEG-2, VC-1) appear on no entry, matching
+  the judgement `scoring.codec_profiles.legacy_regrab` already makes.
+
+An operator extends or overrides the matrix with **`scoring.device_capabilities`** (now
+accepting `audio_codecs` / `max_audio_channels` too) and tunes the group with
+**`scoring.device_fit_v2`** (`enabled`, `magnitude`, `cause_weights`). An unrecognised
+platform is never guessed at: it enters neither numerator nor denominator on any axis.
+
+**What `resolution` means:** the resolution the title is CURRENTLY HELD at
+(`movie_files.resolution` for a movie, `max(episode_files.resolution)` for a series) —
+never the resolution its profile *would* acquire. The profile is chosen FROM the score, so
+feeding the profile's resolution back in would close a feedback loop; and the question the
+term asks is a statement about the file on disk. Bitrate reads `video_bitrate` when present
+and falls back to `size ÷ runtime × 0.9` — load-bearing, because 45% of this library's movie
+rows and 93% of its episode rows report a zero video bitrate.
+
+**The regression guard.** Both scoring passes log the resulting Group-D distribution
+(mean / sd / mode / share-at-mode / distinct values) and warn loudly if it starts behaving
+as a constant again. v1 collapsed in complete silence; that must not be repeatable.
 
 ### GROUP E — Audience Alignment — *“is it for the right viewer / library?”*  (budget ≈ 10)
 
@@ -167,11 +275,14 @@ Trakt show rating) through the same tier table.
 | A4 | rated 10/10 on Trakt | +10 |
 | B1 | beloved recurring cast | +8 |
 | F1 | acclaimed (~8.0 critic avg) | +14 |
-| D1 / D2 | 4K HEVC on an Apple TV 4K | +6 / +5 |
-| **Total** | | **78** |
+| D4 | 4K HEVC, DD+ 5.1, no subtitle tracks — direct-plays everywhere | −0 |
+| **Total** | | **67** |
 
-**78 → 70–79 tier → Remux-2160p HDR.** Grabbed/kept at near-top quality, monitored, given a
-long grace window, and among the **last** titles space-pressure would ever delete.
+**67 → above the 50 rung → Remux-2160p.** Grabbed/kept at near-top quality, monitored, given
+a long grace window, and among the **last** titles space-pressure would ever delete. Note
+what Group D contributes: **nothing**. Playing cleanly is the expectation. Give the same
+title a DTS-HD MA 7.1 track and burned-in foreign subtitles and D4 takes several points
+back — which is the only direction a playback fact should ever move a taste score.
 
 ### ⬇️ Lowered — a never-watched, panned, foreign sequel
 
@@ -184,8 +295,8 @@ long grace window, and among the **last** titles space-pressure would ever delet
 | G3 | critic avg < 4 | −5 |
 | **Total** | | **−23 → clamps to 0** |
 
-**0 → 0–19 tier → SD/480p.** Never monitored, shortest grace, and the **first** title
-space-pressure downgrades or deletes. *The NeverEnding Story III* is the archetype — same
+**0 → below every rung → 720p floor.** Never monitored, shortest grace, and the **first**
+title space-pressure downgrades or deletes. *The NeverEnding Story III* is the archetype — same
 franchise as a beloved original, but unwatched + panned ⇒ bottom of the pile.
 
 ---

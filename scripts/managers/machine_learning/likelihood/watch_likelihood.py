@@ -10,6 +10,23 @@ Single source of truth for the likelihood-gated quality-upgrade rule used by the
 Radarr universe pass, Radarr active-watcher upgrades, and the Sonarr JIT upgrade
 pass — so "earn your quality tier" is applied consistently.
 
+WHAT "WATCHED" MEANS HERE (changed — the global watched bar)
+--------------------------------------------------------------------------------
+``watch_count`` now counts WATCHES, not plays: the producers admit a Tautulli row
+only when it clears the bar (``lifecycle.watched_definition`` — Tautulli's own
+``watched_status``, else ``percent_complete >= watched_threshold.percent``, 85).
+A 30-second sample therefore no longer reaches the ``ewc >= 1`` branch and no
+longer buys ``watched_floor`` 50 (≈ WEB-1080p).
+
+THE INTERACTION THAT MAKES THIS SAFE. The partial-view signal is preserved
+INDEPENDENTLY, on two threshold-free fields, and is what those plays now land on:
+``percent_complete`` (20–90% → ``started_floor`` 45; 0–20% → ``abandoned_ceiling``
+25) and ``last_watched_at`` (a play with no completion figure at all → abandoned).
+Both branches are evaluated BEFORE the untouched branch, so a sub-threshold play
+can never fall through to ``untouched_base + score`` — which would have meant that
+abandoning a title RAISES its quality target. Measured on the live cache after the
+change: 0 titles moved from a floor branch to UNTOUCHED.
+
 Likelihood (0–100) = max(engagement floor, affinity propensity):
   * ENGAGEMENT floors it, GRADED BY WATCH COUNT: watched once → watched_floor (50),
     each further rewatch adds ``rewatch_step`` up to rewatch_floor (90). So one watch
@@ -32,6 +49,83 @@ Two ladders:
 
 All thresholds/weights are config-tunable via a ``watch_likelihood`` block and the
 ``radarr_quality_ladder`` list.
+
+AXIS ANCHOR — ``untouched_base`` 12 -> 25 (SCORER_REVISION 4 / Group D v2)
+--------------------------------------------------------------------------------
+THIS BRANCH CONSUMES A RAW ``watchability_score`` AT GAIN 1.0, so it is welded to
+the 0-100 scoring axis and every translation of that axis lands on it in full. The
+engagement floors (50/64/78/90) and the cutoffs (75/45/20) are CONSTANTS on the
+likelihood scale and did not move; only the affinity term did.
+
+Group D v2 (``scoring/device_fit.py``) replaced a near-constant +12 bonus that 92%
+of the library received with a 0-to-negative transcode-risk penalty, translating the
+score axis DOWN by ~13 points (owned-movie median 21 -> 8, p99 49 -> 34, max 71 -> 58;
+file-owning series median 21 -> 8, p99 43 -> 30). With ``untouched_base`` left at 12,
+an untouched title still needed score >= 33 to clear ``fhd_cutoff`` — a bar that used
+to sit at the top ~8% of untouched movies and now sits past p99.9. MEASURED on the
+real cache: untouched titles reaching 1080p collapsed 456 -> 8 (-98.2%).
+
+WHY A TRANSLATION AND NOT A GAIN CHANGE. What Group D did to the axis IS a
+translation: it removed a constant (+12 on 92% of titles) and added a low-variance
+term (D4 mean -2.51, sd 2.01). The inverse of a translation is a translation. Three
+independent checks agree, and all three say ~+13:
+
+  boundary            v1 score needed   untouched titles   v2 score with the SAME
+                                        at/above it        tail mass    => base'
+  ------------------  ----------------  -----------------  ---------------------
+  fhd_cutoff / WEB      33                456                20.0         25.0
+  Bluray-1080p rung     43                 34                29.0         26.0
+  Remux-1080p rung      53                  1                38.0         27.0
+
+25 is also exactly the median shift of the axis (21 -> 8). It restores the FILE-OWNING
+untouched population that reaches 1080p to 461 against 456 before (+1.1%): movies
+134 vs 145, file-owning series 327 vs 311. The neighbouring integers do far worse
+(24 -> 351, -23%; 26 -> 573, +26%) because the v2 score is integer-valued and heavily
+tied, so no mapping can land between them.
+
+A GAIN CHANGE WAS REJECTED, for three measured reasons:
+  * It over-corrects the upper rungs. Any gain that reproduces the 1080p count also
+    multiplies the spread, so Bluray-1080p goes 34 -> 51-61 and Remux-1080p 1 -> 5.
+    base=25/gain=1.0 gives 28 and 1.
+  * IT RE-CREATES THE PROBLEM THIS EXERCISE REMOVED. Gain saturates titles against
+    ``affinity_cap``, and titles pinned at the cap are indistinguishable — a constant.
+    At gain 2.2, 36 untouched titles (and 132 library-wide) sit at exactly 74. At
+    base=25/gain=1.0, ZERO untouched titles reach the cap, so the affinity ordering
+    is preserved EXACTLY — an unclamped affine map is order-isomorphic.
+  * It makes the low end LESS sticky, not more. The cold floor is defined by how much
+    score it takes to escape 720p: 20 points at base=25/gain=1.0, only 15 at gain 2.2.
+
+INVARIANTS THIS PRESERVES (all pinned by tests in test_untouched_anchor.py):
+  * ``affinity_cap`` (74) < ``uhd_cutoff`` (75) — taste alone still reaches
+    Remux-1080p and NEVER 4K. Unchanged: the cap is not touched.
+  * A cold unwatched title with no affinity (score 0) lands at likelihood 25, which is
+    below ``fhd_cutoff`` (45) and therefore still on the 720p floor, and below every
+    ladder rung above [0, 3]. ``hd_cutoff`` (20) is crossed, but ``hd_res`` and
+    ``floor_res`` are BOTH 720 — the crossing has no behavioural consequence.
+  * Watched titles keep their engagement-decided tier byte-for-byte: for every title
+    whose floor won under v1 (>= 50 for one watch), the floor still wins, because the
+    floor did not move and affinity is compared to it with the SAME max(). The 4K trio
+    (19 entry-4K + 8 Bluray-2160p + 75 Remux-2160p) is identical under every mapping
+    tried. The minority where affinity BEAT the floor under v1 (49 of 302 engaged
+    titles) is re-anchored with the untouched branch, which is the point: it is the
+    same affinity axis. base=25 restores that count to 36 where the un-anchored v2
+    axis had cut it to 5.
+
+``untouched_mode: "percentile"`` NEEDS NO RE-ANCHOR — VERIFIED, NOT ASSUMED. It reads
+``watchability_percentile``, which ``refresh_scores`` computes as
+``rank(pct=True) * 100`` — a pure rank, so its distribution is uniform whatever the
+score axis does. Measured on the real cache, untouched titles reaching 1080p under
+percentile mode: radarr 652 -> 652 (0.0%), sonarr 4,690 -> 4,922 (+4.9%); the residual
+is tie-structure churn inside ``method="average"``, not a level shift, and it is two
+orders of magnitude smaller than absolute mode's -98.2%. ``untouched_pct_floor`` (0.0)
+is a percentile threshold on the same rank scale and is likewise unaffected.
+
+RE-DERIVE THIS THE NEXT TIME THE SCORE AXIS MOVES. The reconstruction is: take each
+title's persisted ``watchability_breakdown``, rebuild the axis under both revisions
+(``_total_raw`` minus the old Group D plus the new one, re-clamped to 0-100), restrict
+to titles that OWN A FILE, and match tail masses at 45/55/65. The long-term
+replacement is ``ml.thresholds`` — a calibrated P(watch within H) — which removes the
+need for an anchor entirely.
 """
 from __future__ import annotations
 
@@ -52,7 +146,8 @@ _DEFAULTS = {
     # (100-floor)% climb — the "only the top X% upgrade" knob.
     "untouched_mode":       "absolute",
     "untouched_pct_floor":  0.0,
-    "untouched_base":       12.0,
+    # ── untouched_base RE-ANCHORED 12 -> 25 (see the "AXIS ANCHOR" block below) ──
+    "untouched_base":       25.0,
     "untouched_score_gain": 1.0,
     "affinity_cap":         74.0,   # < uhd_cutoff ⇒ affinity alone reaches Remux-1080p but NEVER 4K
     # Affinity weight multiplier applied to the scorer's cast/crew/studio/genre caps.
@@ -212,17 +307,35 @@ def explain_likelihood(row, *, config=None) -> dict:
     cast/crew/studio/genre propensity climbed above it.
     """
     wc      = _num(_get(row, "watch_count"), 0.0)
-    # Completion column is `percent_complete` in both schemas (alias completion_pct);
-    # normalise a 0-1 fraction to 0-100.
-    _comp_raw = _get(row, "percent_complete", None)
-    if _comp_raw is None:
-        _comp_raw = _get(row, "completion_pct", None)
-    comp = _num(_comp_raw, 0.0)
-    if 0.0 < comp <= 1.0:
-        comp *= 100.0
+    # Completion, on ONE scale (0-100), resolved by WHICH COLUMN the row carries —
+    # not by guessing from the magnitude:
+    #   * ``percent_complete`` is the PARQUET column and is always 0-100. Taken as-is.
+    #   * ``completion_pct`` is the movie_scorer contract and is a 0-1 FRACTION
+    #     (``completion_threshold`` defaults to 0.9). Scaled up.
+    # The old code sniffed both from the value alone (``0 < v <= 1 -> ×100``), which
+    # reads a parquet row at 1% complete as 100% complete. That was harmless while
+    # ``watch_count > 0`` short-circuited every played row into the "watched" branch;
+    # under the watched bar those rows fall through to here, and six live movie rows
+    # sit at exactly percent_complete == 1. A 1% sample must not grade as fully watched.
+    _pc = _get(row, "percent_complete", None)
+    if _pc is not None and _num(_pc, None) is not None:
+        comp = _num(_pc, 0.0)
+    else:
+        comp = _num(_get(row, "completion_pct", None), 0.0)
+        if 0.0 < comp <= 1.0:
+            comp *= 100.0
     _iw     = _get(row, "is_watched")
     watched = bool(_iw) if _iw is not None else False
     score   = _num(_get(row, "watchability_score"), 0.0)
+    # "Was this ever played?", independent of whether the play counted as a WATCH.
+    # ``last_watched_at`` is deliberately threshold-free (see
+    # lifecycle.watched_definition), so it is the one signal that survives for a play
+    # Tautulli reported at 0% complete — which ``percent_complete`` cannot express and
+    # which would otherwise land on the UNTOUCHED branch below at ``untouched_base +
+    # score``, i.e. abandoning a title could RAISE its quality target. Two live rows
+    # are in exactly that state (The Big Bang Theory S02E03, The Seven Deadly Sins S01E01).
+    _lw = _get(row, "last_watched_at", None)
+    played = bool(_lw) and str(_lw).strip().lower() not in ("nat", "nan", "none")
 
     # Affinity propensity (capped below the top-4K band). Either rank-based
     # (percentile mode — spreads affinity across the tiers) or absolute.
@@ -262,7 +375,9 @@ def explain_likelihood(row, *, config=None) -> dict:
         return _floor_branch("watched", _cfg(config, "watched_floor"))
     if comp >= 20:
         return _floor_branch("started", _cfg(config, "started_floor"))
-    if comp > 0:                                       # abandoned: tried & stopped
+    if comp > 0 or played:      # abandoned: tried & stopped (``played`` catches the
+        # 0%-complete play — evidence of an attempt with no completion figure. Without
+        # it that row reads UNTOUCHED and scores HIGHER for having been abandoned.)
         ceil_ = _cfg(config, "abandoned_ceiling")
         return {
             "likelihood": max(0.0, min(ceil_, affinity)), "engagement": ceil_,
@@ -281,8 +396,10 @@ def watch_likelihood(row, *, config=None) -> float:
     """Estimated 0–100 chance the content will be watched.
 
     = max(engagement floor, affinity propensity). Reads (all optional):
-    ``watch_count``, ``completion_pct`` (0–100), ``is_watched``,
-    ``watchability_score`` (the affinity-bearing composite). Delegates to
+    ``watch_count`` (WATCHES, not plays — see lifecycle.watched_definition),
+    ``percent_complete`` (0–100) or ``completion_pct`` (0–1), ``is_watched``,
+    ``last_watched_at`` (the "was this tried?" bit), ``watchability_score`` (the
+    affinity-bearing composite) and ``universe_credit``. Delegates to
     ``explain_likelihood`` so the number and its explanation never drift.
     """
     return explain_likelihood(row, config=config)["likelihood"]

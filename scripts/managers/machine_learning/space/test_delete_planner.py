@@ -350,3 +350,98 @@ def test_tier0_before_tier1_and_neutral_critic():
     tier0 = [c for c in out if c[0] == 0]
     assert tier0[0][5] == 12  # score 1, lowest watchability, deleted first
     assert {c[5] for c in tier0} == {7, 8, 12, 13}
+
+
+# ── "deletion is the true last resort": the 720p floor invariant ────────────────
+# ``floor_resolution`` (default None = off, byte-identical) mirrors the coordinator
+# pool's rule on the single-service fallback path: a title may only be deleted once it
+# is AT or BELOW the floor, i.e. it has nothing left to shrink.
+def _floor_row(fid, res):
+    return {"movie_file_id": fid, "keep_policy": None, "is_franchise_entry": False,
+            "last_watched_at": None, "date_added": None, "marked_for_deletion": True,
+            "size_bytes": 5 * 1024**3, "resolution": res}
+
+
+def _floor_df():
+    df = pd.DataFrame([_floor_row(1, 2160), _floor_row(2, 1080),
+                       _floor_row(3, 720), _floor_row(4, 480)])
+    df["is_franchise_entry"] = df["is_franchise_entry"].astype(bool)
+    return df
+
+
+def test_floor_resolution_excludes_still_downgradable_titles():
+    df = _floor_df()
+    st = {}
+    out = build_movie_delete_candidates(
+        df, {i: 1 for i in df.index}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20,
+        stats=st, floor_resolution=720)
+    assert {c[5] for c in out} == {3, 4}
+    assert st["skipped_downgradable"] == 2
+
+
+def test_floor_resolution_default_none_is_byte_identical():
+    df = _floor_df()
+    out = build_movie_delete_candidates(
+        df, {i: 1 for i in df.index}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20)
+    assert {c[5] for c in out} == {1, 2, 3, 4}
+
+
+def test_floor_resolution_unknown_resolution_stays_deletable():
+    df = _floor_df().assign(resolution=None)
+    out = build_movie_delete_candidates(
+        df, {i: 1 for i in df.index}, _marked(df), franchise_file_ids=frozenset(),
+        no_delete_cutoff=NO_DELETE_CUTOFF, include_unwatched=True, ceiling=20,
+        floor_resolution=720)
+    assert {c[5] for c in out} == {1, 2, 3, 4}
+
+
+# ── Group-A5 watchlist shield (the household explicitly asked for this title) ──
+def _shield_df(hold):
+    """One movie that is a textbook tier-1 delete: unwatched, score 1 (well under the
+    17 ceiling), old, at the 720p floor, no keep tag. The ONLY thing that can save it is
+    the shield."""
+    df = pd.DataFrame([{
+        "movie_file_id": 800, "keep_policy": None, "is_franchise_entry": False,
+        "last_watched_at": None, "marked_for_deletion": False,
+        "date_added": (NOW - timedelta(days=400)).isoformat(),
+        "size_bytes": 9 * 1024**3, "resolution": 720, "watchlist_hold": hold,
+    }])
+    df["is_franchise_entry"] = df["is_franchise_entry"].astype(bool)
+    return df
+
+
+_SHIELD_COMMON = dict(franchise_file_ids=frozenset(), no_delete_cutoff=NO_DELETE_CUTOFF,
+                      include_unwatched=True, ceiling=17)
+
+
+def test_watchlisted_title_below_the_delete_ceiling_survives():
+    """A5's points alone cannot lift a weak-taste title over the ceiling — the shield is
+    what actually saves it. Score 1 << ceiling 17, and it still isn't a candidate."""
+    st = {}
+    held = build_movie_delete_candidates(_shield_df(True), {0: 1},
+                                         _marked(_shield_df(True)), stats=st, **_SHIELD_COMMON)
+    assert held == []
+    assert st["skipped_watchlist"] == 1
+
+
+def test_the_same_title_is_deletable_once_the_shield_releases():
+    """Proves the guard is the ONLY thing holding it — i.e. the hold really does expire."""
+    df = _shield_df(False)
+    out = build_movie_delete_candidates(df, {0: 1}, _marked(df), **_SHIELD_COMMON)
+    assert {c[5] for c in out} == {800}
+
+
+def test_absent_watchlist_hold_column_is_byte_identical():
+    df = _shield_df(True).drop(columns=["watchlist_hold"])
+    out = build_movie_delete_candidates(df, {0: 1}, _marked(df), **_SHIELD_COMMON)
+    assert {c[5] for c in out} == {800}
+
+
+def test_watchlist_shield_beats_even_a_marked_for_deletion_row():
+    """Tier 0 (watched + grace-expired) must be shielded too, not just tier 1."""
+    df = _shield_df(True)
+    df.at[0, "marked_for_deletion"] = True
+    df.at[0, "last_watched_at"] = (NOW - timedelta(days=400)).isoformat()
+    assert build_movie_delete_candidates(df, {0: 1}, _marked(df), **_SHIELD_COMMON) == []

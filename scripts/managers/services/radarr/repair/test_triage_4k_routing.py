@@ -153,10 +153,12 @@ def test_acquire_standard_baseline_picks_profile_by_score():
 
 
 def test_acquire_standard_baseline_lower_score_lower_profile():
-    # The matrix (target_resolution_for_score): >=35 → 1080, >=20 → 720, else 480 (all capped <4K).
+    # The matrix (target_resolution_for_score) reads the CALIBRATED ladder, so these
+    # scores move whenever it is re-anchored: today >=25 → 1080, >=15 → 720, else 480
+    # (all capped <4K).
     m, gw = _bare_mgr(), _FakeGw()
-    m._acquire_standard_baseline(gw, "standard", "/std", _PROFS, set(), {"tmdbId": 556, "title": "Y"}, 25)
-    assert gw.added[0][1]["qualityProfileId"] == 2       # score 25 → 720 tier
+    m._acquire_standard_baseline(gw, "standard", "/std", _PROFS, set(), {"tmdbId": 556, "title": "Y"}, 20)
+    assert gw.added[0][1]["qualityProfileId"] == 2       # score 20 → 720 tier
     gw2 = _FakeGw()
     m._acquire_standard_baseline(gw2, "standard", "/std", _PROFS, set(), {"tmdbId": 557, "title": "Z"}, 10)
     assert gw2.added[0][1]["qualityProfileId"] == 1       # score 10 → 480 tier

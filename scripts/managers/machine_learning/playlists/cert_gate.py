@@ -134,3 +134,105 @@ def cert_allowed(cert, level: int, *, csm_age=None) -> bool:
 def is_restricted(level: int) -> bool:
     """True when the profile is age-restricted (not an adult/unrestricted profile)."""
     return level < ADULT
+
+
+# ── certification EVIDENCE (ordinal ladder + per-plan summary) ────────────────────
+# The gate above DECIDES what a profile may see; the helpers below let a caller PROVE
+# after the fact that a generated plan respected it (the playlist run-log summary table).
+# They read the SAME ``_CERT_TIER`` model — no second cert taxonomy — and only add an
+# ordinal ORDER so "the strictest certification in this plan" is a well-defined answer.
+#
+# Certifications are ordinal, not alphabetical. The primary key is the gate TIER (so the
+# ordering can never disagree with the gate: a cert that ranks at or below the profile's
+# ceiling is exactly a cert the gate would have admitted). Within a tier the sub-order
+# follows the published ladders — TV: TV-Y < TV-Y7 < TV-G < TV-PG < TV-14 < TV-MA;
+# MPAA: G < PG < PG-13 < R < NC-17 — with the two scales interleaved at their shared
+# tier boundaries. NOTE the one place tier-order and the published TV ladder differ:
+# TV-G is LITTLE_KID here while TV-Y7 is OLDER_KID, so TV-G sorts BELOW TV-Y7. That is
+# deliberate — the gate is the authority, and the alternative would hide a real violation
+# (a TV-Y7 item in a little-kid plan) behind a "TV-G is stricter" reading.
+_CERT_SUBRANK = {
+    "tv-y": 0, "g": 1, "tv-g": 2,                                    # LITTLE_KID
+    "tv-y7": 0, "tv-y7-fv": 1, "pg": 2, "tv-pg": 3,                  # OLDER_KID
+    "pg-13": 0, "tv-14": 1,                                          # TEEN
+    "r": 0, "tv-ma": 1, "nc-17": 2,                                  # ADULT (rated)
+    "nr": 3, "unrated": 3, "not rated": 3, "18": 3, "ma": 3, "m": 3, "x": 3,
+}
+
+# Canonical display spelling for a recognised cert (log cells are plain ASCII).
+_CERT_DISPLAY = {
+    "tv-y": "TV-Y", "tv-y7": "TV-Y7", "tv-y7-fv": "TV-Y7-FV", "tv-g": "TV-G",
+    "tv-pg": "TV-PG", "tv-14": "TV-14", "tv-ma": "TV-MA",
+    "g": "G", "pg": "PG", "pg-13": "PG-13", "r": "R", "nc-17": "NC-17",
+    "nr": "NR", "unrated": "Unrated", "not rated": "Not Rated",
+    "18": "18", "ma": "MA", "m": "M", "x": "X",
+}
+
+# The bucket for a title whose certification is MISSING or in a scale we don't recognise
+# (a regional "12A", a blank Sonarr/Radarr field). Its own bucket by design: it is NEVER
+# counted as a violation (we can't prove one) but it IS surfaced as a count, because an
+# uncertified title admitted by the Common Sense age fallback is the realistic leak path.
+UNKNOWN_CERT = "?"
+
+# What a profile at each tier is ALLOWED up to, as a "TV/movie" label pair — derived from
+# the tier tables above (the most mature TV cert and the most mature MPAA cert the tier
+# admits), so it can never drift from the gate.
+_TIER_CEILING = {
+    LITTLE_KID: "TV-G/G", OLDER_KID: "TV-PG/PG", TEEN: "TV-14/PG-13", ADULT: "any",
+}
+
+
+def cert_rank(cert):
+    """``(tier, subrank)`` ordinal for a certification — comparable with ``<``/``>`` — or
+    ``None`` when the cert is missing/unrecognised (the :data:`UNKNOWN_CERT` bucket).
+
+    The leading element is the gate tier, so ``cert_rank(c)[0] > level`` is precisely
+    "the age gate would have rejected ``c`` for this profile"."""
+    key = str(cert or "").strip().lower()
+    tier = _CERT_TIER.get(key)
+    if tier is None:
+        return None
+    return (tier, _CERT_SUBRANK.get(key, 0))
+
+
+def cert_display(cert) -> str:
+    """Canonical ASCII label for a recognised cert, else :data:`UNKNOWN_CERT`."""
+    key = str(cert or "").strip().lower()
+    return _CERT_DISPLAY.get(key, UNKNOWN_CERT) if key in _CERT_TIER else UNKNOWN_CERT
+
+
+def tier_ceiling(level: int) -> str:
+    """The certification CEILING a profile at ``level`` permits (``'TV-PG/PG'``…), or
+    ``'any'`` for an unrestricted profile. The (a) half of the run-log evidence pair."""
+    return _TIER_CEILING.get(level, "any")
+
+
+def cert_summary(certs, level: int) -> dict:
+    """Certification EVIDENCE for one generated plan — the (b) half of the run-log pair.
+
+    ``certs`` is the per-item certification of everything actually IN the plan (order
+    irrelevant, duplicates fine). Returns ``{"ceiling", "strictest", "unknown",
+    "violations"}``:
+
+    * ``ceiling``    — what the profile permits (:func:`tier_ceiling`).
+    * ``strictest``  — the MOST MATURE recognised cert present, or ``'?'`` when the plan
+      holds nothing recognisable. Comparing it against ``ceiling`` is the eyeball check.
+    * ``unknown``    — how many items carry no recognised cert (never a violation; the
+      leak path an operator should still see).
+    * ``violations`` — items whose cert the gate would have REJECTED at ``level``. Any
+      non-zero value is a bug in the gating, not a preference."""
+    worst = None
+    label = UNKNOWN_CERT
+    unknown = 0
+    violations = 0
+    for c in certs or []:
+        rank = cert_rank(c)
+        if rank is None:
+            unknown += 1
+            continue
+        if worst is None or rank > worst:
+            worst, label = rank, cert_display(c)
+        if rank[0] > level:
+            violations += 1
+    return {"ceiling": tier_ceiling(level), "strictest": label,
+            "unknown": unknown, "violations": violations}

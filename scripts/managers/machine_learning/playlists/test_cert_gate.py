@@ -9,9 +9,14 @@ from scripts.managers.machine_learning.playlists.cert_gate import (
     LITTLE_KID,
     OLDER_KID,
     TEEN,
+    UNKNOWN_CERT,
     cert_allowed,
+    cert_display,
+    cert_rank,
+    cert_summary,
     csm_age_tier,
     is_restricted,
+    tier_ceiling,
     tier_level,
 )
 
@@ -117,3 +122,60 @@ def test_real_cert_beats_csm_age():
     assert not cert_allowed("TV-MA", LITTLE_KID, csm_age=3)        # adult cert wins over a low age
     assert cert_allowed("TV-G", LITTLE_KID, csm_age=99)           # kid cert wins over a high age
     assert cert_allowed("anything", ADULT, csm_age=99)           # adult profile still sees all
+
+
+# ── certification EVIDENCE (ordinal ladder + per-plan summary) ────────────────────
+def test_cert_rank_is_ordinal_not_alphabetical():
+    # Certifications sort by MATURITY, interleaving the TV and MPAA scales.
+    ladder = ["TV-Y", "G", "TV-G", "TV-Y7", "PG", "TV-PG", "PG-13", "TV-14",
+              "R", "TV-MA", "NC-17", "NR"]
+    ranks = [cert_rank(c) for c in ladder]
+    assert ranks == sorted(ranks)                        # strictly non-decreasing as listed
+    assert cert_rank("TV-MA") > cert_rank("G")           # not alphabetical (G > … as text)
+    assert cert_rank("tv-14") == cert_rank("TV-14")      # case/space insensitive
+
+
+def test_cert_rank_never_contradicts_the_gate():
+    # The rank's leading element IS the gate tier, so "ranks above the ceiling" and "the gate
+    # would reject it" can never disagree — that is what makes the VIOLATION flag trustworthy.
+    for level in (LITTLE_KID, OLDER_KID, TEEN, ADULT):
+        for cert in ("TV-Y", "G", "TV-G", "TV-Y7", "PG", "TV-PG", "PG-13", "TV-14",
+                     "R", "TV-MA", "NC-17"):
+            assert (cert_rank(cert)[0] <= level) is bool(cert_allowed(cert, level))
+
+
+def test_unknown_cert_is_its_own_bucket():
+    for missing in (None, "", "   ", "12A", "PG12"):     # absent, or a scale we don't model
+        assert cert_rank(missing) is None
+        assert cert_display(missing) == UNKNOWN_CERT == "?"
+    assert cert_display("tv-y7") == "TV-Y7" and cert_display("nc-17") == "NC-17"
+
+
+def test_tier_ceiling_labels_both_scales():
+    assert tier_ceiling(LITTLE_KID) == "TV-G/G"
+    assert tier_ceiling(OLDER_KID) == "TV-PG/PG"
+    assert tier_ceiling(TEEN) == "TV-14/PG-13"
+    assert tier_ceiling(ADULT) == "any"                  # unrestricted → no ceiling to compare
+
+
+def test_cert_summary_reports_strictest_unknowns_and_violations():
+    # A correctly-gated older-kid plan: strictest is at the ceiling, unrated counted, no flag.
+    assert cert_summary(["TV-Y", "TV-PG", None, "12A"], OLDER_KID) == {
+        "ceiling": "TV-PG/PG", "strictest": "TV-PG", "unknown": 2, "violations": 0}
+    # A leak: two items the gate should have rejected for a little kid.
+    assert cert_summary(["TV-Y", "TV-MA", "R"], LITTLE_KID) == {
+        "ceiling": "TV-G/G", "strictest": "TV-MA", "unknown": 0, "violations": 2}
+    # An adult profile can never violate, and an unrated item is still surfaced.
+    assert cert_summary(["TV-MA", "NC-17", None], ADULT) == {
+        "ceiling": "any", "strictest": "NC-17", "unknown": 1, "violations": 0}
+    # An empty / all-unknown plan reports '?' rather than inventing a clean bill of health.
+    assert cert_summary([], TEEN)["strictest"] == UNKNOWN_CERT
+    assert cert_summary([None, "12A"], LITTLE_KID) == {
+        "ceiling": "TV-G/G", "strictest": UNKNOWN_CERT, "unknown": 2, "violations": 0}
+
+
+def test_cert_summary_treats_explicit_nr_as_adult_not_unknown():
+    # 'NR'/'Unrated' are RECOGNISED adult ratings in the gate table (unlike a missing field),
+    # so one reaching a kid's plan is a real violation — not swept into the unknown bucket.
+    assert cert_summary(["NR"], LITTLE_KID) == {
+        "ceiling": "TV-G/G", "strictest": "NR", "unknown": 0, "violations": 1}

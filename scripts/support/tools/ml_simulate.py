@@ -333,6 +333,13 @@ def emit_cache(rng: np.random.Generator, base: Path, world: World,
             "rating_key": str(int(world.rating_key[i])),
             "title": world.titles[i],
             "percent_complete": pct,
+            # A "relaxed-completion watch" lands at 60-85%, BELOW the global watched
+            # bar's percentage fallback — the fixture's intent is that the household
+            # DID finish it (a group with a relaxed completion_threshold), and only
+            # Tautulli's own verdict can say so. Emitting watched_status explicitly
+            # keeps the relaxed band counting as watched instead of silently becoming
+            # a sample, and exercises the verdict-beats-percentage precedence.
+            "watched_status": 1,
             "user": "sim_household",
         })
         per_title_events[i].append(t)
@@ -345,6 +352,7 @@ def emit_cache(rng: np.random.Generator, base: Path, world: World,
             "rating_key": str(int(world.rating_key[int(i)])),
             "title": world.titles[int(i)],
             "percent_complete": int(rng.uniform(5, 45)),
+            "watched_status": 0,      # sub-threshold noise — Tautulli agrees it is not a watch
             "user": "sim_household",
         })
     records.sort(key=lambda r: r["date"])

@@ -54,6 +54,15 @@ def empty_config() -> dict:
                 "created_at": 0,
             },
             "username": "",
+            # household_member: the Plex/Tautulli account name the Trakt (and MAL) lists
+            # belong to. Group-A5 counts DISTINCT household watchlisters, so a Trakt handle
+            # that does not spell the same as the Plex account makes ONE human look like
+            # TWO on every title they listed in both places (+0.12 of the cap, unearned) —
+            # and leaves a Trakt/MAL-ONLY title with no Tautulli activity to anchor its
+            # delete shield to, so the shield fails closed and never fires. Blank (the
+            # default) falls back to ``username``, which is byte-identical for an install
+            # whose Trakt handle already matches its Plex name.
+            "household_member": "",
         },
         "tvdb": {"api": "", "pin": "", "token": ""},
         "rootFolders": {"series": "", "anime": "", "documentary": "", "reality": ""},
@@ -167,6 +176,13 @@ def empty_config() -> dict:
         #   time floor that stops delete/re-grab thrash when a score hovers at the floor.
         #   keep/universe-tagged or ever-watched movies are never touched; movies
         #   without cached Trakt credits are deferred (never deleted on missing data).
+        # THESE TWO STAY AT 20 while space_pressure_score_ceiling below moved to 17, and
+        #   that asymmetry is DELIBERATE: this pass re-scores raw Radarr dicts through
+        #   repair/anomaly.py::_score_owned, which passes no transcode_profile, so Group
+        #   D v2 never reached it and its axis was never translated. The two floors are
+        #   also hysteresis partners of each other and must move together or a movie in
+        #   the gap is deleted and re-acquired every run. See the two-axis table in
+        #   machine_learning/thresholds/registry.py before changing either.
         "owned_demote_enabled": True,
         "owned_demote_score_threshold": 20,
         "owned_demote_dwell_days": 30,
@@ -182,18 +198,42 @@ def empty_config() -> dict:
         "space_pressure_headroom_ratio": 0.10,
         "space_pressure_delete_enabled": True,
         "space_pressure_include_unwatched": True,
-        "space_pressure_score_ceiling": 20,
+        "space_pressure_score_ceiling": 17,
         # Widen the under-pressure DOWNGRADE band to the delete band: when true, any title the
         # coordinator could delete (watchability < score_ceiling) is first stepped down to 720p
         # (make-before-break via Radarr's replace) and only DELETED if downgrades can't free
         # enough. False (default) keeps the narrower downgrade band (score < 6).
         "space_pressure_downgrade_before_delete": False,
+        # "Deletion is the TRUE last resort" (DEFAULT ON). Downgrade EVERYTHING that can
+        # still be downgraded before ANYTHING is deleted; 720p is the absolute floor.
+        #   * the downgrade planners drop the watchability CEILING as an eligibility filter
+        #     and plan every title above the floor down to it (still lowest-watchability
+        #     first; keep/universe/recent/at-floor guards all unchanged);
+        #   * a title may enter a DELETE pool only once it is AT or BELOW 720p — anything
+        #     still shrinkable is excluded and counted `skipped_downgradable`;
+        #   * the step-down picker may fall below 720 ONLY for a title with no >=720 release;
+        #   * each pass still stops as soon as free space — net of the smaller replacements
+        #     it queued this run — reaches the band top U.
+        # Set false to restore the previous behaviour byte-for-byte.
+        "space_exhaustive_downgrade": True,
+        # Bandwidth guard for the above: max REALIZED downgrades (file deleted + smaller
+        # replacement queued) per run. Items over the cap keep their files and re-qualify
+        # next run — and, being still above the floor, stay undeletable. <=0 = unbounded.
+        "space_downgrade_max_regrabs_per_run": 200,
         # Cross-service space coordinator: when enabled, deletion of movies AND TV is
         # centralised into one ranked, lowest-watchability-first pool (downgrade both
         # first, then delete to free_space_limit). Default OFF until fully rolled out.
         "space_coordinator_enabled": True,
         "tv_downgrade_enabled": True,
-        "tv_space_pressure_score_ceiling": 20,
+        "tv_space_pressure_score_ceiling": 17,
+        # Sonarr twin of owned_restore_score_threshold: re-acquire coordinator-deleted
+        # episodes once their series' PERSISTED watchability_score recovers above this.
+        # A SEPARATE key from the Radarr one on purpose — this leg reads the persisted
+        # score column (the axis Group D v2 translated, hence 17) while anomaly.py's
+        # movie twin re-scores raw Radarr dicts on an axis that never moved (hence 20).
+        # It is also the hysteresis partner of tv_space_pressure_score_ceiling above,
+        # so the two share a value; both comparisons are strict, so equal is thrash-free.
+        "tv_restore_score_threshold": 17,
         # Sonarr SERIES monitor-by-watchability (the monitor-only twin of the Radarr owned-monitor
         # policy): UNMONITOR the persistently low-affinity tail so Sonarr stops grabbing the
         # empty-series backlog (and every pass has fewer monitored series to process), and RE-MONITOR
@@ -206,7 +246,7 @@ def empty_config() -> dict:
         # someone is mid-watch (but Tautulli hasn't synced yet, so the watched guard hasn't tripped) is
         # never dormanted on a single below-floor pass; set to 0 to act on the first pass.
         "series_monitor_score_threshold": 35,
-        "series_demote_score_threshold": 20,
+        "series_demote_score_threshold": 17,
         "series_demote_dwell_days": 2,
         # Pre-destructive safety: before a REAL run (dry_run=false) makes any delete / re-grab,
         # snapshot each Radarr/Sonarr DB+config via its native Backup command and validate it is
@@ -239,6 +279,14 @@ def empty_config() -> dict:
         # reaches high-4K but never TOP-4K (reserved for rewatched). Radarr maps the
         # likelihood onto radarr_quality_ladder (explicit profile ids, below); Sonarr
         # JIT uses the resolution cutoffs (uhd/fhd/hd -> 2160/1080/720).
+        # people_matrix: the person↔media co-occurrence graph + household person-affinity
+        # vector that Group-C4 (scoring.person_affinity) and the co-cast acquisition
+        # candidate source read. Built every run from the Radarr relational credits table
+        # (all seven credited roles, with billing order) plus the daemon's show credit
+        # buckets; fingerprinted, so an unchanged library + watched-set is a no-op.
+        # enabled:false turns the build off — C4 then falls back to cap 0.0 (inert), which
+        # is exactly how the system behaved before the matrix was wired in.
+        "people_matrix": {"enabled": True},
         "watch_likelihood": {
             "rewatch_floor": 90, "watched_floor": 50, "started_floor": 45,
             "abandoned_ceiling": 25,
@@ -248,7 +296,16 @@ def empty_config() -> dict:
             # (100-floor)% of untouched titles climb above the floor profile — the
             # "only the top X% upgrade" knob (raise it to upgrade fewer titles).
             "untouched_mode": "absolute", "untouched_pct_floor": 0,
-            "untouched_base": 12, "untouched_score_gain": 1.0,
+            # untouched_base RE-ANCHORED 12 -> 25 with SCORER_REVISION 4 (Group D v2).
+            # This branch consumes the RAW watchability_score at gain 1.0, so the ~13-point
+            # downward translation of that axis landed on it in full while the cutoffs
+            # (75/45/20) and engagement floors (50/64/78/90) stayed put — untouched titles
+            # reaching 1080p collapsed 456 -> 8 on the real library. 25 is the tail-mass
+            # match at fhd_cutoff AND the median shift of the axis; a base (translation)
+            # rather than a gain (rescale) because Group D removed a CONSTANT, and because
+            # gain saturates titles against affinity_cap and destroys their ordering. Full
+            # derivation: likelihood/watch_likelihood.py, "AXIS ANCHOR" block.
+            "untouched_base": 25, "untouched_score_gain": 1.0,
             # affinity_cap (74) is kept just below uhd_cutoff (75) so taste alone reaches
             # Remux-1080p but NEVER 4K (4K is earned by rewatch / saga caught-up engagement).
             "affinity_cap": 74, "affinity_boost": 1.8,
@@ -282,12 +339,126 @@ def empty_config() -> dict:
                 "slope": 1.5, "pos_cap": 8.0, "neg_cap": -3.0, "conf_divisor": 8.0,
             },
             "related_graph": {"enabled": True, "cap": 4.0},
+            # device_fit_v2: GROUP D as a transcode-RISK PENALTY instead of a playback-
+            # capability BONUS. DEFAULT ON, deliberately — the v1 terms asked "can our
+            # devices play this?", whose answer is YES for every modern device x file
+            # combination, so on a real library 92% of movies scored the SAME 12.0 points:
+            # 57% of the median score carrying no ranking information, and silently
+            # invalidating every absolute threshold anchored on it. v2 asks the question
+            # that varies (WILL it transcode?) and scores it 0 (direct play) to -magnitude,
+            # weighted across the five causes the household is OBSERVED to transcode for —
+            # audio, bitrate/resolution, subtitle burn-in, video codec, container — learned
+            # from tautulli/stream_decisions + transcode_fingerprint and shrunk toward a
+            # shipped prior, so a fresh install is a documented cold start rather than a
+            # fit to nothing. A household with no transcode evidence at all gets a NEUTRAL
+            # 0, never a bonus.
+            #   enabled       false restores the v1 D1/D2/D3 bonuses BYTE-FOR-BYTE.
+            #   magnitude     the group's full-risk penalty (15.0 = v1's nominal cap, so
+            #                 the scale does not lurch). Realised range here is ~0 to -11.
+            #   cause_weights override the learned mix, e.g. {"audio": 0.4, ...}; values
+            #                 are normalised to sum to 1. Leave unset (recommended) to
+            #                 learn it from your own Tautulli decisions.
+            # NOTE: flipping this re-scales the whole 0-100 axis, so the quality_ladder
+            # rungs and the delete-floor family below are calibrated FOR it. Turning it off
+            # without re-anchoring those leaves them meaning something different.
+            "device_fit_v2": {"enabled": True, "magnitude": 15.0},
+            # quality_ladder: the score -> quality-profile-name ladder, [[threshold, pattern], ...]
+            # descending. The SHIPPED default (scoring/_shared.QUALITY_PROFILE_THRESHOLDS) is
+            # CALIBRATED to a real household's score distribution — the rungs sit at p99.9 /
+            # p99.5 / p99 / p98 / p97 of the FILE-OWNING title population (movies plus series
+            # that own at least one episode file), scored with device_fit_v2 on. Both halves
+            # of that sentence are load-bearing: an earlier calibration pooled in file-less
+            # pilot stubs, which dragged every percentile down ~6-8 points, and was measured
+            # against Group D v1's near-constant +12.
+            # Because it is a calibration it can drift: if your library's scores are shaped
+            # differently (a much larger watched share, a very different genre mix, a flipped
+            # device_fit_v2), re-derive the percentiles and set them here. Leave unset to use
+            # the shipped ladder. NOTE this is only HALF the 4K gate — watch_likelihood.
+            # uhd_cutoff (a different scale) caps the tier on top; on the shipped ladder the
+            # 4K entry rung admits fewer titles than this household keeps at 4K today, which
+            # is documented on the constant and is the first thing to override here.
+            # Long term this whole ladder is replaced by ml.thresholds (calibrated P(watch)).
+            "quality_ladder": None,
             # person_affinity: Group-C4 owned-media cast/crew taste overlap (id-keyed, so it's
             # immune to name-spelling drift). Reads the household person-affinity from the
-            # people_matrix; raises the UPGRADE score for a movie/series whose cast/crew the
-            # household favours. cap = max points (mirrors C2's ratios). enabled toggles the
-            # term; it stays inert (byte-identical) until the people_matrix has been built.
+            # people_matrix; raises the score for a movie/series whose cast/crew the household
+            # favours. cap = max points — 8.0, matching C1 (collection completeness), because
+            # "this is by people you keep coming back to" is as strong a keep signal as "you
+            # are most of the way through this collection". enabled toggles the term; it stays
+            # inert (cap forced to 0.0) until the people_matrix has actually been built, which
+            # now happens every run (see the top-level people_matrix block).
             "person_affinity": {"enabled": True, "cap": 8.0},
+            # watchlist_intent: GROUP-A5, the scorecard's only EXPLICIT-INTENT term. Every
+            # other signal INFERS whether the household wants a title from behaviour; this
+            # one reads a statement of it — somebody put the title on a watchlist. Folds
+            # the Plex household watchlist union and the Trakt watchlist into one index
+            # (next_watch.build_intent_index) and grades each title three ways:
+            #   * SOURCE   — reuses services/acquisition/scorer._SOURCE_SCORE's ranking
+            #                (watchlist/plan-to-watch 100 > suggestions 65 > seasonal 55),
+            #                divided by 100. NOT a second opinion: a title must not be
+            #                graded one way when we decide to ACQUIRE it and another way
+            #                when we decide to KEEP it.
+            #   * MEMBERS  — 0.60 of the cap for a solo watchlister, +0.12 per extra
+            #                member, full cap at four. Solo is deliberately not full credit
+            #                so the term can still grade a title two people both asked for.
+            #   * STALENESS — half_life_days/stale_floor, applied ONLY to feeds carrying a
+            #                real per-item timestamp. Trakt does (``listed_at``); Plex's
+            #                union does NOT, and the rolling watchlist snapshots retain
+            #                well under a day, so a "first seen" derived from them would
+            #                date every title to yesterday. Plex intent is therefore scored
+            #                UNDATED (no decay) rather than on a fabricated timestamp.
+            #                These two were DOCUMENTATION-ONLY until they were threaded
+            #                through _shared.resolve_intent_inputs — they were written up
+            #                here and pinned in config.json while the decay ran off the
+            #                module constants, which hold the same 365.0 / 0.25, so an
+            #                operator editing either got silence. They now drive it; the
+            #                constants remain the defaults, so absent/blank/garbage values
+            #                reproduce today's scores exactly, and stale_floor is clamped
+            #                to [0, 1] (a floor above 1 is a bonus multiplier, not a floor).
+            # cap 8.0 = C1/C4's weight: "we said we want this" is as strong a keep signal
+            # as "you are most of the way through this collection". enabled=false forces
+            # cap 0.0 → the term is byte-identical and A5_intent reports 0.0.
+            #
+            # WHO the Trakt/MAL lists belong to is trakt.household_member (see that key):
+            # A5 counts DISTINCT household watchlisters, so a Trakt handle spelled unlike
+            # the Plex account makes one human look like two and leaves Trakt/MAL-only
+            # titles with no Tautulli activity to anchor the shield to.
+            #
+            # shield: watchlisted titles are also HELD BACK FROM DELETION, not merely
+            # scored higher — points alone cannot save a watchlisted title whose taste
+            # profile puts it under the delete ceiling. The hold MUST expire or one
+            # forgotten watchlist entry holds disk forever, so it expires the way
+            # lifecycle/saga_retention already expires watchlist intent: on the
+            # WATCHLISTER'S OWN DORMANCY. dormancy_window_days is deliberately the same 90
+            # as saga_retention.dormancy_window_days — two different answers to "is this
+            # viewer still active?" is how a hold becomes unexplainable.
+            "watchlist_intent": {
+                "enabled": True, "cap": 8.0,
+                "half_life_days": 365.0, "stale_floor": 0.25,
+                "shield": {"enabled": True, "dormancy_window_days": 90},
+            },
+            # device_capabilities: ADD TO / OVERRIDE the Group-D device matrix — the
+            # {platform -> (max_resolution, direct-play codecs)} table D1 (primary-device
+            # capability), D2 (transcode avoidance) and D3 (platform ceiling) fuzzy-match
+            # the platform names Tautulli reports against. The shipped table
+            # (scoring/_shared._DEVICE_CAPABILITIES) is a COLD-START PRIOR: observed
+            # Tautulli transcode events always win, and it is only consulted for a codec
+            # or device with no history. Use this when your household runs a device the
+            # shipped table has never heard of, or gets one wrong. Keyed by a LOWERCASE
+            # SUBSTRING of the reported platform string; the most specific key wins, so
+            # "roku ultra" beats the conservative bare "roku". Example:
+            #   "device_capabilities": {
+            #       "shield android tv": {"max_resolution": 2160,
+            #                             "codecs": ["h264", "hevc", "vp9"]},
+            #       "my projector":      {"max_resolution": 1080},
+            #       "old plasma":        720
+            #   }
+            # A bare int is shorthand for {"max_resolution": <int>}; "codecs" defaults to
+            # ["h264"] (the universal baseline) and is alias-normalised, so "x265"/"HEVC"
+            # both mean hevc. NOTE "av1" is stripped from any entry, shipped or operator:
+            # Plex transcodes AV1 on virtually every client REGARDLESS of hardware decode
+            # support, so it is never scored as direct-play-safe. {} = shipped table only.
+            "device_capabilities": {},
             # Codec-aware transcode reduction: among same-resolution codec-variant profiles, pick the
             # one that minimises Plex transcoding for a title's likely viewers (their device→codec
             # direct-play matrix). enabled = the ADD-time codec re-pick (NOT wired yet → inert);
@@ -498,6 +669,20 @@ def empty_config() -> dict:
                      "this_week_in_history": {"enabled": False, "cap": 7, "min_votes": 0,
                                               "popularity_weight": 0.30, "timezone": "",
                                               "opt_in_users": [], "trust_home_managed": False},
+                     # hidden_gems: a per-profile "Hidden Gems" shelf over the OWNED backlog —
+                     #   titles this profile owns, has NEVER played, and that match its taste.
+                     #   Ranked by a TASTE-ONLY score (the watchability breakdown's affinity /
+                     #   collection / critic groups; the ENGAGEMENT group is dropped, since it is
+                     #   zero on a never-watched title and would just re-rank favourites).
+                     #   size = shelf length; max_per_franchise / max_per_person stop one saga or
+                     #   one actor owning the shelf (0 = that cap off). window_days is BOTH the
+                     #   measurement window (a pick played within it is a HIT) and the re-surface
+                     #   cooldown. play_min_pct = completion that counts as "played" (must match
+                     #   the watched-set floor, 85). opt_in_users = profiles to build for (empty +
+                     #   enabled => ALL tracked users). OFF => nothing built, byte-identical.
+                     "hidden_gems": {"enabled": False, "size": 25, "max_per_franchise": 2,
+                                     "max_per_person": 3, "window_days": 30,
+                                     "play_min_pct": 85, "opt_in_users": []},
                  }},
         "mdblist": {"apikey": ""},   # opt-in: aggregated ratings + lists. apikey -> keyring.
         # Profile titles / safe_users IGNORED across every per-user run (playlists, retention/catch-up,
@@ -553,6 +738,50 @@ def empty_config() -> dict:
                 "movies": True,          # acquire unowned FILM members via Radarr
                 "tv": True,              # acquire unowned SHOW members via Sonarr
             },
+        },
+        # PER-VIEWER EPISODE RETENTION — RECOMMENDED ON (the only Phase-3 block that is,
+        # because the behaviour it replaces is a bug, not a missing feature). Without it an
+        # episode is delete-eligible 3 h after ANYONE watches it, with no backward cushion and
+        # no protection for a second viewer who is further behind — so a household mid-season-4
+        # of a ten-season show has every watched episode of S01-S04 (bar the pilot) queued for
+        # deletion. With it, each ACCOUNT holds
+        #     [ position − backward_buffer , position + pace × horizon_days ]
+        # on every series it watches; an episode inside ANY account's window is never marked.
+        # Past dormant_days with no play on that series an account keeps its position and its
+        # backward cushion but stops projecting forward. Set enabled=false for the legacy
+        # behaviour. Keep IN SYNC with DEFAULT_RETENTION in
+        # machine_learning/lifecycle/viewer_retention.py.
+        # NOTE dormant_days is deliberately ABSENT: unset, it INHERITS
+        # acquisition.next_episode.recency_gate.cold_days (90) so "cold" has ONE definition.
+        # Write it here only to split the two.
+        "episode_retention": {
+            "enabled": True,            # master gate; off → legacy 3h-after-any-watch marking
+            "backward_buffer": 2,       # episodes kept BEHIND each viewer's resume point (rewatch cushion)
+            "horizon_days": 14,         # how far ahead each viewer's pace is projected
+            "pace_window_days": 30,     # window (ending at that viewer's last play) pace is measured over
+            "default_pace": 1.0,        # eps/day assumed when pace is undefined (a single play)
+            # LEGACY ALIAS of watched_threshold.percent, kept so an existing config
+            # keeps working. It was written here when the bar governed the retention
+            # rule alone; it now governs is_watched for the whole library (movies too),
+            # so the system-level key below is the one to tune. New key wins if both set.
+            "watched_percent": 85,
+        },
+        # WHAT COUNTS AS WATCHED — system-level, one definition for every service.
+        # machine_learning/lifecycle/watched_definition.py. A play counts as a WATCH
+        # when Tautulli's own per-row ``watched_status`` says so (1 = watched — its
+        # verdict wins whenever present, because it already reflects the completion
+        # threshold the operator configured in Tautulli/Plex), and otherwise when
+        # ``percent_complete >= percent``. Everything derived from "watched" rides on
+        # this: is_watched / watch_count in BOTH parquets, the 3-hour grace clock, the
+        # A2/A3 engagement + rewatch signals, the watch_likelihood engagement floors and
+        # the per-viewer retention intervals. Raising it makes the library stricter
+        # (fewer files marked watched → fewer grace-marked for deletion, lower
+        # engagement floors); lowering it back to 0 restores the old "any play counts"
+        # behaviour, in which a 30-second sample queued a file for deletion.
+        # NOT thresholded by this: percent_complete and last_watched_at, which stay raw
+        # playback facts so a sub-threshold play still registers as started/abandoned.
+        "watched_threshold": {
+            "percent": 85,              # Tautulli's and Plex's own out-of-the-box default
         },
         # Catch-up (trailing-viewer) RETENTION — the deletion twin of acquisition.universe. For each
         # saga the set of viewers who can BLOCK deletion is DERIVED FROM DATA every run (NO hardcoded

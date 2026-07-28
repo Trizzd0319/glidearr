@@ -79,14 +79,35 @@ def test_inert_when_flag_off():
     assert api.grabs == []
 
 
-def test_dry_run_previews_without_grabbing_or_burning_cooldown():
+def test_dry_run_defers_release_checks_by_default():
+    """DEFAULT dry-run: no interactive release searches at all.
+
+    Each check is a live indexer round-trip (~2s of blocked wall) spent only to
+    NAME the release a live run would grab, so the default budget is 0 and the
+    pass previews the QUEUE instead. Still: nothing grabbed, cooldown ledger
+    untouched."""
     api = _Api({101: [_rel("Old.Show.S01E01.480p.x264-NT", 480, guid="gg")]}, _EPS)
     cache = _Cache()
     m = _mgr(pd.DataFrame([_ROW]), api, cache, dry_run=True, cfg=_cfg())
     out = m.regrab_legacy_codecs("standard")
-    assert out["previewed"] == 1 and out["grabbed"] == 0
-    assert api.grabs == []                       # nothing grabbed
+    assert out["previewed"] == 0 and out["grabbed"] == 0
+    assert out["deferred"] == 1                   # queued for a live run / the daemon
+    assert api.grabs == []                        # nothing grabbed
     assert _LKEY not in cache.d                   # cooldown ledger not written in dry-run
+
+
+def test_dry_run_samples_releases_when_budget_set():
+    """Opt-in dry-run sampling (scoring.codec_profiles.legacy_regrab_dry_run_budget>0)
+    restores the old naming preview — still zero grabs, still no cooldown burn."""
+    cfg = _cfg()
+    cfg.setdefault("scoring", {}).setdefault("codec_profiles", {})["legacy_regrab_dry_run_budget"] = 1
+    api = _Api({101: [_rel("Old.Show.S01E01.480p.x264-NT", 480, guid="gg")]}, _EPS)
+    cache = _Cache()
+    m = _mgr(pd.DataFrame([_ROW]), api, cache, dry_run=True, cfg=cfg)
+    out = m.regrab_legacy_codecs("standard")
+    assert out["previewed"] == 1 and out["grabbed"] == 0
+    assert api.grabs == []
+    assert _LKEY not in cache.d
     assert m.logger.grids and m.logger.grids[0][2][0][-1] == "would-grab"
 
 

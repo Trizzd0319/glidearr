@@ -153,6 +153,68 @@ def test_writeback_doc_row_warns_about_dry_run_and_writes():
     assert "dry_run" in note
 
 
+# ── per-viewer episode retention (ON by default) ──────────────────────────────
+def test_episode_retention_block_is_on_by_default_with_the_documented_numbers():
+    """The ONLY recommended-ON retention block: the behaviour it replaces (delete
+    3h after ANYONE watched, no backward cushion, no protection for a viewer
+    further behind) is a bug, so it ships enabled."""
+    er = empty_config()["episode_retention"]
+    assert er["enabled"] is True
+    assert er["backward_buffer"] == 2
+    assert er["horizon_days"] == 14
+    assert er["pace_window_days"] == 30
+    assert er["default_pace"] == 1.0
+    assert er["watched_percent"] == 85
+    # dormant_days is deliberately absent → inherits the prefetch recency gate
+    assert "dormant_days" not in er
+
+
+def test_episode_retention_skeleton_matches_the_module_defaults():
+    """The skeleton and DEFAULT_RETENTION must not drift — the module is the
+    fallback when config.json omits the block, so a mismatch means a headless
+    install behaves differently from an onboarded one."""
+    from scripts.managers.machine_learning.lifecycle.viewer_retention import (
+        DEFAULT_RETENTION, resolve_retention_config,
+    )
+    cfg = empty_config()
+    assert cfg["episode_retention"] == DEFAULT_RETENTION
+    # ...and the resolved knobs are identical whether the block is present or not
+    resolved_absent = resolve_retention_config({})
+    resolved_skel = resolve_retention_config(cfg)
+    assert resolved_absent == resolved_skel
+    assert resolved_skel["dormant_days"] == 90     # inherited from the recency gate
+
+
+def test_episode_retention_overlay_preserves_operator_edits():
+    merged = deep_merge(empty_config(), {"episode_retention": {"backward_buffer": 5,
+                                                              "dormant_days": 45}})
+    er = merged["episode_retention"]
+    assert er["backward_buffer"] == 5 and er["dormant_days"] == 45
+    assert er["horizon_days"] == 14                 # untouched default fills in
+
+
+def test_doc_leaves_cover_every_episode_retention_knob():
+    paths = _doc_paths()
+    for p in ("episode_retention.enabled", "episode_retention.backward_buffer",
+              "episode_retention.horizon_days", "episode_retention.pace_window_days",
+              "episode_retention.default_pace", "episode_retention.dormant_days",
+              "episode_retention.watched_percent"):
+        assert p in paths
+
+
+def test_episode_retention_env_rows_render_and_dormant_days_documents_the_inherit():
+    env_example = env_map.generate_env_example()
+    md = env_map.generate_markdown_table()
+    for var in ("RECOMMENDARR_EPISODE_RETENTION_ENABLED",
+                "RECOMMENDARR_EPISODE_RETENTION_BACKWARD_BUFFER",
+                "RECOMMENDARR_EPISODE_RETENTION_HORIZON_DAYS",
+                "RECOMMENDARR_EPISODE_RETENTION_DORMANT_DAYS"):
+        assert var in env_example and var in md
+    note = next(n for path, _ex, n in env_map._DOC_LEAVES
+                if path == "episode_retention.dormant_days")
+    assert "inherit" in note and "cold_days" in note
+
+
 def test_doc_leaf_env_names_follow_the_recommendarr_convention():
     assert env_name("plex.playlists.writeback.enabled") == \
         "RECOMMENDARR_PLEX_PLAYLISTS_WRITEBACK_ENABLED"

@@ -21,9 +21,31 @@ Row schema (one row per entity per snapshot):
     watchability_score      the persisted 0-100 score
     sig_<GROUP>             each signal-group value from the breakdown dict
                             (e.g. sig_A1_keep_policy) — "_total_*" meta keys are
-                            NOT flattened (the score column already carries them)
+                            NOT flattened (the score column already carries them).
+                            The column set is DERIVED, not declared: whatever the
+                            scorer put in ``watchability_breakdown`` becomes a
+                            column, and ``append_snapshot``'s pd.concat UNIONS
+                            columns, so a new signal needs no migration here.
+                            Current vocabulary: A1-A5, B1-B5, C1-C4, D1-D4,
+                            E1-E3, F1-F3, G1-G4 (28 columns).
+
+    A NOTE ON PARTITIONS THAT LACK A sig_ COLUMN — because this has already been
+    misread once as a flattener bug. ``ml/snapshots/{radarr,sonarr}/2026-07.parquet``
+    carried 26 sig columns and NO ``sig_D4_transcode_risk``, even though both
+    scorers write ``D4_transcode_risk`` on BOTH branches (the v2 penalty, or a
+    literal 0.0 on the v1 legacy path). Nothing in this module drops it. The rows
+    are built from the ALREADY-PERSISTED ``watchability_breakdown`` column, and the
+    last live run predated the Group-D-v2 change that introduced the key — so the
+    breakdowns being flattened genuinely had 26 keys. The column appears on the
+    next scoring run and needs no backfill: ``challenger/gbt_shadow`` coerces a
+    missing feature to 0.0, which is the CORRECT value for a row scored under a
+    revision where that signal did not exist and contributed nothing to its score.
+    The same reasoning covers ``sig_A5_intent`` on pre-revision-5 partitions.
     size_bytes / resolution
-    watched_before  bool — any household watch recorded at snapshot time
+    watched_before  bool — any household WATCH recorded at snapshot time. Which
+                    definition of "watch" is recorded in
+                    ``watched_definition_version`` (NULL on rows written before
+                    that column existed = the old "any play counts" rule).
     planned_action  the decision-ledger stamp on the row at snapshot time
                     (i.e. the ledger state as persisted — typically last run's plan)
     in_up_next      movies only: tmdb present in the Up Next plan tmdb sets
@@ -68,9 +90,29 @@ _DEDUP_KEYS = ["snapshot_date", "instance", "entity_id"]
 # leakage_flags="credits_today,..."), so consumers can always split on `source`.
 SOURCE_PROSPECTIVE = "prospective"
 SOURCE_BACKFILL = "backfill"
+
+# WHICH DEFINITION OF "WATCHED" a row's ``watched_before`` (and its A2/A3 signal
+# columns) was computed under — the ONE thing ``source`` and
+# ``reconstruction_version`` could not express, because ``reconstruction_version``
+# is BACKFILL-ONLY (None on every prospective row) and this discontinuity hits
+# BOTH kinds.
+#
+#   1  "any play counts"  — is_watched = watch_count > 0 with no completion bar.
+#   2  the GLOBAL WATCHED BAR (lifecycle.watched_definition): Tautulli's own
+#      watched_status, else percent_complete >= watched_threshold.percent.
+#
+# Rows written before this field existed carry NULL = version 1 by construction.
+# The LABEL (``watched_within_h``) is NOT affected — it is computed at training
+# time by labels/labeling.py straight from the raw Tautulli history, under its own
+# thresholds, and never reads the parquet. So the label axis does not move; the
+# FEATURE does, which is precisely the pair that must not silently de-sync.
+# ``challenger/gbt_shadow`` consumes ``watched_before`` as a live model feature.
+WATCHED_DEFINITION_VERSION = 2
+
 _PROVENANCE_DEFAULTS = {
     "source": SOURCE_PROSPECTIVE,
     "reconstruction_version": None,
+    "watched_definition_version": WATCHED_DEFINITION_VERSION,
     "leakage_flags": None,
 }
 

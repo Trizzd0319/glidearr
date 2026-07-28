@@ -60,6 +60,18 @@ _CACHED_HISTORY_FIELDS = (
     "grandparent_title",
     "media_type",
     "percent_complete",
+    # Tautulli's OWN watched verdict for the play (1 / 0.5 / 0). NOT PII — a
+    # playback-completion flag. It already reflects whatever completion threshold
+    # the operator configured in Tautulli (85% out of the box, shared with Plex),
+    # so consumers that need "did they actually watch this, or sample it?" can
+    # honour the server's answer instead of inventing a second, disagreeing
+    # definition. Read by the per-viewer episode retention rule
+    # (machine_learning/lifecycle/viewer_retention.watched_by_tautulli).
+    # ABSENT on rows cached before this key was admitted, and on a Tautulli old
+    # enough not to emit it — watched_by_tautulli falls back to percent_complete
+    # (which those rows DO carry), so the transition is silent: no historical row
+    # reads as unwatched merely because the cache has not cycled yet.
+    "watched_status",
     "platform",
     "transcode_decision",
     "stream_video_codec",

@@ -19,7 +19,27 @@ class MovieFeatureRow:
     genres: tuple[str, ...] = ()
     runtime_minutes: float | None = None
     size_bytes: float | None = None
+    # GROUP D — device/playback fit. ``resolution`` is the HELD file's resolution
+    # (movie_files.resolution) and is what the scorer receives as
+    # ``target_resolution``; ``video_codec`` is the held file's codec (Radarr nests
+    # it at movieFile.mediaInfo.videoCodec — it is NOT a top-level movie field).
+    # Both None → D1/D3 contribute 0.0 and D2 falls back to its neutral +2.0.
     resolution: int | None = None
+    video_codec: str | None = None
+    # GROUP D v2 — the rest of the file's playback facts, feeding the transcode-RISK
+    # axes (scoring/device_fit.py). All optional: an axis whose input is missing is
+    # renormalised out of the weighted risk rather than scored as zero risk.
+    #   video_bitrate  bits/sec; 0 on 45% of this library's rows, hence the
+    #                  size_bytes ÷ runtime_minutes fallback inside the scorer
+    #   audio_*        the #1 observed transcode cause (38% of decisions)
+    #   subtitles      slash-joined language codes; the TRACK COUNT is the signal
+    #   relative_path  the only place the CONTAINER is recorded (file extension)
+    video_bitrate: float | None = None
+    audio_codec: str | None = None
+    audio_channels: float | None = None
+    audio_languages: str | None = None
+    subtitles: str | None = None
+    relative_path: str | None = None
     quality_profile_id: int | None = None
     # engagement
     is_watched: bool = False
@@ -27,6 +47,13 @@ class MovieFeatureRow:
     percent_complete: float = 0.0
     last_watched_at: str | None = None
     date_added: str | None = None
+    # GROUP A4 — the household's own DECLARED verdict (Trakt ``sync/ratings/movies``,
+    # 0-10). Not a critic rating: F1 already reads imdb/tmdb/trakt/metacritic/RT. This is
+    # "we watched it and we said what we thought", set by the service from the cached
+    # ratings map (radarr/quality/space_pressure._build_user_movie_rating_map) — the twin
+    # of ShowFeatureRow.user_rating, which has fed the show scorer since it was written.
+    # None (the default) → user_rating_score returns 0.0 → byte-identical.
+    user_rating: float | None = None
     # affinity-bearing
     watchability_score: float | None = None
     watchability_percentile: float | None = None
@@ -75,6 +102,18 @@ class ShowFeatureRow:
     max_episode_watch_count: int = 0
     video_codec: str | None = None              # modal codec across the series' files
     target_resolution: int | None = None        # max resolution across the series' files
+    # GROUP D v2 — the series-level aggregate of its episode files' playback facts.
+    # Modal for the categoricals (codec/audio/container), MEDIAN for bitrate (one
+    # oversized special must not speak for a whole series), MAX for resolution. All
+    # None on a pilot STUB, which is why a stub scores exactly 0.0 on Group D.
+    video_bitrate: float | None = None
+    size_bytes: float | None = None
+    runtime_seconds: float | None = None
+    audio_codec: str | None = None
+    audio_channels: float | None = None
+    audio_languages: str | None = None
+    subtitles: str | None = None
+    container: str | None = None
     latest_air_date: str | None = None
     user_rating: float | None = None            # household Trakt show rating 0-10
     sonarr_rating: float | None = None

@@ -24,11 +24,16 @@ def _isolate_universe_timeline_bake(monkeypatch):
 
 
 class _Log:
-    def __init__(self): self.infos = []; self.warns = []; self.grids = []
+    def __init__(self): self.infos = []; self.warns = []; self.grids = []; self.files = {}
     def log_info(self, m): self.infos.append(m)
     def log_warning(self, m): self.warns.append(m)
     def log_error(self, m): pass
-    def log_grid(self, headers, rows, title="", cap=16): self.grids.append((title, rows))
+
+    def log_grid(self, headers, rows, title="", cap=16, caption=""):
+        self.grids.append((title, headers, rows))
+
+    def log_to_file(self, category, message, *, reset=False):
+        self.files.setdefault(category, []).append(message)
 
 
 class _Cache:
@@ -522,7 +527,70 @@ def test_no_inventory_short_circuits_with_actionable_warn():
     m = _mgr(cache)
     res = m._build_for_users(_TRACKED, [_movie(1, "X", 2000, 50)], {}, {"rob": set()}, {"rob": {}})
     assert res["can_build"] is False and res["built"] == 0
+    assert m.logger.grids == []                               # no plans → no summary table
     assert any("plex.movies.enabled" in w for w in m.logger.warns)
+
+
+# ── run-log SUMMARY table (replaces the per-playlist 25-row preview grids) ─────
+def test_movie_run_log_emits_one_summary_grid_with_cert_evidence():
+    """ONE table for the whole MOVIE builder — no per-item preview grid in the run log —
+    carrying each profile's allowed ceiling next to the strictest cert in its plan."""
+    cache = _Cache()
+    owned = [_movie(1, "Kids", 2000, 50, cert="G"), _movie(2, "Teen", 2010, 90, cert="PG-13")]
+    inv = {"1": {"rating_key": "k"}, "2": {"rating_key": "t"}}
+    tracked = [{"safe_user": "rob", "title": "Rob"},
+               {"safe_user": "wyatt", "title": "Wyatt", "restriction_profile": "older_kid"}]
+    m = _mgr(cache)
+    m._build_for_users(tracked, owned, inv, {"rob": set(), "wyatt": set()},
+                       {"rob": {}, "wyatt": {}})
+    assert len(m.logger.grids) == 1
+    title, headers, rows = m.logger.grids[0]
+    assert "Movie playlists" in title and "per-profile summary" in title
+    assert "Title" not in headers and "Why" not in headers    # summary, not an item preview
+    adult, kid = (dict(zip(headers, r)) for r in rows)
+    assert adult["Profile"] == "R - adult 1" and adult["Items"] == "2"
+    assert adult["Allowed"] == "any" and adult["Strictest"] == "PG-13" and adult["Cert"] == "OK"
+    assert kid["Profile"] == "W - older_kid 2" and kid["Items"] == "1"   # PG-13 gated out
+    assert kid["Allowed"] == "TV-PG/PG" and kid["Strictest"] == "G"
+    assert kid["Unrated"] == "0" and kid["Cert"] == "OK"
+
+
+def test_movie_summary_flags_an_over_cert_item(monkeypatch):
+    """A synthetic gate leak (cert_allowed forced open) must surface as a flagged row."""
+    import scripts.managers.services.plex.playlists.movie_builder as MB
+    monkeypatch.setattr(MB, "cert_allowed", lambda cert, level, csm_age=None: True)
+    owned = [_movie(1, "Kids", 2000, 50, cert="G"), _movie(2, "Adult", 2010, 90, cert="R")]
+    inv = {"1": {"rating_key": "k"}, "2": {"rating_key": "r"}}
+    m = _mgr(_Cache())
+    m._build_for_users([{"safe_user": "lil", "title": "Lily", "restriction_profile": "little_kid"}],
+                       owned, inv, {"lil": set()}, {"lil": {}})
+    _t, headers, rows = m.logger.grids[0]
+    row = dict(zip(headers, rows[0]))
+    assert row["Allowed"] == "TV-G/G" and row["Strictest"] == "R"
+    assert row["Cert"] == "VIOLATION x1"
+
+
+def test_fresh_arrivals_adds_a_row_to_the_same_summary_table():
+    """A second playlist family is a second ROW, not a second table."""
+    recent = (date.today() - timedelta(days=3)).isoformat()
+    owned = [_movie_added(7, "Fresh", 2000, 80, recent)]
+    m = _mgr(_Cache(), config={"plex": {"playlists": {"fresh_arrivals": {"enabled": True}}}})
+    m._build_for_users(_TRACKED, owned, {"7": {"rating_key": "a"}}, {"rob": set()}, {"rob": {}})
+    assert len(m.logger.grids) == 1
+    _t, _h, rows = m.logger.grids[0]
+    assert [r[0] for r in rows] == ["Up Next", "Fresh Arrivals"]
+    assert {r[1] for r in rows} == {"R - adult 1"}
+
+
+def test_movie_playlists_log_still_receives_the_full_per_item_mirror():
+    owned = [_movie(1, "Kids", 2000, 50, cert="G"), _movie(2, "Teen", 2010, 90, cert="PG-13")]
+    inv = {"1": {"rating_key": "k", "title": "Kids", "year": 2000},
+           "2": {"rating_key": "t", "title": "Teen", "year": 2010}}
+    m = _mgr(_Cache())
+    m._build_for_users(_TRACKED, owned, inv, {"rob": set()}, {"rob": {}})
+    mirror = m.logger.files.get("playlists", [])
+    assert any("'Rob'" in ln and "2 movie(s)" in ln for ln in mirror)   # real name, local file only
+    assert any("Kids (2000)" in ln for ln in mirror) and any("Teen (2010)" in ln for ln in mirror)
 
 
 def test_watched_movie_dropped():

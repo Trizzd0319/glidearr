@@ -48,7 +48,7 @@ on every row via ``leakage_flags``):
     resolved (the row is then included at EVERY grid date).
 
 PROVENANCE — the non-negotiable contract: every row written here carries
-``source="backfill"``, ``reconstruction_version=1`` and ``leakage_flags``;
+``source="backfill"``, the current ``reconstruction_version`` and ``leakage_flags``;
 prospective rows default ``source="prospective"`` (labels/snapshots.py), old
 parquets are read as prospective, and the offline consumers
 (ml_forward_validation / ml_weight_refit / ml_train_challenger) EXCLUDE
@@ -119,11 +119,22 @@ from scripts.managers.machine_learning.labels.snapshots import (                
 from scripts.managers.machine_learning.likelihood.watch_likelihood import (         # noqa: E402
     affinity_boost,
 )
+from scripts.managers.machine_learning.lifecycle.watched_definition import (        # noqa: E402
+    DEFAULT_WATCHED_PERCENT,
+    play_is_watched,
+    resolve_watched_percent,
+)
 from scripts.managers.machine_learning.scoring._shared import (                     # noqa: E402
     resolve_person_affinity_inputs,
 )
 
-RECONSTRUCTION_VERSION = 1
+# BUMPED 1 -> 2 with the global watched bar. v1 rows reconstructed ``watch_count`` as
+# a raw PLAY tally (every Tautulli row counted) and ``is_watched`` as ``plays > 0``;
+# v2 counts only plays that clear lifecycle.watched_definition, matching what the
+# production parquet now records. The two are NOT comparable: on the live history v1
+# marks 162 movie titles watched where v2 marks 79. Anything that pools backfill rows
+# across versions must split on this field.
+RECONSTRUCTION_VERSION = 2
 BASE_LEAKAGE_FLAGS = "credits_today,metadata_today,deletions_unknown"
 _SAFE_USER_RE = re.compile(r'[\\/:*?"<>|]')
 
@@ -203,10 +214,18 @@ def load_trakt_movie_watches(base: Path) -> "tuple[list[datetime], list[int]]":
 
 # ── as-of-t reconstructions (pure over the event prefix) ──────────────────────
 
-def title_watch_map(prefix: "list[tuple[datetime, dict]]") -> dict:
+def title_watch_map(prefix: "list[tuple[datetime, dict]]", *,
+                    watched_pct: float = DEFAULT_WATCHED_PERCENT) -> dict:
     """The as-of-t mirror of RadarrMovieFilesCacheManager._fetch_watch_map:
     Tautulli MOVIE events aggregated by title -> {watch_count, percent_complete
-    (max, 0-100), last_watched_at (datetime)}."""
+    (max, 0-100), last_watched_at (datetime)}.
+
+    MIRROR, so it applies the SAME watched bar (lifecycle.watched_definition):
+    ``watch_count`` counts only plays Tautulli calls watched. Leaving it as a raw
+    play tally would systematically INFLATE backfilled engagement against the
+    production rows the model is trained to predict — the reconstruction would be
+    measuring a definition that no longer exists. ``percent_complete`` and
+    ``last_watched_at`` stay threshold-free, exactly as in production."""
     agg: dict = {}
     for ts, r in prefix:
         if r.get("media_type") != "movie":
@@ -216,7 +235,8 @@ def title_watch_map(prefix: "list[tuple[datetime, dict]]") -> dict:
             continue
         rec = agg.setdefault(str(title), {"watch_count": 0, "percent_complete": 0,
                                           "last_watched_at": None})
-        rec["watch_count"] += 1
+        if play_is_watched(r, threshold_pct=watched_pct):
+            rec["watch_count"] += 1
         try:
             pct = float(r.get("percent_complete") or 0)
         except (TypeError, ValueError):
@@ -597,7 +617,7 @@ def main(argv=None) -> int:
 
         genre_affinity_t = aggregate_affinity(
             prefix_raw, metadata_index, half_life_days=half_life, now=t)
-        watch_map_t = title_watch_map(prefix)
+        watch_map_t = title_watch_map(prefix, watched_pct=resolve_watched_percent(config))
         watched_t = watched_tmdbs_at(prefix, rk_to_tmdb, trakt_ts, trakt_tmdb, t)
         if people_fwd:
             pw_raw = {str(k): v for k, v in aggregate_person_affinity(
@@ -620,6 +640,8 @@ def main(argv=None) -> int:
             last_t = wm["last_watched_at"] if wm else None
 
             row_t = dict(row)
+            # ``wc_t`` is now a WATCH count (title_watch_map applies the bar), so this
+            # derivation mirrors the production parquet exactly — as it always claimed to.
             row_t["watch_count"] = wc_t
             row_t["percent_complete"] = pct_t        # 0-100, matching the parquet
             row_t["is_watched"] = wc_t > 0

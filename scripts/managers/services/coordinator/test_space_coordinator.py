@@ -142,6 +142,7 @@ class _StubLogger:
     def log_info(self, m):    self.infos.append(str(m))
     def log_debug(self, m):   pass
     def log_error(self, m):   pass
+    def log_table(self, *a, **k): pass
 
 
 def _sonarr_mgr() -> M:

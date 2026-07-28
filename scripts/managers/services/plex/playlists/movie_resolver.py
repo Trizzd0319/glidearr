@@ -151,6 +151,42 @@ def watched_movie_recency(history: list, *, min_pct: float = 85.0) -> dict:
     return out
 
 
+def movie_play_times(history: list, *, min_pct: float = 85.0) -> dict:
+    """``{identity: [unix ts, …] ascending}`` for MOVIE plays — the SAME mixed identities as
+    :func:`watched_movie_keys` (ratingKey + ``(title, year)``), but keeping EVERY play instead
+    of collapsing to the latest one.
+
+    The Hidden Gems measurement loop needs the FIRST play at or after a recommendation, not the
+    most recent: a pick watched on day 5 and rewatched on day 40 is a hit, and
+    :func:`watched_movie_recency`'s "latest" would call it a miss. Kept next to its two siblings
+    so all three share one definition of what a movie play IS and what identifies it."""
+    out: dict = {}
+    for row in history or []:
+        if not isinstance(row, dict) or str(row.get("media_type", "")).lower() != "movie":
+            continue
+        try:
+            pct = float(row.get("percent_complete") or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        if pct < min_pct:
+            continue
+        try:
+            ts = int(row.get("date") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts <= 0:
+            continue
+        rk = row.get("rating_key")
+        if rk is not None:
+            out.setdefault(str(rk), []).append(ts)
+        t, y = _norm(row.get("title")), _coerce_int(row.get("year"))
+        if t and y is not None:
+            out.setdefault((t, y), []).append(ts)
+    for key in out:
+        out[key].sort()
+    return out
+
+
 def movie_inputs(owned_movies: list, owned_inventory: dict, watched, movie_scores: dict,
                  *, universe_order: dict | None = None, universe_membership: dict | None = None,
                  watch_recency: dict | None = None):

@@ -11,11 +11,14 @@ from __future__ import annotations
 
 from scripts.managers.machine_learning.space.space_targets import *  # noqa: F401,F403
 from scripts.managers.machine_learning.space.space_targets import (  # noqa: F401
+    DEFAULT_REGRAB_CAP,
     PRESSURE_FALLBACK_GB,
     _cfg_get,
     coordinator_owns_deletion,
     deletions_consented,
     deletions_disabled_reason,
     deletions_enabled,
+    downgrade_regrab_cap,
+    exhaustive_downgrade,
     space_targets,
 )

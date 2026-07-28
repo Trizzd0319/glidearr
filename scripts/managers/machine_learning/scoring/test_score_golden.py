@@ -72,6 +72,41 @@ def test_corpus_is_deterministic():
     assert a == b
 
 
+def test_group_d_v1_is_byte_identical_when_device_fit_v2_is_off():
+    """THE FLAG-OFF GUARANTEE, proved on the golden corpus rather than on a handful of
+    hand-built cases.
+
+    ``scoring.device_fit_v2`` is default-ON, so the shipped scores are the v2 ones. What
+    an operator who sets it to ``false`` is promised is that they get the PREVIOUS
+    behaviour back exactly — and the fixture above, frozen before the v2 work, is the
+    only artefact that can prove that. The corpus never passes a ``transcode_profile``,
+    which is precisely the state ``build_transcode_profile`` returns when the flag is
+    off, so ``test_score_movie_golden_byte_identical`` passing IS the proof. This test
+    pins the equivalence explicitly: the flag-off resolution really does yield the None
+    profile the corpus assumes, and the v2 term really is inert on that path."""
+    from scripts.managers.machine_learning.scoring.device_fit import (
+        build_transcode_profile, resolve_device_fit,
+    )
+    cfg = {"scoring": {"device_fit_v2": False}}
+    settings = resolve_device_fit(cfg)
+    assert settings.enabled is False
+    # Even with a full household's evidence in hand, flag-off yields no profile...
+    assert build_transcode_profile(
+        platform_usage={"Windows": 369, "Tizen": 361},
+        stream_decisions={"1": {"video_decision": "transcode", "audio_decision": "copy",
+                                "subtitle_decision": "burn", "container_decision": "transcode",
+                                "video_codec": "hevc", "stream_video_codec": "hevc"}},
+        transcode_fingerprint=[{"device": "Windows", "fingerprint": ["u", "u", "none", "u", "lan"],
+                                "direct": 318, "transcode": 48, "n": 366}],
+        settings=settings) is None
+    # ...and a None profile leaves D4 inert while D1/D2/D3 carry the group, which is
+    # exactly the shape every vector in the fixture was frozen with.
+    for case in golden_corpus(25, _SEED):
+        _s, bd = score_movie(**case, transcode_profile=None, return_breakdown=True)
+        assert bd["D4_transcode_risk"] == 0.0
+        assert bd["_total_final"] == score_movie(**case)
+
+
 if __name__ == "__main__":
     import sys
     if "--write" in sys.argv:

@@ -127,8 +127,8 @@ Signal groups and per-signal caps (movie engine):
 |---|---|---|
 | A Household Intent | explicit curation + observed engagement | A1 keep_policy (+15), A2 completion (±12), A3 rewatch (+8), A4 user Trakt rating (±10) |
 | B Household Affinity | taste overlap with watch history | B1 actors (+8·boost), B2 directors (+6·boost), B3 writers (+4·boost), B4 genres (+4·boost), B5 studios (+3·boost) |
-| C Collection / Universe | franchise continuity + collaborative graph | C1 collection completeness (+8), C2 universe siblings (+4), C3 related-graph (+4 default cap), C4 person-affinity (cap 0.0 default — inert) |
-| D Device / Playback Fit | will it actually play well here | D1 primary-device capability (+6/−2), D2 transcode avoidance (+5), D3 platform ceiling share (+4) |
+| C Collection / Universe | franchise continuity + collaborative graph | C1 collection completeness (+8), C2 universe siblings (+4), C3 related-graph (+4 default cap), C4 person-affinity (cap **8.0** default — matches C1; live once the people_matrix is built, which now happens every run) |
+| D Device / Playback Fit | will it actually play well here | D1 primary-device capability (+6/−2), D2 transcode avoidance (+5), D3 platform ceiling share (+4) — all three read the HELD file's resolution/codec (`movie_files.resolution` / `.video_codec`, `episode_files` for TV), never a hypothetical target |
 | E Audience Alignment | right content for the right viewers | E1 kids alignment (+6), E2 adult alignment (+4), E3 library fit (+4) |
 | F Content Quality | external quality/recency evidence | F1 critic consensus (+20 — the strongest single positive), F2 popularity (+2), F3 recency (+2) |
 | G Penalties | negative evidence | G1 language (−8, file-aware), G2 abandoned (−10), G3 panned (−5), G4 not-yet-available (−5) |
@@ -611,6 +611,58 @@ bypassing the parity oracle.
 > the order: measure first, derive second, and let a derived value drive only
 > after it has proven itself against the recorded referee ledger.
 
+**Row 4 is now implemented, in shadow.** `thresholds/` (derive · shadow ·
+registry · report) replaces the ANCHOR of every score cutoff with a calibrated
+probability: a threshold is stated as *"act when P(watch within H) ≥ p"* and the
+score cutoff that implements it is the **lower generalized inverse**
+`s* = inf{s : F(s) ≥ p}` of the isotonic map F re-fit each run on matured labels
+(§5). The lower inverse is the only choice that makes `score ≥ s*` equivalent to
+`F(score) ≥ p`; on a plateau it returns the left edge, which at today's n is a
+statement about resolution, not an error. Target probabilities were chosen by
+**inverting today's constants through today's calibrator** — on this household
+(H=14d, radarr, n=11443, n_pos=38) score 20 → P 0.00232, 30 → 0.02985, 35 →
+0.03782, 70 → 0.03782 (saturated: the map is flat above 31, the top matured
+score being 56) — so the defaults reproduce current behaviour rather than
+changing it. Every run fits, inverts, counts the entities that WOULD flip, and
+writes `<cache>/ml/reports/thresholds_{date}.json`. Consumers read through one
+accessor (`thresholds.registry.get_threshold`) whose default mode `"shadow"`
+returns the caller's own literal unchanged, so the rollout is observable long
+before it is operative.
+
+**The §10 milestone is a WEIGHT, not a gate.** A hard refusal below `n_pos = 300`
+gave a fresh install nothing at all (`0/16 cleared the data gate`) and then, one
+positive later, everything. Evidence does not arrive in one step, so the derived
+cutoff and the hand-set constant are pooled with §6's own estimator
+(`foundation.empirical_bayes_pool`, no second implementation):
+
+    effective = w·derived + (1−w)·constant,      w = n_pos / (n_pos + k)
+
+with `k = 150` (`ml.thresholds.shrinkage_k`) — the midpoint of §10's 100
+("usable") and 300 ("stable") rungs, i.e. the calibrator is believed half-way
+exactly where the ladder says it has stopped being a rumour and has not yet
+settled. At `n_pos = 0` the pool returns the parent untouched, so the effective
+cutoff *is* the constant bit-identically and a cold install is unchanged; at
+this household's 38 positives `w = 0.20`; at 1000, `w = 0.87`. The only hard
+refusal left is "no evidence at all" (`MIN_POS_FOR_FIT = 5`, or an unfittable
+map), where there is no `derived` term to blend. The 100/300/1000 ladder
+survives on the report as a confidence annotation — `directional` / `usable` /
+`stable` / `magnitude-grade` — describing how far the value was allowed to move,
+which is what the ±0.2-class magnitude noise floor (§11) actually licenses.
+Threshold fitting also opts INTO backfilled labels by default
+(`ml.thresholds.include_backfill = true`, the only ML entry point that does): a
+new install's *only* labels are reconstructed ones, and the known leakage
+channels bias an accuracy claim far more than a monotone score→P map. The report
+splits `n_pos` by provenance on every row so that trade is never invisible.
+
+> **In plain words:** The first of these constants has been converted — on
+> paper only. Every run now asks "what probability of being watched does a
+> score of 35 actually stand for in this house?", works out which score would
+> match the odds you asked for, and prints how many titles the two rules
+> disagree about. Nothing acts on the answer until someone flips a switch, and
+> even then the answer is mixed with the human's original number in proportion
+> to how many real watches stand behind it: none, and you get the human's
+> number exactly; a handful, and it barely moves; hundreds, and the data leads.
+
 ## 10 Data-regime constraints — why classical statistics is the ceiling
 
 The ground truth is ≈931 Tautulli events household-wide, of which only ~54 are
@@ -634,7 +686,10 @@ That bounds model capacity from above:
   and threshold derivation (§9) get stable; at ≈1000, interaction terms or a
   larger challenger become defensible. Until then, bucketed hazards with
   strong EB pooling, univariate AUC-PRs, and an L2 logistic refit are not the
-  fallback — they are the correct estimators for this n.
+  fallback — they are the correct estimators for this n. Where a milestone
+  meets a *value* rather than a model (§9's thresholds), it is applied as EB
+  shrinkage toward the hand-set constant rather than as a refusal: the same
+  ladder, spent continuously instead of in one step.
 
 > **In plain words:** The entire history is about 931 watch events — only ~54
 > usable movie watches — a count-carefully problem: at roughly one

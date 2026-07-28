@@ -77,6 +77,15 @@ SHOW_BUCKETS: dict[str, Path] = {
 PEOPLE_MATRIX_PATH:   Path = CACHE_TRAKT / "people_matrix.json.gz"      # forward map {(medium,ext_id):{role:[pid]}}
 PEOPLE_AFFINITY_PATH: Path = CACHE_TRAKT / "people_affinity.json.gz"    # household {tmdb_person_id: weight}
 PEOPLE_NAMES_PATH:    Path = CACHE_TRAKT / "people_names.json.gz"       # {tmdb_person_id: name}; infra id→name lookup, not read by the scorers
+# Incremental sidecar for the SHOW half of the matrix. The movie half rebuilds from one
+# relational parquet per instance (cheap); the show half has no relational table, so it
+# must read ~6.3k individually-gzipped daemon credit files — ~25s cold. This sidecar
+# stores {tvdb: mtime_ns} alongside each show's routed roles so a repeat run re-reads
+# ONLY the shows the daemon actually rewrote. Same pattern as owned_episodes.fingerprints.
+PEOPLE_SHOWS_SIDECAR: Path = CACHE_TRAKT / "people_matrix.shows.json.gz"
+# Build fingerprints (movie-half + show-half + inputs) — lets a run whose credits and
+# watched-set are unchanged skip the rebuild entirely.
+PEOPLE_MATRIX_STATE:  Path = CACHE_TRAKT / "people_matrix.state.json"
 
 # Default per-movie scope. translations is ON by default for the globally-shared
 # deployment — it caches localized title/tagline/overview text for non-English

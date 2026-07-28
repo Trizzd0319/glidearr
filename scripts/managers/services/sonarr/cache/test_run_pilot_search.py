@@ -1,8 +1,19 @@
 """Tests for run_pilot_search — deliverable C: best-tier-first / space-divert pilot strategy.
 
 Driven in dry_run via the object.__new__ pattern (heavy helpers shadowed), so no network. In
-dry_run the chosen profile is stamped onto pilot_last_profile_id (via _mark_searched), so the test
-reads that back to assert which tier the pilot targeted.
+dry_run the chosen profile is stamped onto the PLAN-only column pilot_planned_profile_id (via
+_mark_planned), so the test reads that back to assert which tier the pilot targeted.
+
+Dry-run column contract (see run_pilot_search's "Dry-run contract" docstring):
+  * PLAN-only columns — pilot_last_planned_at + pilot_planned_profile_id — are written by a
+    dry-run and persisted (so repeat dry-runs skip the per-stub planning loop). They are read
+    ONLY under a `self.dry_run` guard, so they can never steer live behaviour.
+  * LIVE-state columns — pilot_search_attempts / pilot_last_searched_at / pilot_last_profile_id
+    — are written ONLY by a real search. pilot_last_profile_id is fed back to the ladder as
+    `last_pid`, so stamping it in dry-run would re-aim the next LIVE run's tier; the other two
+    drive the backoff + 24 h interval guard.
+  * A dry-run performs ZERO Sonarr writes (no POST/PUT/DELETE, no worker spawn / daemon
+    offload) — that is the real safety property, asserted via _assert_no_sonarr_writes.
 
 Reserve math (deterministic): total=1000, free_space_limit=100 → space_targets U=110,
 jit_reserve_gb = max(110, 1000*0.05=50) = 110. Per-episode estimates @100min:
@@ -10,9 +21,14 @@ jit_reserve_gb = max(110, 1000*0.05=50) = 110. Per-episode estimates @100min:
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pandas as pd
 
 from scripts.managers.services.sonarr.cache.episode_files import SonarrCacheEpisodeFilesManager
+
+_LIVE_STATE_COLS = ("pilot_search_attempts", "pilot_last_searched_at", "pilot_last_profile_id")
+_PLAN_COLS       = ("pilot_last_planned_at", "pilot_planned_profile_id")
 
 
 class _StubLogger:
@@ -37,8 +53,11 @@ class _FakeApi:
     def __init__(self, series_qp):
         self._series_qp = series_qp
         self.puts = []
+        self.writes = []          # every non-GET call — the dry-run "zero Sonarr writes" ledger
 
     def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+        if method != "GET":
+            self.writes.append((method, endpoint))
         if endpoint == "qualityprofile":
             return list(_PROFILES)
         if endpoint == "series" and method == "GET":
@@ -82,6 +101,41 @@ def _run(config, *, free_gb, series_qp=99, last_pid=None, score="__omit__"):
     return df, stats, api
 
 
+def _assert_no_sonarr_writes(api):
+    """THE dry-run safety property: not one Sonarr write — no POST/PUT/DELETE at all, so no
+    `command` EpisodeSearch/SeriesSearch and no qualityProfileId PUT. (Worker spawn / daemon
+    offload are asserted separately by the tests that stub them.)"""
+    assert getattr(api, "writes", []) == [], f"dry-run issued Sonarr writes: {api.writes}"
+    assert getattr(api, "puts", []) == [], f"dry-run issued profile PUTs: {api.puts}"
+
+
+def _assert_live_state_untouched(df, idx=0, *, expected=None):
+    """The LIVE-state columns a dry-run must NEVER write: pilot_last_profile_id is read back as
+    `last_pid` by the ladder (so writing it would re-aim the next LIVE run's tier), and
+    pilot_search_attempts / pilot_last_searched_at drive the backoff + 24 h interval guard.
+    ``expected`` maps column → the value the row went IN with (default: all three unset)."""
+    expected = expected if expected is not None else {c: None for c in _LIVE_STATE_COLS}
+    for col in _LIVE_STATE_COLS:
+        got, want = df.at[idx, col], expected.get(col)
+        if want is None:
+            assert got is None or pd.isna(got), f"dry-run stamped live-state {col}: {got!r}"
+        else:
+            assert got == want, f"dry-run changed live-state {col}: {got!r} != {want!r}"
+
+
+def _assert_planned(df, idx=0, *, pid):
+    """A dry-run stamps the PLAN-only pair: when it ran, and the tier it WOULD have grabbed."""
+    assert df.at[idx, "pilot_last_planned_at"], "pilot_last_planned_at not stamped in dry-run"
+    assert int(df.at[idx, "pilot_planned_profile_id"]) == pid
+
+
+def _assert_not_planned(df, idx=0):
+    """A stub that was never even planned carries neither plan stamp."""
+    for col in _PLAN_COLS:
+        got = df.at[idx, col]
+        assert got is None or pd.isna(got), f"unsearched stub stamped {col}: {got!r}"
+
+
 # NOTE: the within-run floor-first climb is now the DEFAULT pilot strategy; these tests pin the
 # LEGACY escape-hatch strategies, so they explicitly disable the climb. The climb itself is covered
 # by test_pilot_climb_worker.py and test_climb_default_collects_items_and_spawns_worker below.
@@ -93,25 +147,37 @@ _OFF = {"free_space_limit": 100, "pilot_best_tier_first": {"enabled": False}, **
 
 # ── best-tier-first ───────────────────────────────────────────────────────────────
 def test_pilot_targets_highest_tier_when_space_ample():
-    df, stats, _ = _run(_ON, free_gb=5000)
-    assert int(df.at[0, "pilot_last_profile_id"]) == 13   # 2160p — the highest tier
+    df, stats, api = _run(_ON, free_gb=5000)
+    _assert_planned(df, pid=13)                          # 2160p — the highest tier
     assert stats["searched"] == 1
+    _assert_live_state_untouched(df)                     # tier recorded on the PLAN mirror only
+    _assert_no_sonarr_writes(api)
 
 
 def test_pilot_diverts_down_for_space_within_run():
     # free 120: 4K (−19.53) breaches the 110 reserve; 1080 (−6.84 → 113.2) fits → pid 12.
-    df, _, _ = _run(_ON, free_gb=120)
-    assert int(df.at[0, "pilot_last_profile_id"]) == 12   # diverted 2160 → 1080 for space
+    df, _, api = _run(_ON, free_gb=120)
+    _assert_planned(df, pid=12)                          # diverted 2160 → 1080 for space
+    _assert_live_state_untouched(df)
+    _assert_no_sonarr_writes(api)
     # tighter (free 113): 1080 breaches (106.2<110); 720 fits (110.07) → pid 11.
-    df2, _, _ = _run(_ON, free_gb=113)
-    assert int(df2.at[0, "pilot_last_profile_id"]) == 11
+    df2, _, api2 = _run(_ON, free_gb=113)
+    _assert_planned(df2, pid=11)
+    _assert_live_state_untouched(df2)
+    _assert_no_sonarr_writes(api2)
 
 
 def test_pilot_diverts_down_across_runs_for_availability():
     # Ample space (ceiling = 2160). Last run searched 2160 (current QP & last_pid both 13) and
     # found nothing → this run diverts DOWN one rung to 1080 (availability divert).
-    df, _, _ = _run(_ON, free_gb=5000, series_qp=13, last_pid=13)
-    assert int(df.at[0, "pilot_last_profile_id"]) == 12
+    df, _, api = _run(_ON, free_gb=5000, series_qp=13, last_pid=13)
+    _assert_planned(df, pid=12)
+    # The divert INPUT (last_pid=13, 1 prior attempt) survives the dry-run untouched — the next
+    # LIVE run still sees "last searched at 2160", not this run's plan.
+    _assert_live_state_untouched(df, expected={"pilot_search_attempts": 1,
+                                               "pilot_last_searched_at": None,
+                                               "pilot_last_profile_id": 13})
+    _assert_no_sonarr_writes(api)
 
 
 def test_pilot_skipped_when_no_space_and_force_floor_off():
@@ -119,19 +185,22 @@ def test_pilot_skipped_when_no_space_and_force_floor_off():
     df, stats, api = _run(_ON, free_gb=100)
     assert stats["skipped_space"] == 1
     assert stats["searched"] == 0
-    assert pd.isna(df.at[0, "pilot_last_profile_id"])     # never searched → never stamped
+    _assert_not_planned(df)                              # never searched → never stamped…
+    _assert_live_state_untouched(df)                     # …on either column family
     # No profile change applied — the stub is left untouched for re-probe next run. (run_pilot_search
     # has no delete path at all; the actual never-delete-by-guard proof lives in the deletion-manager
     # tests — here we only prove the pilot is DEFERRED, not searched, when no tier fits.)
-    assert api.puts == []
+    _assert_no_sonarr_writes(api)
 
 
 def test_pilot_forced_to_floor_when_no_space_and_force_floor_on():
     # Same no-space disk, but force_floor=True → always seed the pilot at the floor (720, pid 11).
-    df, stats, _ = _run(_ON_FORCE, free_gb=100)
-    assert int(df.at[0, "pilot_last_profile_id"]) == 11
+    df, stats, api = _run(_ON_FORCE, free_gb=100)
+    _assert_planned(df, pid=11)
     assert stats["searched"] == 1
     assert stats.get("skipped_space", 0) == 0
+    _assert_live_state_untouched(df)
+    _assert_no_sonarr_writes(api)
 
 
 # ── no cumulative reservation: every due stub searches against the SAME free space ──
@@ -150,8 +219,11 @@ def test_multiple_pilots_all_search_no_cumulative_throttle():
     class _MultiApi:
         def __init__(self):
             self.puts = []
+            self.writes = []
 
         def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
+            if method != "GET":
+                self.writes.append((method, endpoint))
             if endpoint == "qualityprofile":
                 return list(_PROFILES)
             if endpoint == "series" and method == "GET":
@@ -181,8 +253,11 @@ def test_multiple_pilots_all_search_no_cumulative_throttle():
     stats = m.run_pilot_search("inst")
     assert stats["searched"] == 2                          # BOTH searched — not throttled cumulatively
     assert stats.get("skipped_space", 0) == 0
-    assert int(df.at[0, "pilot_last_profile_id"]) == 13    # both at the highest tier (2160p)
-    assert int(df.at[1, "pilot_last_profile_id"]) == 13
+    _assert_planned(df, 0, pid=13)                         # both at the highest tier (2160p)
+    _assert_planned(df, 1, pid=13)
+    _assert_live_state_untouched(df, 0)
+    _assert_live_state_untouched(df, 1)
+    _assert_no_sonarr_writes(api)
 
 
 # ── live mode: decision off the bulk snapshot, fresh GET only for the changers ──
@@ -290,9 +365,11 @@ def test_bulk_live_loop_resolves_ids_cache_only():
 def test_flag_off_reproduces_legacy_floor_first():
     # With the flag OFF, attempt 1 targets the FLOOR (720, pid 11) — the OPPOSITE of best-tier-first
     # (which targets 2160). This is the byte-identical legacy behavior.
-    df, stats, _ = _run(_OFF, free_gb=5000)
-    assert int(df.at[0, "pilot_last_profile_id"]) == 11
+    df, stats, api = _run(_OFF, free_gb=5000)
+    _assert_planned(df, pid=11)
     assert stats["searched"] == 1
+    _assert_live_state_untouched(df)
+    _assert_no_sonarr_writes(api)
 
 
 # ── DEFAULT: interactive search (one manual search per stub) ──────────────────────
@@ -369,7 +446,10 @@ def test_removes_stub_with_committed_grab():
 
 
 def test_dry_run_does_not_remove_committed_grab():
-    """Dry-run counts the committed-grab stub but never drops the row or saves."""
+    """Dry-run counts the committed-grab stub but never drops the row — not in memory and not in
+    what it persists. (Dry-run DOES save, deliberately, so plan stamps survive to the next
+    dry-run; the guard here is that the SAVED frame still carries the row, and that the removal
+    plan issued no Sonarr write and disturbed no live-state column.)"""
     df = _stub_df()
 
     class _DlApi(_FakeApi):
@@ -379,24 +459,31 @@ def test_dry_run_does_not_remove_committed_grab():
             return _FakeApi._make_request(self, instance, endpoint, method, payload, fallback)
 
     saved: list = []
+    api = _DlApi(series_qp=99)
     m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
-    m.sonarr_api = _DlApi(series_qp=99)
+    m.sonarr_api = api
     m.sonarr_cache = None
     m.global_cache = None
     m.config = {"free_space_limit": 100}
     m.dry_run = True
     m._resolve_instance = lambda inst: inst
     m.load = lambda inst: df
-    m.save = lambda inst, d: saved.append(True)
+    m.save = lambda inst, d: saved.append(d.copy())
     m._measured_mb_per_min = lambda d: dict(_MEASURED)
     m._get_episode_id = lambda *a, **k: 999
 
     stats = m.run_pilot_search("inst")
 
     assert stats["removed_grabbing"] == 1             # planned…
-    assert saved == []                                 # …but never persisted in dry-run
-    assert len(df) == 1                                # row left intact
+    assert len(df) == 1                                # …row left intact in memory…
+    for _d in saved:                                   # …and in every frame written out
+        assert len(_d) == 1, "dry-run persisted the committed-grab removal"
+    # The stub is dropped BEFORE it is planned, so neither plan stamp is written; the live-state
+    # columns (next run's tier + backoff) are untouched and Sonarr saw no write at all.
+    _assert_not_planned(df)
+    _assert_live_state_untouched(df)
+    _assert_no_sonarr_writes(api)
 
 
 def test_climb_default_collects_items_and_spawns_worker():
@@ -431,8 +518,13 @@ def test_climb_default_collects_items_and_spawns_worker():
     assert [res for _pid, res in spawned["ladder"]] == [720, 1080, 2160]
     assert api.puts == []                                       # main thread flips NO profiles
     assert stats["searched"] == 1
-    # interval guard tracking stamped at the floor tier (so the 24 h guard works next run)
+    # LIVE stamps the live-state columns: interval-guard tracking at the floor tier (so the 24 h
+    # guard works next run). The mirror invariant of the dry-run contract — a LIVE run writes the
+    # live ladder state and never the PLAN-only columns.
     assert int(df.at[0, "pilot_last_profile_id"]) == 11
+    assert df.at[0, "pilot_last_searched_at"]
+    assert int(df.at[0, "pilot_search_attempts"]) == 1
+    _assert_not_planned(df)
 
 
 def test_climb_unresolved_id_defers_instead_of_series_search():
@@ -471,7 +563,10 @@ def test_climb_unresolved_id_defers_instead_of_series_search():
 
 
 def test_climb_dry_run_does_not_spawn_or_write():
-    """Dry-run climb plans but never spawns the worker, PUTs a profile, or saves the df."""
+    """Dry-run climb PLANS but performs no Sonarr work: no background worker, no daemon offload,
+    no profile PUT, no command POST. It does persist the frame (deliberate — repeat dry-runs then
+    skip the whole per-stub planning loop), but the ONLY columns it may write are the PLAN-only
+    pair; the live ladder/backoff columns come out untouched."""
     df = _stub_df()
     api = _FakeApi(series_qp=99)
     saved: list = []
@@ -485,17 +580,90 @@ def test_climb_dry_run_does_not_spawn_or_write():
     m.dry_run = True
     m._resolve_instance = lambda inst: inst
     m.load = lambda inst: df
-    m.save = lambda inst, d: saved.append(True)
+    m.save = lambda inst, d: saved.append(d.copy())
     m._measured_mb_per_min = lambda d: dict(_MEASURED)
     m._get_episode_id = lambda *a, **k: 999
     m._spawn_pilot_climb_worker = lambda *a, **k: spawned.append(True)
+    m._spawn_pilot_interactive_worker = lambda *a, **k: spawned.append(True)
+    m._maybe_offload_pilot_search = lambda *a, **k: spawned.append(True) or True
 
     stats = m.run_pilot_search("inst")
 
-    assert spawned == []          # no background worker in dry-run
-    assert saved == []            # df not persisted in dry-run
-    assert api.puts == []         # no profile writes
+    assert spawned == []          # no background worker AND no daemon offload in dry-run
+    _assert_no_sonarr_writes(api)  # no profile PUT, no command POST — zero Sonarr writes
     assert stats["searched"] == 1
+    # Persisted (deliberate) — and what got persisted is PLAN-only: the floor tier the climb
+    # would have started at, with the live ladder/backoff columns still blank.
+    assert saved, "dry-run must persist the plan stamps"
+    _assert_planned(df, pid=11)                     # floor of the 720→1080→2160 ladder
+    _assert_live_state_untouched(df)
+    _assert_planned(saved[-1], pid=11)              # …and the same in the frame written out
+    _assert_live_state_untouched(saved[-1])
+
+
+# ── anti-influence invariant: a dry-run can never change what the next LIVE run does ──
+def test_dry_run_never_influences_next_live_run():
+    """THE invariant behind the two-column split. A dry-run may stamp the PLAN-only columns, but
+    the three columns LIVE decisions read must come out of it EXACTLY as they went in:
+
+      * ``pilot_last_profile_id`` → fed to next_pilot_profile/next_pilot_profile_descend as
+        ``last_pid``, i.e. it picks the NEXT LIVE run's tier. A dry-run writing it would re-aim a
+        real search (e.g. force a step_down that no real empty search earned).
+      * ``pilot_search_attempts`` / ``pilot_last_searched_at`` → the backoff + 24 h interval
+        guard. A dry-run writing them would SUPPRESS the next real search.
+
+    Checked across every dry-run branch that reaches _mark_planned: the interactive climb
+    (default), the plain climb, and the legacy best-tier-first push.
+    """
+    _old = (datetime.now(tz=timezone.utc) - timedelta(days=30)).isoformat()
+    cases = [
+        # (config, planned pid the dry-run should record)
+        ({"free_space_limit": 100},                                        11),  # interactive climb
+        ({"free_space_limit": 100, "pilot_interactive": {"enabled": False}}, 11),  # plain climb
+        (_ON,                                                              13),  # legacy best-tier
+    ]
+    for cfg, planned_pid in cases:
+        # Pre-seed REAL live state: 2 prior searches, last one 30 days ago (so still due), last
+        # tier 2160 (pid 13). These are exactly the values the next live run would read.
+        df = pd.DataFrame([{
+            "series_id": 1, "series_title": "S", "is_pilot": True, "episode_file_id": None,
+            "pilot_search_attempts": 2, "pilot_last_searched_at": _old,
+            "pilot_last_profile_id": 13,
+        }])
+        before = {c: df.at[0, c] for c in _LIVE_STATE_COLS}
+
+        api = _FakeApi(series_qp=99)
+        saved: list = []
+        spawned: list = []
+        m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+        m.logger = _StubLogger()
+        m.sonarr_api = api
+        m.sonarr_cache = None
+        m.global_cache = None
+        m.config = cfg
+        m.dry_run = True
+        m._resolve_instance = lambda inst: inst
+        m.load = lambda inst: df
+        m.save = lambda inst, d: saved.append(d.copy())
+        m._measured_mb_per_min = lambda d: dict(_MEASURED)
+        m._get_free_space_gb = lambda inst: 5000.0
+        m._get_total_space_gb = lambda inst: 1000.0
+        m._get_episode_id = lambda *a, **k: 999
+        m._spawn_pilot_climb_worker = lambda *a, **k: spawned.append("climb")
+        m._spawn_pilot_interactive_worker = lambda *a, **k: spawned.append("interactive")
+        m._maybe_offload_pilot_search = lambda *a, **k: spawned.append("offload") or True
+
+        stats = m.run_pilot_search("inst")
+
+        assert stats["searched"] == 1, cfg                     # the stub WAS planned…
+        _assert_planned(df, pid=planned_pid)                   # …onto the plan mirror only
+        # …and the next live run's inputs are bit-identical to before the dry-run.
+        after = {c: df.at[0, c] for c in _LIVE_STATE_COLS}
+        assert after == before, f"dry-run mutated live state for {cfg}: {before} → {after}"
+        _assert_live_state_untouched(df, expected=before)
+        _assert_live_state_untouched(saved[-1], expected=before)   # true of the PERSISTED frame too
+        assert spawned == [], f"dry-run spawned/offloaded for {cfg}: {spawned}"
+        _assert_no_sonarr_writes(api)
 
 
 # ── watchability gate on the interactive pilot search ───────────────────────────────
@@ -507,14 +675,17 @@ def test_pilot_held_back_when_below_watchability_floor():
     # untouched, so refresh_scores keeps re-grading it and it returns once affinity climbs.
     df, stats, api = _run(_GATE, free_gb=5000, score=5.0)
     assert stats["searched"] == 0
-    assert pd.isna(df.at[0, "pilot_last_profile_id"])
-    assert api.puts == []
+    _assert_not_planned(df)
+    _assert_live_state_untouched(df)
+    _assert_no_sonarr_writes(api)
 
 
 def test_pilot_searched_when_at_or_above_floor():
-    df, stats, _ = _run(_GATE, free_gb=5000, score=80.0)
+    df, stats, api = _run(_GATE, free_gb=5000, score=80.0)
     assert stats["searched"] == 1
-    assert int(df.at[0, "pilot_last_profile_id"]) == 13
+    _assert_planned(df, pid=13)
+    _assert_live_state_untouched(df)
+    _assert_no_sonarr_writes(api)
 
 
 def test_pilot_unscored_is_sampled_once():

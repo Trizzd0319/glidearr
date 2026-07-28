@@ -183,35 +183,108 @@ def aggregate_person_affinity(
     media_people_fwd: dict,
     *,
     role_weights: dict | None = None,
+    engagement: dict | None = None,
+    billing_decay: float | None = None,
 ) -> dict:
     """Household person-affinity from the watched-set + the people_matrix forward map.
 
     For each watched title key ``(medium, ext_id)`` present in ``media_people_fwd``,
-    add each of its people's role weight (cast/director strong, writer/composer weaker
-    — :data:`people_matrix.PERSON_ROLE_WEIGHTS`) to that ``tmdb_person_id``'s running
-    total. Returns ``{tmdb_person_id: weight}`` sorted descending — the watched-set-
-    derived weight vector the Group-C4 scorer term reads. Pure (defaultdict tally +
+    add each of its people's contribution to that ``tmdb_person_id``'s running total::
+
+        contribution = role_weight × billing_weight(rank) × title_engagement
+
+    Returns ``{tmdb_person_id: weight}`` sorted descending — the watched-set-derived
+    weight vector the Group-C4 scorer term reads. Pure (defaultdict tally +
     sorted-descending, mirroring :func:`aggregate_affinity`).
+
+    The three factors, and why each is there:
+
+    ``role_weight``
+        :data:`people_matrix.PERSON_ROLE_WEIGHTS` — cast/director strong, writer,
+        composer, producer/cinematographer, editor progressively weaker. Overridable
+        via ``role_weights``.
+    ``billing_weight``
+        Applied to :data:`people_matrix.BILLED_ROLES` (cast) only, using the person's
+        POSITION in the forward map's cast list, which the builders keep in billing
+        order. Without it a tenth-billed cameo in a beloved film counts exactly as much
+        as its lead. ``billing_decay=0`` disables it (every rank → 1.0).
+    ``engagement``
+        Optional ``{(medium, ext_id): float}`` — how hard the household actually
+        engaged with that title (finished vs abandoned, rewatched vs seen once).
+        Absent key → 1.0, so passing nothing reproduces "every watched title counts
+        the same". A person credited on three films the household rewatched should
+        outrank one credited on three it bailed on at 20%.
+
+    Only relative magnitude matters downstream: ``person_affinity_score`` divides by the
+    max weight, so scaling the whole vector is a no-op.
 
     No recency decay yet: the household watched-set is an undated id set. When a dated
     watch history is threaded, a ``half_life_days`` knob mirroring ``_entry_weight``
     can decay each title's contribution; deferred to avoid dead complexity.
     """
-    from scripts.managers.machine_learning.people_matrix.build import PERSON_ROLE_WEIGHTS
+    from scripts.managers.machine_learning.people_matrix.build import (
+        BILLED_ROLES, PERSON_BILLING_DECAY, PERSON_ROLE_WEIGHTS, billing_weight,
+    )
     role_weights = role_weights or PERSON_ROLE_WEIGHTS
+    decay = PERSON_BILLING_DECAY if billing_decay is None else float(billing_decay)
+    engagement = engagement or {}
 
     weights: dict = defaultdict(float)
     for key in watched_media_keys:
         roles = media_people_fwd.get(key)
         if not roles:
             continue
+        try:
+            eng = float(engagement.get(key, 1.0))
+        except (TypeError, ValueError):
+            eng = 1.0
+        if eng <= 0:
+            continue
         for role, pids in roles.items():
             rw = role_weights.get(role, 0.0)
             if rw <= 0:
                 continue
-            for pid in pids:
-                weights[pid] += rw
+            billed = role in BILLED_ROLES
+            for rank, pid in enumerate(pids):
+                bw = billing_weight(rank, decay=decay) if billed else 1.0
+                weights[pid] += rw * bw * eng
     return dict(sorted(weights.items(), key=lambda x: x[1], reverse=True))
+
+
+def title_engagement_weight(watch_count, percent_complete) -> float:
+    """How hard the household engaged with ONE title → the ``engagement`` multiplier
+    :func:`aggregate_person_affinity` takes.
+
+    ``completion × (1 + 0.5 × min(rewatches, 4))`` where ``completion`` is the fraction
+    actually watched (default 1.0 when the column is absent but a play exists) and
+    ``rewatches = watch_count - 1``. So:
+
+        watched once, finished        → 1.0
+        watched once, bailed at 30%   → 0.3
+        watched three times, finished → 2.0
+        watched six+ times            → 3.0 (rewatch credit caps at 4 extra plays)
+
+    The rewatch cap stops one obsessively-replayed title from owning the whole affinity
+    vector. Never negative; a title with no plays returns 0.0 (it is not in the
+    watched-set at all, so it should contribute nothing). Pure."""
+    try:
+        wc = int(watch_count or 0)
+    except (TypeError, ValueError):
+        wc = 0
+    if wc <= 0:
+        return 0.0
+    try:
+        pct = float(percent_complete)
+    except (TypeError, ValueError):
+        pct = None
+    if pct is None or pct != pct:                # None / NaN → assume a full play
+        pct = 1.0
+    if pct > 1.0:                                # parquet stores 0-100 for movies
+        pct = pct / 100.0
+    completion = max(0.0, min(1.0, pct))
+    if completion <= 0.0:                        # a play with no measured progress
+        completion = 1.0
+    return completion * (1.0 + 0.5 * min(4, wc - 1))
 
 
 def per_user_affinity(

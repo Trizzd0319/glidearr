@@ -180,11 +180,20 @@ remains the shipping default regardless of what the simulation recovers.
 | Flag | Default | Effect |
 |---|---|---|
 | `ml.snapshots.enabled` | **true** | Stage-1 snapshot appends (pure logging; fully fault-isolated). |
+| `ml.snapshots.backfill_on_first_run` | **true** | On a FRESH install only (no matured/backfilled rows in the store), run `ml_backfill_snapshots` once at the end of the run so the household's existing Tautulli history becomes labels immediately instead of a horizon later. One-shot marker at `<cache>/ml/snapshots/first_run_backfill.json`; any failure is a logged no-op (`labels/first_run.py`). |
+| `ml.snapshots.backfill_grid_days` | **7** | Grid spacing for that first-run replay (`--grid-days`). |
+| `ml.snapshots.backfill_max_grid_points` | **26** | Wall-clock bound on the first-run replay: at most this many grid dates (~6 months weekly), start additionally clamped to the first real event. 0 = unbounded. |
+| `ml.thresholds.mode` | **"shadow"** | `"derived"` lets consumers read the calibrated (shrunk) cutoff; `"off"` skips the end-of-run report entirely. |
+| `ml.thresholds.shrinkage_k` | **150** | Prior strength of the hand-set constant: `effective = w·derived + (1−w)·constant`, `w = n_pos/(n_pos+k)`. n_pos=0 → the constant, bit-identically. |
+| `ml.thresholds.include_backfill` | **true** | Threshold fitting counts reconstructed labels (the only ML entry point that does — a fresh install has no others). The report always splits `n_pos` by provenance. |
+| `ml.thresholds.horizon_days` / `.max_fit_days` / `.targets.*` | 14 / 365 / see `registry.DEFAULT_TARGET_P` | Label horizon, fit-window bound, and the per-bucket target probabilities. |
 | `scoring.ml_challenger.enabled` | **false** | Stage-4 shadow: log divergence + stamp `challenger_p` into snapshots. Needs lightgbm + a trained model; otherwise no-ops. |
 | `space_delete_ranking` | **"score"** | `"utility_per_gb"` switches the coordinator delete ranking (Stage 5b). Unknown values warn and fall back to `"score"`. |
 
 No other stage has a runtime surface. The CLIs are read-only over the cache
-(plus their own `ml/reports/` + `ml/models/` writes).
+(plus their own `ml/reports/` + `ml/models/` writes) — except that the first-run
+trigger above may invoke `ml_backfill_snapshots` once, which appends to
+`ml/snapshots/`.
 
 ## CLI usage
 

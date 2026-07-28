@@ -292,20 +292,52 @@ def profile_max_quality(profile: dict) -> "tuple[int, str | None]":
     return best_res, best_name
 
 
-def target_resolution_for_score(score) -> int:
-    """Watchability / acquisition score → target resolution tier (naming-agnostic, mirrors the
-    scorer's QUALITY_PROFILE_THRESHOLDS bands): score >=70 → 2160, >=35 → 1080, >=20 → 720, else
-    480. Shared by the resolver's score-driven profile pick and the dual-version HD baseline
-    (which clamps it below 4K) so add-time and the baseline use ONE ladder."""
+# The 720p rung of the resolution ladder below. Unlike the 2160/1080 rungs (which are
+# READ from the calibrated scoring ladder so the two can never drift again) this one has
+# no counterpart there — the scoring ladder's floor label IS "HD 720p", so it cannot
+# express "below this, 480p is enough". Anchored at p75: three quarters of the library is
+# background weight that 480p serves.
+#
+# RE-ANCHORED 20 -> 15 with the scoring ladder it sits under. It is the same percentile on
+# the same axis, so it goes stale by the same mechanism — p75 of the FILE-OWNING
+# population under Group D v2 is 15, where p75 of the old stub-inclusive, Group-D-v1 pool
+# was 20. Left at 20 it would have squeezed the 720p band to [20, 25) — five points wide,
+# against ten before — and pushed a quarter of the library that used to justify 720p down
+# to 480p, purely as an artefact of the axis moving underneath it.
+_SD_TO_HD_RUNG = 15
+
+
+def target_resolution_for_score(score, *, config=None) -> int:
+    """Watchability / acquisition score → target resolution tier (naming-agnostic).
+
+    The 2160 and 1080 rungs are READ from the calibrated scoring ladder
+    (``scoring._shared.QUALITY_PROFILE_THRESHOLDS`` via ``ladder_rung_for_resolution``),
+    NOT hard-coded: this used to carry its own copy (70/35/20/480) which silently
+    contradicted the scoring ladder the moment either moved. On the calibrated ladder
+    that resolves to ``>=38 → 2160, >=25 → 1080``; below that ``>=15 → 720``, else 480.
+
+    Shared by the resolver's score-driven profile pick and the dual-version HD baseline
+    (which clamps it below 4K) so add-time and the baseline use ONE ladder. ``config``
+    lets a caller honour a ``scoring.quality_ladder`` override."""
+    from scripts.managers.machine_learning.scoring._shared import (
+        ladder_rung_for_resolution, resolve_quality_ladder,
+    )
     try:
         s = int(score)
     except (TypeError, ValueError):
         return 480
-    if s >= 70:
+    ladder = resolve_quality_ladder(config)
+    # The defaults fire ONLY for a ``scoring.quality_ladder`` override that names no
+    # 2160/1080 rung at all. They must therefore track the SHIPPED ladder — 46/32 were
+    # the pre-Group-D-v2 rungs and would have silently re-instated the old, higher 4K/HD
+    # gates for exactly the operators who customised the ladder.
+    uhd = ladder_rung_for_resolution("2160", ladder, default=38)
+    fhd = ladder_rung_for_resolution("1080", ladder, default=25)
+    if uhd is not None and s >= uhd:
         return 2160
-    if s >= 35:
+    if fhd is not None and s >= fhd:
         return 1080
-    if s >= 20:
+    if s >= _SD_TO_HD_RUNG:
         return 720
     return 480
 

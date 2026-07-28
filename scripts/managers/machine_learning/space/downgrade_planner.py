@@ -20,11 +20,24 @@ PURE — reads the media-files frame cells + the score map + sizing; no HTTP/cac
 service fetches the ranked profile ladder + the reclaim need (U − free) and APPLIES the
 per-title targets (PUT qualityProfileId + search + ledger stamp).
 
+EXHAUSTIVE MODE (``space_exhaustive_downgrade``, DEFAULT ON at the service boundary) —
+"deletion is the true last resort": downgrade EVERYTHING that can still be downgraded
+before ANYTHING is deleted. Both planners then (a) stop applying the watchability score
+CEILING as an eligibility filter and (b) run the spread to FULL DEPTH instead of stopping
+at ``need_gb`` — so every title above the 720p floor is planned down to it, still ordered
+ASCENDING by watchability (least-valued shrinks first). Every other guard is unchanged.
+The 720p floor is what makes the invariant work: the delete pools only accept items already
+AT or BELOW it, so a title with anything left to shrink can never be deleted. The pass that
+APPLIES the plan still stops as soon as free space (net of in-flight re-grabs) reaches the
+band top U, and is bounded by ``space_downgrade_max_regrabs_per_run``.
+
 Public API:
   * plan_movie_downgrades(df, score_map, ranked_profiles, *, need_gb, recent_cutoff,
-        active_colls, protect_threshold, floor_resolution=720) -> (candidates, stats)
+        active_colls, protect_threshold, floor_resolution=720, exhaustive=False)
+        -> (candidates, stats)
   * plan_series_downgrades(df, ranked_profiles, *, need_gb, ceiling, watch_cutoff,
-        air_cutoff, keep_tags, default_runtime_min, floor_resolution=720) -> (candidates, stats)
+        air_cutoff, keep_tags, default_runtime_min, floor_resolution=720, exhaustive=False)
+        -> (candidates, stats)
   * downgrade_reclaim_gb(size_bytes, runtime_minutes, target_profile) -> float
 """
 from __future__ import annotations
@@ -37,6 +50,54 @@ from scripts.managers.machine_learning.sizing.size_model import (
 )
 
 DEFAULT_FLOOR_RESOLUTION = 720   # movies/series never step below 720p (universe owns SD)
+
+
+# ── UNSCORED ROWS ARE DEFERRED, NOT SCORED WITH A GUESS ───────────────────────
+# Both space planners used to read ``score_map.get(idx, 5)`` (and the two service-side
+# pool builders ``... if pd.notna(sc) else 5``): a row the scorer produced no value for
+# was handed the literal 5 and carried straight on into the queue.
+#
+# WHAT WAS WRONG WITH IT. 5 is a POINT ON THE SCORE AXIS, so it silently changed meaning
+# every time that axis moved. When it was chosen it sat at p1.3 of the movie distribution
+# — "an unscored row is the least valuable thing in the library, delete it first". After
+# Group D v2 turned a near-constant +12 bonus into a 0-to-negative transcode-risk penalty,
+# the SAME literal 5 sits at p32.4 — "delete it mid-pack". Nobody decided either of those;
+# both fell out of a constant that did not move with the distribution beneath it.
+#
+# WHAT IT IS FOR, honestly answered: nothing that survives being written down. The policy
+# it was standing in for is already stated one level up, and stated correctly — both delete
+# pool builders REFUSE to contribute any candidate when the whole ``watchability_score``
+# column is empty ("won't delete on fallback scores"). The row-level sentinel contradicted
+# that policy for the partial case. So the sentinel is gone and the two agree: an unscored
+# row DEFERS. That is the answer every other missing-data branch in this codebase already
+# gives — ``anomaly._score_owned`` defers on uncached credits, ``series_monitor_action``
+# defers when ``has_score`` is false, ``build_delete_candidates`` fails safe when the
+# protected-id build throws. Waiting costs the row nothing: refresh_scores fills it in on
+# the next pass, and a deferred row is inert (not deleted AND not downgraded), so it can
+# neither be shed on invented data nor block anything else from being shed.
+#
+# THE FAILURE MODE THIS OPENS, and how it is closed: a row that is PERSISTENTLY unscored
+# would become quietly immortal. So it is COUNTED, never silently dropped —
+# ``stats['skipped_unscored']`` on both planners, ``last_skipped_unscored`` + a log line on
+# both service pool builders. A silent mis-ranking becomes a visible number.
+_MISSING = object()
+
+
+def row_score(score_map, idx):
+    """The row's score, or ``None`` when the scorer produced none (see the note above).
+
+    ``None``/NaN entries count as absent: a score map built from a Parquet column can
+    contain NaN for a row the last ``refresh_scores`` never reached, and that is the same
+    "no value" as a key that isn't there at all."""
+    v = score_map.get(idx, _MISSING)
+    if v is _MISSING or v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return v
 
 
 def _profile_max_res(profile) -> int:
@@ -84,19 +145,29 @@ def step_targets(ranked_profiles, cur_resolution, cur_gib, est_fn, floor_resolut
     return targets, cum
 
 
-def _spread_to_target(eligible: list, need_gb: float) -> float:
+def _spread_to_target(eligible: list, need_gb: float, *, exhaustive: bool = False) -> float:
     """Round-robin step-down: each round advances every eligible title one tier deeper
     (input order = priority, lowest score first), accumulating its cumulative reclaim,
     until ``need_gb`` is met or every title has reached the floor. Mutates each item's
     ``_depth`` (number of tiers stepped). Returns the total projected reclaim.
 
     Each item carries ``cum_reclaim`` — a list whose i-th entry is the cumulative GiB
-    freed if the title is stepped to ``targets[i]`` (increasing, since deeper = smaller)."""
+    freed if the title is stepped to ``targets[i]`` (increasing, since deeper = smaller).
+
+    ``exhaustive`` (``space_exhaustive_downgrade``, DEFAULT-ON at the service boundary):
+    ignore ``need_gb`` entirely and keep spreading until EVERY eligible title has reached
+    the floor — the plan then covers everything that can still be downgraded, which is the
+    precondition for the "deletion is the true last resort" invariant (a title is only
+    delete-eligible once it is at/below the floor). The pass that APPLIES the plan is what
+    stops at the band top U (against a free-space figure net of in-flight re-grabs), so
+    "exhaustive" means "no early stop at a partial projected target", not "downgrade the
+    whole library regardless of need". Default False → byte-identical to the historical
+    spread."""
     for e in eligible:
         e["_depth"] = 0
     total = 0.0
     progressed = True
-    while total < need_gb and progressed:
+    while progressed and (exhaustive or total < need_gb):
         progressed = False
         for e in eligible:
             d = e["_depth"]
@@ -107,7 +178,7 @@ def _spread_to_target(eligible: list, need_gb: float) -> float:
             total += cum[d] - prev
             e["_depth"] = d + 1
             progressed = True
-            if total >= need_gb:
+            if not exhaustive and total >= need_gb:
                 break
     return total
 
@@ -122,11 +193,19 @@ def plan_movie_downgrades(
     active_colls: set,
     protect_threshold: float,
     floor_resolution: int = DEFAULT_FLOOR_RESOLUTION,
+    exhaustive: bool = False,
 ) -> "tuple[list[dict], dict[str, int]]":
     """Step the lowest-watchability movies DOWN the resolution ladder — one tier at a
     time, SPREAD across the eligible pool — until ``need_gb`` is reclaimed. No title is
     sent straight to the floor; each settles wherever the accumulating reclaim crosses
     need_gb (or at the floor resolution).
+
+    ``exhaustive`` (``space_exhaustive_downgrade``, DEFAULT-ON at the service boundary):
+    the score CEILING stops being an eligibility filter (titles at/above
+    ``protect_threshold`` are ADMITTED and counted in ``over_ceiling_included``) and the
+    spread runs to full depth, so every movie above the floor is planned down to it. The
+    ordering is unchanged — ascending watchability, least-valued first — and every other
+    guard below is untouched. The APPLYING pass is what stops at the band top U.
 
     Guards (skip): keep_forever / keep_movie / keep_universe / bare universe (universe
     quality is owned by the universe manager — incl. its credit-gated step-down); hot
@@ -141,6 +220,8 @@ def plan_movie_downgrades(
         "candidates_found": 0, "already_at_720p": 0, "skipped_protected": 0,
         "skipped_high_score": 0, "skipped_recent": 0, "skipped_universe": 0,
         "est_reclaim_gb": 0.0, "target_met": False,
+        # exhaustive-mode observability (0 / False on the legacy path)
+        "exhaustive": bool(exhaustive), "over_ceiling_included": 0,
     }
     if not ranked_profiles:
         return [], stats
@@ -159,7 +240,16 @@ def plan_movie_downgrades(
         runtime     = df.at[idx, "runtime_minutes"] if "runtime_minutes" in df.columns else None
         movie_id    = df.at[idx, "movie_id"] if "movie_id" in df.columns else None
         uni_credit  = df.at[idx, "universe_credit"] if "universe_credit" in df.columns else None
-        score       = score_map.get(idx, 5)
+        # UNSCORED -> DEFER. See the block comment on delete_planner._row_score: the old
+        # ``score_map.get(idx, 5)`` handed an unscored row a literal point on the score
+        # axis, which quietly changed meaning (p1.3 -> p32.4) when Group D v2 translated
+        # that axis. The step-down ladder and the delete pool are two stages of ONE
+        # decision, so they take the same answer to missing data — wait for a real score
+        # rather than shrink a file on a guessed one. Counted, never silently dropped.
+        score       = row_score(score_map, idx)
+        if score is None:
+            stats["skipped_unscored"] = stats.get("skipped_unscored", 0) + 1
+            continue
 
         if pd.isna(movie_id):
             continue
@@ -192,8 +282,13 @@ def plan_movie_downgrades(
             except Exception:
                 pass
         if score >= protect_threshold:
-            stats["skipped_high_score"] += 1
-            continue
+            # EXHAUSTIVE: the watchability ceiling is no longer an eligibility filter —
+            # a high-score title still has to shrink before ANY title is deleted. It
+            # simply sorts LAST (ascending score), so it is the last to be touched.
+            if not exhaustive:
+                stats["skipped_high_score"] += 1
+                continue
+            stats["over_ceiling_included"] += 1
 
         if pd.isna(cur_res):
             stats["already_at_720p"] += 1
@@ -228,7 +323,7 @@ def plan_movie_downgrades(
         })
 
     eligible.sort(key=lambda e: e["score"])
-    total = _spread_to_target(eligible, need_gb)
+    total = _spread_to_target(eligible, need_gb, exhaustive=exhaustive)
 
     candidates: list[dict] = []
     for e in eligible:
@@ -290,6 +385,7 @@ def plan_series_downgrades(
     keep_tags,
     default_runtime_min: float,
     floor_resolution: int = DEFAULT_FLOOR_RESOLUTION,
+    exhaustive: bool = False,
 ) -> "tuple[list[dict], dict[str, int]]":
     """Series twin of plan_movie_downgrades: aggregate episode rows per series (max
     watchability score, keep_policy, on-disk episode count, total bytes, max resolution),
@@ -300,6 +396,12 @@ def plan_series_downgrades(
     (>= ceiling); nothing on disk; already at/below the floor resolution; recently WATCHED; recently
     AIRED; first-step reclaim <= 0.
 
+    ``exhaustive`` (``space_exhaustive_downgrade``, DEFAULT-ON at the service boundary): the
+    ``ceiling`` stops being an eligibility filter (over-ceiling series are ADMITTED and counted in
+    ``over_ceiling_included``) and the spread runs to full depth, so every series above the floor is
+    planned down to it. Ordering (ascending score) and every other guard are unchanged; the APPLYING
+    pass is what stops at the band top U and enforces the re-grab cap.
+
     Returns ``(candidates, stats)``; each candidate carries sid/title/score/n_eps/cur_gib/
     indices and the chosen ``target_profile`` (+ id/name) + cumulative ``reclaim_gb``. PURE.
     The service applies each per-series target (PUT + SeriesSearch + stamp)."""
@@ -307,6 +409,8 @@ def plan_series_downgrades(
         "candidates": 0, "skipped_protected": 0, "skipped_high_score": 0,
         "skipped_recent": 0, "skipped_already": 0, "skipped_universe": 0,
         "est_reclaim_gb": 0.0, "target_met": False,
+        # exhaustive-mode observability (0 / False on the legacy path)
+        "exhaustive": bool(exhaustive), "over_ceiling_included": 0,
     }
     if not ranked_profiles:
         return [], stats
@@ -320,8 +424,12 @@ def plan_series_downgrades(
         except (TypeError, ValueError):
             continue
 
+        # The series path ALWAYS deferred unscored rows — it is the precedent the movie
+        # path has now been brought into line with (see ``row_score``). Only the counter
+        # is new, so a persistently-unscored series is visible rather than silently inert.
         score_vals = pd.to_numeric(rows["watchability_score"], errors="coerce").dropna()
         if not len(score_vals):
+            stats["skipped_unscored"] = stats.get("skipped_unscored", 0) + 1
             continue
         score = float(score_vals.max())   # constant per series; max ignores NaN
 
@@ -352,8 +460,12 @@ def plan_series_downgrades(
             stats["skipped_universe"] += 1
             continue
         if score >= ceiling:
-            stats["skipped_high_score"] += 1
-            continue
+            # EXHAUSTIVE: the ceiling is no longer an eligibility filter — a high-score
+            # series must still shrink before ANY title is deleted; it just sorts LAST.
+            if not exhaustive:
+                stats["skipped_high_score"] += 1
+                continue
+            stats["over_ceiling_included"] += 1
         if n_eps == 0:
             continue   # nothing on disk to reclaim
         max_res = pd.to_numeric(file_rows.get("resolution"), errors="coerce").max() \
@@ -394,7 +506,7 @@ def plan_series_downgrades(
         })
 
     eligible.sort(key=lambda e: e["score"])
-    total = _spread_to_target(eligible, need_gb)
+    total = _spread_to_target(eligible, need_gb, exhaustive=exhaustive)
 
     candidates: list[dict] = []
     for e in eligible:

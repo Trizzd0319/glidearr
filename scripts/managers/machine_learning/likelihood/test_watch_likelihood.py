@@ -61,7 +61,7 @@ def test_affinity_alone_never_reaches_4k():
 
 
 def test_untouched_low_stays_720p():
-    low = _L(watch_count=0, watchability_score=0)               # affinity = untouched_base (12)
+    low = _L(watch_count=0, watchability_score=0)               # affinity = untouched_base (25)
     assert resolution_cap_for_likelihood(low, config=None) == 720
     assert profile_id_for_likelihood(low, config=None) == 3     # HD-720p — the sticky floor
 
@@ -69,7 +69,12 @@ def test_untouched_low_stays_720p():
 def test_started_and_abandoned_below_default():
     assert _L(percent_complete=50) == 45                        # started_floor (entry 1080p)
     assert _L(percent_complete=10, watchability_score=80) == 25  # abandoned: CAPPED at the ceiling
-    assert _L(percent_complete=10) == 12                         # low affinity → stays at affinity
+    # With untouched_base re-anchored to 25 (== abandoned_ceiling), a title that was
+    # TRIED AND STOPPED sits AT the ceiling whatever its taste score — the ceiling is
+    # the binding constraint, which is what "abandoned" is supposed to mean. Every
+    # value in the branch is <= 25 < fhd_cutoff, so the whole branch is still 720p.
+    assert _L(percent_complete=10) == 25                         # ceiling binds at zero affinity too
+    assert resolution_cap_for_likelihood(_L(percent_complete=10), config=None) == 720
 
 
 # ── saga caught-up / depth credit (household, cross-media, timeline) ───────────

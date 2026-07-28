@@ -36,6 +36,20 @@ STAGE 2 — DELETE (LAST RESORT)
 
     NEVER deletes: universe, franchise entries, keep-forever, keep-movie,
     or anything watched within the last 30 days.
+
+EXHAUSTIVE POLICY (``space_exhaustive_downgrade``, DEFAULT ON)
+    "Deletion is the TRUE last resort": downgrade EVERYTHING that can still be
+    downgraded before ANYTHING is deleted. 720p is the absolute floor.
+      * Stage 1 plans every title above the floor (no score ceiling, no early stop
+        at a partial need_gb), lowest watchability first, and stops only once free
+        space NET of the re-grabs it queued this run reaches the band top U.
+      * ``build_delete_candidates`` admits a title ONLY when it is AT or BELOW the
+        720p floor — anything still shrinkable is excluded as ``skipped_downgradable``.
+      * ``_pick_stepdown_release`` may fall BELOW 720 only for a title with literally
+        no >=720 release available.
+      * ``space_downgrade_max_regrabs_per_run`` (default 200) bounds the re-grab storm;
+        deferred titles keep their files and re-qualify next run.
+    Set the flag false to restore the previous behaviour byte-for-byte.
 """
 
 from __future__ import annotations
@@ -55,6 +69,7 @@ from scripts.managers.machine_learning.space.delete_planner import (
     build_movie_delete_candidates,
 )
 from scripts.managers.machine_learning.space.downgrade_planner import (
+    DEFAULT_FLOOR_RESOLUTION as DOWNGRADE_FLOOR_RESOLUTION,
     plan_movie_downgrades,
     UNIVERSE_PROTECT_MIN,
 )
@@ -66,13 +81,15 @@ from scripts.managers.machine_learning.likelihood.watch_likelihood import (
 )
 from scripts.managers.machine_learning.playlists.models import PLACEHOLDER_AFFINITY
 from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
+from scripts.managers.machine_learning.thresholds.registry import get_threshold
 from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.watch_likelihood import (
     affinity_boost as _affinity_boost,
 )
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
 from scripts.support.utilities.space_targets import (
-    coordinator_owns_deletion, deletions_disabled_reason, deletions_enabled, space_targets,
+    coordinator_owns_deletion, deletions_disabled_reason, deletions_enabled,
+    downgrade_regrab_cap, exhaustive_downgrade, space_targets,
 )
 
 
@@ -223,13 +240,17 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
         Default = WATCHABILITY_PROTECT_THRESHOLD (6): only the near-unwatched step down.
         When space_pressure_downgrade_before_delete is on, widen it to MATCH the delete
-        ceiling (space_pressure_score_ceiling, default 20) so any title the coordinator
+        ceiling (space_pressure_score_ceiling, default 17) so any title the coordinator
         could delete is shrunk to 720p FIRST — deletion becomes the last resort."""
         if self.config and self.config.get("space_pressure_downgrade_before_delete", False):
             try:
-                return int(self.config.get("space_pressure_score_ceiling", 20))
+                widened = int(self.config.get("space_pressure_score_ceiling", 17))
             except (TypeError, ValueError):
-                return 20
+                widened = 17
+            # Same decision surface as the delete ceiling — route it identically
+            # so a derived value can never widen one leg and not the other.
+            return get_threshold("movie_delete_ceiling", self.config, widened,
+                                 logger=getattr(self, "logger", None))
         return self.WATCHABILITY_PROTECT_THRESHOLD
 
     @staticmethod
@@ -330,6 +351,47 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
         return genre_affinity, watched_tmdb_ids, collection_members
 
+    def _build_user_movie_rating_map(self) -> "dict[int, float]":
+        """{tmdbId: household Trakt movie rating 0-10} from the cached user ratings
+        (best-effort, cache-only — no live Trakt call).
+
+        THE EXACT MIRROR of ``sonarr/cache/episode_files._build_user_show_rating_map``:
+        same cache namespace, same username fallback, same "id and rating must both be
+        truthy" filter, same swallow-and-continue on a malformed row. The two feed the
+        SAME Group-A4 term through the SAME shared formula
+        (``scoring/_shared.user_rating_score``), so any divergence here would mean the
+        household's own 7/10 counted differently for a film than for a series.
+
+        PRECEDENCE: there is nothing to take precedence OVER. ``score_movie`` has always
+        accepted ``user_rating``, but no caller ever supplied it — every movie in this
+        library scored ``A4_user_rating: 0.0``. Trakt is therefore A4's FIRST and only
+        movie source, not a competitor to one. (``plex/ratings`` produces per-member
+        ``userRating`` maps and its own docstring already names the dedupe rule for the
+        day it is wired — "OWNER-DEDUPE vs Trakt is mandatory downstream (or one verdict
+        hits A4 twice)" — but it is default-off and no scoring path reads it today. The
+        F-group critic ratings (imdb/tmdb/trakt/metacritic/RT) are a different question
+        entirely: "what did the world think" vs "what did WE think".)"""
+        out: "dict[int, float]" = {}
+        gc = self.global_cache
+        if not gc:
+            return out
+        # Fallback must match the WRITER (TraktRatingsManager uses .get("username",
+        # "default") for the cache-key namespace) — every other Trakt cache key in the app
+        # defaults to "default", so a blank username must too or the read silently misses.
+        try:
+            username = ((self.config.get("trakt", {}) if self.config else {}) or {}).get("username") or "default"
+        except Exception:
+            username = "default"
+        for entry in (gc.get(f"trakt/{username}/ratings/movies") or []):
+            try:
+                tmdb = ((entry.get("movie") or {}).get("ids") or {}).get("tmdb")
+                rating = entry.get("rating")
+                if tmdb and rating:
+                    out[int(tmdb)] = float(rating)
+            except Exception:
+                continue
+        return out
+
     @timeit("_score_row")
     def _score_row(self, row: "pd.Series | dict", genre_affinity: dict,
                    watched_tmdb_ids: set[int], collection_members: dict[int, set[int]],
@@ -343,7 +405,14 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                    related_graph_cap: float = 4.0,
                    person_weights: dict | None = None,
                    person_affinity_cap: float = 0.0,
+                   intent_index: dict | None = None,
+                   intent_cap: float = 0.0,
+                   intent_now=None,
+                   intent_half_life_days: float | None = None,
+                   intent_stale_floor: float | None = None,
+                   user_movie_ratings: dict | None = None,
                    language_consumability: bool = False,
+                   transcode_profile=None,
                    return_breakdown: bool = False) -> "int | tuple[int, dict]":
         """
         Score a single movie_files Parquet row using score_movie(). ``row`` is a
@@ -359,6 +428,12 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # The service keeps only the I/O (credits + related set) and the config view.
         from scripts.managers.machine_learning.features.movie_features import (
             build_movie_feature_row, score_movie_features,
+        )
+        # Group-D device matrix: the shipped cold-start prior plus whatever the operator
+        # added under scoring.device_capabilities (a device the shipped table has never
+        # heard of). Returns the shipped table verbatim when the key is absent.
+        from scripts.managers.machine_learning.scoring._shared import (
+            resolve_device_capabilities,
         )
 
         try:
@@ -377,7 +452,12 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 if (related_enabled and pd.notna(tmdb_id)) else None
             )
 
-            fr = build_movie_feature_row(row, credits=credits, related_tmdb_ids=related_tmdb_ids)
+            # GROUP A4 — the household's own Trakt rating for this title (cache-only map
+            # built once per pass). None when unrated → A4 stays 0.0.
+            user_rating = (user_movie_ratings or {}).get(int(tmdb_id)) if pd.notna(tmdb_id) else None
+
+            fr = build_movie_feature_row(row, credits=credits, related_tmdb_ids=related_tmdb_ids,
+                                         user_rating=user_rating)
             return score_movie_features(
                 fr,
                 genre_affinity=genre_affinity,
@@ -385,6 +465,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 collection_members=collection_members,
                 platform_usage=platform_usage,
                 transcode_stats=transcode_stats,
+                device_capabilities=resolve_device_capabilities(self.config),
+                # GROUP D v2 — built once per pass in _build_score_map. None (feature
+                # off, or no household transcode evidence at all) → score_movie takes
+                # the legacy D1/D2/D3 path, byte-identical.
+                transcode_profile=transcode_profile,
                 per_user_affinity=per_user_affinity,
                 kids_users=kids_users,
                 adult_users=adult_users,
@@ -393,11 +478,153 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 related_graph_cap=related_graph_cap,
                 person_weights=person_weights,
                 person_affinity_cap=person_affinity_cap,
+                intent_index=intent_index,
+                intent_cap=intent_cap,
+                intent_now=intent_now,
+                intent_half_life_days=intent_half_life_days,
+                intent_stale_floor=intent_stale_floor,
                 language_consumability=language_consumability,
                 return_breakdown=return_breakdown,
             )
         except Exception:
             return (30, {}) if return_breakdown else 30
+
+    def _apply_watchlist_shield(self, df) -> int:
+        """Stamp ``watchlist_hold`` / ``watchlist_hold_by`` onto the movie_files frame.
+
+        Robert's decision: a watchlisted title is SHIELDED from deletion, not merely scored
+        higher. A5's +4.8 cannot on its own lift a weak-taste title over the delete ceiling
+        (17), and deleting something the household explicitly asked for is the one deletion
+        that is never defensible.
+
+        THE HOLD EXPIRES — otherwise one forgotten watchlist entry holds disk forever. It
+        expires exactly the way ``lifecycle/saga_retention`` already expires watchlist
+        intent (``watchlist_hold_policy: windowed``): on the WATCHLISTER'S OWN DORMANCY,
+        anchored on that member's last play, over the same 90-day window
+        (``scoring.watchlist_intent.shield.dormancy_window_days``, defaulting to
+        ``saga_retention.dormancy_window_days``). A title added in 2020 by somebody who
+        watched something last night is live intent; a title added last week by an account
+        dormant for six months is not.
+
+        Returns the number of held rows. All-False (byte-identical to the previous delete
+        behaviour) when the shield is disabled, nothing is watchlisted, or no watchlister
+        resolves to an active account."""
+        from scripts.managers.machine_learning.scoring._shared import intent_hold_active
+        from scripts.managers.services._intent_index import gather_intent_index
+
+        df["watchlist_hold"] = False
+        df["watchlist_hold_by"] = None
+        wl = ((self.config or {}).get("scoring", {}) or {}).get("watchlist_intent", {}) or {}
+        shield = (wl.get("shield") or {}) if isinstance(wl, dict) else {}
+        if not (bool(wl.get("enabled", True)) and bool(shield.get("enabled", True))):
+            return 0
+        try:
+            dormancy = float(shield.get("dormancy_window_days", 90))
+        except (TypeError, ValueError):
+            dormancy = 90.0
+        index = (gather_intent_index(self.global_cache, self.config,
+                                     logger=getattr(self, "logger", None)) or {}).get("movies") or {}
+        if not index or "tmdb_id" not in df.columns:
+            return 0
+        now = datetime.now(tz=timezone.utc)
+        held = 0
+        _tm = pd.to_numeric(df["tmdb_id"], errors="coerce")
+        for idx in df.index:
+            t = _tm.at[idx]
+            if pd.isna(t):
+                continue
+            entry = index.get(int(t))
+            if not entry or not intent_hold_active(entry, now, dormancy_days=dormancy):
+                continue
+            df.at[idx, "watchlist_hold"] = True
+            df.at[idx, "watchlist_hold_by"] = ", ".join(entry.get("members") or ()) or "watchlist"
+            held += 1
+        if held:
+            self.logger.log_info(
+                f"[Intent] watchlist shield: {held} movie(s) held from deletion "
+                f"(released after {dormancy:.0f}d of watchlister dormancy).")
+        return held
+
+    def _build_transcode_profile(self, platform_usage: dict | None):
+        """The household Group-D-v2 transcode profile, or None (→ the legacy D1/D2/D3
+        terms). Built ONCE per scoring pass — it is a household-level object, not a
+        per-title one.
+
+        Reads the two Tautulli buckets the cause model is learned from:
+          * ``tautulli/stream_decisions``     — per-stream ground truth (why a play
+            transcoded), classified by the same function the operator-facing
+            "transcode causes household-wide" report uses;
+          * ``tautulli/transcode_fingerprint`` — direct/transcode counts per
+            (device, network) cell, giving the base rate and the remote share.
+
+        Returns None on ANY failure as well as on "no evidence", so a broken or empty
+        cache degrades to the previously-shipped scoring path rather than to a new one
+        running blind."""
+        try:
+            from scripts.managers.machine_learning.scoring.device_fit import (
+                build_transcode_profile, resolve_device_fit,
+            )
+            from scripts.managers.machine_learning.scoring._shared import (
+                resolve_device_capabilities,
+            )
+            settings = resolve_device_fit(self.config)
+            if not settings.enabled:
+                return None
+            gc = self.global_cache
+            return build_transcode_profile(
+                platform_usage=platform_usage,
+                stream_decisions=(gc.get("tautulli/stream_decisions") if gc else None),
+                transcode_fingerprint=(gc.get("tautulli/transcode_fingerprint") if gc else None),
+                capabilities=resolve_device_capabilities(self.config),
+                settings=settings,
+                preferred_languages=((self.config or {}).get("preferred_languages") or ["en"]),
+            )
+        except Exception as e:
+            self.logger.log_debug(f"[SpacePressure] device_fit_v2 profile unavailable: {e}")
+            return None
+
+    def _report_group_d(self, breakdowns, instance: str, profile) -> None:
+        """Log the pass's Group-D distribution. THE REGRESSION GUARD THIS WHOLE REDESIGN
+        EXISTS FOR: Group D v1 silently collapsed to a near-constant (92% of movies at
+        EXACTLY 12.0) and nothing in the run output said so, while every absolute
+        threshold anchored on the score was quietly invalidated. A ``mode`` share back
+        near 1.0, or ``distinct`` collapsing toward 1, is now visible in the run log the
+        first time it happens."""
+        try:
+            from scripts.managers.machine_learning.scoring.device_fit import summarise_group_d
+            vals = []
+            for bd in breakdowns:
+                if not isinstance(bd, dict):
+                    continue
+                vals.append(bd.get("D4_transcode_risk", 0.0)
+                            + bd.get("D1_device_capability", 0.0)
+                            + bd.get("D2_transcode_avoidance", 0.0)
+                            + bd.get("D3_platform_ceiling", 0.0))
+            s = summarise_group_d(vals)
+            if not s["n"]:
+                return
+            mode = "v2 risk-penalty" if profile is not None else "v1 legacy bonus"
+            extra = ""
+            if profile is not None:
+                extra = (f" | causes " +
+                         ", ".join(f"{k}:{v:.0%}" for k, v in sorted(
+                             profile.cause_weights.items(), key=lambda kv: -kv[1]))
+                         + f" (n={profile.n_decisions} decisions, {profile.n_plays} plays,"
+                           f" base rate {profile.base_rate:.1%})")
+            self.logger.log_info(
+                f"[SpacePressure] '{instance}' Group D ({mode}): mean {s['mean']:+.2f} "
+                f"sd {s['sd']:.2f} range [{s['min']:+.2f}, {s['max']:+.2f}] "
+                f"mode {s['mode']:+.2f} @ {s['share_at_mode']:.1%} of {s['n']}, "
+                f"{s['distinct']} distinct value(s).{extra}")
+            if s["share_at_mode"] >= 0.75 or s["distinct"] <= 2:
+                self.logger.log_warning(
+                    f"[SpacePressure] '{instance}' Group D is behaving as a CONSTANT "
+                    f"({s['share_at_mode']:.0%} of titles share one value, {s['distinct']} "
+                    f"distinct) — it is contributing no ranking information and every "
+                    f"absolute threshold anchored on the score is drifting. This is the "
+                    f"exact regression scoring/device_fit.py was written to prevent.")
+        except Exception:
+            pass
 
     @timeit("_build_score_map")
     def _build_score_map(self, df: pd.DataFrame, instance: str,
@@ -465,6 +692,34 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         _aff_raw = self.global_cache.get("people_matrix/affinity") if self.global_cache else None
         person_weights, person_affinity_cap = resolve_person_affinity_inputs(self.config, _aff_raw)
 
+        # GROUP A5 — explicit watchlist intent (config.scoring.watchlist_intent). Fold the
+        # cached forward-intent feeds into ONE index per pass; the shared resolver forces
+        # cap=0.0 (byte-identical) when the term is disabled or nothing is watchlisted.
+        # ``intent_now`` is the run-stable clock the staleness decay measures against —
+        # passed in rather than read per row so every title in a pass decays against the
+        # same instant (and the memo cannot flip mid-run).
+        from scripts.managers.machine_learning.scoring._shared import resolve_intent_inputs
+        from scripts.managers.services._intent_index import (
+            gather_intent_index, intent_memo_fingerprint,
+        )
+        _intent_all = gather_intent_index(self.global_cache, self.config,
+                                          logger=getattr(self, "logger", None))
+        (intent_index, intent_cap,
+         intent_half_life, intent_floor) = resolve_intent_inputs(self.config,
+                                                                 _intent_all.get("movies"))
+        intent_now = datetime.now(tz=timezone.utc)
+
+        # GROUP A4 — the household's own declared Trakt ratings, loaded ONCE per pass (the
+        # show pass does the same with _build_user_show_rating_map). Empty map → A4 stays
+        # 0.0 on every row, i.e. exactly how movies scored before this was threaded.
+        user_movie_ratings = self._build_user_movie_rating_map()
+
+        # GROUP D v2 (config.scoring.device_fit_v2, DEFAULT ON) — the household transcode
+        # profile: observed per-stream decision CAUSES + the direct/transcode fingerprint,
+        # blended with the shipped prior. Built ONCE per pass and reused for every row.
+        # None → the legacy D1/D2/D3 bonus terms, byte-identical.
+        transcode_profile = self._build_transcode_profile(platform_usage)
+
         # Iterate plain row dicts (one to_dict("records") pass) rather than building a
         # fresh pd.Series per row via df.loc[idx] — the classic per-row anti-pattern over
         # a few-thousand-row library. build_movie_feature_row reads every field through
@@ -488,13 +743,50 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             except Exception:
                 return ""
 
+        # SCORER_REVISION is part of the context on purpose: the memo is otherwise
+        # keyed only on INPUTS, which do not change when the scoring CODE does — so a
+        # wired-in signal group (or a device-table entry) would keep serving scores
+        # computed by the previous revision until the 1% parity audit happened to catch
+        # it. Bumping the constant forces exactly one full rescore.
+        from scripts.managers.machine_learning.scoring._shared import SCORER_REVISION
         _ctx = _h([genre_affinity, sorted(watched_tmdb_ids or []),
                    {str(k): sorted(v) for k, v in (collection_members or {}).items()},
                    platform_usage, transcode_stats, per_user_affinity, kids_users,
                    adult_users, related_enabled, related_graph_cap, person_weights,
                    person_affinity_cap, language_consumability,
                    people_manager is not None,
-                   _dt.now(tz=_tz.utc).date().isoformat(), bool(with_breakdown)])
+                   _dt.now(tz=_tz.utc).date().isoformat(), bool(with_breakdown),
+                   # The operator's Group-D device overrides. The SHIPPED matrix moves
+                   # only with SCORER_REVISION, but an edit to scoring.device_capabilities
+                   # changes D1/D2/D3 without changing any other input — so it has to be
+                   # part of the key or the memo keeps serving scores from the old table.
+                   ((self.config or {}).get("scoring", {}) or {}).get("device_capabilities"),
+                   # Group-D v2: the household transcode profile is a per-PASS input that
+                   # lives outside the per-row data, so it has to be in the CONTEXT hash
+                   # or a household whose observed cause mix shifts keeps being served
+                   # scores computed from the old weights.
+                   (transcode_profile.memo_key() if transcode_profile is not None else None),
+                   # Group-A5: the watchlist index is a per-PASS household input that is in
+                   # NEITHER half of the per-row key — `_h(row)` hashes the parquet row, and
+                   # the watchlist lives outside the parquet entirely. Without this line,
+                   # adding a title to your watchlist would never invalidate its memoized
+                   # score and A5 would silently do nothing. Only the score-relevant fields
+                   # are digested (see intent_memo_fingerprint), so a cosmetic union change
+                   # does not force a needless full rescore.
+                   # The DECAY knobs ride with the cap for the same reason: they are
+                   # config, not row data, and they move every DATED title's A5 without
+                   # moving one input `_h(row)` can see. Editing half_life_days with only
+                   # the cap in the hash would rescore nothing.
+                   intent_cap, intent_half_life, intent_floor,
+                   intent_memo_fingerprint(_intent_all),
+                   # Group-A4: the household's Trakt movie ratings are a per-PASS input
+                   # that lives OUTSIDE the parquet — `_h(row)` cannot see it. Without
+                   # this line, changing your Trakt rating for a film you already own
+                   # would never invalidate its memoized score and A4 would appear frozen.
+                   # (The show memo has hashed its ratings map since it was written; this
+                   # is the same line on the movie side.)
+                   sorted((k, v) for k, v in (user_movie_ratings or {}).items()),
+                   SCORER_REVISION])
         _MEMO_KEY = f"radarr/{instance}/movie_score_memo"
         _prev: dict = {}
         if self.global_cache and _ctx:
@@ -542,7 +834,14 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 related_graph_cap=related_graph_cap,
                 person_weights=person_weights,
                 person_affinity_cap=person_affinity_cap,
+                intent_index=intent_index,
+                intent_cap=intent_cap,
+                intent_now=intent_now,
+                intent_half_life_days=intent_half_life,
+                intent_stale_floor=intent_floor,
+                user_movie_ratings=user_movie_ratings,
                 language_consumability=language_consumability,
+                transcode_profile=transcode_profile,
                 return_breakdown=with_breakdown,
             )
             out[idx] = _sv
@@ -566,6 +865,13 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             self.logger.log_info(
                 f"[SpacePressure] movie score memo: {_hits}/{len(out)} unchanged — reused "
                 f"(rescored {len(out) - _hits}; audited {_audited}, {_mismatches} mismatch(es)).")
+        # Group-D distribution guard. Only the breakdown-bearing pass (the persistence
+        # path) carries the per-signal dict, which is exactly the pass that writes the
+        # scores every threshold is anchored on.
+        if with_breakdown:
+            self._report_group_d(
+                [v[1] for v in out.values() if isinstance(v, tuple) and len(v) == 2],
+                instance, transcode_profile)
         return out
 
     def _load_related_tmdb_ids(self, tmdb_id: int) -> set[int]:
@@ -616,6 +922,12 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             "skipped_recent":     0,
             "skipped_universe":   0,
             "failed":             0,
+            # ── exhaustive-mode accounting (all 0 on the legacy path) ──
+            "inflight_regrab_gb": 0.0,   # projected size of replacements queued THIS run
+            "freed_now_gb":       0.0,   # bytes actually removed from disk this pass
+            "deferred_cap":       0,     # over space_downgrade_max_regrabs_per_run → next run
+            "stopped_at_target":  0,     # candidates left untouched once free (net) reached U
+            "below_floor_picks":  0,     # stepped BELOW 720 — no >=720 release exists
         }
 
         mfm = self._get_movie_files_manager()
@@ -657,6 +969,13 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # Optional: widen the downgrade band to MATCH the delete band, so any title the
         # coordinator could delete is shrunk to 720p FIRST and only deleted if downgrades
         # can't free enough (make-before-break via Radarr's replace; deletion = last resort).
+        # EXHAUSTIVE (space_exhaustive_downgrade, DEFAULT ON): plan EVERY movie above the
+        # 720p floor down to it — no score ceiling, no early stop at a partial need_gb —
+        # because the delete pools now only accept items already AT/BELOW that floor.
+        # Deletion therefore cannot start while anything is still shrinkable. The apply
+        # loop below is what stops at U, using a free-space figure NET of the re-grabs it
+        # queued this run, and is bounded by space_downgrade_max_regrabs_per_run.
+        _exhaustive = exhaustive_downgrade(self.config)
         protect = self._downgrade_protect_threshold()
         candidates, _pstats = plan_movie_downgrades(
             df, score_map, ranked_profiles,
@@ -665,6 +984,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             active_colls=active_colls,
             protect_threshold=protect,
             floor_resolution=floor_resolution,
+            exhaustive=_exhaustive,
         )
         stats.update(_pstats)
 
@@ -677,12 +997,36 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             f"(~{_pstats.get('est_reclaim_gb', 0):.0f} GB projected, "
             f"target {'met' if _pstats.get('target_met') else 'NOT met — deletions cover the rest'}):"
         )
+        _regrab_cap = downgrade_regrab_cap(self.config) if _exhaustive else 0
+        if _exhaustive:
+            self.logger.log_info(
+                f"[SpacePressure] exhaustive step-down: planning every title above the "
+                f"{floor_resolution}p floor ({_pstats.get('over_ceiling_included', 0)} admitted over "
+                f"the score ceiling); stopping at {U:.0f} GB free NET of in-flight re-grabs; "
+                f"re-grab cap {_regrab_cap if _regrab_cap > 0 else 'off'}/run."
+            )
 
         changed = False
         plan_changed = False
         movie_ids_to_search: list[int] = []
 
         for c in candidates:
+            # ── IN-FLIGHT ACCOUNTING (exhaustive only) ────────────────────────────
+            # A realized step-down deletes the file NOW and imports the smaller
+            # replacement LATER, so free space SPIKES mid-pass. Deciding against that
+            # spike would keep downgrading against phantom headroom, so the stop test
+            # uses free + (bytes actually removed) − (projected size of every
+            # replacement queued this run).
+            if _exhaustive:
+                _net_free = float(free_space_gb) + stats["freed_now_gb"] - stats["inflight_regrab_gb"]
+                if _net_free >= U:
+                    stats["stopped_at_target"] += 1
+                    continue
+                if _regrab_cap > 0 and stats["downgraded"] >= _regrab_cap:
+                    # Bandwidth guard: the file is KEPT (still above the floor, so still
+                    # excluded from deletion) and re-qualifies next run.
+                    stats["deferred_cap"] += 1
+                    continue
             idx         = c["idx"]
             movie_id    = c["movie_id"]
             target_id   = c["target_id"]
@@ -708,6 +1052,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     f"({self._fmt_bytes(_sz_f)}, {cur_qp_name} → {target_name}, ~{reclaim:.1f} GB) — {reason}"
                 )
                 stats["downgraded"] += 1
+                # Model the same free/in-flight split in the PREVIEW so the dry-run plan
+                # stops at U exactly where a live run would (no pick to size, so the
+                # replacement is the planner's estimate: current size − cumulative reclaim).
+                stats["freed_now_gb"] += _sz_f / (1024 ** 3)
+                stats["inflight_regrab_gb"] += max(0.0, _sz_f / (1024 ** 3) - float(reclaim))
                 continue
 
             try:
@@ -733,8 +1082,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 _fid_row = df.at[idx, "movie_file_id"] if "movie_file_id" in df.columns else None
                 releases = self.radarr_api._make_request(
                     instance, f"release?movieId={int(movie_id)}", fallback=None) or []
-                pick = self._pick_stepdown_release(releases, current_res=df.at[idx, "resolution"]
-                                                   if "resolution" in df.columns else None)
+                pick = self._pick_stepdown_release(
+                    releases,
+                    current_res=df.at[idx, "resolution"] if "resolution" in df.columns else None,
+                    allow_below_floor=_exhaustive,
+                )
                 if not pick:
                     self.logger.log_info(
                         f"  ⏸️ '{title}': no smaller release available — file kept at "
@@ -761,10 +1113,17 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 stats["downgraded"] += 1
 
                 _pick_gb = float(pick.get("size") or 0) / (1024 ** 3)
+                # In-flight accounting: the file is GONE now, the replacement lands later.
+                stats["freed_now_gb"] += _sz_f / (1024 ** 3)
+                stats["inflight_regrab_gb"] += _pick_gb
+                _below = ""
+                if pick.get("stepped_below_floor"):
+                    stats["below_floor_picks"] += 1
+                    _below = " [stepped BELOW 720 — no >=720 release exists for this title]"
                 self.logger.log_info(
                     f"  📉 Stepped down: '{title}' "
                     f"({self._fmt_bytes(_sz_f)}, {cur_qp_name} → {target_name}) — file deleted, "
-                    f"grabbed '{pick.get('title')}' ({_pick_gb:.1f} GB) — {reason}"
+                    f"grabbed '{pick.get('title')}' ({_pick_gb:.1f} GB) — {reason}{_below}"
                 )
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ Downgrade failed for '{title}' (id={movie_id}): {e}")
@@ -789,30 +1148,56 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             mfm.save(instance, df)
 
         prefix = "[dry_run] " if self.dry_run else ""
+        _rows = [
+            ["stepped down",        stats['downgraded']],
+            ["at/below floor",      stats['already_at_720p']],
+            ["protected",           stats['skipped_protected']],
+            ["hot-universe",        stats.get('skipped_universe', 0)],
+            ["high-score protected", stats['skipped_high_score']],
+            ["recently watched",    stats['skipped_recent']],
+            ["no smaller release",  stats.get('no_release', 0)],
+            ["failed",              stats['failed']],
+        ]
+        _descs = [
+            "movies stepped down one quality rank",
+            "movies already at or below the 720p floor",
+            "movies protected from downgrade by keep policy",
+            "movies protected — hot franchise/universe credit holds an untagged saga member at tier",
+            "movies protected by a high watchability score",
+            "movies skipped for a recent watch",
+            "file KEPT: no release below the current resolution — profile lowered, re-probes next run",
+            "movies whose PUT/search call errored",
+        ]
+        if _exhaustive:
+            _rows += [
+                ["over-ceiling included", stats.get('over_ceiling_included', 0)],
+                ["stepped below 720",     stats['below_floor_picks']],
+                ["in-flight re-grab GB",  round(stats['inflight_regrab_gb'], 1)],
+                ["freed now GB",          round(stats['freed_now_gb'], 1)],
+                ["target reached",        stats['stopped_at_target']],
+                [f"deferred (cap {_regrab_cap or 'off'})", stats['deferred_cap']],
+            ]
+            _descs += [
+                "movies admitted despite a watchability score over the delete ceiling — "
+                "EVERYTHING shrinks before anything is deleted",
+                "no >=720 release exists for the title, so the pass fell below the 720p floor",
+                "projected size of the smaller replacements queued THIS run — subtracted from "
+                "free space so the pass never downgrades against phantom headroom",
+                "bytes actually removed from disk this pass (the replacements land later)",
+                "candidates left untouched: free space NET of in-flight re-grabs reached the band top",
+                "candidates over the per-run re-grab cap — files KEPT (still above the floor, so "
+                "still undeletable) and re-qualify next run",
+            ]
         self.logger.log_table(
-            ["Outcome", "Count"],
-            [
-                ["stepped down",        stats['downgraded']],
-                ["at/below floor",      stats['already_at_720p']],
-                ["protected",           stats['skipped_protected']],
-                ["hot-universe",        stats.get('skipped_universe', 0)],
-                ["high-score protected", stats['skipped_high_score']],
-                ["recently watched",    stats['skipped_recent']],
-                ["no smaller release",  stats.get('no_release', 0)],
-                ["failed",              stats['failed']],
-            ],
-            title=f"[SpacePressure] {prefix}step-down pass - '{instance}' (~{stats.get('est_reclaim_gb', 0):.0f} GB reclaimed)",
-            caption="Result of the HD-720p step-down pass that shrinks low-score movies to free space.",
-            descriptions=[
-                "movies stepped down one quality rank",
-                "movies already at or below the 720p floor",
-                "movies protected from downgrade by keep policy",
-                "movies protected — hot franchise/universe credit holds an untagged saga member at tier",
-                "movies protected by a high watchability score",
-                "movies skipped for a recent watch",
-                "file KEPT: no release below the current resolution — profile lowered, re-probes next run",
-                "movies whose PUT/search call errored",
-            ],
+            ["Outcome", "Count"], _rows,
+            title=f"[SpacePressure] {prefix}step-down pass - '{instance}' "
+                  f"(~{stats.get('est_reclaim_gb', 0):.0f} GB reclaimed"
+                  f"{'; exhaustive' if _exhaustive else ''})",
+            caption="Result of the HD-720p step-down pass that shrinks low-score movies to free space."
+                    + (" EXHAUSTIVE: every title above the 720p floor is planned down to it (deletion "
+                       "is the true last resort), stopping once free space net of the in-flight "
+                       "re-grabs reaches the band top." if _exhaustive else ""),
+            descriptions=_descs,
         )
         return stats
 
@@ -867,9 +1252,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
         include_unwatched = bool(self.config.get("space_pressure_include_unwatched", True) if self.config else True)
         try:
-            ceiling = int(self.config.get("space_pressure_score_ceiling", 20) if self.config else 20)
+            ceiling = int(self.config.get("space_pressure_score_ceiling", 17) if self.config else 17)
         except (TypeError, ValueError):
-            ceiling = 20
+            ceiling = 17
+        ceiling = get_threshold("movie_delete_ceiling", self.config, ceiling,
+                                logger=getattr(self, "logger", None))
 
         score_map          = self._build_score_map(df, instance)
         franchise_file_ids = mfm._build_franchise_file_ids(df)
@@ -885,6 +1272,9 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # below APPLIES it. Tuple: (tier, score, critic_or_None, -size, idx, fid, size);
         # a missing critic sorts NEUTRAL at 5.0 (not to the protected end). The
         # per-row critic blend is the shared scoring.critic.critic_avg (Step 2).
+        # Same "deletion is the true last resort" invariant the coordinator pool enforces,
+        # applied to this single-service fallback so the policy can't differ by which path
+        # owns deletion: only titles already AT/BELOW the 720p floor are eligible.
         candidates = build_movie_delete_candidates(
             df, score_map, marked,
             franchise_file_ids=franchise_file_ids,
@@ -894,13 +1284,17 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             universe_age_days=self._universe_delete_age_days(),
             now=now,
             stats=stats,
+            floor_resolution=(DOWNGRADE_FLOOR_RESOLUTION
+                              if exhaustive_downgrade(self.config) else None),
         )
 
         _uni = stats.get("skipped_universe", 0)
+        _dg = stats.get("skipped_downgradable", 0)
         self.logger.log_info(
             f"[SpacePressure] '{instance}': {free_space_gb:.1f} GB free — target loop to {U:.0f} GB "
             f"({len(candidates)} candidate(s), lowest-rated first"
-            f"{f'; {_uni} held by hot-universe credit' if _uni else ''})."
+            f"{f'; {_uni} held by hot-universe credit' if _uni else ''}"
+            f"{f'; {_dg} still ABOVE the {DOWNGRADE_FLOOR_RESOLUTION}p floor — must be downgraded first' if _dg else ''})."
         )
 
         freed_gb = 0.0
@@ -1026,15 +1420,30 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         ``ignore_score_ceiling`` (default False) keeps every keep/franchise/recently-watched
         guard but skips ONLY the watchability score ceiling — used to build the dual-version
         4K-copy reclaim pool, where each baseline-backed 4K copy is pure reclaim (no title lost)
-        regardless of watchability, so it must be reclaimable before any whole title."""
+        regardless of watchability, so it must be reclaimable before any whole title.
+
+        DELETE-ELIGIBILITY INVARIANT (``space_exhaustive_downgrade``, DEFAULT ON): a whole title
+        may enter the pool ONLY when its resolution is AT or BELOW the 720p floor — i.e. it has
+        nothing left to shrink. Anything above the floor is excluded and counted as
+        ``skipped_downgradable`` (also published on ``self.last_skipped_downgradable`` for the
+        coordinator's log), so "the delete pool is small" is explained rather than mysterious.
+        An unknown/missing resolution counts as at-floor: the downgrade planner also treats it as
+        nothing-to-step, so it would otherwise be undeletable forever. The 4K-copy reclaim pool
+        (``ignore_score_ceiling``) is EXEMPT for the same reason its score ceiling is relaxed —
+        a baseline-backed 2160p bonus copy loses no title, so it is pure reclaim, not a deletion."""
         out: list[dict] = []
+        self.last_skipped_downgradable = 0
+        self.last_skipped_unscored = 0
+        self.last_skipped_watchlist = 0
         if df is None or df.empty:
             return out
         include_unwatched = bool(self.config.get("space_pressure_include_unwatched", True) if self.config else True)
         try:
-            ceiling = int(self.config.get("space_pressure_score_ceiling", 20) if self.config else 20)
+            ceiling = int(self.config.get("space_pressure_score_ceiling", 17) if self.config else 17)
         except (TypeError, ValueError):
-            ceiling = 20
+            ceiling = 17
+        ceiling = get_threshold("movie_delete_ceiling", self.config, ceiling,
+                                logger=getattr(self, "logger", None))
 
         have_col = "watchability_score" in df.columns
         # If the persisted column exists but is entirely empty, refresh_scores didn't
@@ -1059,6 +1468,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         )
         _univ_age = self._universe_delete_age_days()   # bare-universe ageing (default None = off)
         _held_universe = 0   # hot-saga rows the credit guard spared from the pool (observability)
+        _held_watchlist = 0  # rows a still-active member's watchlist shielded (Group A5)
+        # "Deletion is the true last resort": only at/below-floor titles may be deleted.
+        _floor_gate = exhaustive_downgrade(self.config) and not ignore_score_ceiling
+        _held_downgradable = 0
+        _held_unscored = 0    # rows refresh_scores hasn't reached yet -> deferred, not deleted
 
         for idx in df.index:
             fid = df.at[idx, "movie_file_id"]
@@ -1092,6 +1506,21 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                         continue
                 except (TypeError, ValueError):
                     pass
+            # GROUP-A5 WATCHLIST SHIELD — mirror of the brain delete-planner guard
+            # (space/delete_planner.build_movie_delete_candidates), because THIS method is a
+            # SECOND implementation of the same pool for the coordinator, not a caller of it.
+            # A guard added to only one of the two would mean the shield held under the
+            # single-service fallback and silently did nothing under the coordinator — which
+            # is the path that actually runs here. Column-driven for the same reason: the
+            # coordinator arrives with a bare parquet, no cache handle and no manager graph.
+            # EXEMPT under ``ignore_score_ceiling`` for exactly the reason the score ceiling
+            # is: that pool only reclaims a 4K bonus copy whose 1080p baseline survives, so
+            # the household keeps the watchlisted title either way.
+            if not ignore_score_ceiling and "watchlist_hold" in df.columns:
+                _wh = df.at[idx, "watchlist_hold"]
+                if _wh is not None and pd.notna(_wh) and bool(_wh):
+                    _held_watchlist += 1
+                    continue
             lw = df.at[idx, "last_watched_at"] if "last_watched_at" in df.columns else None
             if lw:
                 try:
@@ -1099,12 +1528,40 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                         continue
                 except Exception:
                     pass
+            # DELETE-ELIGIBILITY INVARIANT — deliberately LAST of the guards so the counter
+            # means "would otherwise be deletable, but still has quality to shed" rather than
+            # double-counting titles a keep tag already spared.
+            if _floor_gate:
+                _r = df.at[idx, "resolution"] if "resolution" in df.columns else None
+                try:
+                    if _r is not None and pd.notna(_r) and int(_r) > DOWNGRADE_FLOOR_RESOLUTION:
+                        _held_downgradable += 1
+                        continue   # still shrinkable → NOT delete-eligible (downgrade it first)
+                except (TypeError, ValueError):
+                    pass           # unreadable resolution → treated as at-floor (see docstring)
+            # NOTE the deliberate ASYMMETRY with the unscored branch immediately below: an
+            # unknown RESOLUTION admits the row (permissive), an unknown SCORE defers it
+            # (conservative). Both are "missing data", and the difference is not an
+            # oversight — a row with no resolution also has nothing the downgrade planner
+            # can step, so deferring it would make it undeletable FOREVER, whereas a row
+            # with no score gets one on the next refresh_scores pass and re-qualifies.
+            # OPEN QUESTION worth revisiting with real numbers: this library currently has
+            # 81 movies with a NULL resolution, 67 of which land in the delete pool
+            # (~74 GB, ~1.3% of the pool's bytes). If that share ever grows, the honest fix
+            # is to find out WHY the column is null, not to flip either branch.
 
-            if have_col:
-                _sc = df.at[idx, "watchability_score"]
-                score = int(_sc) if pd.notna(_sc) else 5
-            else:
-                score = int(score_map.get(idx, 5))
+            # UNSCORED -> DEFERRED. Not "score it 5 and rank it" — that literal was a point
+            # on the score axis and quietly changed meaning (p1.3 -> p32.4) when Group D v2
+            # translated the axis. This now agrees with the whole-column guard above
+            # ("won't delete on fallback scores") for the partial case too. Counted +
+            # logged, so a persistently-unscored row is a number rather than immortal.
+            # Full reasoning: machine_learning/space/downgrade_planner.row_score.
+            _sc = (df.at[idx, "watchability_score"] if have_col
+                   else score_map.get(idx) if score_map else None)
+            if _sc is None or not pd.notna(_sc):
+                _held_unscored += 1
+                continue
+            score = int(_sc)
             size = float(df.at[idx, "size_bytes"]) if ("size_bytes" in df.columns and pd.notna(df.at[idx, "size_bytes"])) else 0.0
 
             if bool(marked.loc[idx]):
@@ -1135,6 +1592,31 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             self.logger.log_info(
                 f"[SpacePressure] '{instance}': {_held_universe} title(s) held by hot-universe credit "
                 f"(coordinator delete pool)."
+            )
+        self.last_skipped_watchlist = _held_watchlist
+        if _held_watchlist:
+            self.logger.log_info(
+                f"[SpacePressure] '{instance}': {_held_watchlist} title(s) held by the WATCHLIST shield "
+                f"(coordinator delete pool) — a household member asked for these and is still active; "
+                f"each releases after their dormancy window."
+            )
+        self.last_skipped_unscored = _held_unscored
+        if _held_unscored:
+            self.logger.log_warning(
+                f"[SpacePressure] '{instance}': {_held_unscored} title(s) DEFERRED from the delete pool "
+                f"— no watchability_score yet, and a title is never deleted on a guessed score. They "
+                f"re-qualify as soon as refresh_scores reaches them; a count that persists across runs "
+                f"means the scorer is skipping those rows."
+            )
+        self.last_skipped_downgradable = _held_downgradable
+        if _held_downgradable:
+            self.logger.log_info(
+                f"[SpacePressure] '{instance}': {_held_downgradable} title(s) EXCLUDED from the delete "
+                f"pool — still above the {DOWNGRADE_FLOOR_RESOLUTION}p floor, so there is quality left "
+                f"to shrink (skipped_downgradable). Deletion is the true last resort: they must reach "
+                f"the floor before they can ever be deleted."
+                + ("" if out else " The pool is EMPTY for exactly this reason — nothing is at the "
+                                  "floor yet, so nothing is deletable.")
             )
         return out
 
@@ -1438,6 +1920,17 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # instead of bunching at the low end of the 0-100 score).
         _sc = pd.to_numeric(df["watchability_score"], errors="coerce")
         df["watchability_percentile"] = (_sc.rank(pct=True, method="average") * 100).round(1)
+        # Group-A5 DELETE SHIELD — stamped as a COLUMN, deliberately, not evaluated at
+        # delete time. The space coordinator's delete path builds its pool from a bare
+        # ``load_movie_files`` parquet with no manager graph and no cache handle, so it
+        # cannot call a live predicate; the same three-layer shape ``retention_hold`` uses
+        # (stamp a column here → read it in the guard → read it again at delete time) is
+        # the only shape that reaches every path. Non-destructive; all-False when the term
+        # is disabled or nothing is watchlisted.
+        try:
+            self._apply_watchlist_shield(df)
+        except Exception as e:
+            self.logger.log_debug(f"[Intent] watchlist shield skipped for '{instance}': {e}")
         # Franchise/universe credit: a hot saga lends borrowed effective-watch-count to its members,
         # so the likelihood-gated upgrade AND the space-pressure downgrade pass elevate a single-watch
         # member (and let it fall again as the saga's last watch recedes). Non-destructive; 0 when cold.
@@ -1887,7 +2380,8 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
     @staticmethod
     def _pick_stepdown_release(releases: list, current_res=None,
-                               min_size_bytes: int = 300 * 1024 * 1024) -> "dict | None":
+                               min_size_bytes: int = 300 * 1024 * 1024,
+                               allow_below_floor: bool = False) -> "dict | None":
         """Pick the release a step-down should grab: walk the resolution ladder
         UP from the floor (720 → 1080) and take the first non-empty rung strictly
         below the current file's resolution — 'no 720 found, take the next tier
@@ -1897,12 +2391,23 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         ``min_size_bytes`` is the fake/undersized sanity floor — default 300 MiB
         (no 300MB "movies"); the Sonarr episode step-down passes a smaller floor
         (a legit 720p episode can be well under 300 MiB).
-        Returns None when no rung has a candidate → caller keeps the file."""
+        Returns None when no rung has a candidate → caller keeps the file.
+
+        ``allow_below_floor`` (``space_exhaustive_downgrade``; DEFAULT False =
+        byte-identical hard 720 floor): when set, and ONLY when no rung >= 720 exists
+        strictly below the current resolution, fall back to the BEST available sub-720
+        release (highest sub-720 rung, median within it, same fake/undersized size floor)
+        rather than keeping the file. 720 stays the floor everywhere it can be honoured —
+        this only fires for a title with literally no >=720 release. The returned dict is a
+        SHALLOW COPY carrying ``stepped_below_floor=True`` so the caller can say "stepped
+        below 720 — no >=720 release exists"; the normal >=720 path returns the release
+        object itself, untouched."""
         try:
             cur = float(current_res) if current_res is not None and current_res == current_res else None
         except (TypeError, ValueError):
             cur = None
         by_rung: dict = {}
+        sub_floor: dict = {}
         for r in releases or []:
             if not isinstance(r, dict) or not r.get("guid"):
                 continue
@@ -1911,14 +2416,27 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 res = int(res)
             except (TypeError, ValueError):
                 continue
-            if res < 720 or (cur is not None and res >= cur):
+            if cur is not None and res >= cur:
                 continue
             if float(r.get("size") or 0) < min_size_bytes:   # sanity floor (movies: no 300MB "movies")
+                continue
+            if res < 720:
+                if allow_below_floor:
+                    sub_floor.setdefault(res, []).append(r)
                 continue
             by_rung.setdefault(res, []).append(r)
         for rung in sorted(by_rung):
             cands = sorted(by_rung[rung], key=lambda r: float(r.get("size") or 0))
             return cands[len(cands) // 2]
+        # LAST RESORT: no >=720 rung below the current resolution exists at all. Take the
+        # HIGHEST sub-720 rung (best of a bad lot) rather than strand the title above the
+        # floor forever — an item that can never reach the floor could otherwise never
+        # become delete-eligible either.
+        for rung in sorted(sub_floor, reverse=True):
+            cands = sorted(sub_floor[rung], key=lambda r: float(r.get("size") or 0))
+            pick = dict(cands[len(cands) // 2])
+            pick["stepped_below_floor"] = True
+            return pick
         return None
 
     @staticmethod

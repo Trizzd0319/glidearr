@@ -115,7 +115,7 @@ def test_apply_hd_baseline_caps_below_4k_even_with_2160_profile_on_standard():
 
 def test_apply_hd_baseline_adaptive_to_lower_score():
     r = _resolver(both=True, with_4k=True)
-    e = _movie(r, score=25)                             # mid score -> 720 baseline
+    e = _movie(r, score=20)                             # mid score -> 720 baseline
     r.apply_hd_baseline(e)
     assert e["quality_profile"]["max_res"] == 720
 

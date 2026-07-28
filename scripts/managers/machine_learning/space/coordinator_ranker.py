@@ -26,6 +26,13 @@ import math
 
 import pandas as pd
 
+#: Sort value for a candidate that reaches the ranker WITHOUT a score. Above the top of
+#: the 0-100 watchability axis, so such an item sorts LAST in the ascending delete order —
+#: "touched only when nothing scored is left", the safe direction. It replaces a literal
+#: 5, which sorted it FIRST. Both pool builders now defer unscored rows before they get
+#: here (see ``downgrade_planner.row_score``), so this is a backstop, not a policy.
+UNSCORED_RANK = 101.0
+
 
 def critic_sort(critic) -> float:
     """Sort key for critic rating — None (episodes carry no critic) sorts to a
@@ -106,7 +113,15 @@ def select_for_target(pool: list[dict], need_gb: float, *,
     _now = pd.to_datetime(now, utc=True) if use_recency else None
 
     def _score_term(c):
-        s = c.get("score", 5)
+        # A candidate with no score should never be able to JUMP the delete queue, which
+        # is exactly what the old literal-5 default did (5 sat at p1.3 of the movie
+        # distribution when it was written, so an unscored item sorted to the very front).
+        # Both pool builders now DEFER unscored rows outright, so this branch is a
+        # backstop; it sorts such an item BEHIND every scored one (101 is above the 0-100
+        # axis) so the worst case is "touched last", not "deleted first". Deliberately a
+        # finite value, not inf: the tier_size branch below takes math.floor of it.
+        s = c.get("score")
+        s = UNSCORED_RANK if s is None else s
         if use_recency:
             s = s + recency_bonus(c, recency_ramp, _now)
         return s

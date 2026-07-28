@@ -33,6 +33,14 @@ Pipeline (all stages dry_run-safe; the leaf managers log-only under dry_run):
 Deletion is the *true* backstop — Stage-1 downgrades only project reclaim; Stage 2
 realizes it. Restorable: every deletion is tracked so a later recovery in
 watchability re-grabs it.
+
+``space_exhaustive_downgrade`` (DEFAULT ON) makes that literal: Stage 1 plans EVERY
+title above the 720p floor down to it, and each service's ``build_delete_candidates``
+admits a title ONLY once it is at/below that floor. Stage 2 can therefore only ever fire
+after the downgrade pool is exhausted. The downgrade CREDIT below is skipped in that mode
+— the invariant already keeps every creditable (still-downgradable) title out of the
+delete pool, so crediting it would double-count the same GB and, with a library-sized
+exhaustive projection, permanently suppress the backstop.
 """
 from __future__ import annotations
 
@@ -53,7 +61,9 @@ from scripts.managers.machine_learning.space.routing_targets import (
 from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
-from scripts.support.utilities.space_targets import coordinator_owns_deletion, space_targets
+from scripts.support.utilities.space_targets import (
+    coordinator_owns_deletion, exhaustive_downgrade, space_targets,
+)
 
 
 class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
@@ -277,6 +287,28 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
             instance_dfs[radarr_inst] = radarr_df
 
         pool: list[dict] = []
+        # Running tally of items each service EXCLUDED for being still above the 720p floor
+        # (the exhaustive delete-eligibility invariant). Read+reset per call, since a service
+        # builds several pools per run (default instance, 4K copies, extra instances).
+        _skipped_dg = {"movie": 0, "episode": 0}
+        # …and items DEFERRED for having no watchability_score yet. A pool builder never
+        # deletes on a guessed score (see space.downgrade_planner.row_score), so this is
+        # the counter that stops "unscored" from becoming a silent, permanent exemption.
+        _skipped_us = {"movie": 0, "episode": 0}
+
+        def _take_skipped(mgr, kind: str) -> None:
+            n = int(getattr(mgr, "last_skipped_downgradable", 0) or 0)
+            if n:
+                _skipped_dg[kind] += n
+            u = int(getattr(mgr, "last_skipped_unscored", 0) or 0)
+            if u:
+                _skipped_us[kind] += u
+            try:
+                mgr.last_skipped_downgradable = 0
+                mgr.last_skipped_unscored = 0
+            except Exception:
+                pass
+
         if radarr_sp and radarr_df is not None and not radarr_df.empty:
             try:
                 _std = radarr_sp.build_delete_candidates(radarr_inst, radarr_df)
@@ -285,11 +317,13 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                 pool += _std
             except Exception as e:
                 self.logger.log_warning(f"[SpaceCoordinator] movie candidate build failed: {e}")
+            _take_skipped(radarr_sp, "movie")
         if sonarr_ef and sonarr_df is not None and not sonarr_df.empty:
             try:
                 pool += sonarr_ef.build_delete_candidates(sonarr_inst, sonarr_df)
             except Exception as e:
                 self.logger.log_warning(f"[SpaceCoordinator] episode candidate build failed: {e}")
+            _take_skipped(sonarr_ef, "episode")
 
         # ── Evict-4K-first (default-off): add the dual-version 4K BONUS copies to the pool ──
         # Each is a 2160p copy whose 1080p baseline SURVIVES on the standard instance, so
@@ -449,6 +483,7 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
                         self.logger.log_warning(
                             f"[SpaceCoordinator] movie candidate build failed for '{other_inst}': {e}"
                         )
+                    _take_skipped(radarr_sp, "movie")
 
         # Shield titles the per-user playlists are actively recommending (esp. a kid's top
         # picks) from the delete pool. The household-blended watchability score can dilute a
@@ -459,7 +494,7 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         if _shielded:
             self.logger.log_info(
                 f"[SpaceCoordinator] shielded {_shielded} recommended title(s) from the delete "
-                f"pool (currently in a user's Up Next playlist)."
+                f"pool (currently in a user's Up Next or Hidden Gems shelf)."
             )
 
         # ── Downgrade-first policy: credit projected downgrade reclaim ──────────
@@ -478,34 +513,110 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         # (1.0 = full credit, 0.0 = legacy delete-covers-everything) if free space
         # must recover faster than re-grabs land.
         need = max(0.0, U - free)   # GB we must reclaim (deletions are the backstop)
-        try:
-            _ratio = float((self.config or {}).get("space_downgrade_credit_ratio", 1.0))
-        except (TypeError, ValueError):
-            _ratio = 1.0
-        _ratio = min(max(_ratio, 0.0), 1.0)
-        _dg_frames = list(instance_dfs.values()) + [sonarr_df]
-        _dg_gb = self._projected_downgrade_gb(_dg_frames) if _ratio > 0 else 0.0
-        _credit = min(need, _dg_gb * _ratio)
-        stats["downgrade_credit_gb"] = round(_credit, 1)
+        _exhaustive = exhaustive_downgrade(self.config)
         _covered = False
-        if _credit > 0:
+        if _exhaustive:
+            # EXHAUSTIVE MODE: the credit is REDUNDANT and is deliberately skipped.
+            # The floor invariant makes the two pools DISJOINT — a title with any quality
+            # left to shrink (above the 720p floor) is exactly what earns downgrade credit,
+            # and is exactly what build_delete_candidates now refuses to admit. So crediting
+            # projected downgrade reclaim against the delete target would net the SAME GB
+            # off a pool that structurally cannot contain them: pure double-counting, and
+            # (because an exhaustive plan projects a library-sized reclaim) it would zero
+            # the deficit every run and silently disable the backstop forever. Deletion here
+            # therefore covers the full residual deficit — but only from items already AT
+            # the floor, which is the true last resort by construction.
+            stats["downgrade_credit_gb"] = 0.0
             self.logger.log_info(
-                f"[SpaceCoordinator] downgrade-first: crediting ~{_dg_gb:.0f} GB projected "
-                f"downgrade reclaim (x{_ratio:.2f}) against the {need:.0f} GB deficit — "
-                f"deletions target {max(0.0, need - _credit):.0f} GB."
+                f"[SpaceCoordinator] exhaustive downgrades: no credit applied (the 720p-floor "
+                f"invariant already keeps every downgradable title OUT of the delete pool, so "
+                f"crediting it would double-count) — deletions target the full {need:.0f} GB "
+                f"from at-floor items only."
             )
-            need -= _credit
-        if need <= 0.001:
+        else:
+            try:
+                _ratio = float((self.config or {}).get("space_downgrade_credit_ratio", 1.0))
+            except (TypeError, ValueError):
+                _ratio = 1.0
+            _ratio = min(max(_ratio, 0.0), 1.0)
+            _dg_frames = list(instance_dfs.values()) + [sonarr_df]
+            _dg_gb = self._projected_downgrade_gb(_dg_frames) if _ratio > 0 else 0.0
+            _credit = min(need, _dg_gb * _ratio)
+            stats["downgrade_credit_gb"] = round(_credit, 1)
             if _credit > 0:
                 self.logger.log_info(
-                    "[SpaceCoordinator] projected downgrades cover the whole deficit — no "
-                    "deletions this run (deletion stays the backstop if re-grabs stall)."
+                    f"[SpaceCoordinator] downgrade-first: crediting ~{_dg_gb:.0f} GB projected "
+                    f"downgrade reclaim (x{_ratio:.2f}) against the {need:.0f} GB deficit — "
+                    f"deletions target {max(0.0, need - _credit):.0f} GB."
                 )
-                _covered = True
-            pool = []
+                need -= _credit
+            if need <= 0.001:
+                if _credit > 0:
+                    self.logger.log_info(
+                        "[SpaceCoordinator] projected downgrades cover the whole deficit — no "
+                        "deletions this run (deletion stays the backstop if re-grabs stall)."
+                    )
+                    _covered = True
+                pool = []
+
+        # ── Delete-pool composition (why the pool is the size it is) ────────────
+        # Under the exhaustive floor invariant a small/empty pool is almost always
+        # "everything still has quality to shed", not "nothing qualifies" — spell that
+        # out in a table rather than leaving the operator to guess.
+        _still_downgradable = _skipped_dg["movie"] + _skipped_dg["episode"]
+        stats["still_downgradable"] = _still_downgradable
+        _n_movies = sum(1 for c in pool if c.get("service") == "movie" and not c.get("is_uhd_copy"))
+        _n_eps = sum(1 for c in pool if c.get("service") == "episode")
+        _n_uhd = sum(1 for c in pool if c.get("is_uhd_copy"))
+        _pool_rows = [
+            ["movie candidates",   _n_movies],
+            ["episode candidates", _n_eps],
+            ["4K bonus copies",    _n_uhd],
+            ["playlist-shielded",  _shielded],
+            ["still downgradable (movies)",   _skipped_dg["movie"]],
+            ["still downgradable (episodes)", _skipped_dg["episode"]],
+            ["unscored (deferred)", _skipped_us["movie"] + _skipped_us["episode"]],
+            ["credit applied GB",  stats.get("downgrade_credit_gb", 0.0)],
+            ["delete target GB",   round(need, 1)],
+        ]
+        self.logger.log_table(
+            ["Pool", "Count"], _pool_rows,
+            title=f"[SpaceCoordinator] delete pool - free {free:.0f} GB, floor {T:.0f} GB, band top "
+                  f"{U:.0f} GB{' (exhaustive)' if _exhaustive else ''}",
+            caption="What the unified movie+TV delete pool is made of, and what was held back. "
+                    + ("Under space_exhaustive_downgrade a title enters the pool ONLY once it is AT "
+                       "or BELOW the 720p floor, so 'still downgradable' rows are titles that must "
+                       "be shrunk first - deletion is the true last resort."
+                       if _exhaustive else
+                       "space_exhaustive_downgrade is off, so resolution does not gate the pool."),
+            descriptions=[
+                "whole movies eligible for deletion (all keep/franchise/recent/score guards passed)",
+                "episode files eligible for deletion",
+                "dual-version 4K copies whose 1080p baseline survives - pure reclaim, evicted first",
+                "recommended titles removed from the pool (currently in a user's Up Next)",
+                "movies EXCLUDED: still above the 720p floor, so they must be downgraded first",
+                "episode files EXCLUDED: still above the 720p floor, so they must be downgraded first",
+                "items DEFERRED: no watchability_score yet - never deleted on a guessed score; they "
+                "re-qualify the moment refresh_scores reaches them (a count that persists means the "
+                "scorer is skipping those rows)",
+                "projected downgrade reclaim credited against the deficit (always 0 in exhaustive "
+                "mode - the invariant already makes the pools disjoint)",
+                "GB deletion must reclaim to bring free space back to the band top",
+            ],
+        )
 
         if not pool:
-            self.logger.log_info("[SpaceCoordinator] no eligible delete candidates — nothing to do.")
+            # Explain an EMPTY pool rather than shrugging: under the floor invariant the
+            # usual cause is "everything is still downgradable", not "nothing qualifies".
+            if _still_downgradable:
+                self.logger.log_info(
+                    f"[SpaceCoordinator] delete pool EMPTY because {_still_downgradable} item(s) are "
+                    f"still ABOVE the 720p floor — they have quality left to shrink, so deletion is "
+                    f"not permitted yet. Downgrades run again next pass; deletion unlocks only once "
+                    f"the downgrade pool is exhausted (deletion is the true last resort)."
+                )
+            else:
+                self.logger.log_info("[SpaceCoordinator] no eligible delete candidates — nothing to do.")
             stats["action"] = "no_candidates"
             deleted_instances: set = set()
         else:
@@ -637,16 +748,24 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
             return None
 
     def _protected_playlist_tmdbs(self) -> set:
-        """Union of movie tmdbIds the movie + combined playlist builders published this run as
-        currently-recommended (per-user Up Next plans). Empty when the builders did not run /
-        published nothing — in which case the shield is a no-op (fail-open is fine: it only ever
-        REMOVES candidates from deletion, never adds)."""
+        """Union of movie tmdbIds the per-user shelf builders published this run as
+        currently-recommended. Empty when the builders did not run / published nothing — in
+        which case the shield is a no-op (fail-open is fine: it only ever REMOVES candidates
+        from deletion, never adds).
+
+        Sources: the movie + combined Up Next plans, and the HIDDEN GEMS shelf. The gems key
+        matters most and closes a real selection bias: the delete pool is ranked
+        lowest-watchability-first, and watchability is dominated by ENGAGEMENT signals that are
+        structurally zero on a never-watched title — precisely the gem pool. Without this, the
+        deletion pass would preferentially remove exactly the titles this household was just
+        told to go and watch, and would do it before anyone had the chance."""
         out: set = set()
         cache = getattr(self, "global_cache", None)
         if not cache:
             return out
         for key in ("plex/playlists/protected_movie_tmdbs/movie",
-                    "plex/playlists/protected_movie_tmdbs/combined"):
+                    "plex/playlists/protected_movie_tmdbs/combined",
+                    "plex/playlists/protected_movie_tmdbs/hidden_gems"):
             try:
                 blob = cache.get(key) or {}
             except Exception:
@@ -658,8 +777,9 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
         return out
 
     def _shield_protected_picks(self, pool: "list[dict]") -> "tuple[list[dict], int]":
-        """Drop whole-title movie candidates whose tmdb_id is in the current per-user playlist
-        plans from the delete pool. 4K bonus copies (``is_uhd_copy``) are NOT shielded — their
+        """Drop whole-title movie candidates whose tmdb_id is in a current per-user plan (Up
+        Next / combined / Hidden Gems) from the delete pool. 4K bonus copies (``is_uhd_copy``)
+        are NOT shielded — their
         1080p baseline survives, so reclaiming them loses no recommended title. No-op when the
         ``space_protect_playlist_picks`` flag is off (default ON) or no plans were published."""
         if not (self.config or {}).get("space_protect_playlist_picks", True):

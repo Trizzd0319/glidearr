@@ -80,13 +80,15 @@ from scripts.managers.services.radarr.quality.universe_membership import (
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
-from scripts.support.utilities.space_targets import space_targets
+from scripts.support.utilities.space_targets import exhaustive_downgrade, space_targets
 from scripts.support.utilities.watch_likelihood import watch_likelihood
 
 # Reuse the SHIPPED step-down release picker (import, not copy) so this pass and
 # space_pressure.run_downgrades can never drift on what "a smaller release" means:
 # lowest rung >=720 strictly below the current file's resolution, climbing 720->1080
-# when a rung is empty, median size within the rung (rejects <300MB fakes).
+# when a rung is empty, median size within the rung (rejects <300MB fakes). Under
+# space_exhaustive_downgrade it may also fall BELOW 720 — but only for a title with
+# literally no >=720 release, which is exactly the universe class's SD case.
 _pick_stepdown_release = RadarrSpacePressureManager._pick_stepdown_release
 
 
@@ -101,8 +103,14 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
     # downgrade below the floor T, upgrade above the band top U, hold in [T, U]. Both
     # triggers derive from free_space_limit (or 25% of the total drive when unset) —
     # NEVER a hardcoded GB floor. See evaluate_quality_actions.
-    SCORE_4K_THRESHOLD   = 70     # score >= this → eligible for 4K (0-100 scale)
-    _4K_MIN_RESOLUTION   = 2000
+    # NOTE: the former SCORE_4K_THRESHOLD (70, watchability scale) and
+    # _4K_MIN_RESOLUTION (2000) were removed — both were dead (no reader anywhere)
+    # and actively misleading: they survived the ML migration that moved the 4K
+    # decision into space.universe_quality.upgrade_target, which gates on
+    # WATCH LIKELIHOOD against ``watch_likelihood.uhd_cutoff`` (default 75), a
+    # different scale from watchability. Re-wiring them would have created a
+    # second, competing 4K gate. To change 4K eligibility, set
+    # ``watch_likelihood.uhd_cutoff`` (or route it via the threshold registry).
 
     @LoggerManager().log_function_entry
     @timeit("__init__")
@@ -938,6 +946,7 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                 pick = _pick_stepdown_release(
                     releases,
                     current_res=df.at[idx, "resolution"] if "resolution" in df.columns else None,
+                    allow_below_floor=exhaustive_downgrade(self.config),
                 )
                 if not pick:
                     self.logger.log_info(

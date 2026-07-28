@@ -37,6 +37,15 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
       * recent-air  — file ids on rows that aired within ``recent_air_days``.
       * household   — file ids on rows where ``all_household_watched`` is present
                       AND falsy (a household member still hasn't watched).
+      * retention   — file ids on rows inside SOME viewer's retention interval
+                      (``retention_hold``; see lifecycle.viewer_retention). This is
+                      the whole-file half of the per-viewer rule: a multi-episode
+                      file backing one held episode must not be destroyed by a
+                      sibling row that fell outside every interval.
+      * watchlist   — file ids on rows whose SERIES is watchlisted by a still-active
+                      household member (``watchlist_hold``; see
+                      episode_files._apply_watchlist_shield). Self-releasing on
+                      watchlister dormancy, so it can never hold disk forever.
       * universe    — file ids of any series whose recency-decayed borrowed franchise/
                       universe credit reaches ``UNIVERSE_PROTECT_MIN`` (a HOT saga resists
                       DELETION just as ``plan_series_downgrades`` makes it resist a step-down;
@@ -92,6 +101,33 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
         # present (not NaN) AND falsy → a household member still hasn't watched;
         # NaN = legacy row / no household config → not a guard.
         _add_fids(ahw.notna() & ~ahw.astype(bool))
+
+    # ── Per-viewer retention guard ───────────────────────────────────────────
+    # ``retention_hold`` is the per-run verdict stamped by
+    # ``episode_files._apply_viewer_retention``: True ⇒ the episode is inside some
+    # ACCOUNT's [position − backward_buffer, position + pace × horizon] window.
+    # Collapsed to file ids here so a multi-episode file backing a held episode is
+    # protected whole — the same footgun the pilot/keep guards above close.
+    # Byte-identical when the column is absent (a pre-retention parquet) or all
+    # falsy (the rule disabled).
+    if "retention_hold" in df.columns:
+        _rh = df["retention_hold"]
+        _add_fids(_rh.notna() & _rh.astype(bool))
+
+    # ── Watchlist intent guard (GROUP A5) ────────────────────────────────────
+    # ``watchlist_hold`` is the per-run verdict stamped by
+    # ``episode_files._apply_watchlist_shield``: True ⇒ somebody in this household put the
+    # SERIES on a watchlist and that member is still an active viewer. Robert's decision:
+    # a watchlisted title is shielded from deletion, not merely scored higher — A5's points
+    # alone cannot lift a weak-taste series over the delete ceiling, and deleting something
+    # the household explicitly asked for is the one deletion that is never defensible.
+    # Collapsed to file ids for the same whole-file reason as every guard above. The hold
+    # SELF-RELEASES once the watchlister goes dormant (see intent_hold_active), so this can
+    # never hold disk forever. Byte-identical when the column is absent (a pre-shield
+    # parquet) or all falsy (the term disabled / nothing watchlisted).
+    if "watchlist_hold" in df.columns:
+        _wh = df["watchlist_hold"]
+        _add_fids(_wh.notna() & _wh.astype(bool))
 
     # ── Hot franchise/universe credit guard ──────────────────────────────────
     # A hot saga (recency-decayed borrowed credit, broadcast per-series onto every

@@ -17,6 +17,7 @@ class _Log:
     def log_warning(self, m): pass
     def log_debug(self, m): pass
     def log_error(self, m): pass
+    def log_table(self, *a, **k): pass
 
 
 class _Api:

@@ -46,6 +46,7 @@ from scripts.managers.services.plex.playlists.combined_builder import CombinedPl
 from scripts.managers.services.plex.playlists.movie_builder import MoviePlaylistBuilderManager
 from scripts.managers.services.plex.playlists.writeback import PlaylistWritebackManager
 from scripts.managers.services.plex.discovery import DiscoveryShelfBuilderManager
+from scripts.managers.services.plex.discovery.gems import HiddenGemsShelfBuilderManager
 from scripts.managers.services.plex.ratings import PlexRatingsManager
 from scripts.managers.services.plex.users import PlexUsersManager
 from scripts.managers.services.plex.validator import PlexValidatorManager
@@ -74,6 +75,7 @@ class PlexManager(BaseManager, ComponentManagerMixin):
     movie_playlist_builder: Optional[MoviePlaylistBuilderManager] = None
     combined_playlist_builder: Optional[CombinedPlaylistBuilderManager] = None
     discovery_shelf:   Optional[DiscoveryShelfBuilderManager] = None
+    hidden_gems_shelf: Optional[HiddenGemsShelfBuilderManager] = None
     playlist_writeback: Optional[PlaylistWritebackManager] = None
 
     @LoggerManager().log_function_entry
@@ -139,6 +141,7 @@ class PlexManager(BaseManager, ComponentManagerMixin):
             "movie_playlist_builder": [],
             "combined_playlist_builder": [],
             "discovery_shelf": [],
+            "hidden_gems_shelf": [],
             "playlist_writeback": [],
             "validator_manager": [],
         }
@@ -158,6 +161,7 @@ class PlexManager(BaseManager, ComponentManagerMixin):
             "movie_playlist_builder": MoviePlaylistBuilderManager,
             "combined_playlist_builder": CombinedPlaylistBuilderManager,
             "discovery_shelf": DiscoveryShelfBuilderManager,
+            "hidden_gems_shelf": HiddenGemsShelfBuilderManager,
             "playlist_writeback": PlaylistWritebackManager,
             "validator_manager": PlexValidatorManager,
         }
@@ -444,6 +448,18 @@ class PlexManager(BaseManager, ComponentManagerMixin):
                 self.discovery_shelf.run()
         except Exception as e:
             self.logger.log_error(f"[Plex] anniversary shelf builder failed: {e}")
+
+        # "Hidden Gems" — per-profile shelf of OWNED + never-played + taste-matched movies, plus
+        # the recommendation/outcome measurement loop. Runs after the movie/combined/anniversary
+        # builders so it can read their cached plans (never double-surface a title already being
+        # shown) and before write-back (which renders its cached plan). Needs the Radarr
+        # movie_files parquet + plex/movies/owned_inventory, so it is gated on plex.movies.enabled
+        # and self-gates on plex.playlists.hidden_gems.enabled -> byte-identical when off.
+        try:
+            if self.hidden_gems_shelf and self._cap_enabled("movies"):
+                self.hidden_gems_shelf.run()
+        except Exception as e:
+            self.logger.log_error(f"[Plex] hidden gems shelf builder failed: {e}")
 
         # Per-user playlist WRITE-BACK (P2-5c) — runs LAST, after the dry-run builders have
         # cached the per-user plans this phase. DEFAULT-OFF / fail-closed: the manager runs the

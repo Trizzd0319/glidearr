@@ -57,14 +57,14 @@ def test_hd_cap_noop_when_no_4k_profile_present(_proactive_cfg):
 def test_hd_target_resolution_clamped_below_4k():
     assert hd_target_resolution(95) == 1080      # score warrants 2160 -> clamped to 1080
     assert hd_target_resolution(40) == 1080
-    assert hd_target_resolution(25) == 720       # mid score -> 720, NOT forced to 1080
+    assert hd_target_resolution(20) == 720       # mid score -> 720, NOT forced to 1080
     assert hd_target_resolution(5) == 480
     assert hd_target_resolution(None) == 1080     # no score yet -> watchable baseline at the cap
 
 
 def test_pick_hd_profile_follows_score_tier():
     assert pick_hd_profile(_PROFILES, score=80)["name"] == "HD-1080"
-    assert pick_hd_profile(_PROFILES, score=25)["name"] == "HD-720"     # 720p justified, not 1080
+    assert pick_hd_profile(_PROFILES, score=20)["name"] == "HD-720"     # 720p justified, not 1080
     assert pick_hd_profile([_profile("UHD", 2160)], score=80) is None    # no <=1080 profile
 
 
@@ -121,7 +121,7 @@ def test_plan_hd_baseline_queues_when_both_and_missing():
 
 def test_plan_hd_baseline_adaptive_to_lower_score():
     plan, _ = plan_hd_baseline(tmdb=1, title="B", routing=_BOTH, hd_profiles=_PROFILES,
-                               hd_instance="standard", hd_root="/m/std", score=25)
+                               hd_instance="standard", hd_root="/m/std", score=20)
     assert plan["profile"]["name"] == "HD-720"          # mid score -> 720p baseline
 
 

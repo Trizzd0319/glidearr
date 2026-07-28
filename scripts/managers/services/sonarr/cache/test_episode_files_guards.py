@@ -53,7 +53,13 @@ def _mgr() -> M:
     return mgr
 
 
-_NOW = datetime(2026, 6, 6, tzinfo=timezone.utc)
+# Anchored to the REAL clock, not a frozen date: every fixture below is built as
+# `_NOW - timedelta(days=n)`, while the code under test (_do_delete_marked_files)
+# calls datetime.now() internally. A frozen anchor silently rots — once wall-clock
+# drifted past the recent-air window the "aired 5 days ago" fixture became "aired
+# 50 days ago" to production and the guard stopped firing. Relative ages keep the
+# scenarios meaningful on any date.
+_NOW = datetime.now(timezone.utc)
 
 
 def _iso(days_ago: float) -> str:
@@ -275,3 +281,42 @@ if __name__ == "__main__":
     test_protected_set()
     test_delete_pass()
     print("\nAll guard tests passed")
+
+
+# ── Group-A5 watchlist shield (whole-file + delete-time defence-in-depth) ──────
+
+def _unwatched(**kw) -> dict:
+    """A row that trips NO other guard: unwatched (so the de-facto-pilot guard can't claim
+    it), non-pilot, long-aired, household-complete. The ONLY thing that can protect it is
+    the watchlist shield."""
+    kw.setdefault("is_watched", False)
+    kw.setdefault("watch_count", 0)
+    kw.setdefault("percent_complete", 0)
+    kw.setdefault("last_watched_at", None)
+    return _row(**kw)
+
+
+def test_watchlist_hold_protects_the_whole_file():
+    """A multi-episode file backing a watchlisted series must be protected WHOLE — the
+    same footgun every other guard in build_protected_file_ids closes."""
+    df = pd.DataFrame([
+        _unwatched(episode_file_id=77, series_id=1, episode_number=1, watchlist_hold=True),
+        _unwatched(episode_file_id=77, series_id=1, episode_number=2, watchlist_hold=True),
+        _unwatched(episode_file_id=88, series_id=2, episode_number=3, watchlist_hold=False),
+    ])
+    protected = _mgr()._build_protected_file_ids(df, _NOW)
+    assert 77 in protected
+    assert 88 not in protected
+
+
+def test_absent_watchlist_hold_column_protects_nothing():
+    """Byte-identical on a pre-shield parquet."""
+    df = pd.DataFrame([_unwatched(episode_file_id=90, series_id=3, episode_number=1)])
+    assert 90 not in _mgr()._build_protected_file_ids(df, _NOW)
+
+
+def test_all_false_watchlist_hold_protects_nothing():
+    """The shield disabled / nothing watchlisted must not quietly hold the library."""
+    df = pd.DataFrame([_unwatched(episode_file_id=91, series_id=4, episode_number=1,
+                                  watchlist_hold=False)])
+    assert 91 not in _mgr()._build_protected_file_ids(df, _NOW)

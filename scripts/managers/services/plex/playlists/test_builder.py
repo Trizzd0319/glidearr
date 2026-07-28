@@ -25,11 +25,17 @@ class _Log:
         self.infos: list = []
         self.warns: list = []
         self.grids: list = []
+        self.files: dict = {}
 
     def log_info(self, m): self.infos.append(m)
     def log_warning(self, m): self.warns.append(m)
     def log_error(self, m): pass
-    def log_grid(self, headers, rows, title="", cap=16): self.grids.append((title, rows))
+
+    def log_grid(self, headers, rows, title="", cap=16, caption=""):
+        self.grids.append((title, headers, rows))
+
+    def log_to_file(self, category, message, *, reset=False):
+        self.files.setdefault(category, []).append(message)
 
 
 class _Cache:
@@ -79,7 +85,8 @@ def test_builds_and_caches_per_user_plans():
     assert res == {"users": 2, "built": 2, "can_build": True}
     assert _items(cache, "rob") == ["b"]                       # watched 'a' dropped
     assert _items(cache, "kid") == ["a", "b"]                  # nothing watched
-    assert len(log.grids) == 2                                 # a preview per user
+    assert len(log.grids) == 1                                 # ONE summary table, not a grid per user
+    assert [r[1] for r in log.grids[0][2]] == ["R - adult 1", "K - adult 2"]   # a row per profile
     assert log.warns == []                                     # full coverage, scored
 
 
@@ -94,6 +101,97 @@ def test_serialized_plan_shape():
     assert it["group_kind"] == "series"
 
 
+# ── run-log SUMMARY table (replaces the per-playlist 25-row preview grids) ─────
+def _row(log, i=0) -> dict:
+    """The i-th summary row of the (single) run-log grid, as {column: cell}."""
+    _title, headers, rows = log.grids[0]
+    return dict(zip(headers, rows[i]))
+
+
+def test_run_log_has_no_per_playlist_item_grid_only_one_summary():
+    """REGRESSION: a 5-profile household used to flood the shell with a 25-row preview grid
+    per (profile x playlist family). The run log must now carry exactly ONE summary table per
+    builder, with no per-item columns and no per-profile header banner."""
+    cache, log = _Cache(), _Log()
+    _mgr(cache, log)._build_for_users(_TRACKED, _OWNED, _INV, _STATS, {1: 80.0},
+                                      {"rob": set(), "kid": set()},
+                                      daemon_enabled=True, daemon_running=False)
+    assert len(log.grids) == 1
+    title, headers, rows = log.grids[0]
+    assert "TV playlists" in title and "per-profile summary" in title
+    assert "Title" not in headers and "Why" not in headers and "Rank" not in headers
+    assert "'R - adult 1'" not in title                        # no per-profile grid header
+    assert len(rows) == 2 and list(headers)[:3] == ["Playlist", "Profile", "Items"]
+
+
+def test_summary_row_shows_ceiling_and_strictest_cert_for_a_kid():
+    """The certification EVIDENCE pair: what the profile is ALLOWED, next to the strictest
+    cert actually in the plan — plus the unrated count (the CSM-fallback leak path)."""
+    cache, log = _Cache(), _Log()
+    owned = [_owned(1, 1, 1, "k1"), _owned(2, 1, 1, "k2"), _owned(3, 1, 1, "k3")]
+    inv = {"k1": {"rating_key": "a"}, "k2": {"rating_key": "b"}, "k3": {"rating_key": "c"}}
+    _mgr(cache, log)._build_for_users(
+        [{"safe_user": "wyatt", "title": "Wyatt", "restriction_profile": "older_kid"}],
+        owned, inv, _STATS, {1: 50, 2: 50, 3: 50}, {"wyatt": set()},
+        series_certs={1: "TV-Y", 2: "TV-PG"},                  # series 3 carries NO cert…
+        series_csm_ages={3: 8},                                # …and is admitted by the CSM age
+        daemon_enabled=False, daemon_running=False)
+    row = _row(log)
+    assert row["Playlist"] == "Up Next" and row["Profile"] == "W - older_kid 1"
+    assert row["Items"] == "3"
+    assert row["Allowed"] == "TV-PG/PG"                        # (a) the profile's ceiling
+    assert row["Strictest"] == "TV-PG"                         # (b) strictest cert IN the plan
+    assert row["Unrated"] == "1"                               # uncertified, vouched by CSM age
+    assert row["Cert"] == "OK"                                 # (b) <= (a) → gating validated
+
+
+def test_over_cert_item_flags_a_violation_in_the_summary(monkeypatch):
+    """The evidence must SHOUT when the gate leaks. With cert_allowed forced open (a broken
+    gate) a TV-MA series reaches a little-kid plan — the row must flag it, not read OK."""
+    import scripts.managers.services.plex.playlists.builder as B
+    monkeypatch.setattr(B, "cert_allowed", lambda cert, level, csm_age=None: True)
+    cache, log = _Cache(), _Log()
+    owned = [_owned(1, 1, 1, "k1"), _owned(2, 1, 1, "k2")]
+    _mgr(cache, log)._build_for_users(
+        [{"safe_user": "lil", "title": "Lily", "restriction_profile": "little_kid"}],
+        owned, {"k1": {"rating_key": "a"}, "k2": {"rating_key": "b"}}, _STATS,
+        {1: 50, 2: 90}, {"lil": set()}, series_certs={1: "TV-Y", 2: "TV-MA"},
+        daemon_enabled=False, daemon_running=False)
+    row = _row(log)
+    assert row["Allowed"] == "TV-G/G" and row["Strictest"] == "TV-MA"
+    assert row["Cert"] == "VIOLATION x1"
+
+
+def test_unrated_item_is_counted_but_never_a_violation(monkeypatch):
+    """An unrecognised/missing cert is its own bucket: surfaced as a count (it IS the realistic
+    leak path) but never flagged, because we can't prove a violation we can't read."""
+    import scripts.managers.services.plex.playlists.builder as B
+    monkeypatch.setattr(B, "cert_allowed", lambda cert, level, csm_age=None: True)
+    cache, log = _Cache(), _Log()
+    owned = [_owned(1, 1, 1, "k1"), _owned(2, 1, 1, "k2")]
+    _mgr(cache, log)._build_for_users(
+        [{"safe_user": "lil", "title": "Lily", "restriction_profile": "little_kid"}],
+        owned, {"k1": {"rating_key": "a"}, "k2": {"rating_key": "b"}}, _STATS,
+        {1: 50, 2: 90}, {"lil": set()},
+        series_certs={1: "TV-Y", 2: "12A"},                    # a regional cert we don't model
+        daemon_enabled=False, daemon_running=False)
+    row = _row(log)
+    assert row["Unrated"] == "1" and row["Strictest"] == "TV-Y" and row["Cert"] == "OK"
+
+
+def test_playlists_log_still_receives_the_full_per_item_mirror():
+    """The operator drill-down is UNCHANGED: playlists.log keeps the real profile name and
+    every previewed item, even though the run log no longer shows the grid."""
+    cache, log = _Cache(), _Log()
+    _mgr(cache, log)._build_for_users(_TRACKED[:1], _OWNED, _INV, _STATS, {1: 80.0},
+                                      {"rob": set()}, daemon_enabled=True, daemon_running=False)
+    mirror = log.files.get("playlists", [])
+    assert any("'Rob'" in ln and "Up Next" in ln and "2 episode(s)" in ln for ln in mirror)
+    assert sum(1 for ln in mirror if "Show S1E" in ln) == 2    # every plan item still mirrored
+    assert not any("Rob" in " ".join(map(str, r))              # …and the run log stays anonymous
+                   for r in log.grids[0][2])
+
+
 # ── no inventory: cannot build, actionable warn, nothing cached ────────────────
 def test_no_inventory_short_circuits():
     cache, log = _Cache(), _Log()
@@ -101,6 +199,7 @@ def test_no_inventory_short_circuits():
                                             {}, daemon_enabled=True, daemon_running=False)
     assert res["can_build"] is False and res["built"] == 0
     assert cache.d == {}                                       # nothing written
+    assert log.grids == []                                     # no plans → no summary table
     assert any("plex.episodes.enabled" in w for w in log.warns)
 
 

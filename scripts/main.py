@@ -459,17 +459,29 @@ class Main(BaseManager, ComponentManagerMixin):
             summary.add_error(f"Radarr: {e}")
             self.logger.log_error(f"[Main] Radarr run failed: {e}")
 
-        # ── People↔media co-occurrence matrix (opt-in build; default-off) ─────
-        # Reads the enrich daemon's people buckets → a searchable person↔media graph
-        # (machine_learning/people_matrix) cached for the scorer's Group-C4 term and
-        # the co-cast acquisition source. Pure derived cache — no library writes, no
-        # Trakt calls. Gated by people_matrix.enabled (default off); the SCORING /
-        # CANDIDATE consumption is separately gated (cap=0.0 / source flag off), so
-        # with defaults this is fully inert. Runs after both *arr enrichments so the
-        # people buckets are warm, and before Phase 3 so the co-cast source can read it.
+        # ── People↔media co-occurrence matrix (built every run; default-ON) ───
+        # Builds the person↔media graph (machine_learning/people_matrix) + the
+        # household person-affinity vector that the scorer's Group-C4 term and the
+        # co-cast acquisition source read. Pure derived cache — no library writes, no
+        # Trakt calls.
+        #
+        # PLACEMENT: immediately after radarr.run(), because run_relational_pull (inside
+        # it) is what refreshes radarr/<inst>/relational/movie_person_relations.parquet
+        # — the credits table the movie half is built from. Credits are at their
+        # warmest here, the show credit buckets have been filled by the enrich daemon,
+        # and it is still before Phase 3 so the co-cast candidate source can read the
+        # result the same run.
+        #
+        # DEFAULT-ON as of the C4 activation: this used to be gated on a
+        # ``people_matrix.enabled`` key that the config schema never defined, so the
+        # build NEVER ran — which left people_matrix/affinity empty, which made
+        # resolve_person_affinity_inputs force C4's cap to 0.0, which made C4 dead code
+        # in every deployment. The build is fingerprinted (unchanged credits + unchanged
+        # watched-set ⇒ skip) and fully fault-isolated, so running it every run is cheap
+        # and cannot break the run.
         try:
             _pm_cfg = self.config.raw_data if hasattr(self.config, "raw_data") else (self.config or {})
-            if (_pm_cfg.get("people_matrix", {}) or {}).get("enabled"):
+            if (_pm_cfg.get("people_matrix") or {}).get("enabled", True):
                 from scripts.managers.services.trakt.people_matrix import TraktPeopleMatrixManager
                 TraktPeopleMatrixManager(
                     logger=self.logger, config=self.config,
@@ -659,7 +671,8 @@ class Main(BaseManager, ComponentManagerMixin):
         # banner below stays the literal last log block.
         try:
             from scripts.managers.machine_learning.plan_summary import PlanSummary
-            PlanSummary(registry=self.registry, logger=self.logger, config=self.config).log(detailed=True)
+            PlanSummary(registry=self.registry, logger=self.logger, config=self.config,
+                        global_cache=self.global_cache).log(detailed=True)
         except Exception as e:
             self.logger.log_debug(f"[Main] plan summary skipped: {e}")
         self._warn_if_deletions_disabled()

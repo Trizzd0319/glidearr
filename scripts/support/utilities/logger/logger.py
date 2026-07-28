@@ -264,11 +264,27 @@ def _box_table(headers, rows, title="", cap=None, caption="") -> str:
 
     # Caption: word-wrapped to the table width, rendered as full-width lines under the title.
     # NBSP-pad like cells so _strip_decor's space-collapsing can't mangle it.
+    # EXPLICIT newlines are honoured: each "\n"-separated segment is wrapped on its OWN,
+    # so a caption can lay out a per-column glossary (one term per line) instead of one
+    # reflowed paragraph. A blank segment emits a blank full-width line, letting a caption
+    # separate a lead-in from the glossary. Captions with no newline are unaffected.
     cap_lines = []
     _cap = (caption or "").strip()
     if _cap:
         import textwrap
-        for _w in (textwrap.wrap(_cap, width=max(1, inner_w - 2)) or [""]):
+        _wrapped: list = []
+        for _seg in _cap.split("\n"):
+            _seg = _seg.rstrip()
+            if not _seg.strip():
+                _wrapped.append("")
+                continue
+            # Hanging indent: continuation lines of a wrapped glossary entry line up
+            # under its text, not under its term, so "term = meaning" stays scannable.
+            _ind = " " * (len(_seg) - len(_seg.lstrip()))
+            _wrapped.extend(textwrap.wrap(
+                _seg, width=max(1, inner_w - 2),
+                initial_indent="", subsequent_indent=_ind + "  ") or [""])
+        for _w in (_wrapped or [""]):
             _w = _w[: inner_w - 2]
             pad = NBSP * (inner_w - 1 - len(_w))
             cap_lines.append("|" + NBSP + _w.replace(" ", NBSP) + pad + "|")
@@ -679,15 +695,17 @@ class LoggerManager:
         if block:
             self.log_info(f"\n{block}\n")
 
-    def log_grid(self, headers, rows, title="", cap=16):
+    def log_grid(self, headers, rows, title="", cap=16, caption=""):
         """Log an outlined, Kometa-style table — borders boxed with ASCII ``|`` / ``=`` and the
         title rendered as a centred banner. Each column is sized to its OWN widest (capped) cell so
         one wide column never forces every column wide; numeric columns are right-aligned. Cells are
         padded with a NON-BREAKING space so the alignment survives ``_strip_decor``'s space-collapsing
         (``re.sub(r"[ \\t]{2,}"," ")``, which mangles ordinary space-padded tables). Cells longer than
-        ``cap`` are truncated with '..'. Pass PLAIN-ASCII cells (avoid ≤ / … / — — the cp1252
-        console/log file can't encode them); a no-op when ``rows`` is empty."""
-        block = _box_table(headers, rows, title=title, cap=cap)
+        ``cap`` are truncated with '..'. ``caption`` (optional, same as :meth:`log_table`) is a
+        word-wrapped description of what the table IS / what its columns mean, rendered under the
+        title. Pass PLAIN-ASCII cells (avoid ≤ / … / — — the cp1252 console/log file can't encode
+        them); a no-op when ``rows`` is empty."""
+        block = _box_table(headers, rows, title=title, cap=cap, caption=caption)
         if block:
             self.log_info(f"\n{block}\n")
 

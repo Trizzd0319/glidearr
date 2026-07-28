@@ -67,8 +67,18 @@ def grace_mark(anchor, grace_td, now):
 def movie_grace_decision(*, is_franchise_entry, fid_franchise_protected,
                          keep_protected, is_watched, has_last_watched) -> str:
     """Radarr per-row precedence. 'clear' (never mark): a franchise entry, a
-    franchise-protected file, or a keep_forever/keep_movie/universe policy. 'skip'
-    (leave as-is): not watched, or no last-watched timestamp. Else 'mark'."""
+    franchise-protected file, a keep_forever/keep_movie/universe policy, or a row
+    that is NOT WATCHED. 'skip' (leave as-is): watched but no last-watched
+    timestamp. Else 'mark'.
+
+    ``not is_watched`` RETURNS 'clear', NOT 'skip'. Grace marking is the only thing
+    that sets ``marked_for_deletion``, so an unwatched row carrying that flag is an
+    impossible state — and 'skip' would preserve it forever. That was inert while
+    ``is_watched`` could only ever go False→True; under the global watched bar
+    (``lifecycle.watched_definition``) a row whose only plays were samples flips
+    True→False, and 'skip' would have left the previous run's mark standing and
+    deleted a file the current definition says was never watched. On rows that were
+    never marked this is a no-op (False → False)."""
     if is_franchise_entry:
         return "clear"
     if fid_franchise_protected:
@@ -76,7 +86,7 @@ def movie_grace_decision(*, is_franchise_entry, fid_franchise_protected,
     if keep_protected:
         return "clear"
     if not is_watched:
-        return "skip"
+        return "clear"
     if not has_last_watched:
         return "skip"
     return "mark"
@@ -84,20 +94,39 @@ def movie_grace_decision(*, is_franchise_entry, fid_franchise_protected,
 
 def episode_grace_decision(*, is_pilot, is_next, is_watched, has_last_watched,
                            fid_protected, keep_series, keep_season_current,
-                           recent_aired, household_blocked) -> str:
+                           recent_aired, household_blocked, viewer_protected=False) -> str:
     """Sonarr per-row precedence. 'clear' (never mark): a pilot/next-episode row, a
+    row that is NOT WATCHED, an episode inside a viewer's retention interval, a
     protected pilot file, a keep_series series, the current keep_season, a
     recently-aired episode, or a household member who hasn't finished. 'skip' (leave
-    as-is): not watched, or no last-watched timestamp. Else 'mark'.
+    as-is): watched but no last-watched timestamp. Else 'mark'.
 
     Order matches the service guards exactly: pilot/next first (they're cleared even
-    when unwatched), then the watched/last-watched skips, then the remaining clears."""
+    when unwatched), then the watched/last-watched legs, then the remaining clears.
+
+    ``not is_watched`` RETURNS 'clear', NOT 'skip' — see the twin note in
+    :func:`movie_grace_decision`. Under the global watched bar an episode whose only
+    plays were sub-threshold samples flips True→False, and 'skip' would have left a
+    previous run's ``marked_for_deletion`` standing. Five live rows are in exactly
+    that state (Fallout S01E06, See S01E06, DuckTales S01E01, Blue Bloods S01E11/E12);
+    without this they would be deleted on the first pass after the change, on a mark
+    the current definition does not support. A no-op on rows that were never marked.
+
+    ``viewer_protected`` is the PER-VIEWER RETENTION guard
+    (``lifecycle.viewer_retention``): the episode sits inside some account's
+    [position − backward_buffer, position + pace × horizon] interval. It is
+    evaluated first among the post-skip clears because it is the guard an operator
+    most often wants to see attributed in the log ("held for Aiden / Raina"); the
+    ordering is cosmetic — every branch below returns the same 'clear'. Default
+    False keeps every existing caller byte-identical."""
     if is_pilot or is_next:
         return "clear"
     if not is_watched:
-        return "skip"
+        return "clear"
     if not has_last_watched:
         return "skip"
+    if viewer_protected:
+        return "clear"
     if fid_protected:
         return "clear"
     if keep_series:

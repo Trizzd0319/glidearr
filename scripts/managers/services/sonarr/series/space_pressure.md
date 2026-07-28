@@ -19,11 +19,11 @@ Class constants:
 - `PRESSURE_FALLBACK_GB = 25.0` — last-resort floor only (used when `free_space_limit` AND total drive are both unreadable).
 - `RECENT_WATCH_DAYS = 7` — don't downgrade a series watched within 7 days.
 - `RECENT_AIR_DAYS = 30` — don't downgrade a series with an episode aired within 30 days (no Radarr analog).
-- `DEFAULT_SCORE_CEILING = 20` — the `tv_space_pressure_score_ceiling` default (0–100 scale).
+- `DEFAULT_SCORE_CEILING = 17` — the `tv_space_pressure_score_ceiling` default (0–100 scale). Re-anchored from 20 when Group D v2 translated the persisted watchability axis; see `machine_learning/thresholds/registry.py`'s delete block.
 - `DEFAULT_RUNTIME_MIN = 45.0` — fallback per-episode runtime when unknown.
 - `KEEP_TAGS = {keep_series, keep_season, keep_universe, keep_forever}` — protected; never downgraded.
 
-Config keys read: `tv_space_pressure_score_ceiling` (default 20); `free_space_limit` (consumed indirectly via `space_targets`). global_cache: none directly. Parquet read/write: episode_files via the registry-resolved `SonarrCacheEpisodeFilesManager` — reads `series_id` / `watchability_score`, ensures + writes the plan columns `planned_action`, `plan_reason`, `plan_reclaim_gb`, then `ef.save(instance, df)`.
+Config keys read: `tv_space_pressure_score_ceiling` (default 17); `free_space_limit` (consumed indirectly via `space_targets`). global_cache: none directly. Parquet read/write: episode_files via the registry-resolved `SonarrCacheEpisodeFilesManager` — reads `series_id` / `watchability_score`, ensures + writes the plan columns `planned_action`, `plan_reason`, `plan_reclaim_gb`, then `ef.save(instance, df)`.
 
 External API endpoints touched: `GET qualityProfile`, `GET series/{id}`, `PUT series/{id}`, `POST command` (`{"name":"SeriesSearch","seriesId":sid}`).
 
@@ -50,7 +50,7 @@ Brain modules delegated to (documented elsewhere): `machine_learning.space.downg
 ## Criteria & examples
 
 - **Pressure band**: only runs when `free < U`; the orchestration verifies this before calling. With `free_space_limit` unset on a 4000 GB drive, the floor `T` defaults to 1000 GB and `U` ≈ 1100 GB; the manager downgrades until projected free reaches `U`.
-- **Score ceiling** (`tv_space_pressure_score_ceiling`, default 20): a series with `watchability_score = 14` (< 20) is eligible; a series scoring `27` (≥ 20) is `skipped_high_score`.
+- **Score ceiling** (`tv_space_pressure_score_ceiling`, default 17): a series with `watchability_score = 14` (< 17) is eligible; a series scoring `27` (≥ 17) is `skipped_high_score`.
 - **Recent-watch guard** (`RECENT_WATCH_DAYS = 7`): a low-scoring show watched 3 days ago is `skipped_recent`; one last watched 40 days ago is eligible.
 - **Recently-aired guard** (`RECENT_AIR_DAYS = 30`): a low-scoring show whose newest episode aired 10 days ago is `skipped_recent` (don't downgrade something currently airing).
 - **Keep tags**: a series tagged `keep_series` is `skipped_protected`, regardless of score.

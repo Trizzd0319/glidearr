@@ -52,11 +52,14 @@ from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.ledger.decision_ledger import stamp
 from scripts.managers.machine_learning.space.downgrade_planner import plan_series_downgrades
+from scripts.managers.machine_learning.thresholds.registry import get_threshold
 from scripts.managers.services.radarr.quality.space_pressure import RadarrSpacePressureManager
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
-from scripts.support.utilities.space_targets import space_targets
+from scripts.support.utilities.space_targets import (
+    downgrade_regrab_cap, exhaustive_downgrade, space_targets,
+)
 
 # The step-down release picker is SHARED with the movie/universe realize paths —
 # imported, not copied (same ladder semantics: rungs >= 720 strictly below the current
@@ -71,7 +74,10 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
     PRESSURE_FALLBACK_GB = 25.0  # last-resort floor only (free_space_limit unset AND total drive unreadable)
     RECENT_WATCH_DAYS    = 7      # don't downgrade a series watched within this window
     RECENT_AIR_DAYS      = 30     # don't downgrade a series with a very recently aired ep
-    DEFAULT_SCORE_CEILING = 20    # tv_space_pressure_score_ceiling default (0-100 scale)
+    # 17, not 20: re-anchored with the whole delete family when Group D v2 replaced a
+    # near-constant +12 bonus with a transcode-risk penalty and translated the score axis
+    # (file-owning series median 21 -> 8). See machine_learning/thresholds/registry.py.
+    DEFAULT_SCORE_CEILING = 17    # tv_space_pressure_score_ceiling default (0-100 scale)
     DEFAULT_RUNTIME_MIN  = 45.0   # fallback per-episode runtime when unknown
     KEEP_TAGS = frozenset({"keep_series", "keep_season", "keep_universe", "keep_forever"})
     DEFAULT_REALIZE_CAP  = 15     # tv_downgrade_realize_cap default — episode files searched+replaced
@@ -150,9 +156,10 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
     def _score_ceiling(self) -> float:
         try:
-            return float((self.config or {}).get("tv_space_pressure_score_ceiling", self.DEFAULT_SCORE_CEILING))
+            ceiling = float((self.config or {}).get("tv_space_pressure_score_ceiling", self.DEFAULT_SCORE_CEILING))
         except (TypeError, ValueError):
-            return float(self.DEFAULT_SCORE_CEILING)
+            ceiling = float(self.DEFAULT_SCORE_CEILING)
+        return get_threshold("tv_delete_ceiling", self.config, ceiling, logger=getattr(self, "logger", None))
 
     def _realize_cap(self) -> int:
         """Inline per-pass budget of episode files REALIZED (interactive-searched and, when
@@ -255,7 +262,10 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
     def _realize_stepdown_files(self, instance: str, df, ef, cand, target_res: int,
                                 fid_rowcount: dict, *, budget: int,
-                                fallback_eids: list, stats: dict) -> int:
+                                fallback_eids: list, stats: dict,
+                                exhaustive: bool = False,
+                                free_base_gb: "float | None" = None,
+                                target_u_gb: "float | None" = None) -> int:
         """Realize ONE candidate series' step-down at episode-file granularity
         (verify → delete → guid-grab; the series profile was already PUT down).
 
@@ -268,9 +278,21 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         counted ``no_release`` (profile stays lowered; re-probes next run). Multi-episode
         files are never realized (a single-episode replacement would orphan the
         siblings). ``budget`` is the shared inline cap; files over it count ``deferred``.
-        Mutates ``stats`` and ``fallback_eids``; returns the remaining budget."""
+        Mutates ``stats`` and ``fallback_eids``; returns the remaining budget.
+
+        ``exhaustive`` + ``free_base_gb`` + ``target_u_gb`` (all default off/None → byte-identical):
+        stop realizing as soon as free space NET of the re-grabs queued this run
+        (``free_base_gb + realized_reclaim_gb − inflight_regrab_gb``) reaches ``target_u_gb``.
+        Without that subtraction the pass would keep shrinking against the phantom headroom the
+        just-deleted files created, since the smaller replacements have not imported yet."""
         sid = cand["sid"]
         for idx, fid, res, size, sn, en in self._iter_stepdown_file_rows(df, cand, target_res):
+            if exhaustive and free_base_gb is not None and target_u_gb is not None:
+                _net = (float(free_base_gb) + stats["realized_reclaim_gb"]
+                        - stats.get("inflight_regrab_gb", 0.0))
+                if _net >= float(target_u_gb):
+                    stats["stopped_at_target"] = stats.get("stopped_at_target", 0) + 1
+                    continue
             label = (f"'{cand['title']}' S{int(sn):02d}E{int(en):02d}"
                      if (sn is not None and pd.notna(sn) and en is not None and pd.notna(en))
                      else f"'{cand['title']}' fid={fid}")
@@ -299,7 +321,8 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             releases = self.sonarr_api._make_request(
                 instance, f"release?episodeId={int(eid)}", fallback=None) or []
             pick = _pick_stepdown_release(releases, current_res=res,
-                                          min_size_bytes=self.STEPDOWN_MIN_RELEASE_BYTES)
+                                          min_size_bytes=self.STEPDOWN_MIN_RELEASE_BYTES,
+                                          allow_below_floor=exhaustive)
             if not pick:
                 stats["no_release"] += 1
                 self.logger.log_info(
@@ -316,6 +339,14 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             # which grab path (guid or blind fallback) restores the smaller copy.
             stats["realized"] += 1
             stats["realized_reclaim_gb"] += size / (1024 ** 3)
+            # …but the replacement is IN FLIGHT: book its projected size against the
+            # free-space figure so the pass can't chase the temporary spike.
+            stats["inflight_regrab_gb"] = (stats.get("inflight_regrab_gb", 0.0)
+                                           + float(pick.get("size") or 0) / (1024 ** 3))
+            if pick.get("stepped_below_floor"):
+                stats["below_floor_picks"] = stats.get("below_floor_picks", 0) + 1
+                self.logger.log_info(
+                    f"  ⤵️ {label}: stepped BELOW 720 — no >=720 release exists for this title.")
             grabbed = False
             try:
                 _res = self.sonarr_api._make_request(
@@ -362,6 +393,10 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             "grab_fallback":       0,     # guid grab failed → blind EpisodeSearch (file already gone)
             "deferred":            0,     # over the inline cap → next run
             "skipped_multi_ep":    0,     # file backs several episodes → never single-grabbed
+            # ── exhaustive-mode accounting (0 on the legacy path) ──
+            "inflight_regrab_gb":  0.0,   # projected size of the replacements queued THIS run
+            "stopped_at_target":   0,     # items left untouched once free (net of in-flight) hit U
+            "below_floor_picks":   0,     # stepped BELOW 720 — no >=720 release exists
         }
 
         ef = self._get_episode_files_manager()
@@ -402,6 +437,10 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # lowest-watchability series DOWN the resolution ladder one tier at a time, spread
         # across the pool, until ~need_gb is reclaimed (no series crushed straight to 720p).
         # The service APPLIES each per-series target (PUT + SeriesSearch + stamp) below.
+        # EXHAUSTIVE (space_exhaustive_downgrade, DEFAULT ON): plan EVERY series above the
+        # 720p floor down to it — no score ceiling, no early stop at a partial need_gb —
+        # because the episode delete pool now only accepts files already AT/BELOW that floor.
+        _exhaustive = exhaustive_downgrade(self.config)
         candidates, _pstats = plan_series_downgrades(
             df, ranked_profiles,
             need_gb=need_gb,
@@ -411,12 +450,17 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             keep_tags=self.KEEP_TAGS,
             default_runtime_min=self.DEFAULT_RUNTIME_MIN,
             floor_resolution=floor_resolution,
+            exhaustive=_exhaustive,
         )
         stats.update(_pstats)
         if not candidates:
+            _why = ("every series is keep-tagged / hot-universe / recent / already at the "
+                    f"{floor_resolution}p floor — the downgrade pool is EXHAUSTED, so deletion "
+                    "is now the only lever left" if _exhaustive
+                    else f"score<{ceiling:.0f}, not keep/hot-universe/recent/at-floor")
             self.logger.log_info(
                 f"[SpacePressure-TV] '{instance}': {free_space_gb:.0f}GB free (<{U:.0f}GB) but no "
-                f"downgrade candidates (score<{ceiling:.0f}, not keep/hot-universe/recent/at-floor)."
+                f"downgrade candidates ({_why})."
             )
             return stats
 
@@ -427,6 +471,23 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # candidate series this pass.
         fallback_eids: list[int] = []
         realize_budget = self._realize_cap()
+        # BANDWIDTH GUARD: in exhaustive mode the TIGHTER of the two caps wins — the TV
+        # inline cap (tv_downgrade_realize_cap, bounds slow interactive searches) and the
+        # cross-service per-run re-grab cap (space_downgrade_max_regrabs_per_run). Files
+        # over it keep their copies, count `deferred`, and re-qualify next run — and since
+        # they are still above the floor they stay excluded from deletion.
+        _regrab_cap = downgrade_regrab_cap(self.config) if _exhaustive else 0
+        if _regrab_cap > 0:
+            realize_budget = min(realize_budget, _regrab_cap)
+        realize_budget_start = realize_budget   # for the summary table's cap description
+        if _exhaustive:
+            self.logger.log_info(
+                f"[SpacePressure-TV] '{instance}': exhaustive step-down — every series above the "
+                f"{floor_resolution}p floor is planned down to it "
+                f"({_pstats.get('over_ceiling_included', 0)} admitted over the score ceiling); "
+                f"stopping at {U:.0f}GB free NET of in-flight re-grabs; realize budget "
+                f"{realize_budget}/run."
+            )
         # How many episode rows each file backs — a multi-episode file is never replaced
         # by a single-episode grab (it would orphan the siblings).
         fid_rowcount: dict = {}
@@ -442,6 +503,17 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         reclaimed = 0.0
 
         for c in candidates:
+            # ── IN-FLIGHT ACCOUNTING (exhaustive only) ────────────────────────────
+            # dry_run has no picks to size, so it models the planner's projected reclaim
+            # (= deleted size − replacement size, i.e. already net); the live pass uses the
+            # realized/in-flight split the realize helper maintains from the actual picks.
+            if _exhaustive:
+                _net_free = float(free_space_gb) + (
+                    reclaimed if self.dry_run
+                    else stats["realized_reclaim_gb"] - stats["inflight_regrab_gb"])
+                if _net_free >= U:
+                    stats["stopped_at_target"] += 1
+                    continue
             reason = f"{c['reason']} → {c['target_name']}"
             # Stamp the series-level downgrade on ONE representative episode row with
             # the WHOLE-series reclaim. The plan ledger (plan_summary.py) counts rows
@@ -488,6 +560,9 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     instance, df, ef, c, int(_t_res),
                     fid_rowcount, budget=realize_budget,
                     fallback_eids=fallback_eids, stats=stats,
+                    exhaustive=_exhaustive,
+                    free_base_gb=float(free_space_gb) if _exhaustive else None,
+                    target_u_gb=U if _exhaustive else None,
                 )
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ Downgrade failed for '{c['title']}' (id={c['sid']}): {e}")
@@ -518,47 +593,67 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
         prefix = "[dry_run] " if self.dry_run else ""
         target_status = "met" if _pstats.get("target_met") else "NOT met"
+        _rows = [
+            ["stepped down",     stats["downgraded"]],
+            ["projected GB",     stats["est_reclaim_gb"]],
+            ["files realized",   stats["realized"]],
+            ["realized GB",      round(stats["realized_reclaim_gb"], 2)],
+            ["no smaller release", stats["no_release"]],
+            ["grab fallback",    stats["grab_fallback"]],
+            ["deferred (cap)",   stats["deferred"]],
+            ["multi-episode file", stats["skipped_multi_ep"]],
+            ["candidates",       stats["candidates"]],
+            ["score over ceil",  stats["skipped_high_score"]],
+            ["keep-tagged",      stats["skipped_protected"]],
+            ["hot-universe",     stats.get("skipped_universe", 0)],
+            ["recent",           stats["skipped_recent"]],
+            ["at/below floor",   stats["skipped_already"]],
+            ["failed",           stats["failed"]],
+        ]
+        _descs = [
+            "series whose profile was stepped down a tier",
+            "planner's projected reclaim once every oversized file is replaced",
+            "episode files ACTUALLY deleted + re-grabbed smaller this pass",
+            "REAL space freed now (sum of the deleted files) — the rest lands as files replace",
+            "files KEPT: no release below the current resolution — re-probes next run",
+            "grab did not take; file already removed, blind EpisodeSearch queued",
+            f"files over the inline cap ({realize_budget_start}/pass) — next run picks them up",
+            "files backing several episodes — never single-grabbed (would orphan siblings)",
+            "series the planner picked as candidates",
+            "series skipped for watchability score over the ceiling",
+            "series skipped because keep-tagged",
+            "series skipped — hot franchise/universe credit holds them at tier",
+            "series skipped for a recent watch or air date",
+            "series already at or below the 720p floor",
+            "series whose PUT/search call errored",
+        ]
+        if _exhaustive:
+            _rows += [
+                ["over-ceiling included", stats.get("over_ceiling_included", 0)],
+                ["stepped below 720",     stats["below_floor_picks"]],
+                ["in-flight re-grab GB",  round(stats["inflight_regrab_gb"], 2)],
+                ["target reached",        stats["stopped_at_target"]],
+            ]
+            _descs += [
+                "series admitted despite a score over the delete ceiling — EVERYTHING shrinks "
+                "before anything is deleted",
+                "no >=720 release exists for the episode, so the pass fell below the 720p floor",
+                "projected size of the smaller replacements queued THIS run — subtracted from free "
+                "space so the pass never downgrades against phantom headroom",
+                "items left untouched: free space NET of the in-flight re-grabs reached the band top",
+            ]
         self.logger.log_table(
-            ["Outcome", "Count"],
-            [
-                ["stepped down",     stats["downgraded"]],
-                ["projected GB",     stats["est_reclaim_gb"]],
-                ["files realized",   stats["realized"]],
-                ["realized GB",      round(stats["realized_reclaim_gb"], 2)],
-                ["no smaller release", stats["no_release"]],
-                ["grab fallback",    stats["grab_fallback"]],
-                ["deferred (cap)",   stats["deferred"]],
-                ["multi-episode file", stats["skipped_multi_ep"]],
-                ["candidates",       stats["candidates"]],
-                ["score over ceil",  stats["skipped_high_score"]],
-                ["keep-tagged",      stats["skipped_protected"]],
-                ["hot-universe",     stats.get("skipped_universe", 0)],
-                ["recent",           stats["skipped_recent"]],
-                ["at/below floor",   stats["skipped_already"]],
-                ["failed",           stats["failed"]],
-            ],
+            ["Outcome", "Count"], _rows,
             title=f"[SpacePressure-TV] {prefix}'{instance}' "
                   f"(free {free_space_gb:.0f}GB, target {U:.0f}GB, need ~{need_gb:.0f}GB, "
-                  f"target {target_status})",
+                  f"target {target_status}{'; exhaustive' if _exhaustive else ''})",
             caption="Per-pass result of the TV space-pressure step-down: how many low-watchability "
                     "series were downgraded toward HD-720p, the space reclaimed, and what was skipped "
-                    "and why.",
-            descriptions=[
-                "series whose profile was stepped down a tier",
-                "planner's projected reclaim once every oversized file is replaced",
-                "episode files ACTUALLY deleted + re-grabbed smaller this pass",
-                "REAL space freed now (sum of the deleted files) — the rest lands as files replace",
-                "files KEPT: no release below the current resolution — re-probes next run",
-                "grab did not take; file already removed, blind EpisodeSearch queued",
-                f"files over the inline cap ({self._realize_cap()}/pass) — next run picks them up",
-                "files backing several episodes — never single-grabbed (would orphan siblings)",
-                "series the planner picked as candidates",
-                "series skipped for watchability score over the ceiling",
-                "series skipped because keep-tagged",
-                "series skipped — hot franchise/universe credit holds them at tier",
-                "series skipped for a recent watch or air date",
-                "series already at or below the 720p floor",
-                "series whose PUT/search call errored",
-            ],
+                    "and why."
+                    + (" EXHAUSTIVE: every series above the 720p floor is planned down to it "
+                       "(deletion is the true last resort); the pass stops once free space net of "
+                       f"the in-flight re-grabs reaches {U:.0f}GB, and realizes at most "
+                       f"{realize_budget_start} file(s)/run." if _exhaustive else ""),
+            descriptions=_descs,
         )
         return stats

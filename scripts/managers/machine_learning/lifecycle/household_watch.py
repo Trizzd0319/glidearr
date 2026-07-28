@@ -6,6 +6,26 @@ input: a file every (or, with a quorum, most) member has watched may be grace-ma
 while one nobody-but-X has finished stays protected. The Tautulli per-user history
 FETCH stays in the service; only this side-effect-free resolution lives here.
 
+SUPERSEDED — DO NOT WIRE THIS UP ALONGSIDE ``lifecycle.viewer_retention``.
+--------------------------------------------------------------------------
+This gate is INERT in practice: it keys off ``rating_groups.household.members``,
+which is absent from the live config, so ``resolve_household_watch`` returns
+``(True, None)`` unconditionally and never blocks anything.
+
+It is deliberately left that way. Its purpose — "don't delete something a
+household member still needs" — is now served by
+``machine_learning/lifecycle/viewer_retention.py``, which answers the same
+question far better: per-ACCOUNT position and pace instead of a household quorum,
+so a viewer who is three seasons behind is protected by WHERE THEY ARE rather
+than by a roster the operator has to maintain by hand. It also needs no config to
+work, which is why it is on by default and this is not.
+
+Wiring both would DOUBLE-GUARD: every episode any member hasn't finished would be
+held forever by this gate, on top of the (bounded, self-expiring) interval the
+retention rule holds — i.e. a library that never releases anything. If you are
+tempted to populate ``rating_groups.household.members``, tune
+``episode_retention`` instead.
+
 PURE — stdlib only; no HTTP, no global_cache, no service imports.
 
 Public API:

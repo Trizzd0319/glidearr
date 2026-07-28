@@ -102,7 +102,12 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                       for v in (movie_inv or {}).values() if v.get("rating_key")}
         display = {**tv_display, **mv_display}
         rk_to_tmdb = self._inventory_rk_to_tmdb(movie_inv)   # plan ratingKey -> Radarr tmdbId
+        # Cert evidence for the run-log summary, keyed by the plan's ratingKeys across BOTH
+        # media (the same maps the age gate filtered on — no second cert source).
+        cert_by_rk = {**self._tv_cert_by_rk(owned_eps, tv_inv, series_certs),
+                      **self._movie_cert_by_rk(owned_movies, movie_inv)}
         protected: set = set()                               # recommended movie tmdbIds (delete shield)
+        self._begin_summary()
         built = 0
         for idx, u in enumerate(tracked, 1):
             user_aff = affinity.get(u["safe_user"]) or {}
@@ -166,7 +171,8 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
             self.logger.log_info(
                 f"[ComboPlaylists] {who} -> {bm.get('episode', 0)} TV + "
                 f"{bm.get('movie', 0)} movie candidate(s), {len(plan.items)} in plan.")
-            self._log_preview(u, plan, stats, display, reasons, kinds=kinds, label="item", anon=who)
+            self._log_preview(u, plan, stats, display, reasons, kinds=kinds, label="item", anon=who,
+                              certs=cert_by_rk, level=level)
 
             # The two MOOD lists (opt-in) sliced from the same candidate pool: The Long Glide =
             # in-progress sagas/franchises/shows (resume-ordered); Touch & Go = the low-commitment
@@ -186,10 +192,13 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                     protected.update(t for i in mood.items
                                      if (t := rk_to_tmdb.get(str(i.rating_key))) is not None)
                 self._log_preview(u, glide, g_stats, display, reasons, kinds=kinds, label="item",
-                                  family_label="The Long Glide", anon=who)
+                                  family_label="The Long Glide", anon=who,
+                                  certs=cert_by_rk, level=level)
                 self._log_preview(u, touchgo, t_stats, display, reasons, kinds=kinds, label="item",
-                                  family_label="Touch & Go", anon=who)
+                                  family_label="Touch & Go", anon=who,
+                                  certs=cert_by_rk, level=level)
             built += 1
         self._publish_protected_movie_tmdbs(_PROTECTED_KEY, protected)
+        self._emit_summary_grid("[dry-run] Combined (movie+TV) playlists - per-profile summary")
         self.logger.log_info(f"[ComboPlaylists] built {built} per-user combined plan(s) (dry-run — no Plex writes).")
         return {"users": len(tracked), "built": built, "can_build": True}

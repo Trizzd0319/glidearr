@@ -31,7 +31,10 @@ from __future__ import annotations
 import pandas as pd
 
 from scripts.managers.machine_learning.scoring.critic import critic_avg
-from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
+from scripts.managers.machine_learning.space.downgrade_planner import (
+    UNIVERSE_PROTECT_MIN,
+    row_score,
+)
 
 # Critic source columns the per-row blend reads (scales live in scoring.critic).
 _CRITIC_COLS = (
@@ -73,6 +76,7 @@ def build_movie_delete_candidates(
     universe_age_days=None,
     now=None,
     stats=None,
+    floor_resolution=None,
 ) -> "list[tuple]":
     """Build the tiered, guarded, lowest-rated-first movie delete queue.
 
@@ -83,13 +87,26 @@ def build_movie_delete_candidates(
     stale saga member becomes deletable again — default None column -> no guard, byte-identical);
     watched within COLLECTION_WINDOW_DAYS
     (``no_delete_cutoff``); a still-ageing bare 'universe' title when ``universe_age_days``
-    is set (default None -> no extra guard, byte-identical). ``stats`` (optional mutable dict) is
-    bumped with ``skipped_universe`` per protected hot-saga row when supplied. Tiering: tier 0 = marked-for-deletion (watched +
+    is set (default None -> no extra guard, byte-identical); a row the score map has no entry for
+    (see ``_row_score`` — an unscored row is DEFERRED, never deleted on a guessed score).
+    a WATCHLISTED title whose watchlister is still active (``watchlist_hold``; see
+    ``radarr/quality/space_pressure._apply_watchlist_shield`` — self-releasing on watchlister
+    dormancy, default None column -> no guard, byte-identical);
+    ``stats`` (optional mutable dict) is bumped with ``skipped_universe`` per protected hot-saga row,
+    ``skipped_watchlist`` per shielded watchlisted row, and ``skipped_unscored`` per deferred
+    unscored row when supplied. Tiering: tier 0 = marked-for-deletion (watched +
     grace-expired); tier 1 = unwatched low-watchability (only when
     ``include_unwatched`` and score < ``ceiling`` and not freshly added within the
     window). ``marked`` is the bool Series the service derived from
     ``marked_for_deletion``. Returns the sorted candidate-tuple list (see module
     docstring); the service drains it under the U target.
+
+    ``floor_resolution`` (DEFAULT None -> off, byte-identical): the "deletion is the true last
+    resort" invariant. When set (the service passes 720 under ``space_exhaustive_downgrade``), a
+    row may only enter the queue once its ``resolution`` is AT or BELOW it — anything still
+    shrinkable must be downgraded first, and is counted in ``stats['skipped_downgradable']``. An
+    unknown/unreadable resolution counts as at-floor, mirroring the downgrade planner (which also
+    treats it as nothing-to-step) so such a row is never undeletable forever.
     """
     candidates: "list[tuple]" = []
     for idx in df.index:
@@ -124,6 +141,21 @@ def build_movie_delete_candidates(
                     continue
             except (TypeError, ValueError):
                 pass
+        # WATCHLIST SHIELD — the household explicitly asked for this title and the member
+        # who asked is still an active viewer. Stamped as a column by
+        # ``refresh_scores._apply_watchlist_shield`` rather than evaluated here, because
+        # the space coordinator reaches this function from a BARE parquet load with no
+        # cache handle and no manager graph — a live predicate would silently protect
+        # nothing on that path. Self-releasing: the column goes False on the first
+        # refresh_scores after the watchlister has been dormant for the window, so this
+        # can never hold disk forever. Byte-identical when the column is absent (a
+        # pre-shield parquet) or all-False (the term disabled / nothing watchlisted).
+        if "watchlist_hold" in df.columns:
+            _wh = df.at[idx, "watchlist_hold"]
+            if _wh is not None and pd.notna(_wh) and bool(_wh):
+                if stats is not None:
+                    stats["skipped_watchlist"] = stats.get("skipped_watchlist", 0) + 1
+                continue
         lw = df.at[idx, "last_watched_at"] if "last_watched_at" in df.columns else None
         if lw:
             try:
@@ -131,8 +163,33 @@ def build_movie_delete_candidates(
                     continue   # protect anything watched within the window
             except Exception:
                 pass
+        # DELETE-ELIGIBILITY INVARIANT — deliberately AFTER the keep/franchise/credit/recent
+        # guards so the counter means "would otherwise be deletable, but still has quality to
+        # shed" instead of double-counting rows a keep tag already spared.
+        if floor_resolution is not None:
+            _r = df.at[idx, "resolution"] if "resolution" in df.columns else None
+            try:
+                if _r is not None and pd.notna(_r) and int(_r) > int(floor_resolution):
+                    if stats is not None:
+                        stats["skipped_downgradable"] = stats.get("skipped_downgradable", 0) + 1
+                    continue
+            except (TypeError, ValueError):
+                pass
+        # ASYMMETRY, deliberate: an unknown RESOLUTION admits the row (above), an unknown
+        # SCORE defers it (below). A row with no resolution also has nothing the downgrade
+        # planner can step, so deferring it would make it undeletable forever; a row with
+        # no score gets one on the next refresh_scores and re-qualifies. See the longer
+        # note (and the current NULL-resolution count) in radarr/quality/space_pressure.
 
-        score  = int(score_map.get(idx, 5))
+        _sc = row_score(score_map, idx)
+        if _sc is None:
+            # UNSCORED -> DEFERRED, never deleted on a guessed score. The full reasoning
+            # (and why the old literal-5 sentinel had to go rather than be re-anchored)
+            # is the block comment on ``downgrade_planner.row_score``.
+            if stats is not None:
+                stats["skipped_unscored"] = stats.get("skipped_unscored", 0) + 1
+            continue
+        score  = int(_sc)
         size   = float(df.at[idx, "size_bytes"]) if ("size_bytes" in df.columns and pd.notna(df.at[idx, "size_bytes"])) else 0.0
         critic = critic_avg({c: df.at[idx, c] for c in _CRITIC_COLS if c in df.columns})
 

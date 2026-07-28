@@ -65,7 +65,14 @@ def test_movie_grace_decision():
     assert _mv(is_franchise_entry=True, is_watched=False) == "clear"   # franchise beats watched
     assert _mv(fid_franchise_protected=True) == "clear"
     assert _mv(keep_protected=True) == "clear"
-    assert _mv(is_watched=False) == "skip"
+    # NOT WATCHED -> 'clear', not 'skip'. Grace marking is the only writer of
+    # marked_for_deletion, so an unwatched row carrying that flag is an impossible
+    # state; 'skip' would preserve it forever. Under the global watched bar
+    # (lifecycle.watched_definition) is_watched can now go True->False, and 35 live
+    # movie rows are marked on a play that no longer counts.
+    assert _mv(is_watched=False) == "clear"
+    # WATCHED but no timestamp is still 'skip' — no window can be computed, so the
+    # row is left exactly as it was.
     assert _mv(has_last_watched=False) == "skip"
     assert _mv() == "mark"
 
@@ -82,8 +89,11 @@ def _ep(**kw):
 def test_episode_grace_decision_clears_and_skips():
     assert _ep(is_pilot=True, is_watched=False) == "clear"   # pilot cleared even when unwatched
     assert _ep(is_next=True) == "clear"
-    assert _ep(is_watched=False) == "skip"                   # (not pilot/next) unwatched -> skip
-    assert _ep(has_last_watched=False) == "skip"
+    # unwatched -> 'clear' (see the twin note in test_movie_grace_decision): the
+    # watched bar can flip a sampled episode True->False, and a stale mark must be
+    # repaired rather than acted on. Five live episode rows are in that state.
+    assert _ep(is_watched=False) == "clear"
+    assert _ep(has_last_watched=False) == "skip"             # watched, no stamp -> leave as-is
     assert _ep(fid_protected=True) == "clear"
     assert _ep(keep_series=True) == "clear"
     assert _ep(keep_season_current=True) == "clear"

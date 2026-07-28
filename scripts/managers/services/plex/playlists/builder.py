@@ -25,8 +25,11 @@ from datetime import date
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.services.mdblist import client as mdblist_client
 from scripts.managers.machine_learning.playlists.cert_gate import (
+    ADULT,
     cert_allowed,
+    cert_summary,
     is_restricted,
+    tier_ceiling,
     tier_level,
 )
 from scripts.managers.machine_learning.playlists.per_user import (
@@ -226,6 +229,8 @@ class PlexPlaylistBuilderManager(BaseManager):
             return {"users": len(tracked), "built": 0, "can_build": False}
 
         display = self._display_map(inventory)
+        cert_by_rk = self._tv_cert_by_rk(owned_eps, inventory, series_certs)
+        self._begin_summary()
         built = 0
         for idx, u in enumerate(tracked, 1):
             watched = watched_by_user.get(u["safe_user"], set())
@@ -287,8 +292,10 @@ class PlexPlaylistBuilderManager(BaseManager):
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))
             reasons = self._tv_reasons(user_owned, inventory, series_genres, user_aff, user_jit)
             self._log_preview(u, plan, stats, display, reasons, label="episode",
-                              anon=anon_label(u.get("title"), tier_name, idx))
+                              anon=anon_label(u.get("title"), tier_name, idx),
+                              certs=cert_by_rk, level=level)
             built += 1
+        self._emit_summary_grid("[dry-run] TV playlists - per-profile summary")
         self.logger.log_info(f"[Playlists] built {built} per-user TV plan(s) (dry-run — no Plex writes).")
         return {"users": len(tracked), "built": built, "can_build": True}
 
@@ -306,14 +313,23 @@ class PlexPlaylistBuilderManager(BaseManager):
 
     def _log_preview(self, user, plan, stats, display: dict, reasons=None, *,
                      kinds=None, label: str = "episode", family_label: str = "Up Next",
-                     anon: str | None = None):
-        """Preview grid: ``# | Title | [Kind] | Rank | Why``.
+                     anon: str | None = None, certs=None, level: int = ADULT):
+        """Record ONE summary row for this (playlist family x profile) and MIRROR the full
+        per-item preview (``# | Title | [Kind] | Rank | Why``) into support/logs/playlists.log.
+
+        Deliberately emits NO grid to the main run log: a household of N profiles times the
+        playlist families each builder makes used to flood the shell with N x families 25-row
+        grids saying little the operator could act on. The per-item detail is unchanged in the
+        playlists.log mirror (the operator drill-down); the run log instead gets ONE compact
+        table per builder from :meth:`_emit_summary_grid`.
 
         ``Rank`` = the per-user priority_score the block is ordered on (affinity > JIT >
         household; 2dp so it stays discriminating). ``Why`` = the human rationale (from the
         ``reasons`` map keyed by ratingKey — genres/JIT/cast/crew/franchise — falling back
         to the brain's group reason). ``Kind`` (TV/Movie) only shows for the combined plan
-        (``kinds`` given). ``label`` makes the header medium-correct (episode/movie/item)."""
+        (``kinds`` given). ``label`` makes the header medium-correct (episode/movie/item).
+        ``certs`` (ratingKey -> certification) + ``level`` (the profile's resolved age tier)
+        are the age-gate evidence for the summary row."""
         title = user.get("title") or user.get("safe_user") or "?"
         reasons = reasons or {}
         show_kind = kinds is not None
@@ -328,15 +344,8 @@ class PlexPlaylistBuilderManager(BaseManager):
             rows.append(row + [score, why])
         # The SHAREABLE run log gets the de-identified handle (anon, e.g. 'T - adult 1'); the real
         # name only ever reaches the local playlists.log mirror below.
-        who = anon or title
-        header = (f"[dry-run] '{who}' {family_label} - {len(plan.items)} {label}(s), "
-                  f"{stats.get('unresolved', 0)} unmatched")
-        cols = ["#", "Title"] + (["Kind"] if show_kind else []) + ["Rank", "Why"]
-        grid = getattr(self.logger, "log_grid", None)
-        if callable(grid) and rows:
-            grid(cols, rows, title=header, cap=44)
-        else:
-            self.logger.log_info(f"[Playlists] {header}")
+        self._add_summary_row(family_label=family_label, who=anon or title, plan=plan,
+                              certs=certs, level=level)
         # Mirror the full preview into the dedicated, per-run support/logs/playlists.log so the
         # complete per-profile contents stay inspectable without bloating the main run log. This
         # file is a LOCAL operator drill-down (not shared), so it KEEPS the real profile name to
@@ -348,6 +357,73 @@ class PlexPlaylistBuilderManager(BaseManager):
             to_file("playlists", file_header)
             for r in rows:
                 to_file("playlists", "  " + " | ".join(str(c) for c in r))
+
+    # ── per-builder run-log SUMMARY (replaces the per-playlist preview grids) ────
+    # ONE table per LIBRARY/MEDIUM (TV builder, MOVIE builder, COMBINED builder), emitted
+    # after that builder's per-user loop and only when it actually produced plans. Each row
+    # is one (playlist family x profile) and carries the CERTIFICATION EVIDENCE needed to
+    # validate the parental-controls gating at a glance — the ceiling the profile permits
+    # next to the strictest certification the generated plan actually contains.
+    _SUMMARY_COLS = ("Playlist", "Profile", "Items", "Allowed", "Strictest", "Unrated", "Cert")
+    _SUMMARY_CAPTION = (
+        "One row per playlist x profile. Allowed = the certification ceiling this profile's "
+        "parental-controls tier permits; Strictest = the most mature certification actually "
+        "present in the generated plan; Unrated = items carrying no recognised certification "
+        "(admitted via the Common Sense age fallback - never a violation, but the leak path "
+        "worth watching); Cert = OK, or VIOLATION when the plan holds something the age gate "
+        "should have rejected. Per-item previews are mirrored to support/logs/playlists.log.")
+
+    def _begin_summary(self) -> None:
+        """Start a fresh accumulation for THIS builder's summary table (call before the
+        per-user loop, so a re-run of the same manager never doubles its rows)."""
+        self._summary_rows: list = []
+
+    def _add_summary_row(self, *, family_label, who, plan, certs=None, level: int = ADULT) -> None:
+        """Accumulate ONE (playlist family x profile) row. ``certs`` maps a plan item's
+        ratingKey to its certification; a missing/unrecognised entry lands in the unrated
+        bucket (never a violation — see :func:`cert_summary`). ``certs=None`` means the
+        medium can't reach certification here: the cert columns render as ``-`` rather than
+        claiming a clean bill of health we didn't actually check."""
+        rows = getattr(self, "_summary_rows", None)
+        if rows is None:
+            rows = self._summary_rows = []
+        if certs is None:
+            ev = {"ceiling": tier_ceiling(level), "strictest": "-", "unknown": "-",
+                  "violations": 0}
+            flag = "-"
+        else:
+            item_certs = [certs.get(i.rating_key, certs.get(str(i.rating_key)))
+                          for i in plan.items]
+            ev = cert_summary(item_certs, level)
+            flag = "OK" if not ev["violations"] else f"VIOLATION x{ev['violations']}"
+        rows.append([str(family_label), str(who), str(len(plan.items)),
+                     ev["ceiling"], ev["strictest"], str(ev["unknown"]), flag])
+
+    def _emit_summary_grid(self, title: str) -> None:
+        """Emit this builder's ONE summary table. A no-op when the builder produced no plans
+        (nothing accumulated), so a household with only one enabled medium sees only that
+        medium's table. Falls back to one info line per row for a logger with no ``log_grid``."""
+        rows = getattr(self, "_summary_rows", None)
+        if not rows:
+            return
+        cols = list(self._SUMMARY_COLS)
+        grid = getattr(self.logger, "log_grid", None)
+        if not callable(grid):                    # a logger with no table support at all
+            for r in rows:
+                self.logger.log_info(f"[Playlists] {title} | " + " | ".join(r))
+            return
+        # ``caption`` is probed rather than assumed so a minimal logger stub predating it still
+        # gets the table (probing beats try/except TypeError, which could re-emit on a genuine
+        # TypeError raised INSIDE the logger).
+        try:
+            import inspect
+            has_caption = "caption" in inspect.signature(grid).parameters
+        except (TypeError, ValueError):
+            has_caption = False
+        if has_caption:
+            grid(cols, rows, title=title, cap=44, caption=self._SUMMARY_CAPTION)
+        else:
+            grid(cols, rows, title=title, cap=44)
 
     @staticmethod
     def _per_user_series_scores(series_scores, series_genres, user_aff, user_jit, hh_max, weights,
@@ -386,6 +462,22 @@ class PlexPlaylistBuilderManager(BaseManager):
             out[rk] = explain_reason(
                 series_genres.get(sid), user_aff,
                 is_jit=(int(sid) in user_jit) if sid is not None else False)
+        return out
+
+    @staticmethod
+    def _tv_cert_by_rk(owned_eps, inventory, series_certs) -> dict:
+        """``{ratingKey: certification}`` for the TV summary's cert evidence — the SAME
+        ``series_certs`` map the age gate filtered on, re-keyed from series_id to the plan's
+        ratingKeys through the owned-episode join (mirrors :meth:`_tv_reasons`). An episode
+        of a series with no Sonarr certification maps to ``None`` → the unrated bucket."""
+        out: dict = {}
+        for ep in owned_eps or []:
+            jk = ep.get("tvdb_join_key")
+            match = (inventory or {}).get(jk) if jk else None
+            rk = str(match["rating_key"]) if (match and match.get("rating_key")) else None
+            if rk is None or rk in out:
+                continue
+            out[rk] = (series_certs or {}).get(ep.get("series_id"))
         return out
 
     @staticmethod

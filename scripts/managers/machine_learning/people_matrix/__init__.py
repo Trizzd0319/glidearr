@@ -8,14 +8,20 @@ read the resulting inverted index + forward map. See ``build.py`` and the design
 from __future__ import annotations
 
 from scripts.managers.machine_learning.people_matrix.build import (
+    BILLED_ROLES,
+    PERSON_BILLING_DECAY,
     PERSON_ROLE_WEIGHTS,
+    RELATION_ROLE_TYPES,
     ROLES,
+    billing_weight,
     build_index,
     co_occurring,
     deserialize_forward,
     deserialize_names,
     films_with_all,
+    forward_from_relations,
     invert_forward,
+    merge_forward,
     route_people,
     route_people_names,
     serialize_forward,
@@ -23,7 +29,9 @@ from scripts.managers.machine_learning.people_matrix.build import (
 )
 
 __all__ = [
-    "PERSON_ROLE_WEIGHTS", "ROLES", "build_index", "co_occurring",
-    "deserialize_forward", "deserialize_names", "films_with_all", "invert_forward",
+    "BILLED_ROLES", "PERSON_BILLING_DECAY", "PERSON_ROLE_WEIGHTS",
+    "RELATION_ROLE_TYPES", "ROLES", "billing_weight", "build_index", "co_occurring",
+    "deserialize_forward", "deserialize_names", "films_with_all",
+    "forward_from_relations", "invert_forward", "merge_forward",
     "route_people", "route_people_names", "serialize_forward", "serialize_names",
 ]

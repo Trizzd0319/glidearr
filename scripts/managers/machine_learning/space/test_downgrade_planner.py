@@ -278,3 +278,197 @@ def test_series_oversized_lower_tier_profile_excluded():
     df = pd.DataFrame([_ep(1, 2160, 5.0, 0) for _ in range(4)])
     cands, _ = _plan_series_tier(df, need_gb=2.0)
     assert cands[0]["target_id"] == 2
+
+
+# ══ EXHAUSTIVE mode (space_exhaustive_downgrade, DEFAULT ON at the service) ══════
+# "Deletion is the TRUE last resort": downgrade EVERYTHING that can still be downgraded
+# before ANYTHING is deleted. The planner therefore (a) drops the watchability CEILING as
+# an eligibility filter and (b) spreads to FULL DEPTH instead of stopping at need_gb — the
+# APPLYING pass is what stops at the band top U. Ordering and every other guard are unchanged.
+def _plan_x(df, *, need_gb, score_map=None, protect_threshold=6):
+    score_map = score_map if score_map is not None else {i: 0 for i in df.index}
+    return plan_movie_downgrades(
+        df, score_map, _RANKED, need_gb=need_gb, recent_cutoff=_CUTOFF,
+        active_colls=set(), protect_threshold=protect_threshold, floor_resolution=720,
+        exhaustive=True,
+    )
+
+
+def test_exhaustive_ignores_the_score_ceiling_but_keeps_ordering():
+    # A 4K title scoring 99 (far over the protect threshold) is normally excluded outright.
+    # Exhaustive ADMITS it — it still has quality to shed before any title is deleted — and it
+    # sorts LAST, behind the score-0 title (ascending watchability is unchanged).
+    df = pd.DataFrame([_row(1, 2160, 20.0), _row(2, 2160, 20.0)])
+    cands, stats = _plan_x(df, need_gb=5.0, score_map={0: 99, 1: 0})
+    assert [c["movie_id"] for c in cands] == [2, 1]          # lowest score first
+    assert stats["skipped_high_score"] == 0
+    assert stats["over_ceiling_included"] == 1 and stats["exhaustive"] is True
+    # …and the legacy path still excludes it:
+    legacy, lstats = _plan(df, need_gb=5.0, score_map={0: 99, 1: 0})
+    assert [c["movie_id"] for c in legacy] == [2] and lstats["skipped_high_score"] == 1
+
+
+def test_exhaustive_preserves_keep_universe_and_recent_guards():
+    # Only the CEILING is relaxed. Every other guard is untouched, so a keep-tagged title, a
+    # keep_universe title, a hot-saga (credit) title and a recently-watched title all still skip.
+    df = pd.DataFrame([
+        _row(1, 2160, 20.0, keep_policy="keep_movie"),
+        _row(2, 2160, 20.0, keep_policy="keep_universe"),
+        _row(3, 2160, 20.0, universe_credit=2.0),
+        dict(_row(4, 2160, 20.0), is_watched=True, last_watched_at="2026-06-01T00:00:00Z"),
+        _row(5, 720, 20.0),                                   # already at the floor
+        _row(6, 2160, 20.0),                                  # the only real candidate
+    ])
+    cands, stats = _plan_x(df, need_gb=999.0, score_map={i: 99 for i in range(6)})
+    assert [c["movie_id"] for c in cands] == [6]
+    assert stats["skipped_protected"] == 2 and stats["skipped_universe"] == 1
+    assert stats["skipped_recent"] == 1 and stats["already_at_720p"] == 1
+
+
+def test_exhaustive_plans_every_title_down_to_the_floor():
+    # Legacy: a small need stops the spread after ONE tier each (4K -> 1080).
+    # Exhaustive: no early stop — every eligible title is planned all the way to 720.
+    df = pd.DataFrame([_row(i, 2160, 20.0) for i in (1, 2, 3)])
+    legacy, _ = _plan(df, need_gb=20.0, score_map={0: 0, 1: 1, 2: 2})
+    assert all(c["target_id"] == 12 for c in legacy)           # 1080 only
+    cands, stats = _plan_x(df, need_gb=20.0, score_map={0: 0, 1: 1, 2: 2})
+    assert [c["movie_id"] for c in cands] == [1, 2, 3]
+    assert all(c["target_id"] == 11 for c in cands)            # 720 floor — nothing left to shrink
+    assert stats["target_met"]
+
+
+def test_exhaustive_never_steps_below_the_720_floor():
+    # The 480 rung (id 10) is in the ladder but is BELOW the floor — full-depth exhaustion
+    # still stops at 720. (The sub-720 escape hatch lives in the release picker, and only
+    # fires when no >=720 release exists at all.)
+    df = pd.DataFrame([_row(1, 2160, 40.0)])
+    cands, _ = _plan_x(df, need_gb=10_000.0)
+    assert cands[0]["target_id"] == 11
+
+
+def test_series_exhaustive_ignores_ceiling_and_plans_to_the_floor():
+    df = pd.DataFrame([
+        _ep(1, 2160, 10.0, 99), _ep(1, 2160, 10.0, 99),        # over the ceiling
+        _ep(2, 2160, 10.0, 0), _ep(2, 2160, 10.0, 0),
+    ])
+    cands, stats = plan_series_downgrades(
+        df, _RANKED, need_gb=5.0, ceiling=20, watch_cutoff=_CUTOFF, air_cutoff=_CUTOFF,
+        keep_tags=frozenset({"keep_series", "keep_season"}), default_runtime_min=45.0,
+        floor_resolution=720, exhaustive=True,
+    )
+    assert [c["sid"] for c in cands] == [2, 1]                 # ascending score, unchanged
+    assert all(c["target_id"] == 11 for c in cands)            # both planned to the floor
+    assert stats["skipped_high_score"] == 0 and stats["over_ceiling_included"] == 1
+
+
+def test_series_exhaustive_preserves_keep_recent_and_universe_guards():
+    df = pd.DataFrame([
+        _ep(1, 2160, 10.0, 99, keep_policy="keep_series"),
+        _ep(2, 2160, 10.0, 99, universe_credit=2.0),
+        _ep(3, 2160, 10.0, 99, last_watched="2026-06-01T00:00:00Z"),
+        _ep(4, 2160, 10.0, 99, air_date="2026-06-01T00:00:00Z"),
+        _ep(5, 720, 10.0, 99),
+    ])
+    cands, stats = plan_series_downgrades(
+        df, _RANKED, need_gb=999.0, ceiling=20, watch_cutoff=_CUTOFF, air_cutoff=_CUTOFF,
+        keep_tags=frozenset({"keep_series", "keep_season"}), default_runtime_min=45.0,
+        floor_resolution=720, exhaustive=True,
+    )
+    assert cands == []
+    assert stats["skipped_protected"] == 1 and stats["skipped_universe"] == 1
+    assert stats["skipped_recent"] == 2 and stats["skipped_already"] == 1
+
+
+# ── exhaustive=False is byte-identical to today's planner on a synthetic library ──
+def _synthetic_library():
+    """A 12-title mixed library: 4K/1080/720 at a spread of scores, plus every guard
+    class (keep tag, keep_universe, hot-saga credit, recently watched, at-floor, and a
+    would-upgrade tiny file). Exercises ordering, spread depth and every skip counter."""
+    rows = [
+        _row(1, 2160, 40.0),
+        _row(2, 2160, 22.0),
+        _row(3, 1080, 9.0),
+        _row(4, 1080, 7.5),
+        _row(5, 720, 3.0),                                     # at floor
+        _row(6, 2160, 30.0, keep_policy="keep_movie"),
+        _row(7, 2160, 30.0, keep_policy="keep_universe"),
+        _row(8, 2160, 30.0, universe_credit=2.0),
+        dict(_row(9, 2160, 30.0), is_watched=True, last_watched_at="2026-06-15T00:00:00Z"),
+        _row(10, 1080, 0.4),                                   # step-down would re-grab BIGGER
+        _row(11, 2160, 18.0, runtime=140.0),
+        _row(12, 1080, 12.0, runtime=140.0),
+    ]
+    scores = {i: s for i, s in enumerate([2, 8, 1, 30, 0, 0, 0, 0, 0, 0, 15, 4])}
+    return pd.DataFrame(rows), scores
+
+
+def test_exhaustive_off_is_byte_identical_to_todays_planner():
+    # FROZEN oracle: the exact candidate list + stats today's planner produces for the
+    # synthetic library. space_exhaustive_downgrade=false must reproduce it verbatim.
+    df, scores = _synthetic_library()
+    cands, stats = plan_movie_downgrades(
+        df, scores, _RANKED, need_gb=45.0, recent_cutoff=_CUTOFF, active_colls=set(),
+        protect_threshold=20, floor_resolution=720, exhaustive=False,
+    )
+    assert [(c["movie_id"], c["target_id"], c["reclaim_gb"], c["score"]) for c in cands] == [
+        (3, 11, 6.07, 1),
+        (1, 12, 33.164, 2),
+        (12, 11, 7.898, 4),
+    ]
+    assert stats == {
+        "candidates_found": 3, "already_at_720p": 2, "skipped_protected": 2,
+        "skipped_high_score": 1, "skipped_recent": 1, "skipped_universe": 1,
+        "est_reclaim_gb": 47.13, "target_met": True,
+        # the two exhaustive-mode counters are the ONLY additions, and are inert here
+        "exhaustive": False, "over_ceiling_included": 0,
+    }
+
+
+def test_exhaustive_on_extends_that_same_library_to_the_floor():
+    # Same synthetic library, exhaustive: the score-30 title (over the ceiling) joins, the
+    # spread runs past need_gb, and EVERY candidate lands on the 720 floor. Ordering is still
+    # ascending watchability, and the three guard classes still hold.
+    df, scores = _synthetic_library()
+    cands, stats = plan_movie_downgrades(
+        df, scores, _RANKED, need_gb=45.0, recent_cutoff=_CUTOFF, active_colls=set(),
+        protect_threshold=20, floor_resolution=720, exhaustive=True,
+    )
+    assert [(c["movie_id"], c["target_id"], c["score"]) for c in cands] == [
+        (3, 11, 1), (1, 11, 2), (12, 11, 4), (2, 11, 8), (11, 11, 15), (4, 11, 30),
+    ]
+    assert stats["over_ceiling_included"] == 1 and stats["skipped_high_score"] == 0
+    # the guards are untouched: same keep/universe/recent/at-floor counts as the legacy run
+    assert (stats["skipped_protected"], stats["skipped_universe"],
+            stats["skipped_recent"], stats["already_at_720p"]) == (2, 1, 1, 2)
+
+
+def test_exhaustive_off_matches_the_pre_change_spread_oracle():
+    # Independent check of the same claim: re-implement the ORIGINAL _spread_to_target
+    # verbatim and confirm the shipped one (exhaustive defaulted off) still agrees.
+    def _legacy_spread(eligible, need_gb):
+        for e in eligible:
+            e["_depth"] = 0
+        total = 0.0
+        progressed = True
+        while total < need_gb and progressed:
+            progressed = False
+            for e in eligible:
+                d = e["_depth"]
+                cum = e["cum_reclaim"]
+                if d >= len(cum):
+                    continue
+                prev = cum[d - 1] if d > 0 else 0.0
+                total += cum[d] - prev
+                e["_depth"] = d + 1
+                progressed = True
+                if total >= need_gb:
+                    break
+        return total
+
+    from scripts.managers.machine_learning.space.downgrade_planner import _spread_to_target
+    for need in (0.0, 3.0, 12.5, 40.0, 999.0):
+        items = [{"cum_reclaim": [2.0, 5.0, 6.0]}, {"cum_reclaim": [1.0]},
+                 {"cum_reclaim": []}, {"cum_reclaim": [4.0, 9.0]}]
+        legacy_items = [dict(i) for i in items]
+        assert _spread_to_target(items, need) == _legacy_spread(legacy_items, need)
+        assert [i["_depth"] for i in items] == [i["_depth"] for i in legacy_items]

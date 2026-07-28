@@ -67,6 +67,14 @@ class TraktManager(BaseManager, ComponentManagerMixin):
         self.trakt_api.recommendations.get_recommendations_shows()
         self.trakt_api.recommendations.get_recommendations_movies()
         self.trakt_api.watchlist.get_watchlist_shows()
+        # The MOVIE watchlist was never fetched here even though the manager has always
+        # exposed it, so ``trakt/{user}/watchlist/movies`` had never been written — the
+        # acquisition path calls it lazily, and acquisition is off by default. Group-A5
+        # reads BOTH halves (Trakt is the only feed carrying a real ``listed_at``, so it is
+        # the only place the staleness term has evidence to work with), and a TV-only
+        # watchlist would have meant movie intent silently had no dated source at all.
+        # One extra cached call per run; the cache key is the same shape as the show one.
+        self.trakt_api.watchlist.get_watchlist_movies()
 
         # Fetch progress once, then reuse it for auto-rating (avoids a second
         # round of ~150 per-show API calls inside auto_rate_watched_shows).

@@ -56,6 +56,7 @@ _TOUCHGO_PLAN_KEY = "plex/playlists/touchgo_plan"      # Touch & Go (low-commitm
 _FRESH_PLAN_KEY = "plex/playlists/fresh_movie_plan"    # Fresh Arrivals (genuinely-new acquisitions)
 _TWIH_MOVIE_PLAN_KEY = "plex/playlists/twih_movie_plan"  # Anniversary Picks (movies, this week in history)
 _TWIH_SHOW_PLAN_KEY = "plex/playlists/twih_show_plan"    # On This Week (shows, this week in history)
+_GEMS_PLAN_KEY = "plex/playlists/gems_plan"              # Hidden Gems (owned + never played + taste-matched)
 
 # The default ALWAYS-written family — combined > tv > movie precedence, titled "Up Next".
 # Its suffix is the one that keeps the LEGACY anchor key (== safe_user), so it's a shared
@@ -140,6 +141,7 @@ class PlaylistWritebackManager(BaseManager):
         mood = bool((self._pl_cfg().get("mood_lists", {}) or {}).get("enabled", False))
         fresh = bool((self._pl_cfg().get("fresh_arrivals", {}) or {}).get("enabled", False))
         disc = bool((self._pl_cfg().get("this_week_in_history", {}) or {}).get("enabled", False))
+        gems = bool((self._pl_cfg().get("hidden_gems", {}) or {}).get("enabled", False))
         return [
             (_UP_NEXT, True),
             ({"suffix": "The Long Glide", "keys": (_GLIDE_PLAN_KEY,)}, mood),
@@ -147,6 +149,7 @@ class PlaylistWritebackManager(BaseManager):
             ({"suffix": "Fresh Arrivals", "keys": (_FRESH_PLAN_KEY,)}, fresh),
             ({"suffix": "Anniversary Picks", "keys": (_TWIH_MOVIE_PLAN_KEY,)}, disc),
             ({"suffix": "On This Week", "keys": (_TWIH_SHOW_PLAN_KEY,)}, disc),
+            ({"suffix": "Hidden Gems", "keys": (_GEMS_PLAN_KEY,)}, gems),
         ]
 
     # ── run (I/O gather → tested core) ────────────────────────────────────────

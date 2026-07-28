@@ -43,6 +43,15 @@ _PROTECTED_KEY = "plex/playlists/protected_movie_tmdbs/movie"
 class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
     parent_name = "PlexManager"
 
+    # movie_files columns :meth:`_load_owned_movies` projects. A CLASS attribute so a subclass
+    # that needs more of the row (the Hidden Gems shelf reads watchability_breakdown + the
+    # cast/director credits) extends the list instead of forking the loader; the base list is
+    # exactly what it always was, so the shipped builders are byte-identical.
+    _OWNED_MOVIE_COLUMNS = ("tmdb_id", "title", "year", "watchability_score", "genres",
+                            "certification", "collection_tmdb_id", "collection_name",
+                            "universe_name", "in_cinemas_date", "digital_release_date",
+                            "physical_release_date", "added_at", "has_file")
+
     # ── run (I/O gather → tested core) ──────────────────────────────────────────
     def run(self) -> dict:
         tracked = self._tracked_users()
@@ -117,7 +126,9 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                    (f"{v.get('title', '')} ({v.get('year')})" if v.get("year") else (v.get("title", "") or str(v.get("rating_key"))))
                    for v in inventory.values() if v.get("rating_key")}
         rk_to_tmdb = self._inventory_rk_to_tmdb(inventory)   # plan ratingKey -> Radarr tmdbId
+        cert_by_rk = self._movie_cert_by_rk(owned, inventory)   # plan ratingKey -> certification
         protected: set = set()                               # recommended movie tmdbIds (delete shield)
+        self._begin_summary()
         built = 0
         for idx, u in enumerate(tracked, 1):
             watched = watched_by_user.get(u["safe_user"], set())
@@ -170,7 +181,8 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                              if (t := rk_to_tmdb.get(str(i.rating_key))) is not None)
             reasons = self._movie_reasons(user_owned, inventory, user_aff)
             who = anon_label(u.get("title"), tier_name, idx)
-            self._log_preview(u, plan, stats, display, reasons, label="movie", anon=who)
+            self._log_preview(u, plan, stats, display, reasons, label="movie", anon=who,
+                              certs=cert_by_rk, level=level)
 
             # Fresh Arrivals (opt-in): a SECOND per-user plan, filtered to genuinely-new
             # acquisitions (churn-immune movie.added) within the window, ranked by the same
@@ -184,9 +196,11 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                 protected.update(t for i in fplan.items
                                  if (t := rk_to_tmdb.get(str(i.rating_key))) is not None)
                 self._log_preview(u, fplan, fstats, display, reasons, label="movie",
-                                  family_label="Fresh Arrivals", anon=who)
+                                  family_label="Fresh Arrivals", anon=who,
+                                  certs=cert_by_rk, level=level)
             built += 1
         self._publish_protected_movie_tmdbs(_PROTECTED_KEY, protected)
+        self._emit_summary_grid("[dry-run] Movie playlists - per-profile summary")
         self.logger.log_info(f"[MoviePlaylists] built {built} per-user movie plan(s) (dry-run — no Plex writes).")
         return {"users": len(tracked), "built": built, "can_build": True}
 
@@ -278,6 +292,21 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                 universe_name=_coll_key(m.get("universe_name")))
         return out
 
+    def _movie_cert_by_rk(self, owned, inventory) -> dict:
+        """``{ratingKey: certification}`` for the movie summary's cert evidence — the SAME
+        Radarr ``certification`` field the age gate filtered on, re-keyed from tmdb_id to
+        the plan's ratingKeys through the owned inventory (mirrors :meth:`_movie_reasons`).
+        An uncertified movie maps to ``None`` → the unrated bucket."""
+        out: dict = {}
+        for m in owned or []:
+            tmdb = self._coerce_int(m.get("tmdb_id"))
+            match = (inventory or {}).get(str(tmdb)) if tmdb is not None else None
+            rk = str(match["rating_key"]) if (match and match.get("rating_key")) else None
+            if rk is None or rk in out:
+                continue
+            out[rk] = m.get("certification")
+        return out
+
     def _watched_movies_for(self, user_id) -> set:
         if user_id is None or not self.registry:
             return set()
@@ -329,10 +358,7 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
             return []
         import pandas as pd
         base = self.global_cache.key_builder.base_dir
-        want = ["tmdb_id", "title", "year", "watchability_score", "genres", "certification",
-                "collection_tmdb_id", "collection_name", "universe_name",
-                "in_cinemas_date", "digital_release_date", "physical_release_date",
-                "added_at", "has_file"]
+        want = list(self._OWNED_MOVIE_COLUMNS)
         seen: dict = {}
         for path in sorted((base / "radarr").glob("*/movie_files.parquet")):
             try:
