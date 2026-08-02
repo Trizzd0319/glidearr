@@ -1,7 +1,5 @@
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
@@ -53,9 +51,13 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
     def get_history(self, page: int = 1, limit: int = 1_000):
         if not self.trakt_api:
             return None
+        # Trakt takes the media type as a PATH segment with a PLURAL name
+        # (sync/history/episodes). ``type=episode`` as a QUERY param is not a
+        # recognised parameter - it was silently dropped, so this returned the
+        # UNFILTERED history and the movie fetch below got the identical payload.
         return self.trakt_api._make_request(
-            "sync/history",
-            params={"page": page, "limit": limit, "type": "episode"},
+            "sync/history/episodes",
+            params={"page": page, "limit": limit},
         )
 
     def get_full_watch_history(self) -> list:
@@ -93,7 +95,7 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
         )
 
     def _fetch_full_movie_history(self):
-        """Paginate through sync/history?type=movie and return the full list.
+        """Paginate through sync/history/movies and return the full list.
 
         Returns None (not []) if a page request fails — e.g. the call was
         rate-limited and skipped — so the cache layer serves the last-good
@@ -109,8 +111,8 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
         self.logger.log_info("[TraktHistory] Fetching all movie history (paginated)...")
         while True:
             items = self.trakt_api._make_request(
-                "sync/history",
-                params={"page": page, "limit": 100, "type": "movie"},
+                "sync/history/movies",
+                params={"page": page, "limit": 100},
             )
             if items is None:
                 # Request failed (likely rate-limited) — defer to cached history
@@ -144,23 +146,64 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
 
     # ── Threaded Fetch ────────────────────────────────────────────────────
 
-    def fetch_all_history_threaded(self, max_pages: int = 1_000, limit: int = 100) -> list:
-        all_items: list = []
+    def fetch_all_history_threaded(self, max_pages: int = 1_000, limit: int = 100,
+                                   kind: str = "episodes", workers: int = 5):
+        """Paginated history fetch - ``workers`` pages in flight, rows in PAGE ORDER.
+
+        Returns the full list, or ``None`` if a page request failed (rate-limited),
+        so a caller can serve its last-good cache instead of a partial list - the
+        same contract as ``_fetch_full_movie_history``.
+
+        ``kind`` is the Trakt PATH segment (``episodes`` / ``movies``); pass None
+        for the unfiltered feed.
+
+        REWRITTEN. The previous version submitted EVERY page up front
+        (``range(1, max_pages + 1)``), and neither of its ``break`` statements
+        cancelled a queued future - ``ThreadPoolExecutor.__exit__`` calls
+        ``shutdown(wait=True)``, so all 1000 requests were issued regardless of
+        when it stopped reading. ``as_completed`` also yields in COMPLETION order,
+        not page order, so the short-page stop test fired on whichever page
+        returned first - usually an EMPTY page past the end of history - which
+        truncated the result to near-nothing while the rest of the requests kept
+        hammering Trakt. It could not return a valid array.
+        """
+        endpoint = f"sync/history/{kind}" if kind else "sync/history"
 
         def fetch_page(page_num):
-            return self.trakt_api._make_request("sync/history", params={"page": page_num, "limit": limit})
+            return self.trakt_api._make_request(
+                endpoint, params={"page": page_num, "limit": limit}
+            )
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(fetch_page, i): i for i in range(1, max_pages + 1)}
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Fetching Trakt History"):
-                items = future.result()
-                if not items:
-                    break
-                all_items.extend(items)
-                if len(items) < limit:
-                    break
+        all_items: list = []
+        page = 1
+        done = False
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            while not done and page <= max_pages:
+                wave = list(range(page, min(page + workers, max_pages + 1)))
+                # Submit ONE wave and wait for it. executor.map yields results in
+                # INPUT order, so pages concatenate correctly, concurrency stays
+                # bounded at `workers`, and nothing is left queued when we stop.
+                for pnum, items in zip(wave, list(executor.map(fetch_page, wave))):
+                    if items is None:
+                        self.logger.log_warning(
+                            f"[TraktHistory] threaded fetch interrupted at page "
+                            f"{pnum} (rate-limited) - returning None so the caller "
+                            f"keeps its last-good cache."
+                        )
+                        return None
+                    if not items:
+                        done = True
+                        break
+                    all_items.extend(items)
+                    if len(items) < limit:
+                        done = True
+                        break
+                page += len(wave)
 
-        self.logger.log_info(f"[TraktHistory] Retrieved {len(all_items)} items (threaded).")
+        self.logger.log_info(
+            f"[TraktHistory] Retrieved {len(all_items)} {kind or 'history'} "
+            f"item(s) (threaded)."
+        )
         return all_items
 
     # ── Grouped History ───────────────────────────────────────────────────
@@ -180,10 +223,133 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
 
         return dict(grouped)
 
-    def get_series_watch_counts(self) -> dict:
+    def get_series_watch_counts(self, id_source: str = "trakt") -> dict:
+        """``{series_id: episode_play_count}`` across the user's episode history.
+
+        History rows carry NO top-level ``trakt_id`` - a show's ids live at
+        ``entry["show"]["ids"]``. The previous lookup read that absent top-level
+        key, so this returned ``{}`` on EVERY call no matter how large the
+        history was (0 of 1913 rows carried it).
+
+        ``id_source`` selects which id keys the map: ``"trakt"`` (default) or
+        ``"tvdb"`` to match ``get_history_grouped_by_series`` and Sonarr's own
+        series keying.
+        """
         counts: dict = defaultdict(int)
         for entry in self.get_full_watch_history():
-            trakt_id = entry.get("trakt_id")
-            if trakt_id:
-                counts[trakt_id] += 1
+            if not entry.get("episode"):
+                continue                       # movie rows carry no show/episode
+            sid = ((entry.get("show") or {}).get("ids") or {}).get(id_source)
+            if sid:
+                counts[sid] += 1
         return dict(counts)
+
+    # ── DataFrame projection ────────────────────────────────────────────
+
+    # Stable flat schema. Movies and episodes SHARE it: for a movie row the bare
+    # id columns describe the film and every show_* column is null; for an episode
+    # they describe the episode and the show_* columns its parent. ``title`` is
+    # deliberately the SHOW title on episode rows - it is the useful grouping key -
+    # with the episode's own name kept in ``episode_title``.
+    HISTORY_DF_COLUMNS = (
+        "play_id", "watched_at", "watched_date", "days_since", "action", "type",
+        "title", "year", "season", "episode", "episode_title",
+        "tmdb_id", "tvdb_id", "imdb_id", "trakt_id",
+        "show_title", "show_tmdb_id", "show_tvdb_id", "show_imdb_id", "show_trakt_id",
+    )
+
+    _DF_NUMERIC = (
+        "play_id", "year", "season", "episode", "days_since",
+        "tmdb_id", "tvdb_id", "trakt_id",
+        "show_tmdb_id", "show_tvdb_id", "show_trakt_id",
+    )
+
+    @staticmethod
+    def _project_history_row(entry: dict) -> dict:
+        """One raw Trakt history row -> one flat dict keyed by HISTORY_DF_COLUMNS."""
+        kind = entry.get("type")
+        # "movie" -> entry["movie"], "episode" -> entry["episode"]
+        item = entry.get(kind) or {}
+        show = entry.get("show") or {}
+        iids = item.get("ids") or {}
+        sids = show.get("ids") or {}
+        return {
+            "play_id":       entry.get("id"),
+            "watched_at":    entry.get("watched_at"),
+            "action":        entry.get("action"),
+            "type":          kind,
+            "title":         show.get("title") or item.get("title"),
+            "year":          show.get("year") or item.get("year"),
+            "season":        item.get("season"),
+            "episode":       item.get("number"),
+            "episode_title": item.get("title") if kind == "episode" else None,
+            "tmdb_id":       iids.get("tmdb"),
+            "tvdb_id":       iids.get("tvdb"),
+            "imdb_id":       iids.get("imdb"),
+            "trakt_id":      iids.get("trakt"),
+            "show_title":    show.get("title"),
+            "show_tmdb_id":  sids.get("tmdb"),
+            "show_tvdb_id":  sids.get("tvdb"),
+            "show_imdb_id":  sids.get("imdb"),
+            "show_trakt_id": sids.get("trakt"),
+        }
+
+    def history_dataframe(self, kind: str = "episodes", *, rows: list | None = None):
+        """Flat, filterable DataFrame of the Trakt watch history.
+
+        ``kind``  "episodes" | "movies" | "all" - which feed to project.
+        ``rows``  project a caller-supplied raw list instead of fetching. Use this
+                  for one-off analysis, tests, or to avoid a second network call
+                  when the caller already holds the history.
+
+        NOTE the two feeds differ in cost: the movie side is served by the 24h
+        ``get_full_movie_history_cached``, the episode side re-paginates live on
+        every call. Pass ``rows`` if you are calling this in a loop.
+
+        Always returns the FULL column set - an empty history yields an empty
+        frame with typed columns, so a caller can filter without a KeyError.
+
+        Typical use::
+
+            df = mgr.history_dataframe("movies")
+            df[df.days_since <= 90]                       # recent window
+            df.groupby("tmdb_id").size()                  # plays per film
+            df[df.title.str.contains("Tangled", na=False)]
+        """
+        import pandas as pd
+
+        if rows is None:
+            rows = []
+            if kind in ("episodes", "all"):
+                rows += list(self.get_full_watch_history() or [])
+            if kind in ("movies", "all"):
+                rows += list(self.get_full_movie_history_cached() or [])
+
+        df = pd.DataFrame(
+            [self._project_history_row(r) for r in (rows or [])],
+            columns=list(self.HISTORY_DF_COLUMNS),
+        )
+        df["watched_at"] = pd.to_datetime(df["watched_at"], utc=True, errors="coerce")
+        df["watched_date"] = df["watched_at"].dt.date
+        df["days_since"] = (pd.Timestamp.now(tz="UTC") - df["watched_at"]).dt.days
+        for col in self._DF_NUMERIC:
+            # Int64 (nullable) - a missing tvdb on a movie row must stay null
+            # rather than silently becoming 0 and colliding with a real id.
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+        return df.sort_values("watched_at", ascending=False).reset_index(drop=True)
+
+    def save_history_parquet(self, path, kind: str = "all", *, rows: list | None = None):
+        """Write :meth:`history_dataframe` to ``path`` as Parquet; returns the frame.
+
+        ``watched_date`` holds ``datetime.date`` objects, which Parquet cannot
+        infer from an object column, so it is cast to string on the way out. The
+        full timestamp survives in ``watched_at``.
+        """
+        df = self.history_dataframe(kind, rows=rows)
+        out = df.copy()
+        out["watched_date"] = out["watched_date"].astype("string")
+        out.to_parquet(path, index=False)
+        self.logger.log_info(
+            f"[TraktHistory] wrote {len(out)} {kind} history row(s) -> {path}"
+        )
+        return df
