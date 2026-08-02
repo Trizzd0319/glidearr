@@ -569,6 +569,12 @@ class PlexUsersManager(BaseManager):
             "is_admin": u["is_admin"],
             "is_managed": u["is_managed"],
             "protected": u["protected"],
+            # Age tier (parental controls). Persisted because this manager runs
+            # AFTER the Radarr scoring phase, so a consumer needing the kid/adult
+            # split (movie_scorer's E1/E2 via space_pressure) cannot read
+            # ``tracked_users`` in memory - it is still empty on that pass. It is a
+            # coarse tier, not PII: no email, no token, same bar as ``is_managed``.
+            "restriction_profile": u.get("restriction_profile"),
             "token_scope_ok": safe_map[u["uuid"]] in self.user_tokens,
         } for u in roster]
         # identity map: keep the join fields; email was only used in-memory for matching.

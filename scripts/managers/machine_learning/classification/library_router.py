@@ -59,7 +59,8 @@ def _norm(p) -> str:
     return str(p or "").replace("\\", "/").rstrip("/").lower()
 
 
-def plan_moves(items, *, is_show, routing, root_folders, movie_root_folders, classify, anime_media=None) -> list:
+def plan_moves(items, *, is_show, routing, root_folders, movie_root_folders, classify,
+               anime_media=None, allowed_roots=None) -> list:
     """For each owned *arr item (a dict carrying at least id/title/rootFolderPath plus the
     classification inputs), classify it (``classify(item) -> category``), apply the routing prefs,
     compute the configured destination folder, and emit a MovePlan when the item's current root
@@ -73,6 +74,14 @@ def plan_moves(items, *, is_show, routing, root_folders, movie_root_folders, cla
         cat = classify(it)
         eff = route_category(cat, is_show, routing)
         target = target_folder(eff, is_show, root_folders, movie_root_folders)
+        # SAME-instance invariant. ``rootFolders`` / ``movieRootFolders`` are GLOBAL
+        # maps, but each *arr instance owns only some of those roots. Without this
+        # guard a 4K-instance title classified ``kids`` planned a move from
+        # /movies/4k into the 1080p /movies/kids root - exactly the cross-library
+        # migration this re-organizer's docstring says it does NOT do. Pass the
+        # instance's real roots to suppress it; omit/empty keeps prior behaviour.
+        if target and allowed_roots and _norm(target) not in allowed_roots:
+            target = ""
         cur = it.get("rootFolderPath") or it.get("path") or ""
         needs_move = bool(target) and _norm(cur) != _norm(target)
 

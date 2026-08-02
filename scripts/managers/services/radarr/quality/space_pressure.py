@@ -92,6 +92,12 @@ from scripts.support.utilities.space_targets import (
     downgrade_regrab_cap, exhaustive_downgrade, space_targets,
 )
 
+# Plex parental-controls age tiers that count as a KID for movie_scorer's E1/E2
+# cohort terms. Matches the vocabulary PlexUsersManager resolves onto
+# ``restriction_profile`` (and the plex.playlists.profile_ages override), so the
+# scorer and the playlist age-gate cannot disagree about who is a child.
+_KID_AGE_TIERS = frozenset({"little_kid", "older_kid", "teen", "kid", "child"})
+
 
 class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
@@ -663,6 +669,82 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     for member in (group.get("members") or []):
                         if member not in kids_users:
                             adult_users.append(member)
+                # ROSTER FALLBACK. ``rating_groups`` is read here but has no shipped
+                # default and no fallback, so an install that never declared it scored
+                # every title with per_user_affinity={} and BOTH cohort lists empty —
+                # movie_scorer's E1 silently degrades to its flat +2 branch and E2 (+4)
+                # is dead for every adult-certified title. _build_affinity_inputs already
+                # guards the same key with a {"household": {}} default; this is the
+                # matching guard for the per-user path.
+                #
+                # The cohort is NOT guessed: PlexUsersManager already resolves an age
+                # tier per profile (Plex Home parental controls, or the
+                # plex.playlists.profile_ages override) and that is exactly the split
+                # the playlist builders run on. Reuse it rather than inventing a second
+                # classifier that could disagree.
+                if not per_user_affinity and not kids_users and not adult_users:
+                    _roster = []
+                    # PREFERRED source: ``plex.playlists.profile_ages`` is the
+                    # operator's OWN explicit {username: age_tier} map, already
+                    # driving the playlist age-gate. Being plain config it has NO
+                    # ordering dependency - unlike the Plex roster below, it is
+                    # available on the very first pass. ``ignored_users`` is honoured
+                    # so an excluded profile cannot skew a cohort's affinity.
+                    try:
+                        _ages = (((self.config or {}).get("plex", {}) or {})
+                                 .get("playlists", {}) or {}).get("profile_ages", {}) or {}
+                        _ignored = {str(x).strip().lower()
+                                    for x in ((self.config or {}).get("ignored_users") or [])}
+                        _roster = [{"title": _n, "restriction_profile": _t}
+                                   for _n, _t in _ages.items()
+                                   if _n and str(_n).strip().lower() not in _ignored]
+                    except Exception:
+                        _roster = []
+                    if not _roster:
+                        try:
+                            _pum = self.registry.get("manager", "PlexUsersManager") if self.registry else None
+                            _roster = list(getattr(_pum, "tracked_users", None) or [])
+                        except Exception:
+                            _roster = []
+                    # ORDERING. PlexUsersManager.run() lands AFTER the Radarr
+                    # scoring phase (measured: 06:20:43 vs scores at 06:20:32-36),
+                    # so ``tracked_users`` is EMPTY in memory on the very pass that
+                    # needs it. Fall back to the roster it persisted last run - the
+                    # age tier is stable between runs, so the cohorts self-heal
+                    # after one pass instead of needing a pipeline reorder.
+                    if not _roster and self.global_cache:
+                        try:
+                            _cached = self.global_cache.get("plex/users") or []
+                            _ident = self.global_cache.get("plex/identity_map") or {}
+                            _roster = [{
+                                "title": u.get("title"),
+                                "restriction_profile": u.get("restriction_profile"),
+                                "tautulli_username": (_ident.get(u.get("uuid")) or {}).get("tautulli_username"),
+                                "safe_user": (_ident.get(u.get("uuid")) or {}).get("safe_key"),
+                            } for u in _cached if isinstance(u, dict)]
+                        except Exception:
+                            _roster = []
+                    for u in _roster:
+                        member = (u.get("tautulli_username") or u.get("title") or "").strip()
+                        if not member:
+                            continue
+                        safe = (u.get("safe_user")
+                                or re.sub(r'[\\/:*?"<>|]', '_', member).strip())
+                        ua = self.global_cache.get(f"tautulli/users/{safe}/affinity")
+                        if ua:
+                            per_user_affinity[member] = ua
+                        _tier = str(u.get("restriction_profile") or "").strip().lower()
+                        if _tier in _KID_AGE_TIERS:
+                            kids_users.append(member)
+                        else:
+                            adult_users.append(member)
+                    if _roster:
+                        self.logger.log_debug(
+                            f"[SpacePressure] rating_groups unset - cohorts derived from the "
+                            f"Plex roster: {len(adult_users)} adult, {len(kids_users)} kid, "
+                            f"{len(per_user_affinity)} with cached affinity. Declare "
+                            f"rating_groups (members / grace_members) to override."
+                        )
             except Exception:
                 pass
 

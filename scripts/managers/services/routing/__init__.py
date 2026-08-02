@@ -95,10 +95,26 @@ class RoutingManager:
             except Exception as e:
                 self._log("log_warning", f"[Routing] {get_ep} fetch failed for '{name}': {e}")
                 continue
+            # The configured folder maps are GLOBAL, but this instance owns only
+            # some roots. Fetch its real ones so plan_moves can refuse a
+            # cross-library target (the 4K instance being told to move a
+            # kids-classified film into the 1080p kids root). Failure leaves the
+            # set empty, which disables the guard rather than the pass.
+            allowed_roots = set()
+            try:
+                allowed_roots = {
+                    library_router._norm(r.get("path"))
+                    for r in (im._make_request(name, "rootfolder", fallback=[]) or [])
+                    if isinstance(r, dict) and r.get("path")
+                }
+            except Exception as e:
+                self._log("log_debug", f"[Routing] {name}: root-folder list "
+                                       f"unavailable, cross-root guard off: {e}")
             plans = library_router.plan_moves(
                 items, is_show=is_show, routing=self._routing,
                 root_folders=self._root_folders, movie_root_folders=self._movie_root_folders,
-                classify=classify, anime_media=anime_media_fn)
+                classify=classify, anime_media=anime_media_fn,
+                allowed_roots=allowed_roots)
             if not plans:
                 continue
             kind = "show" if is_show else "movie"
