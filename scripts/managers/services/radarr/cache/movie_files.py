@@ -103,6 +103,8 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         "custom_formats",      # pipe-separated format names
         # Lifecycle
         "is_franchise_entry", "is_watched", "watch_count",
+        "plays",               # UNGATED play count. ``watch_count`` is gated on the
+                               # completion bar; ``plays`` is every recorded playback.
         "last_watched_at", "percent_complete",
         "marked_for_deletion", "available_until",
         "keep_policy",         # "keep_forever" | "keep_movie" | "universe" | None
@@ -137,7 +139,7 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         "video_bitrate", "video_fps", "video_bit_depth",
         "width", "height",
         "audio_channels", "audio_bitrate", "audio_stream_count",
-        "watch_count", "percent_complete",
+        "watch_count", "plays", "percent_complete",
         "quality_profile_id", "collection_tmdb_id",
         "watchability_score", "watchability_percentile", "plan_reclaim_gb",
     )
@@ -575,9 +577,16 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         # already applied lifecycle.watched_definition), so this derivation now means
         # what Plex and Tautulli mean — identical to the Sonarr episode path.
         watch_count     = watch_data.get("watch_count", 0)
+        plays           = watch_data.get("plays", 0)
         last_watched_at = watch_data.get("last_watched_at")
         pct_complete    = watch_data.get("percent_complete")
-        is_watched      = watch_count > 0
+        # ``is_watched`` means ENGAGED, not COMPLETED. ``watch_count`` stays the
+        # completion-gated count. The old ``watch_count > 0`` made a film played to
+        # 80% twenty times read as *never watched*, and downgrade_planner's
+        # never-watched branch then stepped it to the 720p floor on that basis.
+        # Set lifecycle.watched_definition.engagement_is_watched=false to restore
+        # the completion-only rule byte-for-byte.
+        is_watched      = watch_count > 0 or (self._engagement_is_watched() and plays > 0)
 
         row = {
             "movie_id":             movie_id,
@@ -628,6 +637,7 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
             "is_franchise_entry":   is_franchise_entry,
             "is_watched":           is_watched,
             "watch_count":          watch_count,
+            "plays":                plays,
             "last_watched_at":      last_watched_at,
             "percent_complete":     pct_complete,
             "marked_for_deletion":  False,
@@ -772,12 +782,199 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
 
     # ── Tautulli helpers ────────────────────────────────────────────────────────
 
+    # ── Watch-history sweep tunables ────────────────────────────────────────────
+    # A single get_history call returns the most RECENT N rows across every media
+    # type. At length=5000 with an episodic household that surfaced ~163 distinct
+    # movie titles against a 2000-movie library, so ~97% of the library could only
+    # ever read watch_count=0 and scored as never-watched. The sweep now filters
+    # server-side to movies and walks ``start`` until a short page ends it.
+    _HISTORY_PAGE          = 1000   # rows per get_history call
+    _HISTORY_MAX_PAGES     = 250    # hard stop (250k movie plays) so a bad
+                                    # recordsFiltered can never loop forever
+    _METADATA_TOPUP_BUDGET = 750    # NEW rating_keys resolved to tmdb per run
+
+    def _engagement_is_watched(self) -> bool:
+        """Whether an ENGAGED play (not just a completed one) sets ``is_watched``.
+
+        Default True. False restores the historical completion-only rule.
+        """
+        if getattr(self, "_engagement_flag", None) is None:
+            try:
+                _wd = ((self.config or {}).get("lifecycle", {}) or {}).get(
+                    "watched_definition", {}) or {}
+                self._engagement_flag = bool(_wd.get("engagement_is_watched", True))
+            except Exception:
+                self._engagement_flag = True
+        return self._engagement_flag
+
+    def _resolve_tmdb_by_rating_key(self, api, rating_keys: set) -> dict:
+        """``{rating_key(str): tmdb_id(int)}`` via the shared Tautulli metadata index.
+
+        The index is 7-day cached and carries its own negative cache for keys Plex
+        re-scanned away, so on the steady state this is a cache read. The per-run
+        budget bounds the FIRST sweep after pagination landed — when years of
+        rating_keys the index has never seen appear at once. Anything past the
+        budget resolves on a later run and falls back to the title join meanwhile,
+        so the map is never worse than the pre-pagination behaviour.
+        """
+        out: dict = {}
+        if not rating_keys:
+            return out
+        try:
+            from scripts.managers.services.tautulli.metadata import TautulliMetadataManager
+            meta = None
+            if self.registry:
+                try:
+                    meta = self.registry.get("manager", "TautulliMetadataManager")
+                except Exception:
+                    meta = None
+            if meta is None or not getattr(meta, "tautulli_api", None):
+                meta = TautulliMetadataManager(
+                    logger=self.logger, config=self.config,
+                    global_cache=self.global_cache, registry=self.registry,
+                    tautulli_api=api,
+                )
+            keys = sorted(str(rk) for rk in rating_keys)
+            budget = self._METADATA_TOPUP_BUDGET
+            # Hand the manager a BOUNDED slice (that is what it tops up), then look
+            # every key up in the FULL merged index it returns — keys past the
+            # budget still resolve if a previous run already cached them.
+            index = meta.get_metadata_index_cached(keys[:budget] if budget > 0 else keys)
+            for rk in keys:
+                tmdb = ((index or {}).get(rk) or {}).get("tmdb_id")
+                if tmdb:
+                    try:
+                        out[rk] = int(tmdb)
+                    except (TypeError, ValueError):
+                        pass
+        except Exception as e:
+            self.logger.log_debug(
+                f"[MovieFiles] tmdb resolution unavailable, title join only: {e}")
+        return out
+
+    def _merge_trakt_history(self, aggregated: dict, titles_for_key: dict) -> None:
+        """Fold Trakt's movie history into the Tautulli watch map, keyed by tmdb.
+
+        WHY: Tautulli only serves what its OWN history retains - here 6 months,
+        398 movie plays across 181 titles against a ~2000-movie library, so ~91%
+        of the library reads ``watch_count=0`` and lands in downgrade_planner's
+        never-watched branch. Trakt keeps years (2020-> on this account). This is
+        the feed that closes that gap.
+
+        MERGE RULE - ``max()``, never ``+=``. Plex scrobbles to Trakt, so a single
+        watch appears in BOTH feeds; summing would double-count every corroborated
+        play. ``max()`` also makes the merge MONOTONIC: it can only ever RAISE a
+        count, so even a bad Trakt fetch can make a title look more valuable - it
+        can never cause one to be deleted or downgraded that would otherwise have
+        survived. That is the safe direction for a feed we are still proving out.
+
+        Tautulli stays authoritative for ``percent_complete``: Trakt carries no
+        completion figure (its scrobbler applied one upstream, before the row
+        ever existed).
+
+        Disable with ``scoring.trakt_history_merge.enabled = false``.
+        """
+        _cfg = ((self.config or {}).get("scoring", {}) or {}).get("trakt_history_merge", {}) or {}
+        if not bool(_cfg.get("enabled", True)):
+            return
+        mgr = None
+        try:
+            mgr = self.registry.get("manager", "TraktHistoryManager") if self.registry else None
+        except Exception:
+            mgr = None
+        if mgr is None or not hasattr(mgr, "history_dataframe"):
+            return
+
+        df = mgr.history_dataframe("movies")
+        if df is None or df.empty:
+            return
+        df = df[df["tmdb_id"].notna()]
+        if df.empty:
+            return
+
+        # One row per film: how many plays Trakt has logged, when the last one
+        # was, and a title for the fallback lookup key.
+        stats = df.groupby("tmdb_id").agg(
+            trakt_plays=("play_id", "size"),
+            last_watched=("watched_at", "max"),
+            title=("title", "first"),
+        )
+
+        added = raised = 0
+        for tmdb, row in stats.iterrows():
+            key    = int(tmdb)
+            plays  = int(row["trakt_plays"])
+            _ts    = row["last_watched"]
+            iso    = _ts.isoformat() if pd.notna(_ts) else None
+            title  = row["title"]
+            rec    = aggregated.get(key)
+            if rec is None:
+                # A film Tautulli has no memory of at all.
+                aggregated[key] = {
+                    "watch_count": plays, "plays": plays,
+                    "last_watched_at": iso, "percent_complete": 0,
+                }
+                if title:
+                    titles_for_key.setdefault(key, title)
+                added += 1
+                continue
+            _before = rec["watch_count"]
+            rec["watch_count"] = max(rec["watch_count"], plays)
+            rec["plays"]       = max(rec["plays"], plays)
+            if iso and (rec["last_watched_at"] is None or iso > rec["last_watched_at"]):
+                rec["last_watched_at"] = iso
+            if title:
+                titles_for_key.setdefault(key, title)
+            if rec["watch_count"] > _before:
+                raised += 1
+
+        self.logger.log_info(
+            f"\U0001f4ca Trakt history merge: {len(stats)} film(s) with Trakt plays - "
+            f"+{added} Tautulli had never seen, {raised} existing count(s) raised; "
+            f"watch map now {len(aggregated)} title(s)."
+        )
+
+    def _get_movie_history_pages(self, api, inst_name: str) -> list:
+        """Every movie history row for one Tautulli instance, paginated."""
+        rows: list = []
+        start = 0
+        for _ in range(self._HISTORY_MAX_PAGES):
+            try:
+                response = api.get_history(
+                    length=self._HISTORY_PAGE, start=start, media_type="movie"
+                )
+            except Exception as e:
+                self.logger.log_warning(
+                    f"Tautulli '{inst_name}' history request failed at offset {start}: {e}"
+                )
+                break
+            entries = ((response or {}).get("response") or {}).get("data", {})
+            if isinstance(entries, dict):
+                entries = entries.get("data", [])
+            if not isinstance(entries, list) or not entries:
+                break
+            rows.extend(entries)
+            if len(entries) < self._HISTORY_PAGE:
+                break                      # short page → end of history
+            start += self._HISTORY_PAGE
+        else:
+            self.logger.log_warning(
+                f"Tautulli '{inst_name}': history sweep hit the "
+                f"{self._HISTORY_MAX_PAGES}-page safety stop; watch counts may be partial."
+            )
+        return rows
+
     @timeit("_fetch_watch_map")
     def _fetch_watch_map(self, instance: str) -> dict:
         """
         Try to get movie watch history from Tautulli via registry.
         Returns {} if unavailable.
-        Keys: movie title (str), Values: dict with watch_count/last_watched_at/percent_complete.
+
+        Keys: tmdb id (int) where the play's rating_key resolved, PLUS the movie
+        title (str) for every record — the same dict object is published under both,
+        so a caller may look up by either. tmdb is preferred: it survives Plex
+        re-scans and title drift, which a bare title match does not.
+        Values: dict with watch_count/plays/last_watched_at/percent_complete.
         """
         try:
             from scripts.managers.services.tautulli.instances.api import TautulliAPI as TautulliInstanceAPI
@@ -807,6 +1004,9 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
             )
             _sub_threshold = 0
 
+            titles_for_key: dict = {}
+            _rows = 0
+
             for inst_name, inst_config in instance_configs.items():
                 try:
                     api = TautulliInstanceAPI(
@@ -814,29 +1014,42 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                         instance_config=inst_config,
                         cache=self.global_cache,
                     )
-                    response = api.get_history(length=5000)
                 except Exception as e:
                     self.logger.log_warning(
-                        f"Tautulli '{inst_name}' history request failed: {e}"
+                        f"Tautulli '{inst_name}' client construction failed: {e}"
                     )
                     continue
 
-                entries = ((response or {}).get("response") or {}).get("data", {})
-                if isinstance(entries, dict):
-                    entries = entries.get("data", [])
-                if not isinstance(entries, list):
+                entries = self._get_movie_history_pages(api, inst_name)
+                if not entries:
                     continue
 
+                # Resolve rating_key → tmdb ONCE per instance, then key the aggregate
+                # on tmdb. The old bare-title key silently merged or dropped plays
+                # whenever Plex and Radarr spelled a title differently.
+                _rks = {str(e.get("rating_key")) for e in entries if e.get("rating_key")}
+                tmdb_by_rk = self._resolve_tmdb_by_rating_key(api, _rks)
+
                 for entry in entries:
+                    # Belt-and-braces: the server-side media_type filter is the
+                    # primary gate, this catches a Tautulli that ignores it.
                     if entry.get("media_type") != "movie":
                         continue
                     title = entry.get("title") or entry.get("grandparent_title")
                     played = entry.get("date")
                     pct    = entry.get("percent_complete", 0)
-                    if not title:
+                    tmdb   = tmdb_by_rk.get(str(entry.get("rating_key") or ""))
+                    if tmdb:
+                        key = int(tmdb)
+                    elif title:
+                        key = f"t:{title}"        # unresolved → title-keyed fallback
+                    else:
                         continue
-                    rec = aggregated[title]
+                    rec = aggregated[key]
+                    if title:
+                        titles_for_key.setdefault(key, title)
                     rec["plays"] += 1
+                    _rows += 1
                     if play_is_watched(entry, threshold_pct=_watch_pct):
                         rec["watch_count"] += 1
                     else:
@@ -847,12 +1060,43 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                         if rec["last_watched_at"] is None or ts > rec["last_watched_at"]:
                             rec["last_watched_at"] = ts
 
-            out = dict(aggregated)
+            # Trakt keeps years of history where Tautulli keeps only what it has
+            # retained. Fold it in BEFORE publishing so both the tmdb and title
+            # keys below see the merged counts. Fully wrapped - a Trakt failure
+            # must never cost us the Tautulli map we already built.
+            try:
+                self._merge_trakt_history(aggregated, titles_for_key)
+            except Exception as e:
+                self.logger.log_debug(
+                    f"[MovieFiles] Trakt history merge skipped: {e}")
+
+            # Publish under BOTH the tmdb id and the title. tmdb-keyed records are
+            # emitted first so a title collision resolves to the tmdb-backed record
+            # rather than an unresolved title-only one.
+            out: dict = {}
+            for key, rec in aggregated.items():
+                if not isinstance(key, int):
+                    continue
+                out[key] = rec
+                _t = titles_for_key.get(key)
+                if _t:
+                    out.setdefault(_t, rec)
+            for key, rec in aggregated.items():
+                if isinstance(key, int):
+                    continue
+                _t = titles_for_key.get(key) or str(key)[2:]
+                if _t:
+                    out.setdefault(_t, rec)
+
             if out:
-                _watched = sum(1 for v in out.values() if v["watch_count"] > 0)
+                _watched  = sum(1 for v in aggregated.values() if v["watch_count"] > 0)
+                _engaged  = sum(1 for v in aggregated.values() if v["plays"] > 0)
+                _by_tmdb  = sum(1 for k in aggregated if isinstance(k, int))
                 self.logger.log_info(
-                    f"📊 Tautulli movie watch map: watched bar ≥{_watch_pct:g}% (or "
-                    f"watched_status=1) — {_watched}/{len(out)} title(s) count as WATCHED; "
+                    f"📊 Tautulli movie watch map: {_rows} play(s) → {len(aggregated)} "
+                    f"title(s) ({_by_tmdb} tmdb-keyed, {len(aggregated) - _by_tmdb} "
+                    f"title-only); watched bar ≥{_watch_pct:g}% (or watched_status=1) — "
+                    f"{_watched} count as WATCHED, {_engaged} engaged; "
                     f"{_sub_threshold} sub-threshold play(s) recorded as sampled only"
                 )
             return out
@@ -1062,7 +1306,16 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
             stats["with_file"] += 1
 
             title        = movie.get("title", "")
-            watch_data   = watch_map.get(title) or {}
+            # tmdb first — stable across Plex re-scans and title drift. Title is the
+            # fallback for plays whose rating_key never resolved to a tmdb id.
+            watch_data   = {}
+            if _tmdb:
+                try:
+                    watch_data = watch_map.get(int(_tmdb)) or {}
+                except (TypeError, ValueError):
+                    watch_data = {}
+            if not watch_data:
+                watch_data = watch_map.get(title) or {}
             is_fe        = mid in franchise_ids
             keep_pol     = keep_policy_map.get(mid)
             universe_name = universe_name_map.get(mid)
