@@ -173,7 +173,17 @@ class SonarrSeriesSyncManager(BaseManager, ComponentManagerMixin):
 
             updated_tags = set(series_data.get("tags", []))
             if tag_monitor and tag_monitor.is_series_tagged_keep(sid):
-                updated_tags.add("keep")
+                # GLD-ACQ-31: resolve the keep tag to its INTEGER id — sending the label
+                # string 400s the PUT ($.tags[i] not convertible to Int32). Unresolvable
+                # ⇒ skip tagging this run rather than poison the payload.
+                _kid = (tag_monitor.ensure_keep_tag_id(resolved_instance)
+                        if hasattr(tag_monitor, "ensure_keep_tag_id") else None)
+                if _kid is not None:
+                    updated_tags.add(int(_kid))
+                else:
+                    self.logger.log_warning(
+                        f"⚠️ 'keep' tag id unresolvable on '{resolved_instance}' — "
+                        f"skipping keep-tag for series {sid} this run.")
 
             payload = {
                 "id": sid,

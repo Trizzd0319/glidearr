@@ -60,7 +60,24 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
             params={"page": page, "limit": limit},
         )
 
-    def get_full_watch_history(self) -> list:
+    def get_full_watch_history(self):
+        """Paginate through sync/history/episodes and return the full list.
+
+        Returns None (not []) if a page request fails — the SAME contract as
+        ``_fetch_full_movie_history`` and ``fetch_all_history_threaded`` below.
+        This method was the odd one out: it treated a failed request and the end
+        of the data as the same event (``if not items: break``), so a rate-limited
+        or dropped page returned a TRUNCATED history presented as complete — and
+        ``get_history`` returns None when ``trakt_api`` is absent, so a missing
+        API read as "watched nothing" too.
+
+        That matters because this feed reaches the watched-set that guards
+        deletion: ``radarr/repair/anomaly`` folds Trakt history into
+        ``watched_tmdb_ids``, which is the hard guard
+        (``if keep_policy or tmdb_id in watched_tmdb_ids: guarded``) that stops a
+        WATCHED movie being pruned. A short history silently un-guards every title
+        missing from it.
+        """
         page      = 1
         all_items = []
         self.logger.log_info("[TraktHistory] Fetching all episode history (paginated)...")
@@ -68,17 +85,65 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
         while True:
             self.logger.log_debug(f"[TraktHistory] Fetching page {page}...")
             items = self.get_history(page=page, limit=100)
+            if items is None:
+                # Request failed (rate-limited, dropped, or no trakt_api) — NOT the
+                # end of the data. Returning what we have would present a partial
+                # history as complete.
+                self.logger.log_warning(
+                    f"[TraktHistory] episode history fetch interrupted at page {page} "
+                    f"(after {len(all_items)} items) — returning None so callers do not "
+                    f"mistake a truncated history for a complete one."
+                )
+                return None
             if not items:
-                break
+                break                      # genuine end of data (empty page)
             all_items.extend(items)
             if len(items) < 100:
-                break
+                break                      # short page = end of data
             page += 1
             # Rate limiting is handled centrally by TraktAPIManager._throttle();
             # the old fixed time.sleep(1) per page just added latency on top.
 
         self.logger.log_info(f"[TraktHistory] Retrieved {len(all_items)} total history items.")
         return all_items
+
+    def get_full_watch_history_cached(self) -> list:
+        """Return all watched EPISODES from Trakt sync history, cached for 24 hours.
+
+        THE MISSING TWIN. ``get_full_movie_history_cached`` has existed all along; the
+        episode side had no cached form, so every caller re-paginated the ENTIRE episode
+        history live — ~1,900 rows at 100/page against a rate-limited API. This module's
+        own ``history_dataframe`` docstring names the asymmetry: *"the movie side is
+        served by the 24h get_full_movie_history_cached, the episode side re-paginates
+        live on every call. Pass ``rows`` if you are calling this in a loop."* Telling
+        callers to work around a missing cache is the tell that the cache should exist.
+
+        Worse, ``TraktManager.run()`` called the uncached form and **discarded the
+        result** — a full paginated sweep every run for nothing, because nothing wrote it
+        anywhere. That call now warms this key instead, so the sweep it was already
+        paying for is the one the consumers read.
+
+        Same contract as the movie twin: the generator returns None on a failed page, so
+        ``get_or_generate_cache`` serves the last-good copy rather than caching a
+        truncated history. That matters here — this feed reaches ``watched_tmdb_ids``,
+        the guard that stops a watched title being pruned (see
+        ``get_full_watch_history``'s docstring).
+
+        Key ``trakt/history/episodes`` mirrors ``trakt/history/movies``, so a consumer
+        can read either directly from global_cache the way
+        ``radarr/orchestration.run_relational_pull`` already reads the movie half.
+        """
+        if not self.global_cache:
+            return self.get_full_watch_history()
+        return self.global_cache.get_or_generate_cache(
+            key="trakt/history/episodes",
+            generator_function=self.get_full_watch_history,
+            expiration_time=86_400,
+            # Watched-set source — must refresh daily so newly-watched episodes register.
+            # On a rate-limited fetch the generator returns None and the last-good copy is
+            # served (no hang, no empty cache).
+            regenerate_on_expiry=True,
+        )
 
     def get_full_movie_history_cached(self) -> list:
         """Return all watched movies from Trakt sync history, cached for 24 hours."""
@@ -209,7 +274,18 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
     # ── Grouped History ───────────────────────────────────────────────────
 
     def get_history_grouped_by_series(self) -> dict:
-        history = self.get_full_watch_history()
+        history = self.get_full_watch_history_cached()
+        if history is None:
+            # Fetch failed. Returning {} here is indistinguishable from "this
+            # household has watched no episodes", so say so rather than letting a
+            # transient failure read as an empty history. (Propagating None would
+            # be better still, but this method's callers have not been audited —
+            # the warning at least makes the degradation visible.)
+            self.logger.log_warning(
+                "[TraktHistory] grouped-by-series: history fetch FAILED — returning an "
+                "empty map, which downstream reads as 'no episodes watched'."
+            )
+            return {}
         grouped: dict = defaultdict(list)
 
         for item in history:
@@ -236,7 +312,16 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
         series keying.
         """
         counts: dict = defaultdict(int)
-        for entry in self.get_full_watch_history():
+        history = self.get_full_watch_history_cached()
+        if history is None:
+            # See get_history_grouped_by_series — an empty count map is read as
+            # "never watched", which is the opposite of "we could not tell".
+            self.logger.log_warning(
+                "[TraktHistory] series watch counts: history fetch FAILED — returning an "
+                "empty map, which downstream reads as zero plays for every series."
+            )
+            return {}
+        for entry in history:
             if not entry.get("episode"):
                 continue                       # movie rows carry no show/episode
             sid = ((entry.get("show") or {}).get("ids") or {}).get(id_source)
@@ -302,9 +387,10 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
                   for one-off analysis, tests, or to avoid a second network call
                   when the caller already holds the history.
 
-        NOTE the two feeds differ in cost: the movie side is served by the 24h
-        ``get_full_movie_history_cached``, the episode side re-paginates live on
-        every call. Pass ``rows`` if you are calling this in a loop.
+        NOTE both feeds are now served by a 24h cache
+        (``get_full_watch_history_cached`` / ``get_full_movie_history_cached``), so
+        calling this in a loop no longer re-paginates. ``rows`` is still the way to
+        project a caller-supplied list without touching the cache at all.
 
         Always returns the FULL column set - an empty history yields an empty
         frame with typed columns, so a caller can filter without a KeyError.
@@ -321,7 +407,7 @@ class TraktHistoryManager(BaseManager, ComponentManagerMixin):
         if rows is None:
             rows = []
             if kind in ("episodes", "all"):
-                rows += list(self.get_full_watch_history() or [])
+                rows += list(self.get_full_watch_history_cached() or [])
             if kind in ("movies", "all"):
                 rows += list(self.get_full_movie_history_cached() or [])
 

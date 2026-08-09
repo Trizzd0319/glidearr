@@ -12,7 +12,8 @@ plain``) — there is no device/poll flow like Trakt. So:
     credentials are stored and a runtime token is expected via env.
 
 Stores ``mal.authorization`` (tokens → keyring) and ``mal.username`` alongside
-the client credentials.
+the client credentials, then asks whether to WRITE BACK — see
+:meth:`MalStep._writeback`.
 """
 from __future__ import annotations
 
@@ -73,9 +74,37 @@ class MalStep(Step):
 
         if mal["authorization"].get("access_token"):
             prompter.success(f"   MAL authorized as {mal.get('username') or '?'}")
+            self._writeback(prompter, cfg)
             return [StepResult("mal", ok=True, detail=mal.get("username") or "authorized")]
         prompter.notice("   MAL credentials saved (not authorized).")
         return [StepResult("mal", ok=None, detail="saved (not authorized)")]
+
+    # ── write-back (push watch progress OUT to MAL) ────────────────────────
+    @staticmethod
+    def _writeback(prompter, cfg) -> None:
+        """Ask whether to reflect anime watch progress back to the operator's MAL list.
+
+        LIVES HERE, NOT IN THE TRAKT STEP. It was first written into ``TraktStep`` gated on
+        ``cfg["mal"]["client_id"]`` — which never fires on a first run: ``AccountsStep``
+        orders its members ``[TraktStep, MalStep, …]``, so MAL has no client_id yet when
+        Trakt asks. It also made ``--service mal`` unable to reach the question at all.
+        Asking it where the credentials were just collected fixes both.
+
+        Unlike Trakt there is no ownership question: a MAL list entry is watch STATUS and
+        progress, so this only ever reflects viewing. Still ``dry_run``-gated at run time.
+        """
+        mw = cfg.setdefault("mal_writeback", {})
+        prompter.notice("   MAL write-back reflects ANIME watch progress from Tautulli onto "
+                        "your MAL list (status + episodes watched).")
+        prompter.notice("   MAL has no 'owned' concept — a list entry is watch STATUS, so this "
+                        "records viewing only, never ownership.")
+        mw["enabled"] = prompter.confirm(
+            "mal_writeback.enabled", "   Reflect anime watch progress to your MAL list?",
+            default=bool(mw.get("enabled", False)))
+        if mw["enabled"]:
+            prompter.success("   MAL write-back on — nothing is written while dry_run is true.")
+        else:
+            prompter.notice("   MAL write-back off — glidearr will only READ from MAL.")
 
     def _obtain_token(self, prompter, cid, csec, redirect, auth):
         """Keep a valid token, else refresh, else (interactive) run the PKCE flow."""

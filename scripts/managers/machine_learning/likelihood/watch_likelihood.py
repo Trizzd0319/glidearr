@@ -362,7 +362,16 @@ def explain_likelihood(row, *, config=None) -> dict:
     # Borrowed "universe credit": a hot franchise/universe (rewatched siblings) lends extra effective
     # watch-count, so a single real watch elevates immediately. 0 until a pre-pass injects it → byte-
     # identical when absent. Added to wc BEFORE the graded floor, so 1 watch + ~2 credit ⇒ 3 ⇒ 4K.
-    credit = max(0.0, _num(_get(row, "universe_credit"), 0.0))
+    #
+    # BOTH columns, combined via max. The pre-passes write them SEPARATELY:
+    # ``universe_credit`` = rewatched-sibling heat, ``saga_credit`` = caught-up/depth. They are
+    # split at the source so the DELETE guards can read the first alone - caught-up/depth is a
+    # forward-looking acquisition signal and holding old files on it inverts its meaning. The
+    # QUALITY path (here) wants both, so it recombines them, preserving the exact value the
+    # single blended column used to carry. ``saga_credit`` absent → identical to before.
+    credit = max(0.0,
+                 _num(_get(row, "universe_credit"), 0.0),
+                 _num(_get(row, "saga_credit"), 0.0))
     ewc = wc + credit
     if ewc >= 1:
         # GRADED by EFFECTIVE watch count: 1→50, 2→64, 3→78, 4+→90 — 4K earned by regular (or

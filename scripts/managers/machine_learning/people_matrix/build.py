@@ -31,17 +31,30 @@ from collections import defaultdict
 ROLES: tuple[str, ...] = ("cast", "directors", "writers", "composers", "producers",
                           "cinematographers", "editors")
 
-# Role weights for person-affinity (mirror the Group-B cap ratios: leads + director
-# carry the signal; the below-the-line crafts are progressively weaker). SINGLE source
-# for both the aggregation (affinity.genre_affinity.aggregate_person_affinity) and the
-# scoring term (scoring._shared.person_affinity_score), so the two never drift.
+# Role weights for person-affinity. SINGLE source for both the aggregation
+# (affinity.genre_affinity.aggregate_person_affinity) and the scoring term
+# (scoring._shared.person_affinity_score), so the two never drift.
 #
-# The ordering is the claim being made: a household re-watches a DIRECTOR's or a LEAD's
-# work far more reliably than an EDITOR's. Editors sit lowest because editing credits
-# are both the most numerous per title and the least predictive of a re-watch; a
-# cinematographer's look is more identifiable, so DPs sit a rung above.
+# FINAL TABLE — SET AND MEASURED 2026-08-07 (GLD-PPL-01/04/12, full record in
+# people_matrix/DESIGN.md §9). The ruling: this table expresses PEOPLE-FOLLOWING —
+# "more Robert Downey Jr in Tropic Thunder, less Russo brothers for another
+# superhero movie." Franchise/studio continuation is deliberately NOT chased here
+# (saga/universe + the Group-B studio term already pay it); that is why producers
+# sit at 0.15 despite topping the raw ablation (their lead rides studio-stable
+# continuity + a 5.7-ids/title density edge). WRITERS 0.375 is a measured
+# compromise: on franchise-decontaminated household data writers and cast were
+# statistically TIED (AUC 0.766 vs 0.747, ≪1σ at 30 clean positives), so the
+# operator split the difference between the ruling's 0.3 and the tie-reflecting
+# 0.45; re-measure free at ≥60 clean positives (people_billing_experiment.py
+# --sweep --decontaminate). Directors 0.7 keeps the auteur signal while trimming
+# the franchise-director pattern. Billing decay 0.25 and cast depth 10 are both
+# VALIDATED against the same data (flat measurably worse; deeper flat).
+# ⚠️ These weights currently apply at BOTH aggregation and candidate scoring —
+# cross-role ratios are effectively SQUARED end-to-end (writers ≈ 0.14 vs cast
+# 1.0). Whether that is intentional concentration or a double-count is the one
+# OPEN question in this table: GLD-PPL-13.
 PERSON_ROLE_WEIGHTS: dict[str, float] = {
-    "cast": 1.0, "directors": 1.0, "writers": 0.6, "composers": 0.4, "producers": 0.3,
+    "cast": 1.0, "directors": 0.7, "writers": 0.375, "composers": 0.4, "producers": 0.15,
     "cinematographers": 0.3, "editors": 0.2,
 }
 

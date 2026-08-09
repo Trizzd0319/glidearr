@@ -152,3 +152,59 @@ def test_weight_override_ignores_unknown_key_and_negative_value():
     ref = S(None, None).score(cand)["total"]
     # an unknown signal name and a negative weight are both ignored → total unchanged
     assert S(None, None, weight_overrides={"nope": 0.9, "popularity": -1}).score(cand)["total"] == ref
+
+
+# ─── genre aggregation: noisy-OR, not a mean ──────────────────────────────────
+# Regression cover for the aggregator swap. The previous unweighted mean DIVIDED by the
+# match count, so extra household-liked genres lowered the score and single-tag titles won
+# by default. Nothing in this file pinned that behaviour, so the swap was silent — these
+# tests exist so the next change to _genre_affinity isn't.
+
+def test_multi_genre_match_outranks_single_genre_match():
+    """The property the mean got backwards: more matched genres must score HIGHER.
+
+    Under the mean, [sci-fi, action] scored (1.0+0.7)/2 = 85 — BELOW [sci-fi] at 100.
+    """
+    one = _scorer().score({"genres": ["Sci-Fi"], "source": "trakt_watchlist"})
+    two = _scorer().score({"genres": ["Sci-Fi", "Action"], "source": "trakt_watchlist"})
+    assert two["matrix"]["genre_affinity"] > one["matrix"]["genre_affinity"]
+
+
+def test_unmatched_genres_never_penalize():
+    """A broadly-tagged film is scored on what matches; its other tags cost it nothing."""
+    bare = _scorer().score({"genres": ["Sci-Fi"], "source": "trakt_watchlist"})
+    padded = _scorer().score({"genres": ["Sci-Fi", "Romance", "Western", "Musical"],
+                              "source": "trakt_watchlist"})
+    assert padded["matrix"]["genre_affinity"] == bare["matrix"]["genre_affinity"]
+
+
+def test_single_top_genre_leaves_headroom():
+    """The household's #1 genre alone must stay under 100, or no multi-match can beat it."""
+    top = _scorer().score({"genres": ["Sci-Fi"], "source": "trakt_watchlist"})
+    assert top["matrix"]["genre_affinity"] == 80.0
+
+
+def test_genre_affinity_absent_when_nothing_matches():
+    out = _scorer().score({"genres": ["Romance"], "source": "trakt_watchlist"})
+    assert out["matrix"]["genre_affinity"] is None
+
+
+# ─── recency is suppressed for explicit-intent sources ────────────────────────
+
+def test_watchlist_sources_carry_no_production_recency():
+    """Watchlisting is deliberate; production year must not rank one watchlist item over
+    another. `100 - age*8` had zeroed 503/663 of the live watchlist at weight 0.15."""
+    for feed in ("trakt_watchlist", "plex_watchlist", "mal_plantowatch"):
+        out = _scorer().score({"genres": ["Sci-Fi"], "source": feed, "year": 1951})
+        assert out["matrix"]["recency"] is None, feed
+
+
+def test_discovery_sources_keep_production_recency():
+    """Nobody asked for a recommendation by name, so there "it's recent" is real information."""
+    out = _scorer().score({"genres": ["Sci-Fi"], "source": "trakt_recommendations", "year": 2024})
+    assert out["matrix"]["recency"] == 84.0
+
+
+def test_year_still_reported_when_recency_suppressed():
+    out = _scorer().score({"genres": ["Sci-Fi"], "source": "trakt_watchlist", "year": 1951})
+    assert out["evidence"]["year"] == 1951

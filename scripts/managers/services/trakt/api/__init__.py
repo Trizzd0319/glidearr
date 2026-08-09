@@ -44,7 +44,12 @@ class TraktAPIManager(BaseManager, ComponentManagerMixin):
         self.register()
 
         parent       = kwargs.get("manager")
-        self.dry_run = kwargs.get("dry_run", getattr(parent, "dry_run", False) if parent else False)
+        # dry_run is resolved by BaseManager (explicit kwarg -> pre-super value ->
+        # kwargs["manager"] -> registry parent -> False). The local resolution that used
+        # to sit here defaulted to False, silently overwriting a parent-inherited True --
+        # and self.dry_run feeds init_kwargs for ALL TEN sub-managers below, so it set the
+        # mode for every Trakt write path at once. Second root-level instance in this
+        # package after TraktManager's.
 
         # ── Auth / session ────────────────────────────────────────────────
         trakt_cfg             = (self.config.get("trakt", {}) if self.config else {})
@@ -83,30 +88,109 @@ class TraktAPIManager(BaseManager, ComponentManagerMixin):
         from scripts.managers.services.trakt.recommendations import TraktRecommendationsManager
         from scripts.managers.services.trakt.watchlist       import TraktWatchlistManager
         from scripts.managers.services.trakt.lookup          import TraktLookupManager
-        from scripts.managers.services.trakt.analytics       import TraktAnalyticsManager
-        from scripts.managers.services.trakt.universe        import TraktUniverseManager
         from scripts.managers.services.trakt.progress        import TraktProgressManager
-        from scripts.managers.services.trakt.lists           import TraktListsManager
-        from scripts.managers.services.trakt.sync            import TraktSyncManager
 
         sub_classes = {
+            # ── called by TraktManager.run() ───────────────────────────────────
             "history":         TraktHistoryManager,
             "ratings":         TraktRatingsManager,
             "recommendations": TraktRecommendationsManager,
             "watchlist":       TraktWatchlistManager,
-            "lookup":          TraktLookupManager,
-            "analytics":       TraktAnalyticsManager,
-            "universe":        TraktUniverseManager,
             "progress":        TraktProgressManager,
-            "lists":           TraktListsManager,
-            "sync":            TraktSyncManager,
+            # ── constructed every run, invoked by NOTHING ────────────────────────
+            # A repo-wide search finds this only in its own class definition and in this
+            # map -- no call site anywhere. Not a facade with a named caller (checklist Q9).
+            #
+            # KEPT, unlike its four former neighbours, because its methods are CORRECT:
+            # 25 honest thin GET wrappers over real Trakt endpoints, no fabricated data,
+            # no fail-open guards, no dead routes. Deleting wrong code and deleting merely
+            # unused code are different decisions.
+            #
+            # ⚠️ One hazard worth knowing: TraktLookupManager.get_user_ratings(username)
+            # and TraktRatingsManager.get_user_ratings() share a NAME with different
+            # signatures on different managers -- exactly the checklist-Q10 trap ("does the
+            # caller reach THAT method, or a similarly-named sibling?"). The LIVE one is on
+            # `ratings`. See GLD-TRK-21.
+            "lookup":          TraktLookupManager,
         }
+        # trakt/lists REMOVED (session 94) -- dead, and _generate_unified_summary declares
+        # five fields but writes three: `title` ("") and `in_library` (False) are set in the
+        # defaultdict factory and never assigned, so both are constants rather than data. It
+        # also returns `lists` as a set() (not JSON-serialisable) and, being a defaultdict,
+        # silently includes every WATCHED series rather than only list members.
+        # ⚠️ Unlike sync/universe/analytics this one holds UNIQUE capability worth keeping:
+        # get_user_lists / get_list_items read the operator's OWN Trakt lists, which nothing
+        # else in the repo does (the enrich daemon's `lists` scope is per-TITLE; acquisition
+        # reads watchlist + recommendations only). "Acquire from my Trakt list X" is a real
+        # gap it could fill -- so KEEP THE FILE, unconstructed. See GLD-TRK-20.
+        # trakt/analytics REMOVED (session 94) — dead, and one method CANNOT WORK.
+        # ``analyze_actors`` requests search/tvdb/{id}/people, which is not a Trakt route
+        # (search/tvdb/{id} returns a SEARCH RESULT LIST; the real endpoint is
+        # shows/{id}/people), so every call 404s -> fallback None -> swallowed by
+        # `if not people: continue` -> returns {} for any history. Both methods are also
+        # O(N) API calls per run (one request per watched series, a few hundred, against a
+        # 1000/5min limit) to build a histogram that tautulli/users.compute_genre_affinity
+        # and machine_learning/people_matrix already produce from data in hand.
+        # See the module docstring and GLD-TRK-19; the file is dead and can be deleted.
+        # trakt/universe REMOVED (session 94) — dead AND its data is fabricated.
+        # ``get_universe_mapping`` returns hardcoded tvdb ids in which
+        # marvel-cinematic-universe and arrowverse are THE SAME THREE IDS, and the block
+        # runs in perfect sequential pairs across unrelated franchises (295759/60 MCU,
+        # 295761/62 X-Men, 295763/64 DCEU …). That is generated placeholder data. Universe
+        # membership feeds RETENTION (keep-universe = never deleted; bare universe =
+        # deletable last resort), so a fabricated map would mis-protect and mis-expose.
+        # The real machinery is plex/playlists/universe_order.py (curated + mdblist +
+        # Kometa learning + the chronolists bake) and radarr/quality/universe_membership.py.
+        # See the module docstring and GLD-TRK-18; the file is dead and can be deleted.
+        # trakt/sync REMOVED from the map (session 94). It was constructed every run,
+        # called by nothing, and every method it had is a LESS COMPLETE duplicate of
+        # something that already works:
+        #
+        #   get_collection()      -> sync/collection/shows
+        #        writeback/trakt_collection.py issues the SAME request itself, AND also
+        #        does sync/collection/movies, which trakt/sync never had.
+        #   get_watched()         -> sync/watched/shows        -> overlaps trakt/history
+        #   get_watched_episodes()-> shows/{id}/progress/watched -> that IS trakt/progress
+        #   last_watched_*        -> derived from trakt/history, and FAILS OPEN: every
+        #        error path returns False = "not watched recently" = NOT protected.
+        #
+        # "sync" was Trakt's /sync/ API namespace, not write-synchronisation -- the module
+        # is entirely GETs. The real write-back (collection + watched history + MAL) is
+        # services/writeback, which runs in main.py's final phase and is config-gated.
+        # The file itself is now dead; delete it (it cannot be removed from here).
+        # NOT constructed here at all: trakt/shows/ (whose cache.py declares
+        # parent_name = "TraktShowsManager") and trakt/movies/, which main.py builds
+        # directly as TraktMoviesManager for RadarrOrchestrationManager.run_relational_pull.
+        # movies therefore has a named caller; shows does not appear to be instantiated.
+
+        # Sub-managers TraktManager.run() actually calls. A construction failure in one of
+        # these is FATAL and must say so: the loop below otherwise sets the attribute to
+        # None, and run() then dies on `'NoneType' object has no attribute
+        # 'get_full_watch_history'` -- three frames from the real cause, with the actual
+        # error text already discarded into a warning.
+        #
+        # A legitimate failure is REACHABLE here: TraktHistoryManager RAISES when it cannot
+        # resolve dry_run from kwargs/parent/TraktManager/Main ("Refusing to initialize
+        # without an explicit value"). Swallowing that turns a precise, actionable message
+        # into an AttributeError about NoneType.
+        #
+        # The remaining one (`lookup`) is not called by run() at all, so its failure
+        # genuinely costs nothing this run -- it keeps warn-and-continue.
+        _REQUIRED = ("history", "ratings", "recommendations", "watchlist", "progress")
 
         for attr, cls in sub_classes.items():
             try:
                 setattr(self, attr, cls(**init_kwargs))
             except Exception as exc:
-                self.logger.log_warning(f"[TraktAPI] Sub-manager '{attr}' failed to load: {exc}")
+                if attr in _REQUIRED:
+                    raise RuntimeError(
+                        f"[TraktAPI] required sub-manager '{attr}' failed to construct: "
+                        f"{exc!r}. TraktManager.run() calls it directly, so continuing "
+                        f"would fail later with an AttributeError on None instead of this."
+                    ) from exc
+                self.logger.log_warning(
+                    f"[TraktAPI] Sub-manager '{attr}' failed to load: {exc} "
+                    f"(not called by run(); continuing)")
                 setattr(self, attr, None)
 
         self.logger.log_debug(

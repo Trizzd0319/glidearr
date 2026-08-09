@@ -216,3 +216,97 @@ def test_specials_excluded_by_default_included_on_request():
 def test_empty_input_is_safe():
     plan = order_items([])
     assert plan.items == () and plan.considered == 0 and plan.coverage == {}
+
+
+# ── GLD-PLY-17: session warmth + the recency_mode short-circuit ───────────────
+_NOW = 1_760_000_000.0
+
+
+def _warm_items():
+    """Two series: 'high' with strong watchability, 'low' with weak watchability, plus filler.
+    Every warmth test asks the same question — can a RECENT WATCH lift 'low' past 'high'?"""
+    out = []
+    for i in range(3):
+        out.append(PlaylistInput(rating_key=f"high-{i}", medium="episode", title="high",
+                                 score=92.0, series_id=1, season=5, episode=4 + i,
+                                 air_date=f"2012-01-{5 + i:02d}"))
+    for i in range(3):
+        out.append(PlaylistInput(rating_key=f"low-{i}", medium="episode", title="low",
+                                 score=61.0, series_id=3, season=4, episode=9 + i,
+                                 air_date=f"2013-11-{8 + i:02d}"))
+    for k in range(8):
+        for i in range(3):
+            out.append(PlaylistInput(rating_key=f"f{k}-{i}", medium="episode", title=f"f{k}",
+                                     score=88.0 - k * 1.5, series_id=100 + k, season=1,
+                                     episode=1 + i, air_date=f"2015-01-{1 + i:02d}"))
+    return out
+
+
+def _first_slot(plan, title):
+    for it in plan.items:
+        if it.rating_key.startswith(title + "-"):
+            return it.ordinal
+    return 10_000
+
+
+def test_warmth_is_off_by_default_and_byte_identical():
+    # warmth_weight defaults to 0.0 and recency_mode to "tier", so a caller that does not pass
+    # the new knobs gets EXACTLY the old ordering.
+    items = _warm_items()
+    srec = {3: (_NOW - 2 * 3600, 6), 1: (_NOW - 9 * 86400, 22)}
+    old = order_items(items, max_items=100, normalize_per_medium=True, resume_boost=True,
+                      resume_order="recency", resume_weight=0.35, recency_boost=True,
+                      series_recency=srec)
+    new = order_items(items, max_items=100, normalize_per_medium=True, resume_boost=True,
+                      resume_order="recency", resume_weight=0.35, recency_boost=True,
+                      recency_mode="tier", warmth_weight=0.0, series_recency=srec)
+    assert _rks(old) == _rks(new)
+
+
+def test_recency_boost_tier_bypasses_resume_saga_and_warmth():
+    # THE FINDING. With recency_mode="tier" (the legacy default) the recency_boost branch RETURNS
+    # before resume/saga/warmth are ever read — so a series watched two hours ago ranks exactly
+    # the same as one watched forty days ago, and cranking warmth to 0.9 changes NOTHING.
+    items = _warm_items()
+    hot = {3: (_NOW - 2 * 3600, 6), 1: (_NOW - 9 * 86400, 22)}
+    cold = {3: (_NOW - 40 * 86400, 6), 1: (_NOW - 9 * 86400, 22)}
+    kw = dict(max_items=100, normalize_per_medium=True, resume_boost=True,
+              resume_order="recency", resume_weight=0.35, recency_boost=True,
+              recency_mode="tier", warmth_weight=0.9, now_ts=_NOW)
+    assert _rks(order_items(items, series_recency=hot, **kw)) == \
+           _rks(order_items(items, series_recency=cold, **kw))
+
+
+def test_blend_mode_lets_warmth_promote_a_recently_watched_series():
+    # The fix: under "blend" a group watched hours ago outranks one watched weeks ago even
+    # though its raw watchability is LOWER.
+    items = _warm_items()
+    hot = {3: (_NOW - 2 * 3600, 6), 1: (_NOW - 9 * 86400, 22)}
+    cold = {3: (_NOW - 40 * 86400, 6), 1: (_NOW - 9 * 86400, 22)}
+    kw = dict(max_items=100, normalize_per_medium=True, resume_boost=True,
+              resume_order="recency", resume_weight=0.35, recency_boost=True,
+              recency_mode="blend", warmth_weight=0.6, warmth_halflife_hours=18.0, now_ts=_NOW)
+    assert _first_slot(order_items(items, series_recency=hot, **kw), "low") < \
+           _first_slot(order_items(items, series_recency=cold, **kw), "low")
+
+
+def test_warmth_decays_toward_baseline_as_the_watch_ages():
+    items = _warm_items()
+    kw = dict(max_items=100, normalize_per_medium=True, resume_boost=True,
+              resume_order="recency", resume_weight=0.35, recency_boost=True,
+              recency_mode="blend", warmth_weight=0.6, warmth_halflife_hours=18.0, now_ts=_NOW)
+    seen = [_first_slot(order_items(
+        items, series_recency={3: (_NOW - ago, 6), 1: (_NOW - 9 * 86400, 22)}, **kw), "low")
+        for ago in (2 * 3600, 86400, 7 * 86400, 60 * 86400)]
+    assert seen == sorted(seen)          # monotonically sinks back as the watch gets older
+
+
+def test_warmth_never_lifts_a_group_the_user_has_never_watched():
+    # A group with no watch history carries last=0. Warmth must contribute exactly nothing there,
+    # or "never watched" would read as "watched at the unix epoch" and earn a lift.
+    items = _warm_items()
+    kw = dict(max_items=100, normalize_per_medium=True, resume_boost=True,
+              resume_order="recency", resume_weight=0.35, recency_boost=True,
+              recency_mode="blend", warmth_halflife_hours=18.0, now_ts=_NOW)
+    assert _rks(order_items(items, series_recency={}, warmth_weight=0.0, **kw)) == \
+           _rks(order_items(items, series_recency={}, warmth_weight=0.9, **kw))

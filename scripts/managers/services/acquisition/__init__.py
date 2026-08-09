@@ -229,6 +229,23 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         free, U = self._space_band(gw, inst, cache)
         return free >= U
 
+    def _uhd_space_ok(self, gw, inst, cache: dict) -> bool:
+        """GLD-ACQ-30 UHD sub-policy (operator ruling 2026-08-07, post-1.9TB-wipe): a
+        2160p acquisition needs MORE than merely being above the pressure band — free
+        space must clear the band's upper edge by ``routing.movies.uhd_headroom_multiplier``
+        (default 1.25 = the operator's "25% higher than the floor"). 4K is the
+        biggest-ticket, least-reversible grab and must be the FIRST lane to pause as
+        space tightens — on the day the pilot wave + replacements drove the array back
+        under the min-free wall, the 4K lane held the same bar as everything else.
+        FAIL-OPEN like ``_space_band`` (unknown free ⇒ ok)."""
+        try:
+            mult = float((((self.config.get("routing") or {}).get("movies") or {})
+                          .get("uhd_headroom_multiplier", 1.25)) or 1.25)
+        except (TypeError, ValueError, AttributeError):
+            mult = 1.25
+        free, U = self._space_band(gw, inst, cache)
+        return free >= U * mult
+
     def _acquisition_paused(self, gw, inst, cache: dict) -> bool:
         """True when NEW media must not be acquired: free space is in/below the
         pressure band AND deletion is not armed (no consent / no free_space_limit), so
@@ -820,8 +837,11 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             # sweep. plan_uhd_companion returns None unless dual is active + UHD is warranted +
             # the 4K instance has space + the title isn't already a 4K copy.
             if svc == "radarr" and res.get("ok") and not under_pressure:
+                # GLD-ACQ-30 UHD sub-policy: the COMPANION path uses the STRICTER
+                # headroom callback — the 2160p bonus copy only lands when free space
+                # clears U × uhd_headroom_multiplier, not merely the band.
                 companion = resolver.plan_uhd_companion(
-                    e, space_ok=lambda inst, _gw=gw: self._space_ok(_gw, inst, band_cache),
+                    e, space_ok=lambda inst, _gw=gw: self._uhd_space_ok(_gw, inst, band_cache),
                     can_remote_play=uhd_crp)
                 if companion is not None:
                     cres = adder.add(companion, search=True)
@@ -987,12 +1007,24 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                     f"people on this title (people-affinity {ppl.get('score')})")
 
         # The named cast/crew context: the household taste profile the affinity is scored
-        # against. Shown once — it's household-wide, not per-title.
+        # against. Shown once — it's household-wide, not per-title — and covers all four
+        # tallied roles (directors, cast, composers, producers); a role the metadata source
+        # never supplies comes back empty and prints nothing.
         prof = scorer.taste_profile() if scorer is not None else {}
-        dirs, actors = prof.get("directors") or [], prof.get("actors") or []
-        if dirs or actors:
+        dirs = prof.get("directors") or []
+        actors = prof.get("actors") or []
+        composers = prof.get("composers") or []
+        producers = prof.get("producers") or []
+        if dirs or actors or composers or producers:
             self.logger.log_info("  household taste profile (what affinity is scored against):")
             if dirs:
                 self.logger.log_info("    top directors: " + ", ".join(dirs))
             if actors:
                 self.logger.log_info("    top cast: " + ", ".join(actors))
+            writers = prof.get("writers") or []
+            if writers:
+                self.logger.log_info("    top writers: " + ", ".join(writers))
+            if composers:
+                self.logger.log_info("    top composers: " + ", ".join(composers))
+            if producers:
+                self.logger.log_info("    top producers: " + ", ".join(producers))

@@ -287,3 +287,253 @@ def rehome_4k_only_enabled(config) -> bool:
     if not isinstance(mv, dict) or not mv.get("rehome_4k_only"):
         return False
     return coordinator_owns_deletion(config)
+
+
+# ── category-aware 4K roots, and the kids-visibility gate ──────────────────────────
+#
+# THE PROBLEM THESE SOLVE. ``classify_movie`` puts CONTENT above RESOLUTION on purpose:
+# its order is anime -> kids -> 4k -> standard, so a 2160p Pixar film classifies as
+# "kids", never "4k" ("CONTENT WINS: a 4K kids/anime film routes to kids/anime, so the 4k
+# library holds only non-kids, non-anime UHD movies"). The dual-version reconcile does NOT
+# honour that: it relocates every 4K companion into ONE 4K root. A kids film upgraded to
+# 2160p therefore leaves the Kids library, and a child's Plex profile — which only has
+# access to Kids — can no longer see its own film.
+#
+# The fix is per-category roots on the 4K instance (``routing.movies.uhd_root_folders``),
+# mirroring ``movieRootFolders`` on the standard side, so /4k/kids can be added to the
+# EXISTING Kids Plex library and nothing has to traverse libraries.
+
+def uhd_root_folders(config) -> dict:
+    """Per-CATEGORY root folders on the 4K instance, e.g.::
+
+        "routing": {"movies": {"uhd_root_folders": {
+            "kids":     "/data/media/movies/4k/kids",
+            "anime":    "/data/media/movies/4k/anime",
+            "standard": "/data/media/movies/4k"}}}
+
+    Empty (the default) means the reconcile keeps today's single-root behaviour — existing
+    installs unchanged. Keys are the ``classify_movie`` categories, so the same category a
+    title has on the standard instance decides its 4K root too.
+    """
+    routing = _cfg_get(config, "routing", None) or {}
+    if not isinstance(routing, dict):
+        return {}
+    mv = routing.get("movies", {}) or {}
+    if not isinstance(mv, dict):
+        return {}
+    roots = mv.get("uhd_root_folders") or {}
+    return roots if isinstance(roots, dict) else {}
+
+
+def _norm_path(p) -> str:
+    """Case-folded, forward-slashed, trailing-slash-stripped. Plex reports library paths as
+    the container sees them, which may differ from the *arr root in separator style or case
+    (bind mounts, Windows hosts, SMB), so a raw string compare is too brittle for a gate
+    whose failure hides a child's film."""
+    s = str(p or "").strip().replace("\\", "/").rstrip("/")
+    return s.casefold()
+
+
+def _path_within(child, parent) -> bool:
+    """True when *child* is *parent* or sits beneath it. Compares whole segments, so
+    ``/movies/4k-adult`` is NOT treated as inside ``/movies/4k``."""
+    c, p = _norm_path(child), _norm_path(parent)
+    if not c or not p:
+        return False
+    return c == p or c.startswith(p + "/")
+
+
+#: Categories whose titles live in their OWN Plex library rather than the general movie
+#: shelf. For these, sending a 4K companion to the flat 4K root moves it OUT of the library
+#: its audience browses -- so they get the visibility check below. "standard" is absent on
+#: purpose: the flat 4K root IS where a standard-category 4K copy belongs.
+CONTENT_CATEGORIES: tuple[str, ...] = ("kids", "anime")
+
+#: Alias-aware labels that identify the dedicated 4K/UHD Radarr instance.
+#:
+#: SINGLE SOURCE OF TRUTH. This tuple was duplicated verbatim in
+#: ``services/routing/uhd_reconcile.py`` and ``services/radarr/repair/anomaly.py``, the
+#: second carrying the comment "MUST match UhdReconcileManager._UHD_LABELS" in capitals --
+#: a requirement stated in prose with nothing enforcing it. If the two ever drifted, the
+#: monitored-missing triage and the dual-version reconcile would disagree about WHICH
+#: RADARR SESSION IS THE 4K ONE, silently and in opposite directions: one routing titles to
+#: an instance the other does not consider 4K at all.
+#:
+#: The aliases exist because the vocabulary is genuinely inconsistent upstream -- the role
+#: map writes "4K" while the folder bucket is "4k", and operators reasonably use "uhd" or
+#: "2160p". Accepting all of them means a casing or naming choice never silently disables
+#: the 4K path.
+UHD_INSTANCE_LABELS: tuple[str, ...] = ("4K", "4k", "uhd", "UHD", "2160p", "2160")
+
+
+def category_uhd_root(config, category: str) -> str:
+    """The 4K-instance root folder for *category*, or "" when none is configured."""
+    return str(uhd_root_folders(config).get(str(category or "")) or "").strip()
+
+
+def kids_uhd_root(config) -> str:
+    """The 4K-instance root folder for KIDS movies. Thin alias over
+    :func:`category_uhd_root` — kids is the case with real access consequences, so it keeps a
+    named accessor."""
+    return category_uhd_root(config, "kids")
+
+
+def category_uhd_visible(config, category: str, library_paths) -> bool:
+    """Is *category*'s configured 4K root inside one of the given Plex library locations?
+
+    ``library_paths`` is the on-disk locations of the libraries that serve this category (the
+    caller reads them — the Plex service knows which sections those are; this stays pure).
+    Returns False when no root is configured or none of the paths cover it.
+
+    This is the VERIFICATION half. Use :func:`category_uhd_allowed` for the decision — it
+    also handles "the paths could not be read at all", which is a different answer from
+    "read them and found no match".
+    """
+    root = category_uhd_root(config, category)
+    if not root:
+        return False
+    for lib in (library_paths or ()):
+        if _path_within(root, lib):
+            return True
+    return False
+
+
+def kids_uhd_visible(config, kids_library_paths) -> bool:
+    """Is the configured kids 4K root inside a Plex library a kid profile reaches?"""
+    return category_uhd_visible(config, "kids", kids_library_paths)
+
+
+def plex_sections_covering(sections, path, *, media_type: str = "movie") -> list:
+    """The Plex sections whose on-disk locations CONTAIN *path*.
+
+    ``sections`` is the ``plex/sections`` inventory written by
+    ``PlexLibrarySectionsManager.run()`` — a dict keyed by section id::
+
+        {"3": {"title": "Kids Movies", "type": "movie",
+               "locations": ["/data/media/movies/kids", ...]}}
+
+    Returns the matching section dicts (each with its ``title`` and ``locations``), or []
+    when none cover the path. Filtered by ``media_type`` so a "Kids TV" show library never
+    answers a question about a MOVIE root.
+    """
+    out = []
+    if not isinstance(sections, dict) or not path:
+        return out
+    for sec in sections.values():
+        if not isinstance(sec, dict):
+            continue
+        if media_type and str(sec.get("type") or "").strip().lower() != media_type:
+            continue
+        for loc in (sec.get("locations") or []):
+            if _path_within(path, loc):
+                out.append(sec)
+                break
+    return out
+
+
+def category_library_paths(sections, category_root, *, media_type: str = "movie"):
+    """Every location of the Plex libraries that already hold *category_root*.
+
+    THIS IS HOW THE CATEGORY'S LIBRARY IS IDENTIFIED — by the folder attached to it, not by
+    its name. The operator's existing standard-side root (``movieRootFolders["kids"]``) is
+    already inside exactly one Plex library; that library IS the kids library, whatever it
+    happens to be called. Matching on section TITLES ("kid"/"child"/"family") was a guess
+    that breaks on any local naming — "Little Ones", "Family Movies (4K)", a non-English
+    install — and breaks silently, by capping content it should have allowed.
+
+    Returns the union of those libraries' locations, so a caller can then ask whether some
+    OTHER path (the 4K root) is in the same library. Returns:
+
+        None  the inventory is unreadable/cold          -> caller reports "unverifiable"
+        []    readable, but nothing holds category_root -> the category's own movies are not
+              in any Plex movie library, which is itself worth surfacing
+    """
+    if not isinstance(sections, dict) or not sections:
+        return None
+    if not category_root:
+        return []
+    paths = []
+    for sec in plex_sections_covering(sections, category_root, media_type=media_type):
+        paths.extend(str(p) for p in (sec.get("locations") or []) if p)
+    return paths
+
+
+def category_library_titles(sections, category_root, *, media_type: str = "movie") -> list:
+    """Titles of the Plex libraries holding *category_root* — for operator-facing messages
+    ("added to 'Kids Movies'"), so a log or an onboarding prompt can name the library rather
+    than describe it."""
+    return [str(s.get("title") or "?")
+            for s in plex_sections_covering(sections, category_root, media_type=media_type)]
+
+
+def category_uhd_allowed(config, category: str, library_paths=None) -> tuple[bool, str]:
+    """May a title in *category* be given a 2160p companion? Returns ``(allowed, reason)``.
+
+    The single authority for the question, so the add-time resolver and the proactive
+    reconcile answer it IDENTICALLY (computing it twice is how add-time and reconcile drift
+    apart — cf. the shared classify/plan_moves split).
+
+    Categories outside :data:`CONTENT_CATEGORIES` are always allowed: a standard-category 4K
+    copy belongs in the flat 4K root, so there is nothing to verify.
+
+    For a content category, THREE states — all three CAP unless the root is positively
+    confirmed reachable. "We checked and it is wrong" and "we could not check" are still
+    reported separately, because they want different fixes:
+
+      no root configured                   -> (False, "unconfigured")
+            The DEFAULT. Nothing promises a 4K copy would stay in the right library, so cap
+            at 1080p. Silent — this is the ordinary single-root install.
+
+      configured, category's OWN root not in any Plex movie library -> (False, "category-not-in-plex")
+            Distinct from the case below, and a bigger problem than 4K: the category's
+            EXISTING films are not in any Plex movie library either. Either the standard root
+            was never added to Plex, or ``movieRootFolders[category]`` does not match what
+            Plex actually has. Surface it as its own fault — telling the operator to "add the
+            4K root to the kids library" is useless when there is no kids library.
+
+      configured, paths known, 4K root NOT covered -> (False, "not-in-library")
+            The library exists and holds the standard root, but the 4K root was never added
+            to it as a second folder — so the 4K copy would leave the shelf its audience
+            browses. Cap, and say so; loudly for kids, where a restricted profile loses the
+            film entirely.
+
+      configured, paths unknown (None)     -> (False, "unverifiable")
+            Plex's section inventory could not be read, so we cannot confirm the root is
+            reachable. CAP — operator policy: if the path Radarr reports is not DETECTED in
+            Plex, do not create a 4K copy there. The two outcomes are not symmetric, and this
+            is the cheap one:
+
+                wrongly capped -> the title stays 1080p. Watchable, and the next run with a
+                                 warm Plex cache upgrades it.
+                wrongly allowed -> a 2160p file lands where its audience cannot reach it. For
+                                 kids that is a silent loss whose only symptom is a child
+                                 saying a film is gone.
+
+    ONE BIG MOVIE LIBRARY NEEDS NO SPECIAL CASE. A household running a single ``Movies``
+    library on ``/data/media/movies`` passes automatically: that library holds the kids root
+    (it is inside it), and its location also contains ``/data/media/movies/4k/kids``, so the
+    containment test succeeds. Nothing to configure. And if the 4K root lives on a different
+    mount, it correctly caps — Plex genuinely could not see it there.
+    """
+    cat = str(category or "").strip().lower()
+    if cat not in CONTENT_CATEGORIES:
+        return True, "not-a-content-category"
+    if not category_uhd_root(config, cat):
+        return False, "unconfigured"
+    if library_paths is None:
+        return False, "unverifiable"
+    if not library_paths:
+        return False, "category-not-in-plex"
+    if category_uhd_visible(config, cat, library_paths):
+        return True, "visible"
+    return False, "not-in-library"
+
+
+def kids_uhd_allowed(config, kids_library_paths=None) -> tuple[bool, str]:
+    """May a KIDS title take a 2160p companion? See :func:`category_uhd_allowed`.
+
+    Kids is the case where the failure has real consequences rather than merely untidy ones:
+    a child's profile reaches only the Kids library, so a 4K copy outside it does not look
+    misfiled — the film is simply gone, and the only symptom is a child saying so.
+    """
+    return category_uhd_allowed(config, "kids", kids_library_paths)

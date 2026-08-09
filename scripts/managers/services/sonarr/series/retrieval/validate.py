@@ -1,5 +1,6 @@
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
+from scripts.support.config.cache_keys import CacheKeyPaths
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
 
@@ -95,12 +96,34 @@ class SonarrSeriesRetrievalValidationManager(BaseManager, ComponentManagerMixin)
     def validate_series_tags(self, instance: str) -> list:
         """
         Ensures all tag references used by cached series exist in the known tag list.
-        """
-        tag_key = f"sonarr/{instance}/tags.json"
-        tag_data = self.sonarr_cache.get(tag_key) or []
-        known_tags = {t["id"] for t in tag_data if isinstance(t, dict)}
 
+        TWO FIXES HERE, and the second matters more than the first.
+
+        The key was ``f"sonarr/{instance}/tags.json"`` — the RAW instance (every other line
+        in this method resolves it first) and a ``.json`` suffix that
+        ``CacheKeyPaths.sonarr.TAGS`` does not carry. A fifth cache-key spelling in a
+        codebase that already had four.
+
+        But a wrong key only mattered because of what happened next: a miss produced
+        ``tag_data = []`` → ``known_tags = set()`` → **every tag on every series read as an
+        invalid reference**, and the method reported the entire library as broken. That is
+        absent conflated with empty, in a validator — the one place a false positive is
+        indistinguishable from the thing it exists to detect. An unreadable tag list is now
+        a SKIP with a reason, not a finding.
+        """
         resolved_instance = self.instance_manager.resolve_instance(instance)
+        tag_key = CacheKeyPaths.sonarr.TAGS.replace("<instance>", resolved_instance or "default")
+        tag_data = (self.sonarr_cache.get(tag_key) if self.sonarr_cache else None) or []
+        known_tags = {t["id"] for t in tag_data if isinstance(t, dict) and t.get("id") is not None}
+
+        if not known_tags:
+            self.logger.log_warning(
+                f"⚠️ Skipping tag validation for '{resolved_instance}': no tags cached at "
+                f"'{tag_key}'. That is an unreadable tag list, not a library with no tags — "
+                f"validating against it would report EVERY tag reference as invalid."
+            )
+            return []
+
         invalid_usages = []
 
         for letter in "abcdefghijklmnopqrstuvwxyz0123456789_":

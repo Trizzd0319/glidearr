@@ -63,6 +63,7 @@ from scripts.managers.factories.daemons.daemon_paths import (
     PEOPLE_MATRIX_PATH,
     PEOPLE_MATRIX_STATE,
     PEOPLE_NAMES_PATH,
+    PEOPLE_MOVIES_SIDECAR,
     PEOPLE_SHOWS_SIDECAR,
     SHOW_BUCKETS,
 )
@@ -89,7 +90,8 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
         self.matrix_path   = Path(kwargs.get("matrix_path", PEOPLE_MATRIX_PATH))
         self.affinity_path = Path(kwargs.get("affinity_path", PEOPLE_AFFINITY_PATH))
         self.names_path    = Path(kwargs.get("names_path", PEOPLE_NAMES_PATH))
-        self.shows_sidecar = Path(kwargs.get("shows_sidecar", PEOPLE_SHOWS_SIDECAR))
+        self.shows_sidecar  = Path(kwargs.get("shows_sidecar", PEOPLE_SHOWS_SIDECAR))
+        self.movies_sidecar = Path(kwargs.get("movies_sidecar", PEOPLE_MOVIES_SIDECAR))
         self.state_path    = Path(kwargs.get("state_path", PEOPLE_MATRIX_STATE))
         # Daemon credit-bucket dirs, overridable so a test can point them at an empty
         # temp dir instead of walking the real ~31k-file cache.
@@ -181,20 +183,67 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
                     yield ("show", tvdb), credits
 
     # ── MOVIE half — the relational credits table ───────────────────────────────
+    # HISTORY — why the movie half reads the daemon buckets first.
+    #
+    # The enrich daemon used to call ``movies/{id}/people`` with a TMDB id, but that Trakt
+    # path resolves a TRAKT id (or slug, or imdb id). Colliding numbers returned a
+    # DIFFERENT title's credits, cached under the external id as if correct:
+    #
+    #   movies/65      (8 Mile, tmdb 65)     -> Eddie Murphy, Judge Reinhold  (Beverly Hills Cop)
+    #   movies/1271    (300, tmdb 1271)      -> Daniel Brühl, Leonor Watling
+    #   shows/75710    (Criminal Minds)      -> Ray Evernham, a NASCAR crew chief
+    #
+    # ~77% of movie buckets and ~84% of show buckets were wrong. Fixed in enrich_pool via
+    # ``fetch_map`` (imdb/trakt id in the URL, external id on the bucket) and the whole
+    # corpus was purged and refetched — 845/845 watchlist movies and 90/90 watchlist shows
+    # verified correct afterwards, against Radarr's own tmdbId->title mapping.
+    #
+    # The relational parquet was NOT an independent check on any of that: it is built by
+    # ``relational.build_relations_from_movies`` from ``TraktMoviePeopleManager``, which
+    # reads these same buckets. It inherited every bad row and keeps serving them until
+    # something regenerates it — which is exactly why the buckets now take precedence.
+
     def _movie_forward(self) -> dict:
-        """``{("movie", tmdb): {role: [person_id]}}`` from every instance's
-        ``relational/movie_person_relations.parquet``.
+        """``{("movie", tmdb): {role: [person_id]}}`` — the Radarr relational credit
+        tables, SUPPLEMENTED by the daemon's own credit buckets for titles Radarr
+        doesn't hold.
 
         All seven credited roles come through, cast ordered by ``billing_order``. A
         title present in several instances keeps whichever table actually has credits
         for it (see ``merge_forward``). Returns {} — never raises — when pandas or the
-        tables are unavailable, so the show half and the fallback still run."""
+        tables are unavailable, so the show half and the fallback still run.
+
+        WHY the supplement. The relational parquet is derived from Radarr, so it can only
+        ever describe movies that are IN Radarr. Everything else in this class quietly
+        inherited that ceiling: measured on a live watchlist, 574 of 845 watchlisted
+        movies were in Radarr and 271 were not, and NONE of those 271 could enter the
+        matrix no matter how thoroughly the enrich daemon fetched their credits. Those
+        271 are exactly the acquisition candidates — the titles not yet added — so
+        ``people_affinity`` and the co-occurrence proposer were both structurally blind
+        to the set they exist to rank. The show half never had this problem because it
+        reads its daemon bucket directly (``_show_forward``).
+
+        The parquet stays PRIMARY: it carries Radarr's ``billing_order`` and
+        ``role_type``, which the Trakt credit blobs approximate less precisely. The
+        daemon bucket only fills ids the parquet said nothing about, so behaviour for
+        every already-covered title is unchanged.
+        """
         from scripts.managers.machine_learning.people_matrix import (
             forward_from_relations, merge_forward,
         )
         paths = self._instance_parquets("relational/movie_person_relations.parquet")
         if not paths:
-            return {}
+            # P-B FIX (GLD-PPL-11): a missing parquet used to EARLY-RETURN {} past the
+            # bucket supplement below — the exact inversion of this docstring's own
+            # precedence ("buckets WIN … the AUTHORITATIVE source"). No relational
+            # parquet has ever been produced on this deployment, so the movie half
+            # silently vanished from every build: on 2026-08-07 the published forward
+            # was SHOWS-ONLY (4,152 titles) while a fresh 1.5MB movie sidecar sat
+            # unused, and the household person-affinity published as {} — the C4
+            # people_affinity signal dead system-wide, the co-occurrence proposer
+            # blind, and the billing experiment's join measuring an artifact with no
+            # movies in it. No parquet ⇒ the buckets ARE the movie half.
+            return self._movie_forward_from_buckets()
         try:
             import pandas as pd
         except Exception as e:
@@ -215,7 +264,91 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
                 maps.append(forward_from_relations(df.to_dict("records")))
             except Exception as e:
                 self.logger.log_debug(f"[PeopleMatrix] {path.parent.parent.name} relations unroutable: {e}")
-        return merge_forward(*maps) if maps else {}
+        fwd = merge_forward(*maps) if maps else {}
+        # Daemon buckets WIN over the parquet — see _movie_forward_from_buckets.
+        fwd.update(self._movie_forward_from_buckets())
+        return fwd
+
+    def _movie_forward_from_buckets(self) -> dict:
+        """Movie credits from the daemon's own gz buckets — the AUTHORITATIVE source.
+
+        This used to be a gap-filler behind the Radarr relational parquet, on the belief
+        that the parquet carried Radarr's own credits. It does not. ``relational.py``'s
+        ``build_relations_from_movies`` is fed by ``TraktMoviePeopleManager``, which reads
+        these very buckets — so the parquet is a DERIVATIVE of them, one hop further from
+        the truth and free to go stale. It also holds no extra fidelity: its cast order
+        comes from the same Trakt ``order`` field the buckets carry.
+
+        So the precedence is now bucket-first, parquet only for titles the buckets have
+        not reached. That matters during a refetch: after the id-collision fix the buckets
+        are correct immediately, while the parquet keeps serving the old wrong credits
+        until something regenerates it. Ranking the derived copy above its own source was
+        the thing keeping known-good data out of the matrix.
+
+        Incremental, via a ``{tmdb: mtime_ns}`` sidecar — the same trick ``_show_forward``
+        uses. That is not premature: on a live cache the parquet held 12,987 tmdb ids
+        against 25,007 in the daemon bucket, so the supplement is ~12k titles, and the
+        build fingerprint now includes the movie bucket (it has to, or the supplement
+        would freeze). The daemon rewrites that bucket continuously while it works the
+        unowned backlog, so a non-incremental version would re-decompress 12k gz files
+        every few minutes. Only files whose mtime moved are re-read.
+
+        Best-effort: an unreadable blob is skipped rather than failing the build.
+        """
+        mc = self._get_movie_cache()
+        if mc is None:
+            return {}
+        from scripts.managers.machine_learning.people_matrix import route_people
+
+        current: dict[str, int] = {}
+        try:
+            with os.scandir(self.movie_bucket) as it:
+                for entry in it:
+                    if not entry.name.endswith(".json.gz"):
+                        continue
+                    try:
+                        current[entry.name.split(".", 1)[0]] = entry.stat().st_mtime_ns
+                    except OSError:
+                        continue
+        except (OSError, FileNotFoundError):
+            return {}
+
+        prior = self._read_gz(self.movies_sidecar, ignore_ttl=True) or {}
+        prior_files = prior.get("files") or {}
+        prior_roles = prior.get("roles") or {}
+
+        roles_out: dict[str, dict] = {}
+        reread = 0
+        for mid, mtime in current.items():
+            if prior_files.get(mid) == mtime and mid in prior_roles:
+                roles_out[mid] = prior_roles[mid]
+                continue
+            reread += 1
+            try:
+                credits = mc.get_people(int(mid))
+            except Exception:
+                credits = None
+            if not credits or not (credits.get("cast") or credits.get("crew")):
+                roles_out[mid] = {}
+                continue
+            roles_out[mid] = route_people(credits)
+
+        self._write_gz(self.movies_sidecar, {"files": current, "roles": roles_out})
+
+        out: dict = {}
+        for mid, roles in roles_out.items():
+            if not roles:
+                continue
+            try:
+                out[("movie", int(mid))] = roles
+            except (TypeError, ValueError):
+                continue
+        if out:
+            self.logger.log_info(
+                f"[PeopleMatrix] {len(out):,} movies from daemon credits "
+                f"({reread:,} re-read); these override the relational tables."
+            )
+        return out
 
     def _relational_names(self) -> dict:
         """``{person_tmdb_id: name}`` from the relational ``people.parquet`` tables — the
@@ -311,6 +444,28 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
 
     # ── fingerprints ────────────────────────────────────────────────────────────
     @staticmethod
+    def _bucket_sig(bucket) -> list:
+        """``[file_count, newest_mtime_ns, total_bytes]`` for a daemon gz bucket — a cheap
+        stat-only digest that changes whenever the daemon adds, rewrites or removes a
+        credits blob. ``[0, 0, 0]`` for a missing/unreadable directory."""
+        try:
+            n = newest = total = 0
+            with os.scandir(bucket) as it:
+                for entry in it:
+                    if not entry.name.endswith(".json.gz"):
+                        continue
+                    try:
+                        st = entry.stat()
+                    except OSError:
+                        continue
+                    n += 1
+                    total += st.st_size
+                    newest = max(newest, st.st_mtime_ns)
+            return [n, newest, total]
+        except (OSError, FileNotFoundError):
+            return [0, 0, 0]
+
+    @staticmethod
     def _stat_sig(paths) -> list:
         sig = []
         for p in paths:
@@ -329,29 +484,17 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
         from scripts.managers.machine_learning.people_matrix.build import (
             PERSON_BILLING_DECAY, PERSON_ROLE_WEIGHTS,
         )
-        show_sig = [0, 0, 0]
-        try:
-            n = newest = total = 0
-            with os.scandir(self.show_bucket) as it:
-                for entry in it:
-                    if not entry.name.endswith(".json.gz"):
-                        continue
-                    try:
-                        st = entry.stat()
-                    except OSError:
-                        continue
-                    n += 1
-                    total += st.st_size
-                    newest = max(newest, st.st_mtime_ns)
-            show_sig = [n, newest, total]
-        except (OSError, FileNotFoundError):
-            pass
         payload = [
             MATRIX_REVISION,
             sorted(PERSON_ROLE_WEIGHTS.items()), PERSON_BILLING_DECAY,
             self._stat_sig(self._instance_parquets("relational/movie_person_relations.parquet")),
             self._stat_sig(self._instance_parquets("movie_files.parquet")),
-            show_sig,
+            self._bucket_sig(self.show_bucket),
+            # The movie bucket now feeds _movie_forward_supplement, so the matrix must
+            # rebuild when the daemon enriches a movie Radarr doesn't hold. Without this
+            # the supplement would be computed once and then frozen behind a fingerprint
+            # that could not see the very growth it depends on.
+            self._bucket_sig(self.movie_bucket),
             watched_digest,
         ]
         return hashlib.sha1(
@@ -445,7 +588,7 @@ class TraktPeopleMatrixManager(BaseManager, ComponentManagerMixin):
 
                 movie_fwd = self._movie_forward()
                 show_fwd, show_names, reread = self._show_forward()
-                src = f"relational({len(movie_fwd):,}) + show buckets({len(show_fwd):,}, {reread:,} re-read)"
+                src = f"movie graph({len(movie_fwd):,}) + show buckets({len(show_fwd):,}, {reread:,} re-read)"
 
                 if not movie_fwd:
                     # No relational credits table yet (fresh install): fall back to the

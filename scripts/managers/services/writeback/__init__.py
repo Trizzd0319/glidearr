@@ -4,8 +4,14 @@ WritebackManager — push local state outward (Trakt collection/history, MAL lis
 Runs in main.py's final phase. Each sub-sync is independently gated by config and
 honours ``dry_run`` (logs "would …", writes nothing):
   * trakt_writeback.collection → mirror *arr library into Trakt collection
+      └ collection_watched_only → narrow that to titles actually WATCHED
   * trakt_writeback.history    → push episode-level watched history from Tautulli
   * mal_writeback              → reflect watch progress to the user's MAL list
+
+All four are captured by the Trakt onboarding step, which explains the distinction
+that matters: Trakt's COLLECTION means "I own this" and its HISTORY means "I watched
+this" — two independent lists. MAL has no ownership concept at all, so it is only
+ever offered as watch progress.
 """
 from __future__ import annotations
 
@@ -30,7 +36,12 @@ class WritebackManager(BaseManager, ComponentManagerMixin):
         self.register()
 
         parent = kwargs.get("manager")
-        self.dry_run = kwargs.get("dry_run", getattr(parent, "dry_run", False) if parent else False)
+        # dry_run is resolved by BaseManager (explicit kwarg -> pre-super value ->
+        # kwargs["manager"] -> registry parent -> False). The local
+        # `kwargs.get("dry_run", getattr(parent, ...))` that used to sit here was
+        # not just redundant but HARMFUL: it defaulted to False, so a
+        # parent-inherited True was silently overwritten with LIVE in the one
+        # manager that pushes to third-party accounts with no undo.
         self.trakt = kwargs.get("trakt")
         self.mal = kwargs.get("mal")
         self.sonarr = kwargs.get("sonarr")
@@ -49,8 +60,12 @@ class WritebackManager(BaseManager, ComponentManagerMixin):
         if tw.get("enabled"):
             if tw.get("collection", True):
                 try:
+                    # global_cache is REQUIRED for collection_watched_only: the watched set
+                    # comes from the cached Trakt history. Without it the scoped push skips
+                    # rather than silently widening to the whole library.
                     TraktCollectionSync(self.trakt, self.sonarr, self.radarr,
-                                        self.config, self.logger, self.dry_run).run()
+                                        self.config, self.logger, self.dry_run,
+                                        global_cache=self.global_cache).run()
                 except Exception as e:
                     self.logger.log_warning(f"[writeback] collection sync failed: {e}")
             if tw.get("history", True):

@@ -292,6 +292,20 @@ def _print_table(rows: list) -> None:
               f"{decision:<9}  {title}{year}")
 
 
+def _print_reasons(rows: list) -> None:
+    """The resolver's own explanation for each profile pick. Shows and movies take
+    different branches (pilot floor vs score ladder), so this is usually the fastest
+    answer to 'why did that title get that profile'."""
+    print("\nprofile selection (resolver's own reason per pick)")
+    hdr = f"{'score':>5}  {'profile':<24}  reason / title"
+    print(hdr)
+    print("-" * len(hdr))
+    for e, _ in rows:
+        prof = (e.get("quality_profile") or {}).get("name") or "-"
+        print(f"{e.get('score', 0):>5}  {str(prof)[:24]:<24}  {e.get('title')}")
+        print(f"{'':>5}  {'':<24}  └─ {e.get('profile_reason') or '(no reason recorded)'}")
+
+
 def _print_matrix(rows: list) -> None:
     print("\nscore matrix (component → 0-100; blank = n/a, dropped from the average)")
     keys = ["genre_affinity", "source", "trakt_rating", "popularity", "recency", "people_affinity"]
@@ -364,7 +378,12 @@ def main() -> None:
         scored = scorer.score(e)
         e["score"] = scored["total"]
         e["matrix"] = scored["matrix"]
-        enriched.append(resolver.resolve_quality(e, scored["total"]))
+        e = resolver.resolve_quality(e, scored["total"])
+        # The resolver records WHY it picked that profile on itself, and overwrites it on
+        # the next candidate — capture it now. This is the difference between "why is a
+        # score of 64 sitting on 720p?" and reading resolver.py to find the pilot-floor branch.
+        e["profile_reason"] = getattr(resolver, "_last_profile_reason", "") or ""
+        enriched.append(e)
 
     eligible = sorted((e for e in enriched if e.get("score", 0) >= min_score),
                       key=lambda x: x.get("score", 0), reverse=True)
@@ -379,6 +398,7 @@ def main() -> None:
 
     _print_table(rows)
     if args.verbose and rows:
+        _print_reasons(rows)
         _print_matrix(rows)
 
     print(f"\nresolved={len(enriched)}  eligible={len(eligible)}  "

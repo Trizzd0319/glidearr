@@ -9,10 +9,24 @@ Gated three ways, so it is inert until the operator opts in:
   • routing.configured — the routing onboarding step has run (else: skip entirely, so a
                          never-onboarded install does nothing).
   • routing.reorg_mode  — off (skip) / log_only (classify + LOG misplacements, move
-                          NOTHING) / same_instance (actuate same-instance folder moves).
+                          NOTHING) / same_instance (actuate same-instance folder moves) /
+                          cross_instance (a PEER mode — see below).
   • relocation_enabled  — same_instance ALSO requires explicit move consent; and even then
-                          a dry_run never PUTs. Cross-instance migration (anime / 4K
-                          instance) is NOT done here — that stays a separate, deferred path.
+                          a dry_run never PUTs.
+
+ON cross_instance — A PEER MODE, NOT A SUPERSET.
+``reorg_mode`` is single-valued and the two actuating modes are mutually exclusive by
+design (``routing_targets.py``: *"an install actuates EITHER same-instance folder moves
+OR the cross-instance reconcile — not both at once"*). They move files along different
+axes:
+
+    same_instance   content bucket, one instance   kids / anime / standard   -> THIS manager
+    cross_instance  resolution tier, two instances standard -> ultra (4K)    -> uhd_reconcile
+
+So with ``cross_instance`` set, this manager still classifies and writes the full plan to
+support/logs/routing.log, and moves nothing — that is correct, not a bug. Wanting both at
+once means adding an ``all`` mode to ``_REORG_MODES``; it is not a matter of loosening the
+test here, and ``relocation_enabled`` enforces the same exclusivity independently.
 
 Classification + the move plan are the shared, pure ``library_router`` / ``library_classifier``
 (identical to the add-time resolver, so add-time and re-org never disagree). This manager is
@@ -87,7 +101,17 @@ class RoutingManager:
             return
         classify = self._classifier(is_show)
         anime_media_fn = (lambda it: self._anime_media(it)) if is_show else None
-        # same_instance moves require the mode AND consent AND a live (non-dry) run.
+        # same_instance folder moves require the mode AND consent AND a live (non-dry) run.
+        #
+        # EQUALITY IS DELIBERATE. cross_instance is a PEER mode, not a superset --
+        # routing_targets.py, the single source of truth for these gates, states it:
+        # "reorg_mode is single-valued, so an install actuates EITHER same-instance
+        # folder moves OR the cross-instance reconcile - not both at once (a future
+        # 'all' mode could lift that if ever needed)". relocation_enabled() below
+        # enforces the same thing independently (it returns False unless mode ==
+        # "same_instance"), so widening this test alone changes nothing and widening
+        # BOTH would silently break the stated exclusivity. If you want both
+        # behaviours, add the "all" mode to _REORG_MODES rather than loosening this.
         apply = (mode == "same_instance") and relocation_enabled(self.config) and not self.dry_run
         for name in list((im._get_apis() or {}).keys()):
             try:
@@ -98,8 +122,18 @@ class RoutingManager:
             # The configured folder maps are GLOBAL, but this instance owns only
             # some roots. Fetch its real ones so plan_moves can refuse a
             # cross-library target (the 4K instance being told to move a
-            # kids-classified film into the 1080p kids root). Failure leaves the
-            # set empty, which disables the guard rather than the pass.
+            # kids-classified film into the 1080p kids root).
+            #
+            # FAILS TOWARD INACTION. A failed rootfolder fetch used to leave the set
+            # empty, which DISABLED THE GUARD rather than the pass -- so a transient API
+            # error let same-instance moves proceed with the cross-root check switched
+            # off, in the one place that MOVES FILES. The two outcomes are not
+            # symmetric: skipping the pass costs one run of re-organisation (the plan is
+            # still logged, and the next run redoes it), while moving without the guard
+            # can put a kids film in the 4K instance's root, where its audience cannot
+            # reach it and only a manual move gets it back. Per the fail-direction rule
+            # (machine_learning/discovery), on unknown input prefer the outcome that
+            # changes nothing.
             allowed_roots = set()
             try:
                 allowed_roots = {
@@ -110,6 +144,15 @@ class RoutingManager:
             except Exception as e:
                 self._log("log_debug", f"[Routing] {name}: root-folder list "
                                        f"unavailable, cross-root guard off: {e}")
+            if apply and not allowed_roots:
+                self._log("log_warning",
+                          f"[Routing] {name}: root-folder list unavailable, so the cross-root "
+                          f"guard cannot run -- PLANNING ONLY this run rather than moving files "
+                          f"unguarded. The plan is still written to support/logs/routing.log; "
+                          f"the next run with a readable root list will apply it.")
+                apply_here = False
+            else:
+                apply_here = apply
             plans = library_router.plan_moves(
                 items, is_show=is_show, routing=self._routing,
                 root_folders=self._root_folders, movie_root_folders=self._movie_root_folders,
@@ -119,13 +162,13 @@ class RoutingManager:
                 continue
             kind = "show" if is_show else "movie"
             self._log("log_info", f"[Routing] {name}: {len(plans)} {kind}(s) misplaced "
-                                  f"({'applying same-instance moves' if apply else 'log only'}) "
+                                  f"({'applying same-instance moves' if apply_here else 'log only'}) "
                                   f"— full plan in support/logs/routing.log")
             self._detail(f"-- {name} ({kind}s): {len(plans)} misplaced --")
             for p in plans:
                 self._detail(f"[{name}] {p['title']}: {p['current_root'] or '?'} -> "
                              f"{p['target_root'] or '(stay)'}  [{p['reason']}]")
-            if apply:
+            if apply_here:
                 self._apply(im, name, put_ep, id_key, plans, is_show)
 
     def _apply(self, im, name, put_ep, id_key, plans, is_show):

@@ -52,6 +52,10 @@ from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.ledger.decision_ledger import stamp
 from scripts.managers.machine_learning.space.downgrade_planner import plan_series_downgrades
+from scripts.managers.machine_learning.space.reclaim_ledger import (
+    planned_reclaim_gb,
+    record_planned_reclaim,
+)
 from scripts.managers.machine_learning.thresholds.registry import get_threshold
 from scripts.managers.services.radarr.quality.space_pressure import RadarrSpacePressureManager
 from scripts.support.utilities.decorators.timing import timeit
@@ -71,7 +75,7 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
     parent_name = "SonarrSeries"
 
     HD_720P_PROFILE_NAME = "HD-720p"
-    PRESSURE_FALLBACK_GB = 25.0  # last-resort floor only (free_space_limit unset AND total drive unreadable)
+    PRESSURE_FALLBACK_GB = 0.0   # NO last-resort floor (config free_space_limit, else 25% of total, else none)
     RECENT_WATCH_DAYS    = 7      # don't downgrade a series watched within this window
     RECENT_AIR_DAYS      = 30     # don't downgrade a series with a very recently aired ep
     # 17, not 20: re-anchored with the whole delete family when Group D v2 replaced a
@@ -260,14 +264,194 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         out.sort(key=lambda t: -t[3])
         return out
 
+    def _series_alt_titles(self, instance: str, sid, display_title: str) -> tuple:
+        """GLD-ACQ-27b — alternate title candidates for the identity gate, so releases
+        named in the ORIGINAL language pass for series Sonarr displays in English
+        ('Kimetsu no Yaiba' releases for 'Demon Slayer: Kimetsu no Yaiba').
+
+        Two sources, cheap first: (1) SEGMENTS of the display title split on ':' and
+        parentheticals — the combined-title convention means the romaji is usually
+        already sitting inside the Sonarr title; segments need ≥2 tokens or ≥8 chars
+        so a stray one-word fragment can't loosen the gate. (2) Sonarr's own
+        ``series/{id}.alternateTitles`` (scene + original-language names), fetched
+        once per candidate series per pass and failure-tolerant — the gate stays
+        functional on the segments alone if the call fails. Capped, deduped."""
+        out, seen = [], set()
+
+        def _add(t):
+            t = (t or "").strip()
+            if not t:
+                return
+            toks = [x for x in __import__("re").split(r"[^A-Za-z0-9]+", t) if x]
+            if len(toks) < 2 and len(t) < 8:
+                return
+            key = t.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(t)
+
+        import re as _re
+        for seg in _re.split(r"[:\(\)\[\]–—]+", str(display_title or "")):
+            _add(seg)
+        try:
+            series = self.sonarr_api._make_request(
+                instance, f"series/{int(sid)}", fallback=None) or {}
+            for at in (series.get("alternateTitles") or [])[:20]:
+                _add((at or {}).get("title"))
+        except Exception:
+            pass
+        # The display title itself is the matcher's primary; segments/aliases ride as
+        # alternates. Drop the primary from the alt list if it slipped in.
+        prim = str(display_title or "").strip().lower()
+        return tuple(t for t in out if t.lower() != prim)[:12]
+
+    def _series_absolute_map(self, instance: str, sid) -> "dict | None":
+        """GLD-ACQ-27c — {(season, episode): absoluteEpisodeNumber} for ANIME-typed
+        series, so the identity gate can validate bare-number releases against the
+        EXACT absolute number Sonarr assigns ('Kimetsu no Yaiba - 33' IS S02E07)
+        instead of the season-1-only heuristic. Returns None for non-anime series
+        (bare numbers on standard shows stay under the strict rule) and on any
+        failure — the gate then falls back to the prior conservative behaviour.
+        One ``series/{id}`` + one ``episode?seriesId=`` call per candidate series
+        per pass; this path realizes a handful of files per run, so the cost is
+        noise. Sonarr itself already SEARCHES with absolute forms for anime-typed
+        series — this is the matching half of that same convention."""
+        try:
+            series = self.sonarr_api._make_request(
+                instance, f"series/{int(sid)}", fallback=None) or {}
+            if str(series.get("seriesType") or "").lower() != "anime":
+                return None
+            eps = self.sonarr_api._make_request(
+                instance, f"episode?seriesId={int(sid)}", fallback=None) or []
+            out = {}
+            for e in eps:
+                try:
+                    sn, en = int(e.get("seasonNumber")), int(e.get("episodeNumber"))
+                    ab = e.get("absoluteEpisodeNumber")
+                    if sn > 0 and ab is not None:
+                        out[(sn, en)] = int(ab)
+                except (TypeError, ValueError):
+                    continue
+            return out or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _release_ok_for_episode(release: dict, series_title: str,
+                                season, episode, alt_titles: tuple = (),
+                                absolute: "int | None" = None) -> bool:
+        """GLD-ACQ-27 — does this release NAME the series and CONTAIN the episode we
+        intend to replace? The Sonarr twin of GLD-RAD-30's wrong-movie gate.
+
+        Born 2026-08-07 from a live run: the step-down deleted Space Brothers S01E06
+        and grabbed 'Property.Brothers.S11E06…', S01E05 → 'Super.Giant.Robot.Brothers.
+        S01E05…', and S01E20 → 'Space.Brothers.E81…' (absolute-numbering mismatch).
+        ``release?episodeId=`` returns RAW fuzzy indexer results — including other
+        shows that merely share a word — and the shared ladder picker ranks size/
+        resolution without ever asking WHICH show or WHICH episode the filename
+        claims; POSTing the pick with a forced ``episodeId`` then imports the
+        stranger INTO the slot. All gates are conservative: no identity evidence ⇒
+        no grab ⇒ the file is KEPT (a kept file beats a wrong grab on the
+        destructive path; the blind-fallback EpisodeSearch lane, where Sonarr does
+        its own matching, remains for shapes we reject).
+
+          1. TITLE — the shared GLD-RAD-30 token-subsequence matcher must find the
+             series title — or any alternate title (original-language / romaji /
+             scene, via ``_series_alt_titles``) — in the release name.
+          2. EPISODE — an SxxEyy / SxxEyyEzz / NxM token must cover (season,
+             episode); a bare ``Enn`` or bare-number token (anime absolute style)
+             passes when it equals the series' TRUE ``absoluteEpisodeNumber`` for
+             this episode (``_series_absolute_map``, anime-typed series only —
+             'Kimetsu no Yaiba - 33' IS S02E07) or, absent that data, only when
+             season == 1 AND it equals the episode number (kills E81-for-S01E20);
+             resolution-like numbers are ignored; season packs and episode-less
+             names are rejected.
+          3. LANGUAGE — the shared ``_release_language_ok`` gate.
+        """
+        title = str(release.get("title") or "")
+        if not title or not series_title:
+            return False
+        try:
+            want_s, want_e = int(season), int(episode)
+        except (TypeError, ValueError):
+            return False
+        if not RadarrSpacePressureManager._release_matches_movie(
+                title, str(series_title), alt_titles=alt_titles):
+            # The movie matcher's sequel-number boundary (built to kill 'Scorpion King 4'
+            # wrong-film grabs) also kills 'Space Brothers - 20' — where the trailing
+            # number IS the episode. Retry with the target episode's bare token masked
+            # once; every other title mismatch still fails all variants.
+            import re as _re0
+            ok_title = False
+            _mask_pats = {f"{want_e:d}", f"{want_e:02d}", f"{want_e:03d}"}
+            if absolute is not None:
+                _mask_pats |= {f"{int(absolute):d}", f"{int(absolute):02d}",
+                               f"{int(absolute):03d}", f"{int(absolute):04d}"}
+            for pat in sorted(_mask_pats, key=len, reverse=True):
+                masked = _re0.sub(rf"(?<![0-9]){pat}(?![0-9])", " ", title, count=1)
+                if masked != title and RadarrSpacePressureManager._release_matches_movie(
+                        masked, str(series_title), alt_titles=alt_titles):
+                    ok_title = True
+                    break
+            if not ok_title:
+                return False
+        if not RadarrSpacePressureManager._release_language_ok(release):
+            return False
+        import re as _re
+        toks = [t for t in _re.split(r"[^a-z0-9]+", title.lower()) if t]
+        saw_episode_evidence = False
+        for t in toks:
+            m = _re.fullmatch(r"s(\d{1,2})e(\d{1,3})(?:e(\d{1,3}))?", t)
+            if m:
+                saw_episode_evidence = True
+                s, e1 = int(m.group(1)), int(m.group(2))
+                e2 = int(m.group(3)) if m.group(3) else e1
+                if s == want_s and e1 <= want_e <= e2:
+                    return True
+                continue
+            m = _re.fullmatch(r"(\d{1,2})x(\d{1,3})", t)
+            if m:
+                saw_episode_evidence = True
+                if int(m.group(1)) == want_s and int(m.group(2)) == want_e:
+                    return True
+                continue
+            m = _re.fullmatch(r"e(\d{1,4})", t)
+            if m:
+                saw_episode_evidence = True
+                n = int(m.group(1))
+                if (want_s == 1 and n == want_e) or (absolute is not None
+                                                     and n == int(absolute)):
+                    return True
+                continue
+        if not saw_episode_evidence and (want_s == 1 or absolute is not None):
+            # Anime bare-number style ('Space Brothers - 20', 'Kimetsu no Yaiba - 33'):
+            # only when nothing SxxEyy-shaped appeared anywhere; the number must equal
+            # the season-1 episode OR the series' true absolute number; resolution
+            # tokens excluded.
+            for t in toks:
+                if not (t.isdigit() and 1 <= len(t) <= 4):
+                    continue
+                if t in ("480", "576", "720", "1080", "2160"):
+                    continue
+                n = int(t)
+                if (want_s == 1 and n == want_e) or (absolute is not None
+                                                     and n == int(absolute)):
+                    return True
+        return False
+
     def _realize_stepdown_files(self, instance: str, df, ef, cand, target_res: int,
                                 fid_rowcount: dict, *, budget: int,
                                 fallback_eids: list, stats: dict,
                                 exhaustive: bool = False,
                                 free_base_gb: "float | None" = None,
-                                target_u_gb: "float | None" = None) -> int:
+                                target_u_gb: "float | None" = None,
+                                ledger: dict | None = None) -> int:
         """Realize ONE candidate series' step-down at episode-file granularity
         (verify → delete → guid-grab; the series profile was already PUT down).
+
+        ``ledger`` is the shared step-down cooldown ledger, mutated in place; the caller
+        loads and persists it once per run. None -> a throwaway dict, so the cooldown is
+        simply inert rather than crashing.
 
         Per file above ``target_res``: resolve the Sonarr episode id (the episode-files
         manager's cached ``_get_episode_id``), run ONE interactive ``release?episodeId=``
@@ -286,6 +470,16 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         Without that subtraction the pass would keep shrinking against the phantom headroom the
         just-deleted files created, since the smaller replacements have not imported yet."""
         sid = cand["sid"]
+        # GLD-ACQ-27b: original-language / scene aliases for the identity gate — once
+        # per candidate series, failure-tolerant. 27c: the anime absolute-number map
+        # ({(season, ep): absolute}) so bare-number releases validate EXACTLY.
+        _alt_titles = self._series_alt_titles(instance, sid, cand.get("title"))
+        _abs_map = self._series_absolute_map(instance, sid)
+        from scripts.support.utilities.stepdown_cooldown import (
+            clear as _clear, cooldown_left as _cooldown_left, entry_key as _ekey,
+            stamp_failure as _stamp_failure, wait_days as _wait_days,
+        )
+        _ledger = ledger if ledger is not None else {}
         for idx, fid, res, size, sn, en in self._iter_stepdown_file_rows(df, cand, target_res):
             if exhaustive and free_base_gb is not None and target_u_gb is not None:
                 _net = (float(free_base_gb) + stats["realized_reclaim_gb"]
@@ -318,16 +512,46 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 stats["failed"] += 1
                 continue
             budget -= 1
+            # Keyed on (episode id, CURRENT resolution): a file replaced at a different
+            # tier lands on a fresh key and is retryable immediately.
+            _ckey = _ekey(eid, res)
+            # COOLDOWN, checked BEFORE the interactive search so a backed-off episode
+            # costs no indexer call. Same shared ledger the Radarr passes use, keyed by
+            # EPISODE id rather than episode_file_id: a step-down deletes the file, so a
+            # file-keyed entry would be orphaned on the grab-failure path.
+            _cd = _cooldown_left(_ledger, _ckey, self.config)
+            if _cd > 0:
+                stats["cooldown_skipped"] = stats.get("cooldown_skipped", 0) + 1
+                self.logger.log_debug(
+                    f"  ⏭️ {label}: step-down on cooldown, {_cd:.0f}d left — skipped.")
+                continue
             releases = self.sonarr_api._make_request(
                 instance, f"release?episodeId={int(eid)}", fallback=None) or []
+            # GLD-ACQ-27 identity gate — BEFORE the picker ever ranks anything: only
+            # releases that name THIS series and cover THIS episode survive. The raw
+            # endpoint returns fuzzy strangers ('Property.Brothers.S11E06' for Space
+            # Brothers S01E06) and the picker is identity-blind by construction.
+            _n_raw = len(releases)
+            _abs_n = (_abs_map or {}).get((int(sn), int(en)))
+            releases = [r for r in releases
+                        if self._release_ok_for_episode(r, cand.get("title"),
+                                                        int(sn), int(en),
+                                                        alt_titles=_alt_titles,
+                                                        absolute=_abs_n)]
+            if _n_raw > len(releases):
+                stats["identity_rejected"] = (stats.get("identity_rejected", 0)
+                                              + _n_raw - len(releases))
             pick = _pick_stepdown_release(releases, current_res=res,
                                           min_size_bytes=self.STEPDOWN_MIN_RELEASE_BYTES,
                                           allow_below_floor=exhaustive)
             if not pick:
                 stats["no_release"] += 1
+                _n = _stamp_failure(_ledger, _ckey)
+                _wait = _wait_days(_ledger, _ckey, self.config)
                 self.logger.log_info(
                     f"  ⏸️ {label}: no smaller release available — file kept at {res}p "
-                    f"(profile now {cand['target_name']}; re-probes next run).")
+                    f"(profile now {cand['target_name']}; attempt {_n}, "
+                    f"re-probes in {_wait:.0f}d).")
                 continue
             try:
                 self.sonarr_api._make_request(instance, f"episodefile/{fid}", method="DELETE")
@@ -349,9 +573,14 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     f"  ⤵️ {label}: stepped BELOW 720 — no >=720 release exists for this title.")
             grabbed = False
             try:
+                # SEND THE episodeId — the Sonarr equivalent of Radarr's movieId. Without
+                # it Sonarr re-parses the release title to identify the episode, which fails
+                # on fansub and foreign-language names. The search above was
+                # release?episodeId=N, so the id is already known.
                 _res = self.sonarr_api._make_request(
                     instance, "release", method="POST", fallback=None,
-                    payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId")})
+                    payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId"),
+                             "episodeId": int(eid)})
                 # _make_request returns None on a soft rejection (release no longer
                 # grabbable / indexer down) WITHOUT raising — the file is already gone,
                 # so a soft-reject must fall back too (mirrors legacy_regrab's check).
@@ -360,8 +589,10 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 grabbed = False
             if not grabbed:
                 fallback_eids.append(int(eid))
+                _stamp_failure(_ledger, _ckey)
                 stats["grab_fallback"] += 1
                 continue
+            _clear(_ledger, _ckey)        # grabbed → steppable again
             _pick_gb = float(pick.get("size") or 0) / (1024 ** 3)
             self.logger.log_info(
                 f"  📉 {label}: file deleted ({size / (1024 ** 3):.2f}GB @{res}p), grabbed "
@@ -390,6 +621,7 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             "realized":            0,     # episode files actually deleted + replaced
             "realized_reclaim_gb": 0.0,   # REAL GB freed (sum of deleted file sizes)
             "no_release":          0,     # no smaller release existed → file KEPT
+            "identity_rejected":   0,     # releases dropped by the GLD-ACQ-27 series/episode gate
             "grab_fallback":       0,     # guid grab failed → blind EpisodeSearch (file already gone)
             "deferred":            0,     # over the inline cap → next run
             "skipped_multi_ep":    0,     # file backs several episodes → never single-grabbed
@@ -427,7 +659,18 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             df.loc[_stale, ["planned_action", "plan_reason", "plan_reclaim_gb"]] = None
 
         _, U = self._space_targets(instance)
-        need_gb = max(0.0, U - float(free_space_gb))
+        # TIERED, NOT CONCURRENT — see machine_learning/space/reclaim_ledger.py. Every space
+        # pass reads the SAME free-space figure from the SAME shared mount, so before this
+        # each planned its full deficit independently: Radarr standard 396 GB, Radarr ultra
+        # 205 GB and this pass 476 GB, all against one 922 GB pool, none aware the others
+        # had already committed to part of it. Adding what earlier passes planned makes the
+        # chain drain a single shared deficit instead of three passes racing one number.
+        _planned = planned_reclaim_gb(self.global_cache, exclude=f"sonarr:{instance}:downgrade")
+        need_gb = max(0.0, U - (float(free_space_gb) + _planned))
+        if _planned:
+            self.logger.log_info(
+                f"[SpacePressure-TV] '{instance}': {_planned:.0f} GB already planned by earlier "
+                f"passes this run — need ~{need_gb:.0f} GB (not {max(0.0, U - float(free_space_gb)):.0f}).")
         ceiling = self._score_ceiling()
         now = datetime.now(tz=timezone.utc)
         watch_cutoff = now - timedelta(days=self.RECENT_WATCH_DAYS)
@@ -453,6 +696,12 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             exhaustive=_exhaustive,
         )
         stats.update(_pstats)
+        # Publish this pass's projected reclaim so LATER passes (the coordinator, a second
+        # instance) plan against the remaining deficit rather than the same one. Projected,
+        # not realized: the replacements have not imported yet, and a later pass must not
+        # re-plan space this one has already committed to freeing.
+        record_planned_reclaim(self.global_cache, f"sonarr:{instance}:downgrade",
+                               float(_pstats.get("est_reclaim_gb", 0.0) or 0.0))
         if not candidates:
             _why = ("every series is keep-tagged / hot-universe / recent / already at the "
                     f"{floor_resolution}p floor — the downgrade pool is EXHAUSTED, so deletion "
@@ -470,6 +719,14 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # blocker died with the file). realize_budget is the shared inline cap across all
         # candidate series this pass.
         fallback_eids: list[int] = []
+        # Cooldown ledger: loaded once, mutated across every candidate series, saved once.
+        # Same shared module the Radarr passes use, under sonarr/{instance}/.
+        from scripts.support.utilities.stepdown_cooldown import (
+            clear as _clear, cooldown_left as _cooldown_left, ledger_key as _lkey,
+            prune as _prune, stamp_failure as _stamp_failure, wait_days as _wait_days,
+        )
+        _ledger = dict((self.global_cache.get(_lkey("sonarr", instance))
+                        if self.global_cache else None) or {})
         realize_budget = self._realize_cap()
         # BANDWIDTH GUARD: in exhaustive mode the TIGHTER of the two caps wins — the TV
         # inline cap (tv_downgrade_realize_cap, bounds slow interactive searches) and the
@@ -508,7 +765,10 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             # (= deleted size − replacement size, i.e. already net); the live pass uses the
             # realized/in-flight split the realize helper maintains from the actual picks.
             if _exhaustive:
-                _net_free = float(free_space_gb) + (
+                # The stop condition counts the SHARED deficit too: once free space net of
+                # this pass's in-flight re-grabs PLUS what other passes have already planned
+                # reaches the band top, there is nothing left for this pass to cover.
+                _net_free = float(free_space_gb) + _planned + (
                     reclaimed if self.dry_run
                     else stats["realized_reclaim_gb"] - stats["inflight_regrab_gb"])
                 if _net_free >= U:
@@ -563,6 +823,7 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     exhaustive=_exhaustive,
                     free_base_gb=float(free_space_gb) if _exhaustive else None,
                     target_u_gb=U if _exhaustive else None,
+                    ledger=_ledger,
                 )
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ Downgrade failed for '{c['title']}' (id={c['sid']}): {e}")
@@ -599,6 +860,7 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             ["files realized",   stats["realized"]],
             ["realized GB",      round(stats["realized_reclaim_gb"], 2)],
             ["no smaller release", stats["no_release"]],
+            ["on cooldown",      stats.get("cooldown_skipped", 0)],
             ["grab fallback",    stats["grab_fallback"]],
             ["deferred (cap)",   stats["deferred"]],
             ["multi-episode file", stats["skipped_multi_ep"]],
@@ -615,7 +877,8 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             "planner's projected reclaim once every oversized file is replaced",
             "episode files ACTUALLY deleted + re-grabbed smaller this pass",
             "REAL space freed now (sum of the deleted files) — the rest lands as files replace",
-            "files KEPT: no release below the current resolution — re-probes next run",
+            "files KEPT: no release below the current resolution — backs off, re-probes later",
+            "files skipped without an indexer call: still inside their step-down backoff",
             "grab did not take; file already removed, blind EpisodeSearch queued",
             f"files over the inline cap ({realize_budget_start}/pass) — next run picks them up",
             "files backing several episodes — never single-grabbed (would orphan siblings)",
@@ -642,6 +905,14 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 "space so the pass never downgrades against phantom headroom",
                 "items left untouched: free space NET of the in-flight re-grabs reached the band top",
             ]
+        # rows and descriptions are PARALLEL lists with no structural link. The Radarr twin
+        # silently lost two entries and mislabelled every row after them; guard both.
+        if len(_descs) != len(_rows):
+            self.logger.log_warning(
+                f"[SpacePressure-TV] table description mismatch: {len(_rows)} row(s) but "
+                f"{len(_descs)} description(s) - rows beyond the shorter list would be "
+                f"mislabelled. Padding; fix the two lists in run_downgrades.")
+            _descs = (_descs + [""] * len(_rows))[:len(_rows)]
         self.logger.log_table(
             ["Outcome", "Count"], _rows,
             title=f"[SpacePressure-TV] {prefix}'{instance}' "
@@ -656,4 +927,9 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                        f"{realize_budget_start} file(s)/run." if _exhaustive else ""),
             descriptions=_descs,
         )
+        # Ledger saves regardless of whether anything else changed: a cooldown stamped
+        # this run must survive, or the backoff resets every pass.
+        if self.global_cache:
+            _prune(_ledger, self.config)
+            self.global_cache.set(_lkey("sonarr", instance), _ledger)
         return stats

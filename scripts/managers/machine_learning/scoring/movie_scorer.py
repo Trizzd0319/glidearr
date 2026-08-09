@@ -488,9 +488,14 @@ def score_movie(
     ] or [movie.get("studio")] if movie.get("studio") else []
 
     _ab = max(1.0, float(affinity_boost or 1.0))   # boost cast/crew/studio/genre weight
-    b1 = _affinity(actor_names,    actors_aff,    8.0 * _ab)
+    # Caps redistributed 2026-08-07 (operator ruling, see PERSON_ROLE_WEIGHTS): actors
+    # 8→10, writers 4→2 — SUM-PRESERVING (25 → 25, no axis change). Cast-following is
+    # the signal; writer overlap is largely franchise continuation the saga machinery
+    # already rewards. Directors stay 6.0 here — the Russo-pattern trim is applied once,
+    # on the shared id-side table, not twice.
+    b1 = _affinity(actor_names,    actors_aff,    10.0 * _ab)
     b2 = _affinity(directors,      directors_aff, 6.0 * _ab)
-    b3 = _affinity(writers,        writers_aff,   4.0 * _ab)
+    b3 = _affinity(writers,        writers_aff,   2.0 * _ab)
     b4 = _affinity(movie_genres,   genres_aff,    4.0 * _ab)
     b5 = _affinity(prod_companies, studios_aff,   3.0 * _ab)
 

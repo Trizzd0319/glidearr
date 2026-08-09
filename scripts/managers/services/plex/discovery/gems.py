@@ -67,10 +67,26 @@ _PROTECTED_KEY = "plex/playlists/protected_movie_tmdbs/hidden_gems"
 
 # Other per-user plans whose picks must NOT be re-surfaced here (never double-surface a title
 # the household is already being shown). TV plans are skipped — they carry no movie tmdbs.
+#
+# THE EXCLUSION IS ONE-WAY, AND HIDDEN GEMS IS THE SIDE THAT YIELDS. This shelf's
+# entire claim is "nothing has shown you this" - owned, never played, never
+# surfaced. Every other family is free to pick what it likes; a title appearing
+# anywhere else simply stops being hidden, so it leaves HERE. Making the exclusion
+# mutual would be wrong in both directions: it would let an arbitrary run order
+# decide which shelf got a title, and it would let this shelf's picks suppress a
+# list that had a better reason to show them.
+#
+# ``affinity_plan`` (Because You Watched) is the newest case and the clearest one.
+# It exists precisely to FOLLOW UP on something already surfaced and finished, so
+# by construction its picks are the opposite of hidden. Without this line the two
+# shelves would draw from the same owned-and-unwatched pool with overlapping taste
+# signals and put the same film in front of the household twice, under two names,
+# with two different explanations.
 _OTHER_PLAN_KEYS = (
     "plex/playlists/movie_plan", "plex/playlists/combined_plan",
     "plex/playlists/glide_plan", "plex/playlists/touchgo_plan",
     "plex/playlists/fresh_movie_plan", "plex/playlists/twih_movie_plan",
+    "plex/playlists/affinity_plan", "plex/playlists/tonight_plan",
 )
 
 _SHELF_LABEL = "Hidden Gems"

@@ -12,7 +12,7 @@ The bug being guarded against: a single physical file in Sonarr can back
 several episode rows (multi-episode files share one ``episodeFileId``).  The
 per-row guards only inspect the row being processed, so a watched/grace-expired
 episode could ``DELETE episodefile/{id}`` and silently destroy a sibling that
-is pilot / keep / recent-air / household protected.
+is pilot / keep / recent-air / household (active watchers only, GLD-ACQ-18) protected.
 
 Run directly:  python -m scripts.managers.services.sonarr.cache.test_episode_files_guards
 """
@@ -116,7 +116,10 @@ def scenario_recent_air_sibling():
 
 
 def scenario_household_sibling():
-    """E02 (marked) shares file 22492 with E03 (not all household watched)."""
+    """E02 (marked) shares file 22492 with E03 (not all household watched) — and an
+    ACTIVE WATCHER IS APPROACHING E03 (``retention_hold=True``). GLD-ACQ-18: the
+    household guard holds only for approaching active watchers, so this file IS
+    protected (whole-file)."""
     rows = [
         _row(series_id=2, season_number=1, episode_number=1,
              is_pilot=True, episode_file_id=11002),
@@ -124,9 +127,26 @@ def scenario_household_sibling():
              episode_file_id=22492, marked_for_deletion=True),
         _row(series_id=2, season_number=1, episode_number=3,
              episode_file_id=22492, marked_for_deletion=False,
-             all_household_watched=False),
+             all_household_watched=False, retention_hold=True),
     ]
     return _df(rows), {22492}
+
+
+def scenario_household_released():
+    """GLD-ACQ-18's release case: E03 is not-all-household-watched but NO active
+    watcher is approaching it (no ``retention_hold``). The old all-members mandate
+    froze this file forever — Mom is not going to watch Blue Bloods — so the
+    narrowed guard must NOT protect it, and marked E02 deletes."""
+    rows = [
+        _row(series_id=5, season_number=1, episode_number=1,
+             is_pilot=True, episode_file_id=11005),
+        _row(series_id=5, season_number=1, episode_number=2,
+             episode_file_id=22495, marked_for_deletion=True),
+        _row(series_id=5, season_number=1, episode_number=3,
+             episode_file_id=22495, marked_for_deletion=False,
+             all_household_watched=False),
+    ]
+    return _df(rows), {22495}
 
 
 def scenario_keep_season_sibling():
@@ -227,6 +247,12 @@ def test_protected_set():
     got = set(mgr._build_protected_file_ids(df, _NOW))
     _check("cold-saga file 70000 not protected", 70000 not in got, f"got {got}")
 
+    # GLD-ACQ-18: not-all-household-watched WITHOUT an approaching active watcher
+    # no longer protects — the all-members mandate is released.
+    df, _ = scenario_household_released()
+    got = set(mgr._build_protected_file_ids(df, _NOW))
+    _check("household released: 22495 not protected", 22495 not in got, f"got {got}")
+
 
 def test_delete_pass():
     print("test_do_delete_marked_files (dry_run):")
@@ -241,13 +267,38 @@ def test_delete_pass():
     _check("recent-air: E02 flag cleared",
            bool(df.loc[df["episode_number"] == 2, "marked_for_deletion"].iloc[0]) is False)
 
-    # 2. household sibling → not deleted
+    # 2. household sibling (active watcher approaching) → not deleted
     mgr = _mgr()
     df, _ = scenario_household_sibling()
     _, stats = mgr._do_delete_marked_files("inst", df)
     _check("household: deleted == 0", stats["deleted"] == 0, f"stats={stats}")
     _check("household: skipped_shared_file == 1",
            stats["skipped_shared_file"] == 1, f"stats={stats}")
+
+    # 2b. GLD-ACQ-18 release: household-incomplete sibling, NO approaching watcher
+    # → the file is unprotected and marked E02 deletes.
+    mgr = _mgr()
+    df, _ = scenario_household_released()
+    _, stats = mgr._do_delete_marked_files("inst", df)
+    _check("household released: deleted == 1", stats["deleted"] == 1, f"stats={stats}")
+    _check("household released: skipped_household == 0",
+           stats["skipped_household"] == 0, f"stats={stats}")
+
+    # 2c. GLD-ACQ-18 row-level: the MARKED row itself is household-incomplete AND
+    # inside an active watcher's interval → the household branch fires first and
+    # names itself (before the retention / shared-file guards see the row).
+    mgr = _mgr()
+    df = _df([
+        _row(series_id=6, season_number=1, episode_number=1,
+             is_pilot=True, episode_file_id=11006),
+        _row(series_id=6, season_number=1, episode_number=2,
+             episode_file_id=22496, marked_for_deletion=True,
+             all_household_watched=False, retention_hold=True),
+    ])
+    _, stats = mgr._do_delete_marked_files("inst", df)
+    _check("household row-level: deleted == 0", stats["deleted"] == 0, f"stats={stats}")
+    _check("household row-level: skipped_household == 1",
+           stats["skipped_household"] == 1, f"stats={stats}")
 
     # 3. keep_season sibling (partial policy) → not deleted
     mgr = _mgr()

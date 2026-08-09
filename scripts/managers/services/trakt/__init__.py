@@ -18,7 +18,12 @@ class TraktManager(BaseManager, ComponentManagerMixin):
         self.register()
 
         parent       = kwargs.get("manager")
-        self.dry_run = kwargs.get("dry_run", getattr(parent, "dry_run", False) if parent else False)
+        # dry_run is resolved by BaseManager (explicit kwarg -> pre-super value ->
+        # kwargs["manager"] -> registry parent -> False). The local resolution that used
+        # to sit here defaulted to False, silently overwriting a parent-inherited True --
+        # and this is the TRAKT SERVICE ROOT: self.dry_run is passed into base_kwargs
+        # below, so it set the mode for every Trakt sub-manager including ratings
+        # (which POSTs to a third-party account with no undo).
 
         # Optional cross-service handles (injected by caller, never instantiated here)
         self.sonarr_apis  = kwargs.get("sonarr_apis", {})
@@ -61,7 +66,13 @@ class TraktManager(BaseManager, ComponentManagerMixin):
     def run(self):
         self.logger.log_info("[TraktManager] Running system-wide sync...")
 
-        self.trakt_api.history.get_full_watch_history()
+        # Episode history — the CACHED form. This used to call get_full_watch_history()
+        # and discard the result: a full paginated sweep (~1,900 rows at 100/page,
+        # rate-limited) whose output went nowhere, because nothing wrote it to cache.
+        # Its three consumers (grouped-by-series, series watch counts, history_dataframe)
+        # then each re-paginated the same history again. Same sweep, now warming
+        # trakt/history/episodes for 24h — the twin of trakt/history/movies below.
+        self.trakt_api.history.get_full_watch_history_cached()
         self.trakt_api.history.get_full_movie_history_cached()
         self.trakt_api.ratings.get_user_ratings()
         self.trakt_api.recommendations.get_recommendations_shows()

@@ -352,9 +352,11 @@ def score_show(
     network = show.get("network")
     networks = [network] if network else []
 
-    b1 = _affinity(actor_names, actors_aff,    8.0)
+    # Caps redistributed 2026-08-07 (operator ruling, see PERSON_ROLE_WEIGHTS): actors
+    # 8→10, writers 4→2 — sum-preserving, mirrors the movie scorer.
+    b1 = _affinity(actor_names, actors_aff,    10.0)
     b2 = _affinity(directors,   directors_aff, 6.0)
-    b3 = _affinity(writers,     writers_aff,   4.0)
+    b3 = _affinity(writers,     writers_aff,   2.0)
     b4 = _affinity(show_genres, genres_aff,    4.0)
     b5 = _affinity(networks,    studios_aff,   3.0)
 

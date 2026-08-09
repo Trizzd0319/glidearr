@@ -1,26 +1,42 @@
 """
 PlexManager — the household's explicit forward-intent + identity layer.
 ================================================================================
-Plex is **FETCH/CACHE-only (v1)** — no APPLY, no write-backs. Its one job is to
-add the signals only Plex has natively and join them to the existing model:
+Plex adds the signals only Plex has natively and joins them to the existing model:
 
   * the multi-user account **watchlist** (top-weighted next-watch signal +
     watchlisted-but-not-owned → acquisition candidates),
   * the **Plex-Home-user ↔ Tautulli-user ↔ rating_groups identity crosswalk** that
-    lets every per-user Plex signal join the existing affinity/completion model.
+    lets every per-user Plex signal join the existing affinity/completion model,
+  * per-user PLAYLISTS and discovery shelves, built here and written back.
 
 The deterministic A–G scorecard stays the curation authority; Plex never owns play
 history, the watched-set, affinity, or deletion (DESIGN §1).
 
+⚠️ THIS IS NO LONGER FETCH/CACHE-ONLY. The header used to open "Plex is
+FETCH/CACHE-only (v1) — no APPLY, no write-backs", and that stopped being true
+without the sentence changing. ``PlaylistWritebackManager`` sits in
+``all_component_classes`` below, is constructed every run, and WRITES per-user
+playlists to Plex when ``plex.playlists.writeback.enabled`` is set and the run is
+not a dry-run — support/logs/audit.log carries one line per write. Plex is still
+read-only for play history, the watched-set, affinity and deletion; it is NOT
+read-only for playlists.
+
+The write is gated three ways: the capability flag, ``writeback_armed()``
+(config AND not dry_run), and the same ``episodes``/``movies`` build flags — with
+both builds off there are no cached plans to write. Verified across four dry runs:
+audit.log was unchanged while playlists were built each time.
+
 Two passes (DESIGN §3.6), driven from main.py:
   * ``run()`` — inventory / identity / watchlist, Phase 2 **before Trakt**, so
     acquisition (last phase) reads ``plex/watchlist/union`` warm.
-  * ``run_reconcile()`` — pure zero-API set-diff, Phase 2 **after Radarr+Sonarr**
-    populate their library caches.
+  * ``run_reconcile()`` — set-diff + the playlist/shelf builders + write-back,
+    Phase 2 **after Radarr+Sonarr** populate their library caches.
 
 Plex is **NON-critical**: like MAL it self-disables when unconfigured / unreachable
 / scope-fails, and is left OUT of Main._validate_managers — a Plex-less or
 scope-failed install must still run. Structure mirrors TautulliManager exactly.
+(Contrast TraktManager, which RAISES on a validation failure and aborts manager
+construction — see GLD-TRK-10; Plex and MAL degrade, Trakt alone does not.)
 """
 from __future__ import annotations
 
@@ -32,6 +48,7 @@ from scripts.managers.factories.mixins.component_manager import ComponentManager
 from scripts.managers.factories.mixins.ordered_components import topo_order
 from scripts.managers.services.plex.api import PlexAPI
 from scripts.managers.services.plex.collections import PlexCollectionsManager
+from scripts.managers.services.plex.collections.posters import CollectionPosterManager
 from scripts.managers.services.plex.episodes import PlexEpisodesManager
 from scripts.managers.services.plex.libraries import PlexLibrarySectionsManager
 from scripts.managers.services.plex.metadata import PlexMetadataManager
@@ -45,6 +62,10 @@ from scripts.managers.services.plex.playlists.builder import (
 from scripts.managers.services.plex.playlists.combined_builder import CombinedPlaylistBuilderManager
 from scripts.managers.services.plex.playlists.movie_builder import MoviePlaylistBuilderManager
 from scripts.managers.services.plex.playlists.writeback import PlaylistWritebackManager
+from scripts.managers.services.plex.playlists.smart_shelves import PlexSmartShelvesManager
+from scripts.managers.services.plex.playlists.tonight_builder import TonightPlaylistBuilderManager
+from scripts.managers.services.plex.playlists.poster_render import PlaylistPosterRenderManager
+from scripts.managers.services.plex.playlists.affinity_builder import AffinityPlaylistBuilderManager
 from scripts.managers.services.plex.discovery import DiscoveryShelfBuilderManager
 from scripts.managers.services.plex.discovery.gems import HiddenGemsShelfBuilderManager
 from scripts.managers.services.plex.ratings import PlexRatingsManager
@@ -69,14 +90,19 @@ class PlexManager(BaseManager, ComponentManagerMixin):
     episodes:          Optional[PlexEpisodesManager] = None
     movies:            Optional[PlexMoviesManager] = None
     collections:       Optional[PlexCollectionsManager] = None
+    collection_posters: Optional[CollectionPosterManager] = None
     validator_manager: Optional[PlexValidatorManager] = None
     playlists:         Optional[PlexPlaylistsManager] = None
     playlist_builder:  Optional[PlexPlaylistBuilderManager] = None
     movie_playlist_builder: Optional[MoviePlaylistBuilderManager] = None
     combined_playlist_builder: Optional[CombinedPlaylistBuilderManager] = None
+    tonight_builder:   Optional[TonightPlaylistBuilderManager] = None
+    poster_render:     Optional[PlaylistPosterRenderManager] = None
+    affinity_builder:  Optional[AffinityPlaylistBuilderManager] = None
     discovery_shelf:   Optional[DiscoveryShelfBuilderManager] = None
     hidden_gems_shelf: Optional[HiddenGemsShelfBuilderManager] = None
     playlist_writeback: Optional[PlaylistWritebackManager] = None
+    smart_shelves:      Optional[PlexSmartShelvesManager] = None
 
     @LoggerManager().log_function_entry
     @timeit("__init__")
@@ -86,11 +112,15 @@ class PlexManager(BaseManager, ComponentManagerMixin):
         super().__init__(logger, config, global_cache, validator, registry, **kwargs)
         self.register()
 
-        # dry_run footgun: BaseManager does NOT capture it. Plex is FETCH/CACHE-only
-        # in v1 so it gates nothing yet, but the wiring must exist so any future
-        # write (collection write-back, ratings sync) is gated from day one.
+        # dry_run is resolved by BaseManager (explicit kwarg -> pre-super value ->
+        # kwargs["manager"] -> registry parent -> False). The local resolution that used
+        # to sit here carried the comment "BaseManager does NOT capture it" -- true when
+        # written, no longer true since GLD-ORCH-01 gave BaseManager the 5-rung
+        # precedence. It also justified itself as future-proofing for "any future write
+        # (collection write-back, ratings sync)"; that future arrived -- playlist
+        # write-back is live -- which is exactly why the value must come from the one
+        # place that resolves it correctly rather than a local default of False.
         parent = kwargs.get("manager")
-        self.dry_run = kwargs.get("dry_run", getattr(parent, "dry_run", False) if parent else False)
 
         # FLAT config block {url, port, plex_token, plex_media_path} — NOT the nested
         # {"default": {...}} Tautulli collapses. Token key is plex_token.
@@ -140,9 +170,14 @@ class PlexManager(BaseManager, ComponentManagerMixin):
             "playlist_builder": [],
             "movie_playlist_builder": [],
             "combined_playlist_builder": [],
+            "tonight_builder": [],
+            "poster_render":   [],
+            "affinity_builder": [],
             "discovery_shelf": [],
             "hidden_gems_shelf": [],
             "playlist_writeback": [],
+            "collection_posters": [],
+            "smart_shelves":    [],
             "validator_manager": [],
         }
 
@@ -156,13 +191,18 @@ class PlexManager(BaseManager, ComponentManagerMixin):
             "episodes":         PlexEpisodesManager,
             "movies":           PlexMoviesManager,
             "collections":      PlexCollectionsManager,
+            "collection_posters": CollectionPosterManager,
             "playlists":        PlexPlaylistsManager,
             "playlist_builder": PlexPlaylistBuilderManager,
             "movie_playlist_builder": MoviePlaylistBuilderManager,
             "combined_playlist_builder": CombinedPlaylistBuilderManager,
+            "tonight_builder": TonightPlaylistBuilderManager,
+            "poster_render":   PlaylistPosterRenderManager,
+            "affinity_builder": AffinityPlaylistBuilderManager,
             "discovery_shelf": DiscoveryShelfBuilderManager,
             "hidden_gems_shelf": HiddenGemsShelfBuilderManager,
             "playlist_writeback": PlaylistWritebackManager,
+            "smart_shelves":    PlexSmartShelvesManager,
             "validator_manager": PlexValidatorManager,
         }
 
@@ -449,17 +489,50 @@ class PlexManager(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_error(f"[Plex] anniversary shelf builder failed: {e}")
 
-        # "Hidden Gems" — per-profile shelf of OWNED + never-played + taste-matched movies, plus
-        # the recommendation/outcome measurement loop. Runs after the movie/combined/anniversary
-        # builders so it can read their cached plans (never double-surface a title already being
-        # shown) and before write-back (which renders its cached plan). Needs the Radarr
-        # movie_files parquet + plex/movies/owned_inventory, so it is gated on plex.movies.enabled
-        # and self-gates on plex.playlists.hidden_gems.enabled -> byte-identical when off.
+        # TONIGHT - the per-profile weekday-habit list, built for TOMORROW. Runs BEFORE
+        # the write-back so its plan is on disk when the write-back looks for it, and
+        # after the inventories so the candidate pools are warm. Default-OFF via
+        # plex.playlists.tonight.enabled; caches a plan and performs no Plex writes.
+        try:
+            if self.tonight_builder and (self._cap_enabled("episodes") or self._cap_enabled("movies")):
+                self.tonight_builder.run()
+        except Exception as e:
+            self.logger.log_error(f"[Plex] tonight builder failed: {e}")
+
+        # BECAUSE YOU WATCHED - seeded from the recommendation ledger, so it must run
+        # AFTER the shelves that record into it (their placements this run are what a
+        # later run measures) and BEFORE poster_render + write-back, which need its
+        # plan on disk. Default-OFF; builds nothing while the ledger is empty.
+        try:
+            if self.affinity_builder:
+                self.affinity_builder.run()
+        except Exception as e:
+            self.logger.log_error(f"[Plex] because-you-watched builder failed: {e}")
+
+        # HIDDEN GEMS - runs LAST of the builders, deliberately. Its exclusion set is
+        # every other per-user plan (_OTHER_PLAN_KEYS), and an exclusion can only see
+        # plans already written: sitting earlier in the order it read the PREVIOUS
+        # run's, so a title newly picked up by Tonight or Because You Watched stayed
+        # in "Hidden" Gems for a day, and on the first run after either was enabled it
+        # excluded nothing at all. This shelf's whole claim is "nothing has shown you
+        # this", so it is the one that must yield, and it can only yield to plans that
+        # exist yet. Still before write-back, which renders its cached plan.
         try:
             if self.hidden_gems_shelf and self._cap_enabled("movies"):
                 self.hidden_gems_shelf.run()
         except Exception as e:
             self.logger.log_error(f"[Plex] hidden gems shelf builder failed: {e}")
+
+        # PER-USER POSTERS - rendered from the plans the builders just cached, and
+        # BEFORE the write-back that uploads them. Both halves of that ordering are
+        # load-bearing: earlier and it renders from stale plans, later and the
+        # write-back has already uploaded whatever was on disk.
+        # Follows plex.playlists.branding.enabled; writes PNGs only, never Plex.
+        try:
+            if self.poster_render:
+                self.poster_render.run()
+        except Exception as e:
+            self.logger.log_error(f"[Plex] per-user poster render failed: {e}")
 
         # Per-user playlist WRITE-BACK (P2-5c) — runs LAST, after the dry-run builders have
         # cached the per-user plans this phase. DEFAULT-OFF / fail-closed: the manager runs the
@@ -472,6 +545,33 @@ class PlexManager(BaseManager, ComponentManagerMixin):
                 self.playlist_writeback.run()
         except Exception as e:
             self.logger.log_error(f"[Plex] playlist write-back failed: {e}")
+
+        # LABEL-DRIVEN SMART SHELVES — runs AFTER the dumb builders and write-back so the
+        # owned inventories are warm and the two approaches can run side by side for
+        # comparison. Unlike everything above it, what this writes is SELF-MAINTAINING: it
+        # labels qualifying items and creates smart playlists that re-evaluate themselves,
+        # so between rotations Plex keeps them current with no glidearr involvement at all.
+        # Default-OFF (plex.playlists.smart_shelves.enabled) and dry_run-gated.
+        try:
+            if self.smart_shelves and (self._cap_enabled("episodes") or self._cap_enabled("movies")):
+                self.smart_shelves.run()
+        except Exception as e:
+            self.logger.log_error(f"[Plex] smart shelves failed: {e}")
+
+        # COLLECTION POSTERS — runs LAST of the write paths, after smart_shelves has had its
+        # chance to create the collections this sets artwork on. Artwork ONLY: it never creates,
+        # populates or deletes a collection, so a poster bug cannot touch membership.
+        #
+        # Deliberately NOT gated on _cap_enabled("collections"): that flag turns on the P4
+        # collection INDEX pass, which walks every collection's children resolving TMDB ids,
+        # and setting artwork has no business dragging that cost in. The manager self-gates
+        # instead — absent config block => immediate no-op with zero API calls; present but
+        # disabled => full preview, no writes; enabled AND not dry_run => armed.
+        try:
+            if self.collection_posters:
+                self.collection_posters.run()
+        except Exception as e:
+            self.logger.log_error(f"[Plex] collection posters failed: {e}")
 
         # ONE line reporting the phase's EXTERNAL universe fetches (Plex collection listings +
         # children reads, mdblist list refreshes) and how many repeat calls the run-scoped memo

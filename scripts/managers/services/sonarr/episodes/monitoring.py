@@ -17,8 +17,10 @@ class SonarrEpisodesMonitoringManager(BaseManager, ComponentManagerMixin):
         self.manager = kwargs.get("manager") or self.registry.get("manager", self.parent_name)
         self.sonarr_api = kwargs.get("sonarr_api") or getattr(self.manager, "sonarr_api", None)
 
-        # 🧲 Mode Flag
-        self.dry_run = kwargs.get("dry_run", getattr(self.manager, "dry_run", False))
+        # dry_run is resolved by BaseManager (explicit kwarg -> pre-super value ->
+        # kwargs["manager"] -> registry parent -> False). The local resolution that used
+        # to sit here defaulted to False, silently overwriting a parent-inherited True --
+        # in a manager that issues bulk_update_episodes.
 
         # 🛠 Dual Cache Support
         self.global_cache = global_cache or getattr(self.manager, "global_cache", None)
@@ -50,6 +52,19 @@ class SonarrEpisodesMonitoringManager(BaseManager, ComponentManagerMixin):
                 to_unmonitor.append({"id": episode["id"], "monitored": False})
 
         if to_unmonitor:
+            # DRY-RUN GUARD. bulk_update_episodes is a WRITE -- it unmonitors episodes in
+            # Sonarr -- and this method had no dry_run check at all. It went unnoticed
+            # because the component has never loaded: split_components dropped it on a
+            # parent_name mismatch (the class declares "SonarrEpisodesMonitoringManager";
+            # ManagerAttributionMixin's path inference overwrites it with "SonarrEpisodes").
+            # Enabling the component makes this reachable, so the guard goes in FIRST.
+            # (P-I: never-executed code accumulates defects -- cf. GLD-SQ-01's broken
+            # construction loop and GLD-REP-11's nonexistent method, both found the same way.)
+            if self.dry_run:
+                self.logger.log_info(
+                    f"[dry_run] would batch-unmonitor {len(to_unmonitor)} episode(s) "
+                    f"(cutoff met) on '{instance}'.")
+                return
             try:
                 self.sonarr_api.bulk_update_episodes(to_unmonitor)
                 self.logger.log_info(f"🔻 Batch unmonitored {len(to_unmonitor)} episodes (cutoff met).")

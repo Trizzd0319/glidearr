@@ -97,6 +97,23 @@ _CACHED_HISTORY_FIELDS = (
 )
 
 
+class HistoryFetchError(RuntimeError):
+    """Raised when the Tautulli history fetch fails or is incomplete.
+
+    EXISTS SO A FAILURE IS NOT INDISTINGUISHABLE FROM "NOTHING WAS WATCHED".
+    ``get_all_history`` used to return ``[]`` on a dead API and to ``break`` out of
+    the page loop on a failed page, so a transient blip produced an empty (or
+    silently truncated) history that ``get_or_generate_cache`` then stored for a
+    full hour. Roughly six consumers per run read that key, and one of them is the
+    hard guard that stops a WATCHED movie being deleted
+    (``radarr/repair/anomaly.demote_stale_monitored``:
+    ``if keep_policy or tmdb_id in watched_tmdb_ids: guarded``).
+
+    The reference for this shape is ``plex/metadata``:
+        ``if not resp: return None  # transient - allow retry on a later run``
+    """
+
+
 class TautulliWatchHistoryManager(BaseManager):
     def __init__(self, logger=None, config=None, global_cache=None,
                  validator=None, registry=None, **kwargs):
@@ -114,10 +131,18 @@ class TautulliWatchHistoryManager(BaseManager):
 
     def get_all_history(self, user_id=None, page_size: int = 1000) -> list:
         """Fetch all history records with pagination. Returns flat list of entries
-        projected to only the non-PII fields consumed downstream."""
+        projected to only the non-PII fields consumed downstream.
+
+        RAISES ``HistoryFetchError`` rather than returning a short list when the
+        API is missing or a page fails. A partial history is not a smaller truth --
+        every consumer reads absence as "not watched", so a truncated fetch is
+        strictly more dangerous than no fetch at all. See the class docstring.
+        """
         if not self.tautulli_api:
-            self.logger.log_warning("[TautulliHistory] No API available.")
-            return []
+            raise HistoryFetchError(
+                "[TautulliHistory] No API available - cannot distinguish this from "
+                "an empty watch history, so refusing to return one."
+            )
 
         entries = []
         start = 0
@@ -126,34 +151,93 @@ class TautulliWatchHistoryManager(BaseManager):
                 length=page_size, start=start, user_id=user_id
             )
             if not resp:
-                break
+                # A failed page, NOT the end of the data. Breaking here would return
+                # everything fetched so far as though it were complete.
+                raise HistoryFetchError(
+                    f"[TautulliHistory] history fetch failed at offset {start} "
+                    f"(after {len(entries)} entries) - refusing to cache a partial history."
+                )
             data = (resp.get("response") or {}).get("data", {})
             page = data.get("data", []) if isinstance(data, dict) else []
             if not page:
-                break
+                break                      # genuine end of data
             entries.extend(self._project_record(e) for e in page)
-            total = int(data.get("recordsFiltered", 0)) if isinstance(data, dict) else 0
+
+            # SHORT PAGE = end of data. This is the primary terminator and it works
+            # without recordsFiltered; the grand-total check below is only a
+            # fast-path. Previously an ABSENT recordsFiltered defaulted total to 0,
+            # so `start >= 0` fired immediately and the whole history truncated to
+            # ONE page -- exactly the failure plex/ documents avoiding by falling
+            # through to its empty-page terminator.
+            if len(page) < page_size:
+                break
+
             start += page_size
-            if start >= total:
+            try:
+                total = int(data["recordsFiltered"]) if isinstance(data, dict) else None
+            except (KeyError, TypeError, ValueError):
+                total = None               # absent/garbage -> rely on the page terminators
+            if total is not None and start >= total:
                 break
 
         self.logger.log_info(f"[TautulliHistory] Fetched {len(entries)} total history entries.")
         return entries
 
     def get_all_history_cached(self, user_id=None) -> list:
-        """Return all history entries, cached for 24 hours."""
+        """Return all history entries, cached for _HISTORY_TTL (1 hour).
+
+        ON FETCH FAILURE, PREFERS STALE OVER EMPTY. A stale watched-set is wrong by
+        an hour; an empty one is wrong about every title in the library, and the
+        consumers cannot tell the difference. Returns `[]` only when there is
+        genuinely nothing to fall back on, and says so loudly when it does.
+        """
         if not self.global_cache:
-            return self.get_all_history(user_id=user_id)
+            try:
+                return self.get_all_history(user_id=user_id)
+            except HistoryFetchError as e:
+                self.logger.log_warning(f"{e} No cache available - returning empty.")
+                return []
+
         key = "tautulli/history/all" if user_id is None else f"tautulli/history/user/{user_id}"
-        return self.global_cache.get_or_generate_cache(
-            key=key,
-            generator_function=lambda: self.get_all_history(user_id=user_id),
-            expiration_time=_HISTORY_TTL,
-            # Upstream source of truth for the household watched-set — refresh on
-            # TTL so new Plex watches flow through (Tautulli is local; no rate
-            # limit to fear). Frozen history was silently staling everything.
-            regenerate_on_expiry=True,
-        )
+
+        def _stale_or_empty(reason: str) -> list:
+            try:
+                stale = self.global_cache.get(key)
+            except Exception:
+                stale = None
+            if isinstance(stale, list) and stale:
+                self.logger.log_warning(
+                    f"{reason} Serving {len(stale)} STALE entries from '{key}' rather than "
+                    f"an empty history (an empty watched-set un-guards every watched title)."
+                )
+                return stale
+            self.logger.log_warning(
+                f"{reason} No usable cached history at '{key}' - returning EMPTY. "
+                f"Downstream this reads as 'nothing was watched': affinity, completion, "
+                f"the delete grace window and the watched-set delete guard are all "
+                f"degraded for this run."
+            )
+            return []
+
+        try:
+            result = self.global_cache.get_or_generate_cache(
+                key=key,
+                generator_function=lambda: self.get_all_history(user_id=user_id),
+                expiration_time=_HISTORY_TTL,
+                # Upstream source of truth for the household watched-set — refresh on
+                # TTL so new Plex watches flow through (Tautulli is local; no rate
+                # limit to fear). Frozen history was silently staling everything.
+                regenerate_on_expiry=True,
+            )
+        except HistoryFetchError as e:
+            return _stale_or_empty(str(e))
+
+        # Belt-and-braces: if the cache layer swallows generator exceptions and hands
+        # back a falsy value instead, that is the same failure wearing a different
+        # coat -- do not let it through as "nothing was watched" either.
+        if not result:
+            return _stale_or_empty("[TautulliHistory] history cache returned nothing.")
+        return result
 
     def get_group_movie_completions(
         self,

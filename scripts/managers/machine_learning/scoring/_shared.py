@@ -974,7 +974,11 @@ def person_affinity_score(
     Per matched person: ``(weight / max_weight) * role_weight``; the top-3 such products
     are averaged and scaled to ``cap`` (mirrors ``affinity_topk``'s top-3-mean shape so
     C4 behaves like the other affinity bumps, only keyed on ids). 0.0 when either map is
-    empty or nothing matches.
+    empty or nothing matches. ⚠️ ``role_weight`` here is the SAME table
+    ``aggregate_person_affinity`` already applied building ``person_weights`` — the
+    weight acts at BOTH stages, so cross-role ratios are effectively squared
+    end-to-end; the 2026-08-07 table is tuned under that regime (GLD-PPL-13, open —
+    change either application site and the table's numbers change meaning).
     """
     if not media_people_ids or not person_weights or cap <= 0:
         return 0.0

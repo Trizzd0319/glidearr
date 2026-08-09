@@ -48,6 +48,34 @@ class SonarrQualityManager(BaseManager, ComponentManagerMixin):
         }
 
         critical_keys = {"adjustments", "custom_formats", "file_sizes", "selector"}
+        _unknown = critical_keys - set(all_component_classes)
+        if _unknown:
+            raise KeyError(
+                f"{self.__class__.__name__}: critical_keys names component(s) that do not "
+                f"exist: {sorted(_unknown)}. Known: {sorted(all_component_classes)}."
+            )
+
+        # Hoisted out of the split_components(...) call so the construction loops
+        # below can reuse it. They previously read
+        # ``cls(**critical_components[name]["init_kwargs"])`` -- but
+        # critical_components[name] IS the class, and subscripting a class raises
+        # TypeError: 'type' object is not subscriptable. Every one of the four
+        # components failed, the per-component except swallowed it into
+        # load_summary, and all_critical_loaded went False. Never observed because
+        # this manager is filtered out of SonarrManager's loadable set and is
+        # superseded by orchestration/quality.py, which has the loop right.
+        quality_init_kwargs = {
+            "logger": self.logger,
+            "config": self.config,
+            "global_cache": self.global_cache,
+            "validator": self.validator,
+            "registry": self.registry,
+            "manager": self,
+            "sonarr_api": sonarr_api,
+            "cache_manager": self.sonarr_cache,
+            "key_builder": self.key_builder,
+            "dry_run": self.dry_run,
+        }
 
         critical_components, noncritical_components = split_components(
             all_components=all_component_classes,
@@ -55,23 +83,12 @@ class SonarrQualityManager(BaseManager, ComponentManagerMixin):
             parent_name_match=self.parent_name,
             logger=self.logger,
             logger_context=self.__class__.__name__,
-            init_kwargs={
-                "logger": self.logger,
-                "config": self.config,
-                "global_cache": self.global_cache,
-                "validator": self.validator,
-                "registry": self.registry,
-                "manager": self,
-                "sonarr_api": sonarr_api,
-                "cache_manager": self.sonarr_cache,
-                "key_builder": self.key_builder,
-                "dry_run": self.dry_run,
-            },
+            init_kwargs=quality_init_kwargs,
         )
 
         for name, cls in critical_components.items():
             try:
-                instance = cls(**critical_components[name]["init_kwargs"])
+                instance = cls(**quality_init_kwargs)
                 setattr(self, name, instance)
                 self.registry.set_flag(f"sonarr.quality.{name}_initialized", True)
                 self.load_summary[name] = "✅ Loaded"
@@ -82,7 +99,7 @@ class SonarrQualityManager(BaseManager, ComponentManagerMixin):
 
         for name, cls in noncritical_components.items():
             try:
-                instance = cls(**noncritical_components[name]["init_kwargs"])
+                instance = cls(**quality_init_kwargs)
                 setattr(self, name, instance)
                 self.registry.set_flag(f"sonarr.quality.{name}_initialized", True)
                 self.load_summary[name] = "✅ Loaded"

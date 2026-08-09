@@ -577,6 +577,47 @@ class LoggerManager:
     def is_concise(self):
         return self.concise_mode
 
+    # Every exception caught by the ``log_function_entry`` wrapper this process, as
+    # ``(qualified_function, message)``. Collected so the run can END with a summary
+    # instead of leaving one ERROR line buried in a 780 KB log.
+    #
+    # WHY THIS EXISTS: a NameError aborted the whole Sonarr sync pipeline mid-run. It WAS
+    # logged at ERROR, and it WAS on stdout -- but the run carried on with its other passes
+    # and finished with the normal banner, so the failure read as a quiet run. It cost five
+    # rounds of debugging to find, and the only reason it stayed hidden is that nothing
+    # restates it at the end where an operator is actually looking.
+    _run_exceptions: list = []
+
+    @classmethod
+    def record_exception(cls, func_name: str, message: str) -> None:
+        """Record a pass-level exception for the end-of-run summary. Deduped by
+        (function, message) so a per-item failure inside a loop reports once, not N times."""
+        entry = (str(func_name), str(message))
+        if entry not in cls._run_exceptions:
+            cls._run_exceptions.append(entry)
+
+    @classmethod
+    def run_exceptions(cls) -> list:
+        return list(cls._run_exceptions)
+
+    def log_run_exception_summary(self) -> int:
+        """Print the end-of-run exception summary. Returns the count (0 = nothing raised,
+        and NOTHING is printed, so a clean run stays clean).
+
+        Deliberately the LAST thing an operator sees alongside the deletions banner: a pass
+        that raised did NOT do its job, and every downstream conclusion drawn from that run
+        is suspect. Silence here is the only honest signal that a run was complete.
+        """
+        errs = self.run_exceptions()
+        if not errs:
+            return 0
+        self.log_error(
+            f"{len(errs)} pass(es) RAISED this run - their work did NOT complete, and any "
+            f"summary above that depended on them is incomplete:")
+        for fn, msg in errs:
+            self.log_error(f"    - {fn}: {msg}")
+        return len(errs)
+
     def log_error(self, message):
         context = self.get_log_context()
         self.logger.error(self._present(f"{context} {message}"))
@@ -622,6 +663,9 @@ class LoggerManager:
             except Exception as e:
                 self.logger.error(self._present(f"TRACE [{trace_id}] Exception in {func_name}: {e}"))
                 self._log_trace_to_file(trace_id, func_name, location, str(e))
+                # Also collect for the END-OF-RUN summary. The ERROR line above is easy to
+                # lose in a large log when the run continues and finishes normally.
+                LoggerManager.record_exception(func_name, str(e))
                 raise
             finally:
                 try:

@@ -132,6 +132,21 @@ class DiscoveryShelfBuilderManager(PlexPlaylistBuilderManager):
             s_items, _ = gated_plan(s_scored, level=level, cap=cap, resolve=sr_u, seen=s_seen)
             self.global_cache.set(f"{_TWIH_MOVIE_PLAN_KEY}/{safe}", self._plan_dict("twih_movie", m_items))
             self.global_cache.set(f"{_TWIH_SHOW_PLAN_KEY}/{safe}", self._plan_dict("twih_show", s_items))
+            # RECORD the placement, armed only — a dry run previews a shelf, it does
+            # not show it to anybody, and a recorded placement nobody saw becomes a
+            # manufactured MISS when its window closes unplayed.
+            #
+            # Movies and shows go to ONE surface. They are the same editorial act
+            # ("this week in history") split across two Plex objects only because a
+            # smart playlist points at one section; splitting them in the ledger
+            # would halve every sample for no analytical gain.
+            # NOT RECORDED HERE. Recording lives in `playlists/writeback._record_surfaced`,
+            # because this builder is read-only: it caches a plan, and a plan is not
+            # a thing anybody saw. Write-back is the only component that knows the
+            # playlist actually reached Plex - a create can fail, a token can be
+            # missing, the run can be a dry run - and every one of those would
+            # otherwise enter these picks into a 30-day window they were never
+            # displayed for, each maturing into a manufactured MISS.
             self.logger.log_info(
                 f"[Anniversary] {self._anon(u)} -> {len(m_items)} movie + {len(s_items)} show "
                 f"owned pick(s) (tier {level}).")

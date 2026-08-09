@@ -36,7 +36,38 @@ class TautulliUsersManager(BaseManager):
 
     def _affinity_half_life(self):
         """Optional recency half-life (days) for affinity decay — config
-        ``scoring.affinity_half_life_days``. None/0 = legacy raw counts (default)."""
+        ``scoring.affinity_half_life_days``. None/0 = legacy raw counts (default).
+
+        ⚠️  SETTING THIS IS AN AXIS TRANSLATION — IT IS NOT A LOCAL CHANGE.
+
+        Decay reweights every affinity contribution by ``exp(-age_days/half_life)``,
+        which shifts the whole ``watchability_score`` distribution downward (older
+        watches stop counting at full weight). ``likelihood`` consumes that score at
+        GAIN 1.0, so every boundary calibrated against the current distribution moves
+        out from under itself the moment this is non-zero.
+
+        The last time the axis translated — Group D v2 replacing a near-constant +12
+        bonus with a transcode-risk penalty — it cost a coordinated re-anchor:
+
+          * the DELETE family 20 -> 17 (``tv_delete_ceiling``, ``series_demote``, and
+            the movie delete floor) — see machine_learning/thresholds/registry.py;
+          * ``likelihood.untouched_base`` 12 -> 25, after untouched titles reaching
+            1080p collapsed 456 -> 8 (-98.2%);
+          * the monitor threshold deliberately LEFT at 35, because it is crossed only
+            by file-owning series and stubs never reach it either way (the asymmetry
+            is documented in sonarr/series/quality.py — do not "fix" it).
+
+        That collapse was caught by manual measurement, NOT by any check: there is
+        still no axis-drift detector (GLD-LIK-01). So before enabling this:
+
+          1. re-measure the score distribution with decay on;
+          2. re-anchor the delete family and ``untouched_base`` against it;
+          3. prefer ``thresholds`` percentile mode where available — it is immune to
+             translation (measured 0.0% / +4.9% drift vs -98.2% for absolute cutoffs).
+
+        Evidence for the half-life itself is thin (n~931, n_pos<<100), so an
+        aggressive value discards most of the signal it is meant to weight. See D32.
+        """
         return ((self.config or {}).get("scoring", {}) or {}).get("affinity_half_life_days")
 
     def _compute_affinity_from_entries(

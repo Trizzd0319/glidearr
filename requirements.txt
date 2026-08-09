@@ -8,7 +8,14 @@ pyarrow
 tabulate
 tqdm
 prettytable
-lightbgm
+resvg-py
+
+# OPTIONAL — the shadow challenger (machine_learning/challenger/gbt_shadow.py)
+# degrades to a no-op without it. Was previously listed here misspelled as
+# "lightbgm", which pip cannot resolve; because pip aborts the whole file on an
+# unresolvable requirement, that one typo meant `pip install -r requirements.txt`
+# installed NOTHING on a clean environment. Drop this line for a lean install.
+lightgbm
 
 # Secret management — keeps API keys/tokens out of plaintext config.json.
 # Desktop: uses the OS keyring (Windows Credential Manager / macOS Keychain /

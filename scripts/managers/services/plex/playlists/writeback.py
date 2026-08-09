@@ -33,11 +33,13 @@ Safety rails, all P0 (see the PR brief):
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.machine_learning.playlists.cert_gate import tier_level
 from scripts.managers.services.plex._common import anon_label, metadata_items, parse_item
+from scripts.managers.services.plex.playlists import recorder
 
 # cert_gate level → label, mirroring PlexPlaylistBuilderManager._TIER_NAMES so the de-identified
 # handle this manager logs ('T - adult 1') matches the one the builders log for the same profile.
@@ -57,6 +59,35 @@ _FRESH_PLAN_KEY = "plex/playlists/fresh_movie_plan"    # Fresh Arrivals (genuine
 _TWIH_MOVIE_PLAN_KEY = "plex/playlists/twih_movie_plan"  # Anniversary Picks (movies, this week in history)
 _TWIH_SHOW_PLAN_KEY = "plex/playlists/twih_show_plan"    # On This Week (shows, this week in history)
 _GEMS_PLAN_KEY = "plex/playlists/gems_plan"              # Hidden Gems (owned + never played + taste-matched)
+_TONIGHT_PLAN_KEY = "plex/playlists/tonight_plan"        # Tonight (per-profile weekday habit, built for TOMORROW)
+_AFFINITY_PLAN_KEY = "plex/playlists/affinity_plan"      # Because You Watched (seeded from discovery COMPLETIONS)
+
+#: family suffix -> ledger surface. Recording happens HERE, not in the builders,
+#: because this is the only component that knows a placement actually REACHED
+#: Plex. A builder caches a plan; a plan is not a thing anybody saw.
+#:
+#: Each of these would otherwise manufacture a MISS - a pick entered into its
+#: 30-day window, never displayed, maturing into evidence that the shelf does not
+#: work:
+#:   * dry_run          the plan was previewed, never published
+#:   * create failed    "create failed for '...' - skipped"
+#:   * recreate failed  old list kept, new one never minted
+#:   * no write token   the profile was skipped entirely
+#:   * empty plan       the playlist was DELETED, not shown
+#:
+#: Deferral is NOT one of them: a deferred playlist is live and holding the items
+#: it was written with, and those were recorded on the run that wrote them.
+#:
+#: Up Next / The Long Glide / Touch & Go are absent on purpose - the next episode
+#: of a show already being watched is not a discovery. Hidden Gems is absent
+#: because it records through its own publish path, and a second writer would
+#: double every row and corrupt the hit rate it has been accumulating.
+_RECORD_SURFACE = {
+    "Anniversary Picks": "anniversary",
+    "On This Week": "anniversary",
+    "Tonight": "tonight",
+    "Because You Watched": "because_you_watched",
+}
 
 # The default ALWAYS-written family — combined > tv > movie precedence, titled "Up Next".
 # Its suffix is the one that keeps the LEGACY anchor key (== safe_user), so it's a shared
@@ -95,8 +126,27 @@ _BRAND_ASSETS = {
     "Fresh Arrivals": "fresh_arrivals",
     "Anniversary Picks": "anniversary_picks",
     "On This Week": "on_this_week",
+    # GLD-PLY-18: "Hidden Gems" is in _all_families() and enabled in config, but had NO entry
+    # here -- so _branding_asset returned None and it was the one live playlist that never got a
+    # poster (visible in playlists.log: a 'would be titled' line with no matching 'poster would be
+    # set'). The asset now exists as a template, so the mapping is filled in.
+    "Hidden Gems": "hidden_gems",
+    # Tonight is per-PROFILE and built for a specific upcoming day, so unlike
+    # every other family here its poster carries a live date band and must be
+    # regenerated whenever the date rolls.
+    "Tonight": "tonight",
+    # Seeded from what the household FINISHED off a discovery shelf, so its copy
+    # ("because you watch {{GENRE}}") is answerable from the plan itself.
+    "Because You Watched": "because_you_watched",
 }
-_ASSETS_DIR = Path(__file__).resolve().parents[4] / "support" / "assets" / "playlists"
+_ASSETS_DIR = (Path(__file__).resolve().parents[4] / "support" / "assets"
+               / "posters" / "playlists")
+# PLAYLISTS, not collections. This module uploads to a PLAYLIST, which Plex renders in a
+# 1:1 tile and centre-crops anything taller -- so it must read the SQUARE 1000x1000 set.
+# The 2:3 portrait set under posters/collections/ is consumed by
+# plex/collections/posters.CollectionPosterManager, because a collection is a library item
+# in the 2:3 grid. Pointing this at the collections folder would upload portrait art to
+# playlist tiles and Plex would crop away the title band.
 
 # Drift fraction above which a user is skipped (the plan is too stale to write safely; a
 # re-run after the next inventory scan resolves it).
@@ -104,7 +154,77 @@ _DRIFT_SKIP_RATIO = 0.5
 
 # When the in-place diff would touch MORE than the whole desired list, fall back to a clean
 # recreate (create-new-then-delete-old) rather than dribbling N removes + N adds.
+# GLD-PLY-13: this threshold is only meaningful because ``move`` is now the MINIMUM number of
+# displaced items (see _min_moves). It previously counted the WHOLE survivor list on any re-rank,
+# which made n_changes == len(desired) + removes and tripped this fallback on nearly every run.
 _RECREATE_RATIO = 1.0
+
+# -- rewrite cadence (GLD-PLY-15) ----------------------------------------------------------------
+# Epoch seconds of the last ARMED item write, per playlist.
+_LASTWRITE_KEY = "plex/playlists/last_write"           # + /{anchor_id}
+
+# A re-ranked plan yields a large in-place diff EVERY run (observed live: +22/-0/~78 on a 100-item
+# "Up Next"), so writing every run churns each member's playlist for pure ordering noise. The ITEM
+# write is therefore rate-limited to once per this many hours. 20, not 24, so a DAILY-scheduled run
+# is never blocked by a few minutes of clock drift. <= 0 disables the gate entirely.
+# Config: plex.playlists.writeback.min_interval_hours.
+_MIN_REWRITE_INTERVAL_HOURS = 20.0
+
+# The escape hatch: the fraction of the list added (vs desired) or removed (vs current) that forces
+# a write through BEFORE the interval elapses -- "a lot got watched off it" / "re-ranking pulled in
+# a lot of new material". 0.40 sits deliberately ABOVE this install's observed steady-state add
+# churn (~0.22) so routine re-ranking defers and only a genuine overhaul overrides.
+# Config: plex.playlists.writeback.churn_override_ratio.
+_CHURN_OVERRIDE_RATIO = 0.40
+
+# A pure RE-ORDER can never trip the churn override above (it is measured on adds/removes only,
+# by design). But a re-order that changes what sits at the TOP of the list is exactly what the
+# household actually sees -- e.g. session warmth promoting a series watched a few hours ago from
+# #43 to #10 (GLD-PLY-17). So the head of the list gets its own override: if the SET of items in
+# the first _HEAD_SIZE slots differs from what is live by this fraction, write through now.
+# Reordering that stays below the fold is still absorbed by the interval.
+# Config: plex.playlists.writeback.head_size / head_churn_ratio.
+_HEAD_SIZE = 10
+_HEAD_CHURN_RATIO = 0.30
+
+
+def _min_moves(cur_order, desired_order) -> list:
+    """The MINIMUM set of items that must be repositioned to turn ``cur_order`` into
+    ``desired_order`` (both permutations of the same set): every item OUTSIDE the longest
+    subsequence that is already in the right relative order. Items in that subsequence need no
+    move -- the rest get carried around them.
+
+    GLD-PLY-13. The previous implementation returned the ENTIRE survivor list whenever the order
+    differed at all, so ``n_changes`` came to len(desired) + removes on any re-rank and tripped
+    _RECREATE_RATIO on nearly every run -- turning "delete+recreate as a last resort" into the
+    DEFAULT path (measured on this install: 4 of 6 "Up Next" lists recreated every run, each
+    minting a fresh ratingKey).
+
+    O(n log n) patience-sorting LIS. Verified exhaustively against brute force for every
+    permutation up to n=7, plus randomized replay up to n=60.
+    """
+    pos = {rk: i for i, rk in enumerate(desired_order)}
+    seq = [pos[rk] for rk in cur_order if rk in pos]
+    tails: list = []                  # tails[k] = index into seq of the smallest tail of a
+    prev: list = [-1] * len(seq)      # length-(k+1) increasing run; prev[] threads the chain
+    for i, v in enumerate(seq):
+        lo, hi = 0, len(tails)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if seq[tails[mid]] < v:
+                lo = mid + 1
+            else:
+                hi = mid
+        prev[i] = tails[lo - 1] if lo > 0 else -1
+        if lo == len(tails):
+            tails.append(i)
+        else:
+            tails[lo] = i
+    keep, k = set(), (tails[-1] if tails else -1)
+    while k >= 0:
+        keep.add(seq[k])
+        k = prev[k]
+    return [rk for rk in desired_order if pos[rk] not in keep]
 
 
 class PlaylistWritebackManager(BaseManager):
@@ -142,6 +262,8 @@ class PlaylistWritebackManager(BaseManager):
         fresh = bool((self._pl_cfg().get("fresh_arrivals", {}) or {}).get("enabled", False))
         disc = bool((self._pl_cfg().get("this_week_in_history", {}) or {}).get("enabled", False))
         gems = bool((self._pl_cfg().get("hidden_gems", {}) or {}).get("enabled", False))
+        tonight = bool((self._pl_cfg().get("tonight", {}) or {}).get("enabled", False))
+        affinity = bool((self._pl_cfg().get("because_you_watched", {}) or {}).get("enabled", False))
         return [
             (_UP_NEXT, True),
             ({"suffix": "The Long Glide", "keys": (_GLIDE_PLAN_KEY,)}, mood),
@@ -150,6 +272,8 @@ class PlaylistWritebackManager(BaseManager):
             ({"suffix": "Anniversary Picks", "keys": (_TWIH_MOVIE_PLAN_KEY,)}, disc),
             ({"suffix": "On This Week", "keys": (_TWIH_SHOW_PLAN_KEY,)}, disc),
             ({"suffix": "Hidden Gems", "keys": (_GEMS_PLAN_KEY,)}, gems),
+            ({"suffix": "Tonight", "keys": (_TONIGHT_PLAN_KEY,)}, tonight),
+            ({"suffix": "Because You Watched", "keys": (_AFFINITY_PLAN_KEY,)}, affinity),
         ]
 
     # ── run (I/O gather → tested core) ────────────────────────────────────────
@@ -169,7 +293,12 @@ class PlaylistWritebackManager(BaseManager):
         excluded = self._excluded_users()
         valid_rks = self._valid_rating_keys(tv_inv, movie_inv)
         stats = {"armed": armed, "created": 0, "updated": 0, "deleted": 0,
-                 "skipped": 0, "users": len(tracked), "orphans": 0, "branded": 0, "retitled": 0}
+                 "skipped": 0, "users": len(tracked), "orphans": 0, "branded": 0, "retitled": 0,
+                 "recreated": 0, "deferred": 0, "sort_repaired": 0}
+        # Per-run memo for the live titleSort listing; see _live_sort_title. Reset
+        # here rather than in __init__ so a manager reused across runs cannot carry
+        # one run's server state into the next.
+        self._sort_memo = {}
         # safe_user → de-identified handle, so run-log lines below never print the real profile
         # name (the dedicated playlists.log preview keeps it). Built once from the tracked order.
         self._anon_by_safe = {u.get("safe_user"): self._anon(u, i)
@@ -250,21 +379,35 @@ class PlaylistWritebackManager(BaseManager):
         self._ensure_title(safe, suffix, rk, token, armed, stats)
         if anchor.get("created"):
             self._apply_branding(safe, suffix, rk, token, armed, stats)   # fresh list → brand it
+            self._stamp_write(safe, suffix, armed)   # starts the GLD-PLY-15 rewrite interval
+            self._record_surfaced(safe, suffix, desired, armed, stats)
             return                       # freshly created with the desired items, in order
 
         current = self._current_items(rk, token)
         desired_rks = [it["rating_key"] for it in desired]
         if [c["rating_key"] for c in current] == desired_rks:
             self.logger.log_debug(f"[Writeback] '{title}' already in steady state — no item write.")
+            # STILL RECORDED: the playlist is live and holding exactly these items,
+            # which is what "surfaced" means. Dedup on (date, surface, profile,
+            # entity_id) makes the repeat free, and this is the branch a
+            # held-open shelf sits in for most of its window.
+            self._record_surfaced(safe, suffix, desired, armed, stats)
             self._apply_branding(safe, suffix, rk, token, armed, stats)   # ensure the poster (gated)
             return                       # P0 #5: current == desired → no item write
 
         plan = self._diff(current, desired_rks)
+        # GLD-PLY-15: rate-limit the ITEM write to once per interval unless the churn is a genuine
+        # overhaul. Title/poster stay OUTSIDE the gate -- they are one-time, version-gated
+        # migrations and holding them back for a day buys nothing.
+        if self._cadence_defer(safe, suffix, plan, current, desired_rks, stats):
+            self._apply_branding(safe, suffix, rk, token, armed, stats)
+            return
         n_changes = len(plan["add"]) + len(plan["remove"]) + len(plan["move"])
         if n_changes > max(len(desired_rks), 1) * _RECREATE_RATIO:
             # Diff exceeds the whole list → cheaper + safer to recreate (new-then-old). _recreate
             # force-brands the NEW ratingKey, so we don't brand the about-to-be-deleted old one here.
-            self._recreate(user, safe, title, rk, desired_rks, token, armed, stats, suffix)
+            self._recreate(user, safe, title, rk, desired_rks, token, armed, stats, suffix,
+                           desired=desired)
             return
 
         if not armed:
@@ -276,9 +419,37 @@ class PlaylistWritebackManager(BaseManager):
             return
 
         self._apply_diff(rk, current, desired_rks, plan, token)
+        self._stamp_write(safe, suffix, armed)
         stats["updated"] += 1
         self._audit(user, "replace", rk, len(desired_rks))
         self._apply_branding(safe, suffix, rk, token, armed, stats)       # in-place update → brand
+        self._record_surfaced(safe, suffix, desired, armed, stats)
+
+    def _record_surfaced(self, safe, suffix, desired, armed, stats):
+        """Record this family's items into the recommendation ledger — ARMED ONLY,
+        and only from a path where the playlist demonstrably reached Plex.
+
+        See ``_RECORD_SURFACE`` for why this lives here rather than in the
+        builders, and for the list of failure modes that would otherwise each
+        manufacture a miss.
+
+        Identity comes from the PLAN ITEMS, which carry ``tmdb_id`` /
+        ``tvdb_join_key`` captured at selection time (`GLD-PLY-24`) plus the
+        ``rating_key`` as surfaced. Nothing is re-derived from a ratingKey here:
+        a re-scan retires them, and a wrongly-attributed ledger row is
+        undetectable downstream.
+        """
+        surface = _RECORD_SURFACE.get(suffix)
+        if not surface or not armed or not desired:
+            return
+        base_dir = recorder.base_dir_of(self.global_cache)
+        if base_dir is None:
+            return
+        res = recorder.record_surface(
+            base_dir=base_dir, picks=list(desired), profile=safe,
+            surface=surface, logger=self.logger)
+        stats["recorded"] = stats.get("recorded", 0) + res["recorded"]
+        stats["unrecordable"] = stats.get("unrecordable", 0) + res["skipped"]
 
     def _find_or_create_anchor(self, safe, title, token, armed, desired, stats, suffix="Up Next") -> dict | None:
         """Resolve OUR managed playlist for this user (P0 #3). Cached ratingKey FIRST; on a
@@ -311,13 +482,15 @@ class PlaylistWritebackManager(BaseManager):
         self._audit({"title": title, "safe_user": safe}, "create", rk, len(desired_rks))
         return {"rating_key": rk, "created": True}
 
-    def _recreate(self, user, safe, title, old_rk, desired_rks, token, armed, stats, suffix="Up Next"):
+    def _recreate(self, user, safe, title, old_rk, desired_rks, token, armed, stats,
+                  suffix="Up Next", desired=None):
         """Delete+create fallback, CREATE-NEW-THEN-DELETE-OLD so a failed create never loses
         the user's playlist (P0 #5). Only the new anchor is ever deleted on the next pass."""
         if not armed:
             self._detail(
                 f"[Writeback] [disarmed] '{title}' would be RECREATED ({len(desired_rks)} item(s)).")
             stats["updated"] += 1
+            stats["recreated"] = stats.get("recreated", 0) + 1
             return
         new_rk = self._create_playlist(title, desired_rks, token)
         if new_rk is None:
@@ -327,10 +500,22 @@ class PlaylistWritebackManager(BaseManager):
             return
         self._anchor_set(safe, new_rk, suffix)    # repoint the anchor BEFORE deleting the old one
         self.plex_api.delete_playlist(old_rk, token=token)
-        # The new list is a fresh ratingKey with no poster — force a re-brand past the version gate.
+        # GLD-PLY-14: the new ratingKey has NEITHER a titleSort NOR a poster, and BOTH gates are
+        # keyed on anchor_id -- which does NOT change across a recreate. So both must be FORCED, or
+        # the fresh list silently keeps Plex's default sort key (losing the '!' front-pin) and no
+        # art, permanently, because the stale "done" markers still match. Branding already did this;
+        # the title gate was the missed half.
+        self._ensure_title(safe, suffix, new_rk, token, armed, stats, force=True)
         self._apply_branding(safe, suffix, new_rk, token, armed, stats, force=True)
+        self._stamp_write(safe, suffix, armed)
         stats["updated"] += 1
+        stats["recreated"] = stats.get("recreated", 0) + 1
         self._audit(user, "replace", new_rk, len(desired_rks))
+        # Recorded only HERE, after the new list exists. The early-return above
+        # (create failed → old playlist kept) deliberately records nothing: those
+        # items were never re-published, and a recorded placement nobody saw
+        # matures into a manufactured miss.
+        self._record_surfaced(safe, suffix, desired, armed, stats)
 
     # ── empty-plan + orphan handling ──────────────────────────────────────────
     def _handle_empty(self, user, users_mgr, armed, stats, fam=_UP_NEXT):
@@ -367,7 +552,32 @@ class PlaylistWritebackManager(BaseManager):
         must LEAVE the playlist alone — we key orphan-detection on the roster, never on
         tracked_users. The anchor map is keyed by safe_user; we map roster uuids → safe_user
         via the persisted roster + tracked set, and only sweep anchors whose user has truly
-        vanished from the household."""
+        vanished from the household.
+
+        ⚠️ THE DELETE ITSELF PROBABLY CANNOT SUCCEED, AND IS COUNTED AS IF IT DID.
+        The departed user's per-server token can no longer be minted, so this falls back to
+        ``self.plex_api.token`` — the OWNER token. Everywhere else this module treats that as
+        forbidden precisely because it does not work on a managed member's account
+        (``_process_family`` refuses it outright: "refusing to write … with the OWNER token").
+        A managed user's playlist lives on THEIR account, so the owner token should 404/403.
+
+        The return value of ``delete_playlist`` is then DISCARDED and ``stats["deleted"]`` is
+        incremented regardless, and an audit line is written claiming a deletion happened. So
+        the banner and the audit trail would both report orphan deletions that did not occur.
+
+        Contrast ``_apply_branding`` in this same file, which gets this exactly right: it only
+        caches success on a verified 2xx, with the reasoning spelled out — *"a silent 404/401
+        must NOT mark the list branded (else it never retries)"*. The same discipline belongs
+        here.
+
+        NOT FIXED HERE because the right answer is a product decision, not a code tweak:
+          * a departed member's playlist may simply be unreachable — Plex removes the Home
+            user and their library with them, in which case there is nothing to delete and
+            the sweep should stop counting it; or
+          * ``delete_playlist`` should report success/failure and the counter + audit line
+            should follow it, leaving the anchor in place on failure so a later run retries.
+        Either way the counter must stop asserting something it has not verified.
+        """
         anchors = self._all_anchors()
         if not anchors:
             return
@@ -457,10 +667,14 @@ class PlaylistWritebackManager(BaseManager):
         desired_set = set(desired_rks)
         remove = [c for c in current if c["rating_key"] not in desired_set]
         add = [rk for rk in desired_rks if rk not in cur_by_rk]
-        # A "move" is any surviving item whose position changes once removes/adds settle.
+        # GLD-PLY-13: "move" is the MINIMUM set of survivors that must be repositioned -- the
+        # complement of the longest already-correctly-ordered subsequence. It used to be the WHOLE
+        # survivor list whenever the order differed at all, which is what tripped _RECREATE_RATIO on
+        # every re-ranked run. _apply_diff still re-walks the full desired order (deterministic and
+        # idempotent); this count is the DRIFT METRIC the recreate threshold and the preview read.
         survivors = [rk for rk in desired_rks if rk in cur_by_rk]
         cur_order = [c["rating_key"] for c in current if c["rating_key"] in desired_set]
-        move = survivors if survivors != cur_order else []
+        move = _min_moves(cur_order, survivors)
         return {"add": add, "remove": remove, "move": move}
 
     def _apply_diff(self, rk, current, desired_rks, plan, token):
@@ -586,6 +800,101 @@ class PlaylistWritebackManager(BaseManager):
             return {k: v for k, v in index.items() if v is not None}
         return {}
 
+    # -- rewrite cadence (GLD-PLY-15) ------------------------------------------
+    def _cadence_cfg(self, key, default) -> float:
+        """A cadence knob, config-derived with a documented module constant as the fallback."""
+        wb = (self._pl_cfg().get("writeback", {}) or {})
+        try:
+            return float(wb.get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    def _last_write(self, safe, suffix):
+        """Epoch seconds of the last ARMED item write for this playlist, or None when there has
+        never been one.
+
+        P-C discipline: the file cache returns {} for a MISSING key, and a missing stamp MUST read
+        as "never written" (-> the write is allowed). Reading it as "written just now" would
+        suppress the very first write for a whole interval -- the same absent/empty conflation
+        that has been a live bug three times in this repo."""
+        val = self._cache_get(f"{_LASTWRITE_KEY}/{self._anchor_id(safe, suffix)}", None)
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return None
+
+    def _stamp_write(self, safe, suffix, armed):
+        """Record that the items were written. ONLY when armed -- a disarmed preview performs no
+        Plex write at all, so stamping it would defer the first REAL write by a full interval."""
+        if not armed or not self.global_cache:
+            return
+        try:
+            self.global_cache.set(f"{_LASTWRITE_KEY}/{self._anchor_id(safe, suffix)}", time.time())
+        except Exception:
+            pass
+
+    def _cadence_defer(self, safe, suffix, plan, current, desired_rks, stats) -> bool:
+        """True when this playlist was rewritten INSIDE the interval and the pending diff is only
+        routine churn -- re-ranking noise, which can wait for the daily rewrite.
+
+        The override is measured on ADDS and REMOVES only, deliberately never on moves: a pure
+        re-order is precisely the noise this gate exists to absorb, so it must not be able to
+        override the gate. Removes (vs the CURRENT list) are the "watched off it" signal; adds
+        (vs the DESIRED list) are the "re-ranking pulled in new material" signal. Either one
+        crossing the ratio is a genuine overhaul and writes through immediately."""
+        hours = self._cadence_cfg("min_interval_hours", _MIN_REWRITE_INTERVAL_HOURS)
+        if hours <= 0:
+            return False                          # gate explicitly disabled
+        last = self._last_write(safe, suffix)
+        if last is None:
+            return False                          # never written -> always write
+        age_h = (time.time() - last) / 3600.0
+        if age_h >= hours:
+            return False                          # interval elapsed -> the daily rewrite
+        ratio = self._cadence_cfg("churn_override_ratio", _CHURN_OVERRIDE_RATIO)
+        add_frac = len(plan["add"]) / max(len(desired_rks), 1)
+        rem_frac = len(plan["remove"]) / max(len(current), 1)
+        if add_frac >= ratio or rem_frac >= ratio:
+            self._detail(
+                f"[Writeback] '{suffix}' written {age_h:.1f}h ago, but churn overrides the "
+                f"{hours:.0f}h interval (+{add_frac:.0%} new / -{rem_frac:.0%} gone, "
+                f"override at {ratio:.0%}).")
+            return False
+        head_frac, head_n = self._head_churn(current, desired_rks)
+        head_ratio = self._cadence_cfg("head_churn_ratio", _HEAD_CHURN_RATIO)
+        if head_frac >= head_ratio:
+            self._detail(
+                f"[Writeback] '{suffix}' written {age_h:.1f}h ago, but the TOP {head_n} changed "
+                f"({head_frac:.0%} new up there, override at {head_ratio:.0%}) -- writing now.")
+            return False
+        self._detail(
+            f"[Writeback] '{suffix}' deferred -- written {age_h:.1f}h ago, next in "
+            f"{hours - age_h:.1f}h (+{len(plan['add'])}/-{len(plan['remove'])}/"
+            f"~{len(plan['move'])}; churn +{add_frac:.0%}/-{rem_frac:.0%} below {ratio:.0%}).")
+        stats["deferred"] = stats.get("deferred", 0) + 1
+        return True
+
+    def _head_churn(self, current, desired_rks):
+        """``(fraction, head_n)`` -- how much of the TOP of the list is about to change.
+
+        Compares the SET of the first ``head_size`` desired ratingKeys against the set of the
+        first ``head_size`` live ones. A set comparison, deliberately: shuffling three items that
+        are ALREADY in the top ten is invisible noise and scores 0, while an item arriving from
+        #43 scores. That is the distinction the interval exists to draw (GLD-PLY-17).
+
+        Note this is the ONLY override that a pure re-order can trip -- the add/remove override
+        above cannot see a move at all.
+        """
+        head_n = int(self._cadence_cfg("head_size", _HEAD_SIZE))
+        if head_n <= 0:
+            return 0.0, 0
+        want = desired_rks[:head_n]
+        if not want:
+            return 0.0, head_n
+        live = {c["rating_key"] for c in current[:head_n]}
+        newcomers = sum(1 for rk in want if rk not in live)
+        return newcomers / len(want), head_n
+
     # ── helpers ────────────────────────────────────────────────────────────────
     def _write_token(self, user, users_mgr):
         if users_mgr is None or not hasattr(users_mgr, "server_write_token"):
@@ -676,23 +985,58 @@ class PlaylistWritebackManager(BaseManager):
         """The armed/disarmed summary banner, logged EVERY run (P0 #7)."""
         state = "ARMED" if stats["armed"] else "disarmed (dry-run/disabled — no Plex writes)"
         self.logger.log_info(
-            f"[Writeback] {state}: {stats['created']} create / {stats['updated']} update / "
-            f"{stats['deleted']} delete / {stats['skipped']} skipped / {stats.get('branded', 0)} branded "
+            f"[Writeback] {state}: {stats['created']} create / {stats['updated']} update "
+            f"({stats.get('recreated', 0)} of them full recreates) / "
+            f"{stats['deleted']} delete / {stats.get('deferred', 0)} deferred / "
+            f"{stats['skipped']} skipped / {stats.get('branded', 0)} branded "
             f"/ {stats.get('retitled', 0)} retitled "
-            f"(over {stats['users']} user(s), {stats['orphans']} orphan(s)) "
+            + (f"({stats['sort_repaired']} sort key(s) REPAIRED after server drift) "
+               if stats.get("sort_repaired") else "")
+            + f"(over {stats['users']} user(s), {stats['orphans']} orphan(s)) "
             f"— per-playlist detail in support/logs/playlists.log.")
 
     # ── title (rename) gate ──────────────────────────────────────────────────────
-    def _ensure_title(self, safe, suffix, rk, token, armed, stats):
+    def _ensure_title(self, safe, suffix, rk, token, armed, stats, force=False):
         """Give a managed playlist its CLEAN display title (bare suffix, no username) and a
         ``!``-prefixed titleSort (front-pin) ONCE. Gated on the persisted last-set titleSort so a
         steady run edits nothing; a fresh create gets the titleSort its POST can't set, and a list
         carrying an old ``'{name} {suffix}'`` / ``'!{suffix}'`` title is migrated on the first armed
-        run. Honors the arm gate (disarmed only previews) and the per-user ``token``."""
+        run. Honors the arm gate (disarmed only previews) and the per-user ``token``.
+
+        ``force`` bypasses the gate after a recreate (GLD-PLY-14): the gate key is the anchor_id,
+        which SURVIVES a recreate, so a fresh ratingKey would otherwise inherit a stale "already
+        titled" marker and never get its titleSort."""
         title = self._playlist_title({}, suffix)         # clean: just the suffix
         sort = self._sort_title(suffix)                  # '!{suffix}'
         key = f"{_TITLE_KEY}/{self._anchor_id(safe, suffix)}"
-        if self._cache_get(key, None) == sort:
+
+        # VERIFY AGAINST PLEX, not against our own marker. The cache records what we
+        # last SENT; it is not evidence of what the server currently holds. A shelf
+        # renamed by hand, a restored database, or any Plex-side reset drops the
+        # titleSort while the marker still reads "done" -- and the list then sits in
+        # plain alphabetical order forever, because the one thing that could repair
+        # it has convinced itself there is nothing to repair.
+        #
+        # The read is one token-scoped playlist listing, the same call
+        # ``_adopt_by_title`` already makes, and it runs OUTSIDE the cadence gate:
+        # a titleSort edit changes no membership and costs one idempotent call, so
+        # there is no reason for it to wait behind an item-rewrite budget.
+        live = self._live_sort_title(rk, token)
+        if live is not None and live != sort:
+            if self._cache_get(key, None) == sort:
+                self.logger.log_info(
+                    f"[Writeback] '{suffix}' sort key drifted on the server "
+                    f"(Plex has {live!r}, expected {sort!r}) - repairing.")
+                stats["sort_repaired"] = stats.get("sort_repaired", 0) + 1
+            force = True                 # server disagrees: the marker is not evidence
+        elif live is not None and live == sort:
+            # Server is already correct. Re-seed the marker so a cache clear does not
+            # cost a needless rewrite, and skip.
+            if self._cache_get(key, None) != sort:
+                self._title_set(safe, suffix, sort)
+            return
+
+        if not force and self._cache_get(key, None) == sort:
             return
         if not armed:
             self._detail(f"[Writeback] [disarmed] '{suffix}' would be titled '{title}' (sort '{sort}').")
@@ -706,6 +1050,24 @@ class PlaylistWritebackManager(BaseManager):
         self._title_set(safe, suffix, sort)
         stats["retitled"] = stats.get("retitled", 0) + 1
         self._detail(f"[Writeback] titled '{title}' (sort '{sort}').")
+
+    def _live_sort_title(self, rk, token):
+        """The titleSort Plex ACTUALLY holds for ``rk``, or None when unreadable.
+
+        None means "could not determine" and the caller must fall back to the
+        cached marker - never treat it as "empty", or a transient API hiccup would
+        rewrite every title on every run (P-C).
+        """
+        if rk is None or not self.plex_api:
+            return None
+        try:
+            resp = self.plex_api.get_playlists(token=token)
+        except Exception:
+            return None
+        for d in metadata_items(resp):
+            if isinstance(d, dict) and str(d.get("ratingKey")) == str(rk):
+                return str(d.get("titleSort") or "")
+        return None
 
     def _title_set(self, safe, suffix, sort):
         if not self.global_cache:
@@ -730,17 +1092,38 @@ class PlaylistWritebackManager(BaseManager):
         override = self._branding_cfg().get("assets_dir")
         return Path(override) if override else _ASSETS_DIR
 
-    def _branding_asset(self, suffix) -> Path | None:
-        """The poster Path for a family ``suffix``, or None when there's no mapping or no file on disk
-        (a missing asset is skipped quietly — branding is best-effort, never a write-back blocker)."""
+    def _branding_asset(self, suffix, safe=None) -> Path | None:
+        """The poster Path for a family, PREFERRING this profile's own render.
+
+        ``assets/posters/playlists/by_user/{safe}/{slug}.png`` when
+        ``PlaylistPosterRenderManager`` produced one, else the shared default.
+
+        The per-user file exists because five of the eight families are personal -
+        Up Next's lead shows, The Long Glide's sagas, Tonight's picks - and one
+        shared PNG cannot say "next up in Andor . The Bear" for one profile and
+        something else for another. Before this, every poster shipped its SPEC
+        default and a playlist holding 3 days of content announced "12 just
+        landed".
+
+        FALLING BACK IS DELIBERATE, not a failure path: a profile whose render was
+        skipped (no rasteriser, no plan) keeps the generic art rather than losing
+        its poster. None only when there is no mapping or no file at all, which is
+        skipped quietly - branding is best-effort and never a write-back blocker.
+        """
         slug = _BRAND_ASSETS.get(suffix)
         if not slug:
             return None
-        path = self._assets_dir() / f"{slug}.png"
-        try:
-            return path if path.is_file() else None
-        except OSError:
-            return None
+        base = self._assets_dir()
+        for path in ((base / "by_user" / str(safe) / f"{slug}.png") if safe else None,
+                     base / f"{slug}.png"):
+            if path is None:
+                continue
+            try:
+                if path.is_file():
+                    return path
+            except OSError:
+                continue
+        return None
 
     @staticmethod
     def _asset_version(path: Path) -> str | None:
@@ -760,7 +1143,7 @@ class PlaylistWritebackManager(BaseManager):
         the member's own list, never the owner's."""
         if not self._branding_enabled():
             return
-        asset = self._branding_asset(suffix)
+        asset = self._branding_asset(suffix, safe)
         if asset is None:
             return
         version = self._asset_version(asset)
@@ -770,7 +1153,8 @@ class PlaylistWritebackManager(BaseManager):
         if not force and self._cache_get(key, None) == version:
             return                       # already branded with this exact art → no re-upload
         if not armed:
-            self._detail(f"[Writeback] [disarmed] '{suffix}' poster would be set.")
+            self._detail(f"[Writeback] [disarmed] '{suffix}' poster would be set. "
+                         f"{self._poster_text(suffix)}")
             return
         if rk is None or token is None:
             return
@@ -793,7 +1177,33 @@ class PlaylistWritebackManager(BaseManager):
             except Exception:
                 pass
         stats["branded"] = stats.get("branded", 0) + 1
-        self._detail(f"[Writeback] '{suffix}' poster set ({len(data)} bytes).")
+        self._detail(f"[Writeback] '{suffix}' poster set ({len(data)} bytes). "
+                     f"{self._poster_text(suffix)}")
+
+    def _poster_text(self, suffix) -> str:
+        """The words printed ON the poster for ``suffix``, for the preview log.
+
+        This module uploads a PNG, so by the time it sees a poster the text is
+        pixels and unreadable. generate_posters writes ``_poster_text.json``
+        beside the PNGs at render time; this reads it back so a dry run can show
+        WHAT a poster says rather than only that one would be sent.
+
+        Returns '' when the manifest is absent (a poster set generated before
+        manifests existed) - missing text must degrade to a quieter log line,
+        never to an error on the branding path, which is best-effort throughout.
+        """
+        slug = _BRAND_ASSETS.get(suffix)
+        if not slug:
+            return ""
+        try:
+            import json
+            man = json.loads((self._assets_dir() / "_poster_text.json")
+                             .read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return ""
+        t = man.get(slug) or {}
+        parts = [t.get("title"), t.get("date"), t.get("why")]
+        return "[" + " | ".join(p for p in parts if p) + "]" if any(parts) else ""
 
     def _cache_get(self, key, default):
         if not self.global_cache:

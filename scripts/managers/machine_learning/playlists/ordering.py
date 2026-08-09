@@ -17,9 +17,10 @@ so a golden corpus pins the exact order regardless of input order.
 """
 from __future__ import annotations
 
+import time as _time
 from datetime import date
 
-from scripts.managers.machine_learning.playlists.caps import apply_size_cap
+from scripts.managers.machine_learning.playlists.caps import apply_size_cap, limit_per_group
 from scripts.managers.machine_learning.playlists.grouping import (
     _affinity_keys,
     coverage_stats,
@@ -127,8 +128,11 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
                 include_specials: bool = False, recency_boost: bool = False,
                 window_days: int = 30, now: date | None = None,
                 resume_boost: bool = False, resume_order: str = "recency",
-                resume_weight: float = 0.0,
-                progress_filter: str | None = None, series_recency=None) -> PlaylistPlan:
+                resume_weight: float = 0.0, recency_mode: str = "tier",
+                recency_weight: float = 0.35, warmth_weight: float = 0.0,
+                warmth_halflife_hours: float = 18.0, now_ts: float | None = None,
+                progress_filter: str | None = None, series_recency=None,
+                saga_boost=None, max_per_group: int | None = None) -> PlaylistPlan:
     """Order candidate items into a spoiler-safe, group-contiguous, watchability-ranked
     :class:`PlaylistPlan`. See module docstring for the pipeline.
 
@@ -168,7 +172,27 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
 
     ``series_recency`` (``{series_id: (last_watch_ts, watched_count)}``) supplies the TV side of the
     resume keys (recency + depth) that watched episodes can't, since they're filtered out before
-    here — so an in-progress SHOW ranks in The Long Glide like an in-progress movie saga."""
+    here — so an in-progress SHOW ranks in The Long Glide like an in-progress movie saga.
+
+    ``recency_mode`` (GLD-PLY-17) decides how ``recency_boost`` combines with everything else:
+
+    * ``"tier"`` (DEFAULT, legacy, byte-identical) — a qualifying caught-up+fresh group sorts
+      ABOVE everything else and the function RETURNS THERE. That short-circuit means
+      ``resume_boost``, ``resume_order``, ``resume_weight``, ``saga_boost`` and ``warmth_weight``
+      are ALL DEAD whenever ``recency_boost`` is on — they are computed, passed, and never read.
+    * ``"blend"`` — freshness becomes an ADDITIVE ``recency_weight`` term alongside the resume
+      bonus, the saga boost and the warmth term, so the signals compose instead of one silently
+      winning. This is what you want when more than one of them is enabled.
+
+    ``warmth_weight`` (default 0.0 → byte-identical) is SESSION WARMTH: how recently the profile
+    watched THIS group, halving every ``warmth_halflife_hours``. It is the "I was watching Blue
+    Bloods this afternoon, put the next one near the top" signal — distinct from ``recency_boost``,
+    which is about content being newly AIRED/ADDED. Note the two senses of "recency" in this
+    module: ``recency_boost`` = the CONTENT is fresh; ``resume_order="recency"`` / ``warmth`` =
+    the WATCH is fresh. Only ``warmth`` puts the latter on the ranking axis — ``resume_order``
+    alone lands after ``-eff`` in the sort tuple and so only breaks exact float ties.
+
+    ``now_ts`` overrides the warmth clock (unix seconds; testability)."""
     items = list(items)
     considered = len(items)
 
@@ -250,6 +274,41 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
     def _norm(t):
         return ((t - _lo) / _rng) if (_rng and t != _NEG_INF) else 0.0
 
+    _clock_ts = now_ts if now_ts is not None else _time.time()
+
+    def _warmth(last):
+        """SESSION WARMTH on the same normalised 0..1 scale as ``_norm``: how recently this
+        profile watched this group, halving every ``warmth_halflife_hours``.
+
+        This is the only place a fresh WATCH reaches the ranking axis. ``resume_order``'s
+        ``(-last, -depth)`` key sits AFTER ``-eff`` in the sort tuple, and ``eff`` is a
+        continuous float — so it decides essentially nothing on its own (GLD-PLY-17).
+
+        0.0 when disabled or when the group has never been watched, so OFF is byte-identical.
+        """
+        if warmth_weight <= 0 or not last:
+            return 0.0
+        hours = max(0.0, (_clock_ts - float(last)) / 3600.0)
+        return warmth_weight * (0.5 ** (hours / max(float(warmth_halflife_hours), 1e-6)))
+
+    def _saga(g):
+        """``saga_boost`` for this group, on the SAME normalised 0..1 scale as ``_norm``.
+
+        ``{group_key: 0..1}`` from ``playlists.engagement.saga_boost`` — completion
+        proximity de-rated by how often the profile has been shown this saga and walked
+        past it while watching other things.
+
+        ADDITIVE, not a tier: a saga nearly finished pulls hard, one barely begun adds
+        almost nothing, and a high-affinity standalone can still outrank both. Franchise
+        membership buys NO position on its own — a hard tier would put every member of
+        every large saga above whatever the household actually wanted next. Absent or
+        empty -> 0.0 -> byte-identical ordering.
+        """
+        try:
+            return float((saga_boost or {}).get(g.key, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
     # rank groups: watchability DESC, then size DESC, then earliest lead date,
     # then lead title, then group key — fully deterministic. When the recency boost
     # is on, a qualifying (caught-up + fresh) group sorts ABOVE everything else first
@@ -258,7 +317,9 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
         g, members, top = entry
         lead = members[0]
         base = (-top, -len(members), chrono_value(lead), lead.title.casefold(), g.key)
-        if recency_boost:
+        if recency_boost and recency_mode == "tier":
+            # LEGACY short-circuit. Everything below — resume, saga, warmth — is unreachable
+            # while this is taken; see ``recency_mode`` in the docstring (GLD-PLY-17).
             return (0 if boosted[id(g)] else 1,) + base
         if progress_filter == "in":
             # The Long Glide (pure resume list): recency/progress is the PRIMARY order.
@@ -270,13 +331,25 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
             # recency/progress tiebreak among comparable groups, then the deterministic keys.
             in_prog, last, depth = resume[id(g)]
             order_key = (-last, -depth) if resume_order == "recency" else (-depth, -last)
-            eff = _norm(top) + (resume_weight if in_prog else 0.0)
+            eff = (_norm(top) + (resume_weight if in_prog else 0.0) + _saga(g)
+                   + (recency_weight if (recency_boost and boosted.get(id(g))) else 0.0)
+                   + _warmth(last))
             return (-eff,) + order_key + base
+        if saga_boost:
+            # Saga boost works WITHOUT resume_boost too - the two are independent signals
+            # ("you are mid-series" vs "you are near the end of this saga") and a caller
+            # may want either alone.
+            return (-(_norm(top) + _saga(g)),) + base
         return base
 
     rendered.sort(key=_rank)
 
     blocks = [members for _, members, _ in rendered]
+    # PER-GROUP TRIM, before the size cap. A one-offs family sets this to 1 so a
+    # single series cannot occupy five consecutive slots; leaving it None keeps
+    # every existing family byte-identical. Ordered first so the size cap budgets
+    # against the trimmed groups rather than against members it is about to drop.
+    blocks, per_group_dropped = limit_per_group(blocks, max_per_group)
     kept, truncated = apply_size_cap(blocks, max_items)
     kept_ids = {id(it) for it in kept}      # cap may SKIP an oversized group, so kept is
                                             # NOT necessarily a prefix — align by identity
@@ -304,4 +377,5 @@ def order_items(items: list[PlaylistInput], *, family: str = "up_next",
 
     return PlaylistPlan(
         family=family, items=tuple(plans), considered=considered,
-        dropped_watched=dropped_watched, truncated=truncated, coverage=coverage)
+        dropped_watched=dropped_watched, truncated=truncated,
+        per_group_dropped=per_group_dropped, coverage=coverage)

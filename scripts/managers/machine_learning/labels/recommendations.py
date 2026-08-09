@@ -50,11 +50,35 @@ import pandas as pd
 
 RECOMMENDATION_SUBDIR = ("ml", "recommendations")
 SURFACE_HIDDEN_GEMS = "hidden_gems"
+
+#: Namespace prefixes for NON-MOVIE entity ids.
+#:
+#: A movie's ``entity_id`` is its bare tmdb id as a string, and it stays that way
+#: forever: the live ledger already holds rows keyed that way, and ``_DEDUP_KEYS``
+#: joins on ``entity_id``, so re-keying movies would orphan every published pick
+#: still inside its measurement window.
+#:
+#: TV ids are therefore PREFIXED rather than bare. That is not cosmetic - tmdb and
+#: tvdb number-spaces overlap, so a bare "550" could be Fight Club or a series,
+#: and since ``media`` is NOT part of the dedup key the two would collide into one
+#: row and silently lose a pick.
+ENTITY_SHOW = "tvdb"        # tvdb:121361
+ENTITY_EPISODE = "tvdb"     # tvdb:121361:1:4  (season/episode appended)
 _DEDUP_KEYS = ["recommended_date", "surface", "profile", "entity_id"]
 
 #: Columns every row carries, in order — so an empty load still has a usable frame shape.
+#:
+#: ``rating_key`` is the Plex handle AS IT WAS WHEN SURFACED. It is a SECONDARY
+#: identity, never the join key: ``entity_id`` is authoritative because a re-scan
+#: retires ratingKeys. But recording it costs nothing and buys a direct match for
+#: the common case - a play shortly after the recommendation carries the same
+#: ratingKey the ledger saw, even if a later re-scan has since moved the item and
+#: the CURRENT inventory no longer agrees with either. Old partitions written
+#: before this column existed load as NaN, which the resolver reads as "absent",
+#: not as "no ratingKey".
 COLUMNS = ("recommended_at", "recommended_date", "surface", "profile", "entity_id",
-           "tmdb_id", "title", "year", "media", "taste_score", "rank", "window_days")
+           "tmdb_id", "rating_key", "title", "year", "media", "taste_score", "rank",
+           "window_days")
 
 
 def utc_now_iso() -> str:
@@ -84,21 +108,99 @@ def iso_to_epoch(ts):
     return dt.timestamp()
 
 
+def entity_of(pick, media: str = "movie"):
+    """``(entity_id, tmdb_id, media)`` for one pick, or ``None`` when unidentifiable.
+
+    WHY THIS EXISTS. ``build_events`` used to require ``int(tmdb_id)`` and skip
+    anything without it. That is correct for Hidden Gems, which is movies-only,
+    and silently wrong for every other surface: Anniversary publishes 23 movies
+    AND 97 shows per profile, and all 97 would vanish - not as an error, but as
+    an absence indistinguishable from "no TV was surfaced". The dangerous state
+    is the silent skip, not the missing feature.
+
+    ``media`` is resolved PER PICK (``pick["media"]`` wins over the call-level
+    default) because one shelf legitimately mixes both.
+
+    Accepted identities, in order of preference:
+      movie    ``tmdb_id``                          -> ``"550"``
+      episode  ``tvdb_join_key`` or tvdb+season+ep  -> ``"tvdb:121361:1:4"``
+      show     ``tvdb_id`` / ``series_tvdb_id``     -> ``"tvdb:121361"``
+    """
+    if not isinstance(pick, dict):
+        return None
+    kind = str(pick.get("media") or media or "movie").strip().lower()
+
+    if kind == "movie":
+        try:
+            tmdb = int(pick.get("tmdb_id"))
+        except (TypeError, ValueError):
+            return None
+        return str(tmdb), tmdb, "movie"
+
+    # An explicit join key already carries the whole identity.
+    join = pick.get("tvdb_join_key") or pick.get("join_key")
+    if join:
+        text = str(join).strip()
+        if text:
+            return (text if text.startswith(f"{ENTITY_EPISODE}:")
+                    else f"{ENTITY_EPISODE}:{text}"), None, "episode"
+
+    tvdb = pick.get("tvdb_id") or pick.get("series_tvdb_id")
+    try:
+        tvdb = int(tvdb)
+    except (TypeError, ValueError):
+        return None
+    season, episode = pick.get("season_number"), pick.get("episode_number")
+    try:
+        if season is not None and episode is not None:
+            return (f"{ENTITY_EPISODE}:{tvdb}:{int(season)}:{int(episode)}",
+                    None, "episode")
+    except (TypeError, ValueError):
+        pass                                  # fall through to series identity
+    return f"{ENTITY_SHOW}:{tvdb}", None, "show"
+
+
 def build_events(picks, *, profile: str, surface: str = SURFACE_HIDDEN_GEMS,
                  recommended_at: "str | None" = None, media: str = "movie",
                  window_days: int = 30) -> list:
     """One event row per published pick. PURE (no I/O; the clock is an argument).
 
     ``picks`` are the shelf items :func:`discovery.gems.apply_diversity_caps` returned — each
-    carrying ``tmdb_id``, ``taste_score`` and ``rank``. A pick with no tmdb id is skipped
-    (there would be nothing to join an outcome to)."""
+    carrying ``tmdb_id``, ``taste_score`` and ``rank``.
+
+    MOVIES, SHOWS AND EPISODES are all recordable; see :func:`entity_of` for the
+    identity each resolves to. A pick that resolves to NOTHING is skipped and
+    COUNTED — the caller gets ``(rows, skipped)`` from :func:`build_events_ex` if
+    it wants to know, because a silent skip is how 97 shows a night disappear
+    without anyone noticing.
+
+    The movie path is unchanged, byte for byte: bare tmdb ``entity_id``, populated
+    ``tmdb_id`` column. Existing rows and existing joins are untouched."""
+    rows, _skipped = build_events_ex(
+        picks, profile=profile, surface=surface, recommended_at=recommended_at,
+        media=media, window_days=window_days)
+    return rows
+
+
+def build_events_ex(picks, *, profile: str, surface: str = SURFACE_HIDDEN_GEMS,
+                    recommended_at: "str | None" = None, media: str = "movie",
+                    window_days: int = 30) -> tuple:
+    """:func:`build_events`, but returns ``(rows, skipped)``.
+
+    ``skipped`` is the count of picks with no resolvable identity. Surfaced
+    without being recordable is a real state and it must be reportable: the
+    alternative is a shelf that publishes 97 items and logs nothing about the 97
+    that never reached the ledger.
+    """
     ts = recommended_at or utc_now_iso()
     rows: list = []
+    skipped = 0
     for i, p in enumerate(picks or []):
-        try:
-            tmdb = int(p.get("tmdb_id"))
-        except (TypeError, ValueError, AttributeError):
+        ident = entity_of(p, media)
+        if ident is None:
+            skipped += 1
             continue
+        entity_id, tmdb, kind = ident
         rank = p.get("rank")
         try:
             year = int(p.get("year"))
@@ -109,16 +211,17 @@ def build_events(picks, *, profile: str, surface: str = SURFACE_HIDDEN_GEMS,
             "recommended_date": ts[:10],
             "surface": str(surface),
             "profile": str(profile),
-            "entity_id": str(tmdb),
+            "entity_id": entity_id,
             "tmdb_id": tmdb,
+            "rating_key": (str(p.get("rating_key")) if p.get("rating_key") is not None else None),
             "title": (str(p.get("title")) if p.get("title") is not None else None),
             "year": year,
-            "media": str(media),
+            "media": kind,
             "taste_score": (float(p["taste_score"]) if p.get("taste_score") is not None else None),
             "rank": int(rank) if rank is not None else i,
             "window_days": int(window_days),
         })
-    return rows
+    return rows, skipped
 
 
 def append_events(base_dir, rows: list, *, surface: str = SURFACE_HIDDEN_GEMS) -> int:

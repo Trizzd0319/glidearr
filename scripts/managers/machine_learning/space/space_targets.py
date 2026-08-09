@@ -20,26 +20,38 @@ Rule of thumb:
 When ``free_space_limit`` is not set, the floor DEFAULTS TO 25% of the total drive
 (``PRESSURE_FALLBACK_FRACTION``) so the gate scales with the disk instead of any
 hardcoded GB constant. Callers pass ``total_gb`` (mount-deduped, e.g.
-``instance_manager.disk_total_gb``) to enable that. The ``fallback_gb`` constant is
-only a last resort for when BOTH ``free_space_limit`` and ``total_gb`` are unknown.
+``instance_manager.disk_total_gb``) to enable that.
+
+NO HARDCODED GB FLOOR REMAINS. When BOTH ``free_space_limit`` and ``total_gb`` are
+unknown the floor is **0.0** — i.e. NO FLOOR, so ``free < T`` is never true and no
+reclamation happens. Previously each caller supplied its own last-resort constant and
+they did not agree: ``PRESSURE_FALLBACK_GB`` 25.0 here, 25.0 in sonarr/series, 1000.0 in
+the coordinator, and 25.0 again in radarr/quality under a DIFFERENT NAME
+(``PRESSURE_THRESHOLD_GB``, so a grep for the common name missed it entirely). Four
+declarations of one concept, one of them 40x the others, none of them chosen by the
+operator.
+
+0.0 is the right last resort because the alternatives are not symmetric: a wrongly-low
+floor does nothing (no pressure, no deletes), while a wrongly-high one declares pressure
+on a healthy disk and starts reclaiming. If we cannot determine a floor from the
+operator's config OR the drive's own size, we have no basis for claiming the disk is
+full. ``deletions_enabled`` already requires ``free_space_limit > 0`` independently, so
+this only ever affected DOWNGRADES and the non-delete gates.
 
 SWEEP COMPLETE: every space gate now passes ``total_gb`` (mount-deduped via
 ``instance_manager.disk_total_gb``), so the 25%-of-total fallback applies uniformly and
-no gate respects a hardcoded GB floor. The per-manager constants that remain
-(PRESSURE_THRESHOLD_GB / PRESSURE_FALLBACK_GB 25, MIN_FREE_SPACE_GB 50) are only the
-LAST-RESORT ``fallback_gb`` for when ``free_space_limit`` is unset AND the drive's total
-size is unreadable. UPGRADE_MIN_FREE_GB (100) and DEFAULT_UPGRADE_GB (50) were deleted.
-Two deliberate exceptions, justified inline at their call sites:
+no gate respects a hardcoded GB floor. UPGRADE_MIN_FREE_GB (100) and DEFAULT_UPGRADE_GB
+(50) were deleted. Two deliberate exceptions, justified inline at their call sites:
   • universe.DEFAULT_DOWNGRADE_GB (10) — a deep low-disk EMERGENCY trigger for the
     never-deleted universe class; intentionally a fixed floor, not total-derived.
   • repair/anomaly.py (fallback_gb=0.0, no total_gb) — a SENTINEL selecting the legacy
-    time-based owned-movie prune when no ``free_space_limit`` is configured.
+    time-based owned-movie prune when no ``free_space_limit`` is configured. Now simply
+    the default rather than an explicit argument.
 """
 from __future__ import annotations
 
 import os
 
-PRESSURE_FALLBACK_GB = 25.0          # last resort only (total drive unknown too)
 PRESSURE_FALLBACK_FRACTION = 0.25    # of total drive when free_space_limit unset
 
 
@@ -55,7 +67,7 @@ def _cfg_get(config, key, default):
 
 def space_targets(
     config,
-    fallback_gb: float = PRESSURE_FALLBACK_GB,
+    fallback_gb: float = 0.0,
     *,
     total_gb: "float | None" = None,
 ) -> tuple[float, float]:
@@ -63,15 +75,17 @@ def space_targets(
 
     ``T = free_space_limit`` when configured. Otherwise ``T`` defaults to
     ``PRESSURE_FALLBACK_FRACTION`` (25%) of ``total_gb`` (the total drive), and only
-    if ``total_gb`` is also unknown does it fall back to ``fallback_gb``.
+    if ``total_gb`` is also unknown does it fall back to ``fallback_gb`` — which now
+    DEFAULTS TO 0.0, meaning no floor and therefore no pressure. See the module
+    docstring for why 0.0 rather than a constant.
     """
     try:
         T = float(_cfg_get(config, "free_space_limit", 0) or 0)
     except (TypeError, ValueError):
         T = 0.0
     if T <= 0:
-        # No configured floor → 25% of the total drive (scales with the disk),
-        # falling back to the constant only when the total is also unavailable.
+        # No configured floor → 25% of the total drive (scales with the disk), falling
+        # back to fallback_gb (0.0 = no floor) only when the total is also unavailable.
         try:
             tg = float(total_gb) if total_gb is not None else 0.0
         except (TypeError, ValueError):

@@ -11,11 +11,15 @@ that CAPTURES each write call, so the safety rails are asserted on the actual ca
 """
 from __future__ import annotations
 
+import time
+
 from scripts.managers.services.plex.playlists.writeback import (
     _ANCHOR_KEY,
     _BRAND_KEY,
+    _LASTWRITE_KEY,
     _TITLE_KEY,
     PlaylistWritebackManager,
+    _min_moves,
 )
 
 
@@ -700,6 +704,276 @@ def test_banner_logged_every_run():
     m = _mgr(_Cache(), api, config={"plex": {"playlists": {"writeback": {"enabled": False}}}})
     m._writeback([], [], _Users({}), {}, {})
     assert any("disarmed" in i for i in m.logger.infos)
+
+
+# ── GLD-PLY-13: the diff metric counts DISPLACED items, not every survivor ─────
+def _replay_moves(cur, desired):
+    """Pull the returned movers out of ``cur``, then re-insert each after its desired
+    predecessor. Returns (movers, resulting_order) so a test can assert the COUNT is minimal
+    AND that the moves actually reproduce ``desired``.
+
+    Asserting the count rather than the identity matters: when several items are tied for
+    'displaced' (e.g. ['a','c','b'] -> ['a','b','c'], where moving either 'b' or 'c' costs one),
+    every minimal answer is equally correct and which one the LIS lands on is arbitrary.
+    """
+    movers = _min_moves(cur, desired)
+    moved = set(movers)
+    order = [x for x in cur if x not in moved]
+    for i, want in enumerate(desired):
+        if want not in moved:
+            continue
+        prev = desired[i - 1] if i > 0 else None
+        at = (order.index(prev) + 1) if (prev is not None and prev in order) else 0
+        order.insert(at, want)
+    return movers, order
+
+
+def test_min_moves_counts_only_displaced_items():
+    # Already in order -> nothing moves.
+    assert _min_moves(["a", "b", "c"], ["a", "b", "c"]) == []
+    # One item out of place -> exactly ONE move, not "all three" (the old behaviour).
+    movers, order = _replay_moves(["a", "c", "b"], ["a", "b", "c"])
+    assert len(movers) == 1 and order == ["a", "b", "c"]
+    # Full reversal of 4 -> 3 moves (the longest correctly-ordered run is length 1).
+    movers, order = _replay_moves(["d", "c", "b", "a"], ["a", "b", "c", "d"])
+    assert len(movers) == 3 and order == ["a", "b", "c", "d"]
+    # An item moved from the back to the front costs exactly one move (no tie here).
+    assert _min_moves(["b", "c", "d", "a"], ["a", "b", "c", "d"]) == ["a"]
+
+
+def test_min_moves_is_minimal_and_correct_on_random_permutations():
+    # The invariant that actually matters: the returned movers reproduce the desired order, and
+    # the count never exceeds n-1. Guards a future "optimisation" that returns too few moves.
+    import random
+    rng = random.Random(1729)
+    for _ in range(300):
+        n = rng.randint(0, 40)
+        desired = [f"r{i}" for i in range(n)]
+        cur = desired[:]
+        rng.shuffle(cur)
+        movers, order = _replay_moves(cur, desired)
+        assert order == desired                      # the moves are SUFFICIENT
+        assert len(movers) <= max(n - 1, 0)          # ...and never the whole list
+
+
+def test_rerank_with_removal_stays_in_place_and_does_not_recreate():
+    # THE REGRESSION. Live shape from support/logs/playlists-5.log: a re-ranked plan where a
+    # couple of items were watched off. The old _diff reported EVERY survivor as a "move", so
+    # n_changes came to len(desired) + removes and tripped _RECREATE_RATIO -> a delete+recreate
+    # (fresh ratingKey) on essentially every run. It must now diff IN PLACE.
+    desired = [f"r{i}" for i in range(20)]
+    # current: two items that are NOT in the plan (watched off) + the survivors, lightly re-ranked
+    survivors = desired[2:]
+    shuffled = survivors[3:6] + survivors[:3] + survivors[6:]
+    current = [{"rating_key": "gone1", "playlist_item_id": "pg1"},
+               {"rating_key": "gone2", "playlist_item_id": "pg2"}]
+    current += [{"rating_key": rk, "playlist_item_id": f"p-{rk}"} for rk in shuffled]
+    plan = PlaylistWritebackManager._diff(current, desired)
+    n_changes = len(plan["add"]) + len(plan["remove"]) + len(plan["move"])
+    assert len(plan["remove"]) == 2                    # both watched-off items dropped
+    assert n_changes <= len(desired)                   # -> in-place, NOT recreate
+    assert len(plan["move"]) < len(survivors)          # not "every survivor moved"
+
+
+def test_reranked_plan_updates_in_place_keeping_the_same_rating_key():
+    # End-to-end: the anchor ratingKey must SURVIVE a re-ranked run (no create, no delete).
+    cache = _Cache({
+        "plex/playlists/tv_plan/rob": _plan("a", "b", "c"),
+        f"{_ANCHOR_KEY}/rob": "555",
+        f"{_TITLE_KEY}/rob": "!Up Next",
+    })
+    inv = {"1": {"rating_key": "a"}, "2": {"rating_key": "b"}, "3": {"rating_key": "c"}}
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [          # same items, different ORDER
+        {"ratingKey": "c", "playlistItemID": "p3"},
+        {"ratingKey": "a", "playlistItemID": "p1"},
+        {"ratingKey": "b", "playlistItemID": "p2"}]})
+    m = _mgr(cache, api)
+    users = _Users({"rob": "OWNER"}); users.tracked_users = [_OWNER_USER]
+    stats = m._writeback([_OWNER_USER], [{"uuid": "u-rob"}], users, inv, {})
+    assert not any(w[0] == "create" for w in api.writes)     # no new playlist minted
+    assert not any(w[0] == "delete" for w in api.writes)     # old one not torn down
+    assert any(w[0] == "move" for w in api.writes)           # re-ordered in place
+    assert cache.get(f"{_ANCHOR_KEY}/rob") == "555"          # SAME ratingKey
+    assert stats["recreated"] == 0
+
+
+# ── GLD-PLY-14: a recreate must re-title the NEW ratingKey ────────────────────
+def test_title_reapplied_to_recreated_playlist():
+    # The title gate is keyed on anchor_id, which SURVIVES a recreate — so without force=True the
+    # fresh ratingKey inherits a stale "already titled" marker and never gets its '!' titleSort,
+    # silently losing the front-pin forever. Mirrors test_branding_reapplies_to_recreated_playlist.
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan("c"),
+        f"{_ANCHOR_KEY}/kid": "555",
+        f"{_TITLE_KEY}/kid": "!Up Next",          # already titled on the OLD rk
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [        # 3 live, 1 desired -> recreate
+        {"ratingKey": "a", "playlistItemID": "p1"},
+        {"ratingKey": "b", "playlistItemID": "p2"},
+        {"ratingKey": "c", "playlistItemID": "p3"}]})
+    m = _mgr(cache, api)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    stats = m._writeback([_KID_USER], [], users, _TV_INV, {})
+    creates = [w for w in api.writes if w[0] == "create"]
+    edits = [w for w in api.writes if w[0] == "edit"]
+    assert len(creates) == 1 and stats["recreated"] == 1
+    assert len(edits) == 1                                     # the NEW list was titled
+    assert edits[0][1] != "555"                                # ...on the new rk, not the old one
+    assert edits[0][2] == {"title": "Up Next", "title_sort": "!Up Next"}
+
+
+# ── GLD-PLY-15: once-a-day rewrite cadence, with a churn escape hatch ─────────
+def _cadence_case(hours_ago, plan_rks, live_rks, cfg_extra=None):
+    """An armed manager whose 'Up Next' was last written ``hours_ago``, with a cached plan of
+    ``plan_rks`` against a live playlist of ``live_rks``."""
+    wb = {"enabled": True}
+    wb.update(cfg_extra or {})
+    inv = {str(i): {"rating_key": rk} for i, rk in enumerate(set(plan_rks) | set(live_rks))}
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan(*plan_rks),
+        f"{_ANCHOR_KEY}/kid": "555",
+        f"{_TITLE_KEY}/kid": "!Up Next",
+        f"{_LASTWRITE_KEY}/kid": time.time() - hours_ago * 3600.0,
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [
+        {"ratingKey": rk, "playlistItemID": f"p-{rk}"} for rk in live_rks]})
+    m = _mgr(cache, api, config={"plex": {"playlists": {"writeback": wb}}})
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    return m, api, cache, users
+
+
+def test_routine_rerank_inside_the_interval_is_deferred():
+    # Written 2h ago; the plan is the same items lightly re-ranked plus one new -> routine churn,
+    # well under the override. No item write at all until the interval elapses.
+    m, api, _cache, users = _cadence_case(
+        2.0, ["a", "b", "c", "d", "e"], ["b", "a", "c", "d"])
+    stats = m._writeback([_KID_USER], [], users, _cadence_inv(), {})
+    assert not any(w[0] in ("add", "remove", "move", "create", "delete") for w in api.writes)
+    assert stats["deferred"] == 1 and stats["updated"] == 0
+    assert any("deferred" in ln for ln in m.logger.files.get("playlists", []))
+
+
+def test_interval_elapsed_writes_normally():
+    m, api, _cache, users = _cadence_case(
+        21.0, ["a", "b", "c", "d", "e"], ["b", "a", "c", "d"])   # past the 20h default
+    stats = m._writeback([_KID_USER], [], users, _cadence_inv(), {})
+    assert any(w[0] == "add" for w in api.writes)
+    assert stats["deferred"] == 0 and stats["updated"] == 1
+
+
+def test_large_watch_off_overrides_the_interval():
+    # 3 of 5 live items watched off (60% removed, over the 40% override) 2h after the last write
+    # -> a genuine overhaul writes through immediately rather than waiting for tomorrow.
+    m, api, _cache, users = _cadence_case(
+        2.0, ["a", "b"], ["a", "b", "x", "y", "z"])
+    stats = m._writeback([_KID_USER], [], users, _cadence_inv(), {})
+    assert stats["deferred"] == 0
+    assert any(w[0] in ("remove", "create") for w in api.writes)
+    assert any("churn overrides" in ln for ln in m.logger.files.get("playlists", []))
+
+
+def test_large_new_material_overrides_the_interval():
+    # 3 of 5 desired items are brand new (60% adds) -> re-ranked watchability pulled in a lot.
+    m, api, _cache, users = _cadence_case(
+        2.0, ["a", "b", "x", "y", "z"], ["a", "b"])
+    stats = m._writeback([_KID_USER], [], users, _cadence_inv(), {})
+    assert stats["deferred"] == 0
+    assert any(w[0] in ("add", "create") for w in api.writes)
+
+
+def test_cadence_gate_disabled_by_zero_interval():
+    m, api, _cache, users = _cadence_case(
+        0.1, ["a", "b", "c", "d", "e"], ["b", "a", "c", "d"], {"min_interval_hours": 0})
+    stats = m._writeback([_KID_USER], [], users, _cadence_inv(), {})
+    assert stats["deferred"] == 0 and stats["updated"] == 1
+
+
+def test_missing_stamp_never_suppresses_the_first_write():
+    # P-C: the real file cache returns {} for a MISSING key. That must read as "never written"
+    # (write allowed), NOT as "written just now" — which would suppress the first write for a
+    # whole interval and look exactly like the feature being broken.
+    m = _mgr(_Cache({f"{_LASTWRITE_KEY}/kid": {}}), _FakeAPI())
+    assert m._last_write("kid", "Up Next") is None
+    assert m._cadence_defer("kid", "Up Next",
+                            {"add": ["a"], "remove": [], "move": []},
+                            [{"rating_key": "b"}], ["a", "b"], {}) is False
+
+
+def test_disarmed_run_never_stamps_the_interval():
+    # A dry run performs no Plex write, so it must not start the interval — otherwise the first
+    # ARMED run would be deferred for a full day.
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan("a", "b"),
+        f"{_ANCHOR_KEY}/kid": "555",
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [{"ratingKey": "a", "playlistItemID": "p1"}]})
+    m = _mgr(cache, api, dry_run=True)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert cache.get(f"{_LASTWRITE_KEY}/kid") is None
+
+
+def test_armed_write_stamps_so_the_next_run_defers():
+    cache = _Cache({
+        "plex/playlists/tv_plan/kid": _plan("a", "b"),
+        f"{_ANCHOR_KEY}/kid": "555",
+        f"{_TITLE_KEY}/kid": "!Up Next",
+    })
+    api = _FakeAPI(token="OWNER", items_by_rk={"555": [{"ratingKey": "a", "playlistItemID": "p1"}]})
+    m = _mgr(cache, api)
+    users = _Users({"kid": "KIDTOK"}); users.tracked_users = [_KID_USER]
+    s1 = m._writeback([_KID_USER], [], users, _TV_INV, {})
+    assert s1["updated"] == 1 and cache.get(f"{_LASTWRITE_KEY}/kid") is not None
+    # Second run, same minute: the live list now matches, so this is a steady-state no-op anyway —
+    # what matters is the stamp exists and is fresh.
+    assert m._last_write("kid", "Up Next") is not None
+
+
+def _cadence_inv():
+    """An owned-inventory that resolves every ratingKey the cadence cases use."""
+    return {k: {"rating_key": k} for k in ("a", "b", "c", "d", "e", "x", "y", "z")}
+
+
+def test_head_churn_override_lets_a_promotion_through_the_interval():
+    # GLD-PLY-17. Session warmth promoting a series from far down the list is a PURE RE-ORDER:
+    # no adds, no removes, so the churn override cannot see it at all. Without the head-churn
+    # override the promotion would sit unwritten until tomorrow, which defeats the point of
+    # reacting to "you were watching this a few hours ago".
+    live = [f"r{i}" for i in range(20)]
+    desired = ["r15", "r16", "r17"] + [rk for rk in live if rk not in ("r15", "r16", "r17")]
+    m = _mgr(_Cache({f"{_LASTWRITE_KEY}/kid": time.time() - 3600.0}), _FakeAPI())
+    current = [{"rating_key": rk, "playlist_item_id": f"p-{rk}"} for rk in live]
+    plan = PlaylistWritebackManager._diff(current, desired)
+    assert plan["add"] == [] and plan["remove"] == []      # pure re-order: nothing added or gone
+    stats = {}
+    assert m._cadence_defer("kid", "Up Next", plan, current, desired, stats) is False
+    assert stats.get("deferred", 0) == 0
+    assert any("TOP 10 changed" in ln for ln in m.logger.files.get("playlists", []))
+
+
+def test_reshuffling_within_the_head_is_still_deferred():
+    # The complement: the SAME ten items jittering among themselves is invisible noise and must
+    # still be absorbed by the interval. A set comparison is what draws that line.
+    live = [f"r{i}" for i in range(20)]
+    desired = ["r3", "r0", "r1", "r2", "r5", "r4", "r6", "r8", "r7", "r9"] + live[10:]
+    m = _mgr(_Cache({f"{_LASTWRITE_KEY}/kid": time.time() - 3600.0}), _FakeAPI())
+    current = [{"rating_key": rk, "playlist_item_id": f"p-{rk}"} for rk in live]
+    plan = PlaylistWritebackManager._diff(current, desired)
+    assert plan["move"]                                    # there IS a re-order...
+    stats = {}
+    assert m._cadence_defer("kid", "Up Next", plan, current, desired, stats) is True
+    assert stats["deferred"] == 1                          # ...but it stays below the fold
+
+
+def test_head_churn_is_measured_on_the_set_not_the_order():
+    m = _mgr(_Cache(), _FakeAPI())
+    cur = [{"rating_key": f"r{i}", "playlist_item_id": f"p{i}"} for i in range(10)]
+    same_set_shuffled = [f"r{i}" for i in (9, 8, 7, 6, 5, 4, 3, 2, 1, 0)]
+    frac, n = m._head_churn(cur, same_set_shuffled)
+    assert frac == 0.0 and n == 10                         # reordered, but nobody NEW up there
+    three_new = ["x1", "x2", "x3"] + [f"r{i}" for i in range(7)]
+    frac, _ = m._head_churn(cur, three_new)
+    assert abs(frac - 0.3) < 1e-9                          # 3 of 10 are newcomers
 
 
 # ── tiny registry stand-in for the one run() that reads it ─────────────────────

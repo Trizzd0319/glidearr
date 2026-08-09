@@ -13,9 +13,21 @@ Temporal decay (opt-in): with ``half_life_days`` set, each watch is weighted by
 stale taste. DEFAULT (``half_life_days`` None/0) — each watch counts 1 (int), so the
 maps are byte-identical to the legacy raw counts.
 
+⚠️  ENABLING DECAY IS AN AXIS TRANSLATION, NOT A LOCAL CHANGE.
+These maps feed the affinity groups of ``watchability_score``, and ``likelihood``
+consumes that score at GAIN 1.0 — so a non-zero ``half_life_days`` shifts the whole
+score distribution and every absolute boundary calibrated against it. The last
+translation (Group D v2) required re-anchoring the DELETE family 20 -> 17 and
+``likelihood.untouched_base`` 12 -> 25, the latter only after untouched titles
+reaching 1080p collapsed 456 -> 8 (-98.2%) — caught by manual measurement, not by any
+check (there is still no axis-drift detector). The config surface and the full
+pre-flight are documented at ``services/tautulli/users._affinity_half_life``; the
+affected cutoffs are in ``machine_learning/thresholds/registry.py``. Do not enable
+this without re-anchoring both.
+
 Public API:
   * aggregate_affinity(history_entries, metadata_index, *, half_life_days=None, now=None) -> dict
-        {genres, actors, directors, composers, producers, studios, format_metrics}
+        {genres, actors, directors, writers, composers, producers, studios, format_metrics}
         each a {name: weight} map sorted descending.
   * per_user_affinity(history_entries, metadata_index, user_list, *, half_life_days=None, now=None) -> dict
         {username: aggregate_affinity(...)} — entries grouped by the ``user`` field;
@@ -116,20 +128,39 @@ def merge_library_first(library_index: dict, tautulli_index: dict) -> dict:
 
 
 def aggregate_affinity(history_entries: list, metadata_index: dict, *,
-                       half_life_days=None, now=None) -> dict:
+                       half_life_days=None, now=None,
+                       person_billing_decay: float | None = None) -> dict:
     """Core affinity computation over an arbitrary entry list.
 
     Each history entry's ``rating_key`` is looked up in ``metadata_index``; the
-    metadata's genres/actors/directors/composers/producers/studios/codecs/audio
-    languages are tallied (by 1, or by a recency weight when ``half_life_days`` is
-    set). Returns ranked {name: weight} maps. Pure.
+    metadata's genres/actors/directors/writers/composers/producers/studios/codecs/
+    audio languages are tallied (by 1, or by a recency weight when ``half_life_days``
+    is set). Returns ranked {name: weight} maps. Pure.
+
+    ACTORS ARE BILLING-TIERED (GLD-AFF-10): the n-th listed actor contributes
+    ``w x billing_weight(n)`` using the SAME shared constant the id-based
+    person-affinity uses (``people_matrix.PERSON_BILLING_DECAY``, hyperbolic
+    1/(1+0.25n)) — Plex/Tautulli actor arrays arrive in billing order, so position
+    is the rank. One weighting semantics for the printed taste profile and the
+    scoring paths alike. ``person_billing_decay=0`` reproduces the flat legacy
+    tally. Crew roles stay unordered (mirrors ``BILLED_ROLES``: a film has one
+    director; "second-credited writer" carries no billing semantics). ROLE weights
+    are deliberately NOT applied here: Group B's caps (8/6/4/4/3) tier the roles at
+    consumption time, and ``affinity_topk`` max-normalizes each map, so tallies
+    stay role-neutral — applying ``PERSON_ROLE_WEIGHTS`` here too would
+    double-tier.
     """
     if half_life_days and now is None:
         now = datetime.now(tz=timezone.utc)
+    from scripts.managers.machine_learning.people_matrix.build import (
+        PERSON_BILLING_DECAY, billing_weight)
+    _decay = (PERSON_BILLING_DECAY if person_billing_decay is None
+              else float(person_billing_decay))
 
     genre_map       = defaultdict(int)
     actor_map       = defaultdict(int)
     director_map    = defaultdict(int)
+    writer_map      = defaultdict(int)
     composer_map    = defaultdict(int)
     producer_map    = defaultdict(int)
     studio_map      = defaultdict(int)
@@ -145,10 +176,12 @@ def aggregate_affinity(history_entries: list, metadata_index: dict, *,
         w = _entry_weight(entry, half_life_days, now)
         for genre in meta.get("genres", []) or []:
             genre_map[genre] += w
-        for actor in meta.get("actors", []) or []:
-            actor_map[actor] += w
+        for rank, actor in enumerate(meta.get("actors", []) or []):
+            actor_map[actor] += w * billing_weight(rank, decay=_decay)
         for director in meta.get("directors", []) or []:
             director_map[director] += w
+        for writer in meta.get("writers", []) or []:
+            writer_map[writer] += w
         for composer in meta.get("composers", []) or []:
             composer_map[composer] += w
         for producer in meta.get("producers", []) or []:
@@ -167,6 +200,7 @@ def aggregate_affinity(history_entries: list, metadata_index: dict, *,
         "genres":    dict(sorted(genre_map.items(),    key=lambda x: x[1], reverse=True)),
         "actors":    dict(sorted(actor_map.items(),    key=lambda x: x[1], reverse=True)),
         "directors": dict(sorted(director_map.items(), key=lambda x: x[1], reverse=True)),
+        "writers":   dict(sorted(writer_map.items(),   key=lambda x: x[1], reverse=True)),
         "composers": dict(sorted(composer_map.items(), key=lambda x: x[1], reverse=True)),
         "producers": dict(sorted(producer_map.items(), key=lambda x: x[1], reverse=True)),
         "studios":   dict(sorted(studio_map.items(),   key=lambda x: x[1], reverse=True)),
@@ -200,9 +234,14 @@ def aggregate_person_affinity(
     The three factors, and why each is there:
 
     ``role_weight``
-        :data:`people_matrix.PERSON_ROLE_WEIGHTS` — cast/director strong, writer,
-        composer, producer/cinematographer, editor progressively weaker. Overridable
-        via ``role_weights``.
+        :data:`people_matrix.PERSON_ROLE_WEIGHTS` — the FINAL 2026-08-07 table (cast
+        1.0, directors 0.7, writers 0.375, composers 0.4, producers 0.15, …), set by
+        operator ruling + decontaminated measurement; full record in
+        people_matrix/DESIGN.md §9. ⚠️ The same table is applied AGAIN candidate-side
+        in ``scoring._shared.person_affinity_score``, so cross-role ratios are
+        effectively SQUARED end-to-end — the table is tuned under that regime
+        (GLD-PPL-13, open). Overridable via ``role_weights`` (the billing experiment's
+        sweep hook).
     ``billing_weight``
         Applied to :data:`people_matrix.BILLED_ROLES` (cast) only, using the person's
         POSITION in the forward map's cast list, which the builders keep in billing

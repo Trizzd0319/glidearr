@@ -176,7 +176,12 @@ class _BaseDaemonSupervisor:
         # Mark the child as a daemon so any 'default' LoggerManager it incidentally builds
         # (e.g. via ConfigLoader) is redirected to a daemon-owned sink and never rotates/clobbers
         # the orchestrator's run log (LoggerManager.DAEMON_ENV / _effective_log_name).
-        child_env = {**os.environ, "GLIDEARR_DAEMON": "1"}
+        # PYTHONUNBUFFERED (GLD-ACQ-28): the child's stdout is BLOCK-buffered when
+        # redirected to a file, so a hard kill (job-object teardown when an IDE run
+        # closes) destroys every unflushed line — on 2026-08-07 a daemon lived 23
+        # minutes, processed a job, and left a log whose mtime never moved. Unbuffered,
+        # every line lands the moment it's printed and deaths are visible.
+        child_env = {**os.environ, "GLIDEARR_DAEMON": "1", "PYTHONUNBUFFERED": "1"}
 
         def _popen(flags: int):
             return subprocess.Popen(
@@ -200,8 +205,9 @@ class _BaseDaemonSupervisor:
             if breakaway:
                 self.logger.log_warning(
                     f"[{self._name}] CREATE_BREAKAWAY_FROM_JOB rejected by the launcher's "
-                    "job object — the daemon may not outlive an IDE run. Launch main.py from "
-                    "a terminal or Task Scheduler for a persistent background daemon."
+                    "job object — the daemon WILL BE KILLED when this IDE run window closes "
+                    "(mid-batch, silently). A long pilot/legacy spree will truncate. Launch "
+                    "main.py from a terminal or Task Scheduler for a persistent daemon."
                 )
             proc = _popen(base_flags)
 
@@ -209,9 +215,24 @@ class _BaseDaemonSupervisor:
             self._pid_path.write_text(str(proc.pid))
         except OSError as e:
             self.logger.log_warning(f"[{self._name}] could not write pid file: {e}")
+        # GLD-ACQ-28: verify the child actually LIVED. A spawn that dies inside two
+        # seconds (import crash, interpreter failure, immediate job-object kill) used
+        # to be announced as a success and discovered days later as a frozen log.
+        time.sleep(1.5)
+        rc = proc.poll()
+        if rc is not None:
+            self.logger.log_error(
+                f"[{self._name}] daemon exited IMMEDIATELY after spawn (rc={rc}) — "
+                f"queued jobs will NOT be processed. Check {self._log_path} for a "
+                f"traceback (output is now unbuffered, so even instant deaths leave one).")
+            try:
+                self._pid_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return proc.pid
         self.logger.log_info(
-            f"[{self._name}] spawned {self._spawned_desc} (pid {proc.pid}); "
-            f"logging to {self._log_path}"
+            f"[{self._name}] spawned {self._spawned_desc} (pid {proc.pid}, alive after "
+            f"1.5s); logging to {self._log_path}"
         )
         return proc.pid
 

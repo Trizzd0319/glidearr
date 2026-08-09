@@ -217,6 +217,30 @@ THRESHOLD_SPECS: "tuple[ThresholdSpec, ...]" = (
     #
     # NOT AN INVITATION TO ROUND IT BACK UP: re-derive it (same reconstruction) whenever
     # the score axis is translated again. The long-term replacement is ``ml.thresholds``.
+    #
+    # WHAT WOULD TRANSLATE THE AXIS AGAIN — the known triggers, so "whenever" above is
+    # actionable rather than a standing worry:
+    #
+    #   1. ANOTHER SCORER REVISION. Any change to a group's contribution shifts the
+    #      distribution; Group D v2 (SCORER_REVISION 4) is the worked example above.
+    #   2. ``scoring.affinity_half_life_days`` — AFFINITY TEMPORAL DECAY, built and
+    #      DEFAULT-OFF. Setting it reweights every watch by exp(-age/half_life), which
+    #      shifts the affinity groups and therefore the whole score. Read at
+    #      ``services/tautulli/users._affinity_half_life`` (which carries the pre-flight)
+    #      and applied in ``machine_learning/affinity/genre_affinity``. It is the ONE
+    #      config key an operator can flip that translates this axis — nothing about the
+    #      key's name says so, which is why it is named here.
+    #   3. Anything that changes which INPUTS reach ``_score_row`` — e.g. enriching a
+    #      previously-absent group for the whole library. A group that goes from
+    #      "missing, renormalised out" to "present" moves every title carrying it.
+    #
+    # AND RE-ANCHORING THIS FILE IS NOT SUFFICIENT. ``likelihood.untouched_base`` sits on
+    # the LIKELIHOOD scale, not the watchability scale, so it has no spec here — yet it
+    # needed the same treatment when the axis last moved: 12 -> 25, applied only AFTER
+    # untouched titles reaching 1080p had already collapsed 456 -> 8 (-98.2%). That
+    # collapse was found by manual measurement; there is still no axis-drift detector.
+    # A re-anchor pass that walks only THRESHOLD_SPECS will miss it. Check
+    # ``machine_learning/likelihood/`` too.
     ThresholdSpec(
         name="movie_delete_ceiling", bucket="delete", constant=17, service="radarr",
         consumer="services/radarr/quality/space_pressure.py:247,1094,1279",

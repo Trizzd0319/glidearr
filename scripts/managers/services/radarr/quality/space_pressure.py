@@ -80,6 +80,11 @@ from scripts.managers.machine_learning.likelihood.watch_likelihood import (
     movie_universe_credits,
 )
 from scripts.managers.machine_learning.playlists.models import PLACEHOLDER_AFFINITY
+from scripts.managers.machine_learning.space.reclaim_ledger import (
+    planned_reclaim_gb,
+    record_planned_reclaim,
+)
+from scripts.managers.machine_learning.space.routing_targets import UHD_INSTANCE_LABELS
 from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
 from scripts.managers.machine_learning.thresholds.registry import get_threshold
 from scripts.support.utilities.backup_gate import effective_dry_run
@@ -101,7 +106,9 @@ _KID_AGE_TIERS = frozenset({"little_kid", "older_kid", "teen", "kid", "child"})
 
 class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
-    PRESSURE_THRESHOLD_GB          = 25.0   # last-resort floor only (free_space_limit unset AND total drive unreadable)
+    PRESSURE_THRESHOLD_GB          = 0.0    # NO last-resort floor (config free_space_limit, else 25% of total, else none)
+                                            # Was 25.0 -- and named differently from the other three managers'
+                                            # PRESSURE_FALLBACK_GB, so a grep for the common name missed this site entirely.
     HD_720P_PROFILE_NAME           = "HD-720p"
     RECENT_WATCH_DAYS              = 7
     COLLECTION_WINDOW_DAYS         = 30
@@ -988,6 +995,33 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
     # ── Stage 1: downgrade to HD-720p ────────────────────────────────────────────
 
+    def _is_uhd_instance(self, instance) -> bool:
+        """Is *instance* the dedicated 4K/UHD Radarr session?
+
+        Read from ``radarr_instances_categorized`` (the operator's own tier map, captured
+        during onboarding) using the SAME alias list uhd_reconcile and radarr/repair/anomaly
+        use -- the role map writes "4K" while the folder bucket is "4k", and operators
+        reasonably use "uhd" or "2160p".
+
+        Fails CLOSED to False: an unreadable map means this manager behaves exactly as it
+        did before (an ordinary 720p-floor instance), rather than silently disabling the
+        downgrade pass everywhere.
+        """
+        if not instance:
+            return False
+        try:
+            cat = (self.config.get("radarr_instances_categorized", {}) or {}) if self.config else {}
+        except Exception:
+            return False
+        if not isinstance(cat, dict):
+            return False
+        target = str(instance).strip().casefold()
+        for label in UHD_INSTANCE_LABELS:
+            got = cat.get(label)
+            if got and str(got).strip().casefold() == target:
+                return True
+        return False
+
     @LoggerManager().log_function_entry
     @timeit("run_space_pressure_downgrades")
     def run_downgrades(self, instance: str, free_space_gb: float) -> dict:
@@ -1028,8 +1062,30 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # Movies floor at the HD-720p resolution: they step DOWN toward it (4K → 1080p →
         # 720p) but never below (universe titles, which may reach SD, are handled by the
         # universe manager).
+        #
+        # EXCEPT ON THE DEDICATED 4K INSTANCE, where the floor is 2160p — i.e. nothing to
+        # step down to, so this pass finds no candidates there. Two reasons:
+        #
+        #  1. IT FOUGHT uhd_reconcile. In the SAME run, uhd_reconcile plans to MOVE 2160p
+        #     copies ONTO the 4K instance while this pass planned to SHRINK them once they
+        #     arrived. uhd_reconcile already excludes the 4K instance from its move sources
+        #     ("the guard that stops the sweep from dragging a real 4K library into the
+        #     move"); this manager had no equivalent guard and treated every instance alike.
+        #  2. SHRINKING A 4K COPY IN PLACE LOSES THE TIER WITH NO BASELINE. The purpose-built
+        #     path (uhd_reconcile._demote_overqualified_4k) deletes the 4K FILE only once a
+        #     ≤1080p baseline is confirmed surviving on standard, ledgers the shell, and
+        #     re-acquires if the score recovers — make-before-break. Stepping 2160p → 720p in
+        #     place gives up the 4K with nothing held anywhere.
+        #
+        # 4K space is therefore reclaimed by eviction, not by downgrade.
         hd720p = self._fetch_hd720p_profile(instance)
         floor_resolution = (self._profile_max_resolution(hd720p) or 720) if hd720p is not None else 720
+        if self._is_uhd_instance(instance):
+            floor_resolution = 2160
+            self.logger.log_debug(
+                f"[SpacePressure] '{instance}' is the dedicated 4K instance — step-down floor "
+                f"is 2160p (no downgrade); its space is reclaimed by the 4K eviction path, "
+                f"which keeps a 1080p baseline before removing anything.")
 
         now           = datetime.now(tz=timezone.utc)
         recent_cutoff = now - timedelta(days=self.RECENT_WATCH_DAYS)
@@ -1037,11 +1093,22 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         score_map     = self._build_score_map(df, instance)
 
         _floor_gb, U = self._space_targets(instance)
-        need_gb = max(0.0, U - float(free_space_gb))
+        # TIERED, NOT CONCURRENT. Every space pass in the run reads the SAME free-space
+        # figure from the SAME shared mount, so before this they each planned their full
+        # need independently: standard planned 396 GB, ultra 205 GB and Sonarr TV 476 GB
+        # against ONE 922 GB pool -- ~1077 GB of reclaim for a deficit of ~4575 GB, with no
+        # pass aware that the others had already committed to part of it. Now each pass
+        # ADDS what earlier passes have already planned this run to its effective free
+        # space, so the tree drains a single shared deficit instead of three passes racing
+        # the same number. Same idea as the in-run `inflight_regrab_gb` subtraction, lifted
+        # from within one pass to across all of them.
+        _planned = planned_reclaim_gb(self.global_cache)
+        need_gb = max(0.0, U - (float(free_space_gb) + _planned))
         self.logger.log_info(
             f"[SpacePressure] '{instance}': {free_space_gb:.1f} GB free "
-            f"(floor {_floor_gb:.0f} GB; need ~{need_gb:.0f} GB to band top {U:.0f} GB). "
-            f"Active collections last {self.COLLECTION_WINDOW_DAYS}d: {len(active_colls)}"
+            f"(floor {_floor_gb:.0f} GB; need ~{need_gb:.0f} GB to band top {U:.0f} GB"
+            + (f"; {_planned:.0f} GB already planned by earlier passes this run" if _planned else "")
+            + f"). Active collections last {self.COLLECTION_WINDOW_DAYS}d: {len(active_colls)}"
         )
 
         # DECISION (ML Step 7c): the brain (space.downgrade_planner.plan_movie_downgrades)
@@ -1069,6 +1136,13 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             exhaustive=_exhaustive,
         )
         stats.update(_pstats)
+        # Publish this pass's projected reclaim so LATER passes (the other Radarr instance,
+        # Sonarr TV, the universe pass, the coordinator) plan against the remaining deficit
+        # rather than the same one. Projected, not realized: the whole point is that the
+        # replacements have not landed yet, and a later pass must not re-plan the space this
+        # one has already committed to freeing.
+        record_planned_reclaim(self.global_cache, f"radarr:{instance}:downgrade",
+                               float(_pstats.get("est_reclaim_gb", 0.0) or 0.0))
 
         if not candidates:
             self.logger.log_info("[SpacePressure] No downgrade candidates found.")
@@ -1091,6 +1165,12 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         changed = False
         plan_changed = False
         movie_ids_to_search: list[int] = []
+        # Cooldown ledger: loaded once, mutated in the loop, saved once at the end.
+        from scripts.support.utilities.stepdown_cooldown import (
+            clear as _clear, cooldown_left as _cooldown_left, entry_key as _ekey,
+            stamp_failure as _stamp_failure, wait_days as _wait_days,
+        )
+        _ledger = self._stepdown_ledger(instance)
 
         for c in candidates:
             # ── IN-FLIGHT ACCOUNTING (exhaustive only) ────────────────────────────
@@ -1142,6 +1222,18 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 continue
 
             try:
+                # GLD-RAD-32 (operator ruling 2026-08-07): the space step-down NEVER runs on
+                # the 4K instance — its whole purpose is to shrink below current, and on
+                # ultra everything below current is sub-2160, which is a PLACEMENT event
+                # (UhdReconcile demote/rehome + the coordinator's evict_uhd_first own it),
+                # not a grab. Skip before the payload fetch, PUT, and indexer call.
+                _uhd_inst = (self.config.get("radarr_instances_categorized") or {}).get("4K")
+                if _uhd_inst and instance == _uhd_inst:
+                    stats["uhd_deferred"] = stats.get("uhd_deferred", 0) + 1
+                    self.logger.log_info(
+                        f"  📦 '{title}': step-down on the 4K instance '{instance}' — deferred "
+                        f"to the UHD demote/evict machinery (no profile change, no grab).")
+                    continue
                 payload = self.radarr_api._make_request(instance, f"movie/{movie_id}", fallback=None)
                 if not payload or not isinstance(payload, dict):
                     self.logger.log_warning(f"  ⚠️ Could not fetch payload for '{title}' (id={movie_id})")
@@ -1162,31 +1254,100 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 # the file is KEPT (a title is never traded for an empty indexer
                 # result) and the row re-probes next run.
                 _fid_row = df.at[idx, "movie_file_id"] if "movie_file_id" in df.columns else None
+                # COOLDOWN. A title that already failed to find a smaller release is not
+                # re-probed until its backoff expires - skipped BEFORE the interactive
+                # search, so it costs no indexer call at all. Escalates per attempt and
+                # caps at 90d, so nothing is written off permanently.
+                _ck = _ekey(df.at[idx, "tmdb_id"] if "tmdb_id" in df.columns else movie_id,
+                            df.at[idx, "resolution"] if "resolution" in df.columns else None)
+                _cd = _cooldown_left(_ledger, _ck, self.config)
+                if _cd > 0:
+                    stats["cooldown_skipped"] = stats.get("cooldown_skipped", 0) + 1
+                    self.logger.log_debug(
+                        f"  ⏭️ '{title}': step-down on cooldown, {_cd:.0f}d left — skipped.")
+                    continue
                 releases = self.radarr_api._make_request(
                     instance, f"release?movieId={int(movie_id)}", fallback=None) or []
                 pick = self._pick_stepdown_release(
                     releases,
                     current_res=df.at[idx, "resolution"] if "resolution" in df.columns else None,
                     allow_below_floor=_exhaustive,
+                    movie_title=title,
+                    movie_year=(df.at[idx, "year"] if "year" in df.columns else None),
                 )
                 if not pick:
+                    # Back this title off instead of re-probing it every run. 31 titles on
+                    # a real library have no smaller encode at any indexer at all.
+                    _n = _stamp_failure(_ledger, _ck)
+                    _wait = _wait_days(_ledger, _ck, self.config)
                     self.logger.log_info(
                         f"  ⏸️ '{title}': no smaller release available — file kept at "
-                        f"{cur_qp_name} (profile now {target_name}; re-probes next run).")
+                        f"{cur_qp_name} (profile now {target_name}; attempt {_n}, "
+                        f"re-probes in {_wait:.0f}d).")
                     stats["no_release"] = stats.get("no_release", 0) + 1
                     df.at[idx, "quality_profile_id"]   = target_id
                     df.at[idx, "quality_profile_name"] = target_name
                     changed = True
                     continue
+                if _fid_row is None or pd.isna(_fid_row):
+                    # FID UNKNOWN ⇒ NO DELETE POSSIBLE ⇒ NO GRAB (GLD-RAD-31). Same
+                    # hardening as the universe realize: 19 of 21 realize rows on the
+                    # 2026-08-07 apply had an empty movie_file_id, so the delete was
+                    # silently skipped and the grab left to die on cutoff-met.
+                    stats["fid_missing"] = stats.get("fid_missing", 0) + 1
+                    _stamp_failure(_ledger, _ck)
+                    self.logger.log_warning(
+                        f"  ⚠️ '{title}': no movie_file_id on the row — cannot "
+                        f"delete-then-grab; grab SKIPPED, re-probes after backoff.")
+                    df.at[idx, "quality_profile_id"]   = target_id
+                    df.at[idx, "quality_profile_name"] = target_name
+                    changed = True
+                    continue
                 if _fid_row is not None and pd.notna(_fid_row):
-                    self.radarr_api._make_request(
-                        instance, f"moviefile/{int(_fid_row)}", method="DELETE")
+                    # CHECKED: DELETE success now returns True (base contract fix). On
+                    # failure the old file is still on disk — grabbing anyway imports a
+                    # second copy over a file Radarr cannot remove. Skip, stamp the
+                    # ledger, re-probe after the operator fixes the delete path.
+                    if not bool(self.radarr_api._make_request(
+                            instance, f"moviefile/{int(_fid_row)}", method="DELETE")):
+                        stats["delete_failed"] = stats.get("delete_failed", 0) + 1
+                        _stamp_failure(_ledger, _ck)
+                        self.logger.log_warning(
+                            f"  ⚠️ '{title}': step-down delete FAILED (see instance-manager "
+                            f"error above) — file kept, grab SKIPPED; re-probes after backoff.")
+                        continue
                 try:
-                    self.radarr_api._make_request(
+                    # RETURN VALUE, not an exception: ``fallback=None`` makes _make_request
+                    # swallow the HTTP error and return the fallback, so this ``except`` was
+                    # unreachable. A 404 from POST /release left the file deleted with no
+                    # replacement grabbed and no blind search queued. Same defect as the
+                    # universe quality pass.
+                    # SEND THE movieId. Without it Radarr re-parses the release TITLE to
+                    # work out which movie this is, and a release whose name does not
+                    # resemble the library title fails that parse: 7 grabs 404'd with
+                    # "Unable to find matching movie, will need to be manually provided" on
+                    # foreign-language and fansub releases (Schimpansen.2013.German,
+                    # [DeadFish] Liz...). The id is right here - the search was
+                    # release?movieId=N - so the parse is avoidable, not merely detectable.
+                    # This is the fix for that whole class; the grab-result check below
+                    # remains the backstop for everything else.
+                    _res = self.radarr_api._make_request(
                         instance, "release", method="POST", fallback=None,
-                        payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId")})
+                        payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId"),
+                                 "movieId": int(movie_id)})
+                    if not _res:
+                        movie_ids_to_search.append(movie_id)
+                        stats["grab_failed"] = stats.get("grab_failed", 0) + 1
+                        _stamp_failure(_ledger, _ck)
+                        self.logger.log_warning(
+                            f"  ⚠️ '{title}': file DELETED but the guid grab FAILED — blind "
+                            f"search queued. Restore from the recycle bin if it finds nothing."
+                        )
+                    else:
+                        _clear(_ledger, _ck)                    # steppable again
                 except Exception:
                     movie_ids_to_search.append(movie_id)   # file is gone → blind search now works
+                    stats["grab_failed"] = stats.get("grab_failed", 0) + 1
 
                 df.at[idx, "quality_profile_id"]   = target_id
                 df.at[idx, "quality_profile_name"] = target_name
@@ -1228,6 +1389,9 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # (the latter is the dry_run preview path).
         if changed or plan_changed:
             mfm.save(instance, df)
+        # Ledger saves regardless: a cooldown stamped this run must survive even when
+        # nothing else changed, or the backoff would reset every pass.
+        self._save_stepdown_ledger(instance, _ledger)
 
         prefix = "[dry_run] " if self.dry_run else ""
         _rows = [
@@ -1238,6 +1402,8 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             ["high-score protected", stats['skipped_high_score']],
             ["recently watched",    stats['skipped_recent']],
             ["no smaller release",  stats.get('no_release', 0)],
+            ["on cooldown",         stats.get('cooldown_skipped', 0)],
+            ["grab failed",         stats.get('grab_failed', 0)],
             ["failed",              stats['failed']],
         ]
         _descs = [
@@ -1248,6 +1414,14 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             "movies protected by a high watchability score",
             "movies skipped for a recent watch",
             "file KEPT: no release below the current resolution — profile lowered, re-probes next run",
+            # These two were MISSING, so every description from here shifted up by two and the
+            # last pair fell off the end entirely. The table then read, among others,
+            # "over-ceiling included | 818 | projected size of the smaller replacements" and
+            # "freed now GB | 171.2 | candidates over the per-run re-grab cap - files KEPT" --
+            # i.e. an operator reading the delete-adjacent report was told the opposite of what
+            # each number meant. The Sonarr TV twin has always carried both.
+            "movies skipped without an indexer call: still inside their step-down backoff",
+            "grab did not take; file already removed, blind MoviesSearch queued",
             "movies whose PUT/search call errored",
         ]
         if _exhaustive:
@@ -1270,6 +1444,18 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 "candidates over the per-run re-grab cap — files KEPT (still above the floor, so "
                 "still undeletable) and re-qualify next run",
             ]
+        # rows and descriptions are PARALLEL lists with no structural link -- the same shape as
+        # the cast_names/cast_characters/cast_order triple, and it failed the same way: two
+        # missing entries silently re-paired every later row with the wrong text. Nothing in
+        # log_table checks, so the mismatch is invisible until a human reads the grid and
+        # notices the numbers contradict their labels. Pad + warn rather than raise: a
+        # reporting bug must never take down the pass it is reporting on.
+        if len(_descs) != len(_rows):
+            self.logger.log_warning(
+                f"[SpacePressure] table description mismatch: {len(_rows)} row(s) but "
+                f"{len(_descs)} description(s) - rows beyond the shorter list would be "
+                f"mislabelled. Padding; fix the two lists in run_downgrades.")
+            _descs = (_descs + [""] * len(_rows))[:len(_rows)]
         self.logger.log_table(
             ["Outcome", "Count"], _rows,
             title=f"[SpacePressure] {prefix}step-down pass - '{instance}' "
@@ -1734,7 +1920,17 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 stats["bytes_freed"] += size
                 continue
             try:
-                self.radarr_api._make_request(instance, f"moviefile/{fid}", method="DELETE")
+                # CHECKED: DELETE success returns True (base contract fix). The old
+                # try/except here was DEAD protection — _make_request swallows HTTP
+                # errors and returns the fallback, so 30 failed deletes in one apply
+                # counted as freed GB, cleared their marks, and fed deleted_tmdbs.
+                if not bool(self.radarr_api._make_request(
+                        instance, f"moviefile/{fid}", method="DELETE")):
+                    self.logger.log_warning(
+                        f"  ⚠️ Movie delete FAILED for '{title}' (movieFileId={fid}) — "
+                        f"see instance-manager error above; mark kept, retries next run.")
+                    stats["failed"] += 1
+                    continue
                 if "marked_for_deletion" in df.columns:
                     df.at[idx, "marked_for_deletion"] = False
                 stats["deleted"] += 1
@@ -2098,8 +2294,15 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # max with the rewatched-fraction credit above. Default-off: returns {} (no change) when
         # scoring.saga_credit.enabled is unset, so this is byte-identical inert until opted in.
         saga_cr = self._saga_quality_credits(df, _mid, instance)
+        # SPLIT, not blended - see the matching note in the Sonarr episode cache.
+        # ``universe_credit`` = rewatched-sibling heat only (a real reason to resist DELETION).
+        # ``saga_credit`` = caught-up/depth, a forward-looking ACQUISITION/QUALITY signal that
+        # must not hold old files on disk. Quality consumers take the max of the two; the
+        # delete-pool guard below reads universe_credit alone.
         df["universe_credit"] = _mid.map(
-            lambda m: max(credits.get(int(m), 0.0), saga_cr.get(int(m), 0.0)) if pd.notna(m) else 0.0)
+            lambda m: credits.get(int(m), 0.0) if pd.notna(m) else 0.0)
+        df["saga_credit"] = _mid.map(
+            lambda m: saga_cr.get(int(m), 0.0) if pd.notna(m) else 0.0)
         if credits or saga_cr:
             _allc = dict(credits)
             for _k, _v in saga_cr.items():
@@ -2430,7 +2633,8 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 # replaced (mirrors legacy_regrab). The old file is untouched, so it re-flags next run.
                 res = self.radarr_api._make_request(
                     instance, "release", method="POST", fallback=None,
-                    payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId")})
+                    payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId"),
+                             "movieId": int(mid)})
                 if res is None:
                     stats["failed"] += 1
                     self.logger.log_warning(
@@ -2460,10 +2664,142 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             )
         return stats
 
+    # ── Step-down failure cooldown ────────────────────────────────────────
+    # Implemented in support.utilities.stepdown_cooldown - the SAME ledger idiom
+    # legacy_regrab uses, so there is one convention for "don't retry this yet" rather
+    # than two. Keyed by TMDB id, not movie_file_id: a step-down deletes the file, so a
+    # file-keyed entry would be orphaned on the grab_failed path - exactly when the
+    # backoff matters most.
+
+    def _stepdown_ledger(self, instance: str) -> dict:
+        """Load this instance's cooldown ledger (mutated in place, saved once per run)."""
+        from scripts.support.utilities.stepdown_cooldown import ledger_key
+        if not self.global_cache:
+            return {}
+        return dict(self.global_cache.get(ledger_key("radarr", instance)) or {})
+
+    def _save_stepdown_ledger(self, instance: str, ledger: dict) -> None:
+        """Persist the ledger, pruning entries whose window has fully elapsed."""
+        from scripts.support.utilities.stepdown_cooldown import ledger_key, prune
+        if not self.global_cache or ledger is None:
+            return
+        prune(ledger, self.config)
+        self.global_cache.set(ledger_key("radarr", instance), ledger)
+
+    _ROMAN_NUM = {"i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5",
+                  "vi": "6", "vii": "7", "viii": "8", "ix": "9", "x": "10"}
+    _FOREIGN_AUDIO = {"french", "truefrench", "vff", "vfq", "vostfr", "german",
+                      "ita", "italian", "spanish", "castellano", "latino", "hindi",
+                      "russian", "rus", "korean", "mandarin", "cantonese", "polish",
+                      "turkish", "nordic", "swedish", "norwegian", "danish"}
+    _AUDIO_OK = {"english", "eng", "dual", "multi"}
+
+    @staticmethod
+    def _norm_title_tokens(text: str) -> list:
+        """Lowercase, '&'→'and', punctuation→space, roman numerals→arabic per token.
+        The shared normal form for release↔movie title matching (GLD-RAD-30)."""
+        import re as _re
+        s = (text or "").lower().replace("&", " and ")
+        toks = [t for t in _re.split(r"[^a-z0-9]+", s) if t]
+        return [RadarrSpacePressureManager._ROMAN_NUM.get(t, t) for t in toks]
+
+    @staticmethod
+    def _release_matches_movie(release_title: str, movie_title: str,
+                               movie_year=None, alt_titles=()) -> bool:
+        """GLD-RAD-30 — does this release NAME the movie we intend to grab?
+
+        Born from a real apply pass that grabbed 'A.Business.Proposal.2025' for
+        Demon Slayer: Infinity Castle, 'Snapdragon.1993' for DBZ: Broly,
+        'Spiderman.2002' (film 1) for Spider-Man 2 and 'Scorpion.King.4' for The
+        Scorpion King — the picker filtered on resolution/size/seeders and never
+        asked WHICH movie the filename claims to be.
+
+        Method: token-normalize both sides; drop standalone year tokens from the
+        release (validated separately); require the movie's tokens (or any
+        alternate title's) to appear as a CONTIGUOUS token subsequence, allowing
+        adjacent-token joins in either direction ('spider man'≡'spiderman'); the
+        token AFTER the match must not be a bare 1-2 digit sequel number the
+        title itself doesn't end with (kills film-1-for-film-2 and sequel-4
+        grabs); any year in the release must sit within ±1 of the movie's year
+        (kills 'Superman.2025' for Superman '78, tolerates re-release cuts).
+        A leading article (the/a/an) on the title is optional. Conservative by
+        design: no title evidence ⇒ no match ⇒ the file is KEPT — a kept file
+        beats a wrong grab on the destructive path."""
+        _N = RadarrSpacePressureManager._norm_title_tokens
+        rt_all = _N(release_title)
+        rel_years = [int(t) for t in rt_all if len(t) == 4 and t.isdigit()
+                     and 1900 <= int(t) <= 2099]
+        rt = [t for t in rt_all if not (len(t) == 4 and t.isdigit()
+                                        and 1900 <= int(t) <= 2099)]
+        if movie_year is not None and rel_years:
+            try:
+                if min(abs(ry - int(movie_year)) for ry in rel_years) > 1:
+                    return False
+            except (TypeError, ValueError):
+                pass
+
+        def _flex(mt: list, start: int):
+            i, j = start, 0
+            while j < len(mt):
+                if i >= len(rt):
+                    return None
+                a, b = mt[j], rt[i]
+                if a == b:
+                    i += 1; j += 1; continue
+                if j + 1 < len(mt) and mt[j] + mt[j + 1] == b:
+                    i += 1; j += 2; continue
+                if i + 1 < len(rt) and a == rt[i] + rt[i + 1]:
+                    i += 2; j += 1; continue
+                return None
+            return i
+
+        candidates = [movie_title] + [t for t in (alt_titles or ()) if t]
+        for cand in candidates:
+            mt = _N(cand)
+            variants = [mt]
+            if mt and mt[0] in ("the", "a", "an"):
+                variants.append(mt[1:])
+            for v in variants:
+                if not v:
+                    continue
+                for s in range(len(rt)):
+                    end = _flex(v, s)
+                    if end is None:
+                        continue
+                    nxt = rt[end] if end < len(rt) else None
+                    if nxt and nxt.isdigit() and len(nxt) <= 2 and v[-1] != nxt:
+                        continue   # sequel-number boundary: wrong film in franchise
+                    return True
+        return False
+
+    @staticmethod
+    def _release_language_ok(release: dict, allowed=("english",)) -> bool:
+        """GLD-RAD-30 — audio-language gate. Radarr's per-release ``languages`` is
+        authoritative when present: require an allowed language (or 'unknown').
+        When absent, fall back to filename markers — a foreign-audio token
+        (FRENCH/TRUEFRENCH/ITA/…) with no english/dual/multi marker rejects; subs
+        tags (HebSubs, NL Subs) are subtitles, not audio, and stay eligible. Four
+        of one apply pass's 21 grabs were FRENCH audio; this is that gate."""
+        _allowed = {str(a).lower() for a in (allowed or ("english",))}
+        langs = release.get("languages")
+        if isinstance(langs, list) and langs:
+            names = {str((l or {}).get("name", "")).lower()
+                     for l in langs if isinstance(l, dict)}
+            names.discard("")
+            if names:
+                return bool(names & _allowed) or "unknown" in names
+        toks = set(RadarrSpacePressureManager._norm_title_tokens(release.get("title") or ""))
+        if toks & RadarrSpacePressureManager._FOREIGN_AUDIO and not (
+                toks & RadarrSpacePressureManager._AUDIO_OK):
+            return False
+        return True
+
     @staticmethod
     def _pick_stepdown_release(releases: list, current_res=None,
                                min_size_bytes: int = 300 * 1024 * 1024,
-                               allow_below_floor: bool = False) -> "dict | None":
+                               allow_below_floor: bool = False,
+                               target_res=None, movie_title=None, movie_year=None,
+                               alt_titles=(), allowed_langs=("english",)) -> "dict | None":
         """Pick the release a step-down should grab: walk the resolution ladder
         UP from the floor (720 → 1080) and take the first non-empty rung strictly
         below the current file's resolution — 'no 720 found, take the next tier
@@ -2474,6 +2810,10 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         (no 300MB "movies"); the Sonarr episode step-down passes a smaller floor
         (a legit 720p episode can be well under 300 MiB).
         Returns None when no rung has a candidate → caller keeps the file.
+
+        ``target_res`` is the resolution the CALLER's profile change settled on. The picker
+        prefers that tier and only descends when it is empty - see the note at the rung
+        loop. None -> byte-identical to the previous behaviour.
 
         ``allow_below_floor`` (``space_exhaustive_downgrade``; DEFAULT False =
         byte-identical hard 720 floor): when set, and ONLY when no rung >= 720 exists
@@ -2502,14 +2842,66 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 continue
             if float(r.get("size") or 0) < min_size_bytes:   # sanity floor (movies: no 300MB "movies")
                 continue
+            # VIABILITY. This picker deletes the existing file BEFORE grabbing, so a
+            # release that can never download costs the household the copy it had. The
+            # sibling picker (``_pick_movie_regrab_release``) already screens for this;
+            # it guards a re-grab of a file that still exists, so the stricter check was
+            # on the safer path and absent from the destructive one.
+            #
+            # Hard rejections only (sample / blocklist): a 'not an upgrade' or quality
+            # rejection is EXPECTED here - a step-down is by definition not an upgrade,
+            # and a manual grab by guid overrides those.
+            _rj = [str(x).lower() for x in (r.get("rejections") or [])]
+            if any(bad in x for x in _rj for bad in ("sample", "blocklist", "blacklist")):
+                continue
+            # WRONG-MOVIE / WRONG-LANGUAGE GATES (GLD-RAD-30). Radarr's own mapping
+            # verdict first (an 'unknown movie' rejection is fatal here even though
+            # quality rejections are expected), then the filename-parse identity
+            # check, then the audio-language gate. movie_title=None (legacy caller
+            # or tests) skips the identity check — byte-identical old behaviour.
+            if any(bad in x for x in _rj for bad in
+                   ("unknown movie", "unable to parse", "does not match", "not a match")):
+                continue
+            if movie_title and not RadarrSpacePressureManager._release_matches_movie(
+                    r.get("title") or "", movie_title, movie_year, alt_titles):
+                continue
+            if not RadarrSpacePressureManager._release_language_ok(r, allowed_langs):
+                continue
+            # Torrent with nobody seeding it will never complete. Usenet reports no
+            # seeders at all, so only a present-and-zero value disqualifies.
+            _seed = r.get("seeders")
+            if _seed is not None and _seed <= 0:
+                continue
             if res < 720:
                 if allow_below_floor:
                     sub_floor.setdefault(res, []).append(r)
                 continue
             by_rung.setdefault(res, []).append(r)
+        try:
+            _target = int(target_res) if target_res is not None else None
+        except (TypeError, ValueError):
+            _target = None
         for rung in sorted(by_rung):
+            # TARGET FLOOR. The caller's profile move decided a specific tier (e.g. 2160 ->
+            # 1080, profile set to HD-1080p). Without this the loop takes the LOWEST rung
+            # >= 720 and grabs 720p for a movie whose profile now demands 1080p - Radarr
+            # then rejects the import or 404s the guid, and the file is already deleted.
+            # Observed on 6 titles in one live pass (Deadpool 2, Eternals, Civil War,
+            # Far From Home, GotG Vol. 2, ...).
+            #
+            # Rungs below the target are SKIPPED, not rejected outright: if nothing exists
+            # at the target tier the loop still descends, which keeps the old "take what you
+            # can get" behaviour rather than stranding a title. target_res=None (or a caller
+            # that does not pass it) -> byte-identical to before.
+            if _target is not None and rung < _target:
+                continue
             cands = sorted(by_rung[rung], key=lambda r: float(r.get("size") or 0))
             return cands[len(cands) // 2]
+        # Nothing at or above the target: fall back to the ladder as it was, lowest first.
+        if _target is not None:
+            for rung in sorted(by_rung):
+                cands = sorted(by_rung[rung], key=lambda r: float(r.get("size") or 0))
+                return cands[len(cands) // 2]
         # LAST RESORT: no >=720 rung below the current resolution exists at all. Take the
         # HIGHEST sub-720 rung (best of a bad lot) rather than strand the title above the
         # floor forever — an item that can never reach the floor could otherwise never

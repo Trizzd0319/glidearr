@@ -177,7 +177,7 @@ def franchise_tier(is_curated, sources, min_sources: int = 2) -> int:
 
 
 def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
-                           deny_tvdbs=None, cluster_same_stem=True) -> dict:
+                           deny_tvdbs=None, cluster_same_stem=False) -> dict:
     """Synthetic ``tvfran:`` universe-source entries — the SINGLE seam that makes discovered TV
     franchises participate in playlist grouping, catch-up retention AND acquisition. Merges Layer-2
     (the baked/generated tvdb-keyed ``catalog`` — cross-named families + the migrated curated
@@ -202,6 +202,22 @@ def tv_franchise_universes(owned_series_rows, catalog, *, engaged_tvdbs=None,
     order. ``deny_tvdbs`` = tvdbs a film universe already groups. PURE — no I/O; ``catalog={}`` makes
     the Layer-2 branch a no-op (Layer-1 clustering still runs)."""
     clusters = stem_franchise_clusters(owned_series_rows) if cluster_same_stem else {}
+    # cluster_same_stem now defaults to FALSE: Layer-1 groups by TITLE SHAPE, not by any
+    # evidence that two shows are related, and on a real library it manufactures families
+    # that do not exist. Observed: a "Blue" family joining Blue Bloods (CBS procedural),
+    # Blue Planet II (nature doc), Blue Mountain State (comedy) and six unrelated anime;
+    # "Abbott" joining The Abbott and Costello Show to Abbott Elementary; likewise
+    # "America's" (8 shows), "Earth", "See", "Magic". That credit is real money - it feeds
+    # the watchability score AND the universe DELETE guard, so a show can be held on disk
+    # by borrowing engagement from a stranger that shares an adjective.
+    #
+    # Layer-2 (the tvdb-keyed catalog) is evidence-based: Wikidata spin-off edges, Wikipedia
+    # infoboxes and category scrapes, plus the hand-curated floor and learned Kometa
+    # collections - and it names members explicitly rather than inferring from spelling, so
+    # it gets cross-named families (Grey's<->Station 19, Buffy<->Angel) that title matching
+    # can never derive AND avoids the false positives it can never avoid.
+    #
+    # Pass cluster_same_stem=True to restore the old behaviour.
 
     # Debut + first-seen index per tvdb (for member ordering). Undated rows → stable input order.
     debut: dict = {}
@@ -616,12 +632,32 @@ def collection_group_key(title, franchise_index=None) -> str | None:
     return franchise_index.get(_collection_norm(title)) if franchise_index else None
 
 
+# Kometa collection titles that describe a LIBRARY FACET rather than a story: quality,
+# format, rating, decade, source. Matched as a whole word against the title, so "4K" is
+# noise but "Kingdom" is not. These are how an operator organises a shelf, and grouping on
+# them fuses the entire library: an observed install learned "720p Movies" as a franchise
+# of 1368 unrelated shows (tier 0, so trusted) and "Not Rated Movies" as another 55.
+_FACET_WORDS = frozenset({
+    "4k", "1080p", "720p", "480p", "2160p", "uhd", "hdr", "hdr10", "dolby", "vision",
+    "atmos", "remux", "bluray", "blu-ray", "webdl", "web-dl", "hevc", "x265", "x264",
+    "rated", "unrated", "nr", "sd", "hd", "resolution", "quality", "codec", "audio",
+    "subtitles", "decade", "newly", "recently", "added", "random", "trending", "popular",
+})
+
+
 def is_collection_noise(title) -> bool:
-    """True for a Kometa STRUCTURAL collection — a separator (``<Word> Collections``) or a streaming
-    rollup (``<Word> Shows``) — which is never a franchise. Lets an UNRECOGNISED, non-noise SHOW
-    collection be trusted as a franchise group (its members ARE the franchise). PURE."""
+    """True for a Kometa STRUCTURAL collection - a separator (``<Word> Collections``), a
+    streaming rollup (``<Word> Shows``), or a LIBRARY FACET (quality / format / rating /
+    recency) - none of which is a franchise. Lets an UNRECOGNISED, non-noise SHOW
+    collection be trusted as a franchise group (its members ARE the franchise). PURE.
+    """
     t = str(title or "").strip()
-    return t.endswith((" Collections", " Shows"))
+    if not t:
+        return True
+    if t.endswith((" Collections", " Shows")):
+        return True
+    words = {w.strip("()[[]-–—.,:").lower() for w in t.split()}
+    return bool(words & _FACET_WORDS)
 
 
 # Reverse of UNIVERSE_COLLECTION_NAMES (key -> a Title-Cased display name), built once. Used by

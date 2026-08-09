@@ -37,7 +37,15 @@ class SonarrOrchestrationRepairManager(BaseManager, ComponentManagerMixin):
     def run_orphan_repairs(self): self.repair.orphans.remove_orphaned_series(); self.repair.orphans.cleanup_tagless_metadata()
     def run_file_repairs(self): self.repair.file.validate_episode_files()
     def run_cache_repairs(self): self.repair.repair_cache.purge_invalid_keys(); self.repair.repair_cache.refresh_all_entries()
-    def run_anomaly_repairs(self): self.repair.anomaly.detect_unexpected_entries()
+    # Split in two: the scan is pure and the repair mutates the cache, so they are
+    # separate verbs rather than one ambiguous "run". WAS a single
+    # run_anomaly_repairs() calling self.repair.anomaly.detect_unexpected_entries()
+    # -- a method that does not exist on that class -- UNTRAPPED at step 11 of
+    # run_all_repairs' 14, so the AttributeError aborted the four passes after it
+    # and the completion line never printed. Undetected because nothing calls
+    # run_all_repairs (GLD-REP-07).
+    def report_anomaly_repairs(self): return self.repair.anomaly.generate_anomaly_report()
+    def run_anomaly_repairs(self, report=None): return self.repair.anomaly.repair_anomalies(report)
     def run_monitoring_repairs(self): self.repair.monitoring.sync_monitoring_flags()
     def run_history_repairs(self): self.repair.history.repair_missing_history()
     def run_episodes_repairs(self): self.repair.episodes.validate_episode_entries(); self.repair.episodes.fix_episode_status()
@@ -55,7 +63,10 @@ class SonarrOrchestrationRepairManager(BaseManager, ComponentManagerMixin):
         self.run_orphan_repairs()
         self.run_file_repairs()
         self.run_cache_repairs()
-        self.run_anomaly_repairs()
+        # Scan once, then act on that same report — rescanning between the two would
+        # re-read the whole library for no benefit and could act on a different set
+        # than was reported.
+        self.run_anomaly_repairs(self.report_anomaly_repairs())
         self.run_monitoring_repairs()
         self.run_history_repairs()
         self.run_episodes_repairs()

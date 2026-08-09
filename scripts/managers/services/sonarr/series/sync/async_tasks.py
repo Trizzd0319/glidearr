@@ -74,8 +74,15 @@ class SonarrSeriesSyncAsyncManager(BaseManager, ComponentManagerMixin):
             updated_tags = set(current_tags)
 
             if self.tag_monitor and self.tag_monitor.is_series_tagged_keep(series_id):
-                updated_tags.add("keep")
-                self.logger.log_info(f"🔒 Enforcing 'keep' tag on '{title}' ({instance_name})")
+                # GLD-ACQ-31: integer tag id, never the label (a string 400s the PUT).
+                _kid = (self.tag_monitor.ensure_keep_tag_id(instance_name)
+                        if hasattr(self.tag_monitor, "ensure_keep_tag_id") else None)
+                if _kid is not None:
+                    updated_tags.add(int(_kid))
+                    self.logger.log_info(f"🔒 Enforcing 'keep' tag on '{title}' ({instance_name})")
+                else:
+                    self.logger.log_warning(
+                        f"⚠️ 'keep' tag id unresolvable on '{instance_name}' — skipping for '{title}'.")
 
             if updated_tags != current_tags:
                 self.logger.log_info(f"✏️ Diff for '{title}': tags changed ({current_tags} → {updated_tags})")

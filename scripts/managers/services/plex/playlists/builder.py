@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.services.mdblist import client as mdblist_client
@@ -45,6 +45,8 @@ from scripts.managers.services.plex.playlists.tv_resolver import (
     build_tv_plan,
     watched_episode_keys,
     watched_episode_recency,
+    trakt_episode_identities,
+    merge_household_history,
 )
 from scripts.managers.services.plex.playlists.universe_order import (
     CURATED_TV_FRANCHISES,
@@ -73,6 +75,18 @@ _INVENTORY_KEY = "plex/episodes/owned_inventory"
 _STATS_KEY = "plex/episodes/resolution_stats"
 _PLAN_KEY = "plex/playlists/tv_plan"          # + /{safe_user}
 _UNIVERSE_SRC_KEY = "plex/playlists/universe_source"   # fetched universe lists (cache VOLUME)
+# Per-user universe/franchise progress. A SEPARATE tracked artifact - read-only, feeds
+# nothing in the pipeline, shaped for direct serialisation by a future web layer.
+_SAGA_PROGRESS_KEY = "plex/playlists/saga_progress"
+# Owned-movie inventory (tmdb -> {rating_key, title, year}); the same key movie_builder
+# reads. Inverted here to resolve a Tautulli play's ratingKey back to a tmdb.
+_MOVIE_INVENTORY_KEY = "plex/movies/owned_inventory"
+# Durable Plex ratingKey -> native id. APPEND-ONLY: a key Plex retires on a re-scan keeps
+# resolving, which is the only way a play recorded before that re-scan stays attributable.
+_RK_CROSSWALK_KEY = "tautulli/rating_key_crosswalk"
+# Per-profile record of which surfaced groups were watched vs walked past WHILE ACTIVE.
+# Day-based, not run-based: see playlists.engagement.
+_ENGAGEMENT_KEY = "plex/playlists/engagement"          # + /{safe_user}
 _KOMETA_FRANCHISE_KEY = "plex/playlists/kometa_franchises"   # franchises LEARNED from the live Kometa collections
 _UNIVERSE_TTL_DAYS = 7                                  # re-fetch a universe list at most weekly
 # Layer-2 cross-named TV-franchise catalog files (co-located with this package), in load order:
@@ -183,6 +197,11 @@ class PlexPlaylistBuilderManager(BaseManager):
                            for u in tracked}
         affinity_by_user = {u["safe_user"]: self._user_affinity(u.get("tautulli_username"))
                             for u in tracked}
+        # Episode-level watch recency per user. Without this tv_inputs sees wrec={} and every
+        # series_recency entry carries ts=0, so the resume ordering has nothing to sort on.
+        resume_on, resume_order, resume_weight = self._resume_cfg()
+        recency_by_user = ({u["safe_user"]: self._watched_episode_recency_for(u.get("tautulli_user_id"))
+                            for u in tracked} if resume_on else {})
         # TV-only playlist: let a Kometa user's custom SHOW-collection order lead (prefer_plex).
         franchise_by_series, series_timeline = self._tv_franchise_maps(owned_eps, prefer_plex=True)
         return self._build_for_users(
@@ -190,13 +209,17 @@ class PlexPlaylistBuilderManager(BaseManager):
             watched_by_user, series_genres=series_genres, affinity_by_user=affinity_by_user,
             series_certs=series_certs, series_csm_ages=self._series_csm_ages(),
             daemon_enabled=self._daemon_enabled(), daemon_running=self._daemon_running(),
-            franchise_by_series=franchise_by_series, series_timeline=series_timeline)
+            franchise_by_series=franchise_by_series, series_timeline=series_timeline,
+            resume_boost=resume_on, resume_order=resume_order,
+            resume_weight=resume_weight, recency_by_user=recency_by_user)
 
     def _build_for_users(self, tracked, owned_eps, inventory, resolution_stats,
                          series_scores, watched_by_user, *, series_genres=None,
                          affinity_by_user=None, series_certs=None, series_csm_ages=None,
                          daemon_enabled, daemon_running,
-                         franchise_by_series=None, series_timeline=None) -> dict:
+                         franchise_by_series=None, series_timeline=None,
+                         resume_boost=False, resume_order="recency",
+                         resume_weight=0.0, recency_by_user=None) -> dict:
         """The orchestration core: diagnose readiness, then per user AGE-GATE (parental
         controls) + PERSONALIZE the series watchability by their genre affinity (tilt),
         build+cache the plan, and log a preview. Returns run stats. ``series_csm_ages``
@@ -230,10 +253,27 @@ class PlexPlaylistBuilderManager(BaseManager):
 
         display = self._display_map(inventory)
         cert_by_rk = self._tv_cert_by_rk(owned_eps, inventory, series_certs)
+        # HOUSEHOLD layer, fetched ONCE. Trakt is a master-profile feed with no per-user
+        # attribution, so it is applied to every Home profile; age-gating still happens
+        # above via cert_allowed on user_owned, so an out-of-tier show contributes no
+        # candidates regardless of its household position.
+        hh_watched, hh_recency, hh_series = self._trakt_household_episodes() if resume_boost else (set(), {}, {})
         self._begin_summary()
         built = 0
         for idx, u in enumerate(tracked, 1):
             watched = watched_by_user.get(u["safe_user"], set())
+            user_recency = (recency_by_user or {}).get(u["safe_user"], {})
+            # Engagement is measured against the plan SURFACED last run, so read it before
+            # this run overwrites it below.
+            _prior_plan = self._cache_get(f"{_PLAN_KEY}/{u['safe_user']}", None)
+            _saga_b = self._saga_boost_for(u["safe_user"], watched, _prior_plan)
+            if hh_series:
+                watched, user_recency, _hh = merge_household_history(
+                    watched, user_recency, hh_watched, hh_recency, hh_series)
+                self.logger.log_debug(
+                    f"[Playlists] {u.get('safe_user')}: household Trakt merge - "
+                    f"{_hh['trakt_series']} series in feed, {_hh['held_series']} held at the "
+                    f"user's own newer position, +{_hh['added']} episode identities.")
             user_aff = affinity_by_user.get(u["safe_user"]) or {}
             user_jit = jit_by_user.get(u["safe_user"], set())
 
@@ -287,7 +327,10 @@ class PlexPlaylistBuilderManager(BaseManager):
                 user_owned, inventory, watched, user_scores, family="up_next",
                 episode_cap=self._episode_cap(), max_items=self._max_items(),
                 franchise_by_series=franchise_by_series, series_timeline=series_timeline,
-                recency_boost=recency_on, window_days=recency_window)
+                recency_boost=recency_on, window_days=recency_window,
+                watch_recency=user_recency,
+                resume_boost=resume_boost, resume_order=resume_order,
+                resume_weight=resume_weight, saga_boost=_saga_b)
             if self.global_cache:
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))
             reasons = self._tv_reasons(user_owned, inventory, series_genres, user_aff, user_jit)
@@ -297,6 +340,14 @@ class PlexPlaylistBuilderManager(BaseManager):
             built += 1
         self._emit_summary_grid("[dry-run] TV playlists - per-profile summary")
         self.logger.log_info(f"[Playlists] built {built} per-user TV plan(s) (dry-run — no Plex writes).")
+        # READ-ONLY projection. Wrapped so a progress failure can never cost the run the
+        # playlists it just built.
+        try:
+            self._emit_saga_progress(tracked, watched_by_user, recency_by_user)
+        except Exception as e:
+            # WARNING, not debug: the first wiring of this failed on a relative cache path
+            # and the whole feature vanished from the log with nothing to point at.
+            self.logger.log_warning(f"[SagaProgress] skipped: {type(e).__name__}: {e}")
         return {"users": len(tracked), "built": built, "can_build": True}
 
     # ── serialization + preview ─────────────────────────────────────────────────
@@ -1128,6 +1179,25 @@ class PlexPlaylistBuilderManager(BaseManager):
                 self.logger.log_debug(f"[UniverseOrder] tv-franchise catalog read skipped ({fname}): {e}")
         learned = self._cache_get(_KOMETA_FRANCHISE_KEY, {})   # franchises LEARNED from the operator's Kometa
         if isinstance(learned, dict) and learned:              # collections — trusted (their own curation) and
+            # Re-apply the noise filter on READ, not just on learn. The cache is MERGED with
+            # prior state every run, so an entry captured before the filter existed would
+            # otherwise persist forever - and one did: "720p Movies" was learned as a tier-0
+            # franchise of 1368 unrelated shows, fusing most of the library into one saga.
+            # Filtering here makes a stale cache self-heal instead of needing hand surgery.
+            _clean, _dropped = {}, []
+            for _k, _v in learned.items():
+                _title = (_v or {}).get("display") if isinstance(_v, dict) else None
+                if is_collection_noise(_title or _k):
+                    _dropped.append(_title or _k)
+                    continue
+                _clean[_k] = _v
+            if _dropped:
+                self.logger.log_info(
+                    f"[UniverseOrder] dropped {len(_dropped)} learned collection(s) that describe "
+                    f"a library facet, not a franchise: {', '.join(sorted(_dropped)[:4])}"
+                    f"{' …' if len(_dropped) > 4 else ''}")
+            learned = _clean
+        if isinstance(learned, dict) and learned:
             catalog.update(learned)                            # PERSISTED, so grouping survives a Kometa-less run
             curated_keys.update(learned.keys())
         overlay = self._pl_cfg().get("tv_franchises", {})
@@ -1511,6 +1581,545 @@ class PlexPlaylistBuilderManager(BaseManager):
             return watched_episode_keys(hm.get_all_history_cached(user_id))
         except Exception:
             return set()
+
+    def _trakt_household_episodes(self):
+        """``(identities, recency, series_latest)`` from the household Trakt episode feed.
+
+        Fetched ONCE per run and shared across profiles - Trakt has no per-user attribution,
+        so there is nothing to fetch per user. Returns empty structures on any miss, which
+        makes the merge downstream a no-op rather than a failure: a Trakt outage must not
+        cost a profile the Tautulli history it already had.
+
+        Raw rows deliberately, not ``history_dataframe``: the identities have to be built
+        with the SAME ``_norm`` / ``_coerce_int`` the Tautulli path uses, or a Trakt identity
+        and a Tautulli identity for one episode would differ and silently double-count
+        instead of merging.
+        """
+        try:
+            hm = self.registry.get("manager", "TraktHistoryManager") if self.registry else None
+            if hm is None or not hasattr(hm, "get_full_watch_history_cached"):
+                return set(), {}, {}
+            # CACHED form. This called the uncached get_full_watch_history(), which
+            # re-paginates the whole ~1,900-row episode history live -- so the household
+            # feed cost a full Trakt sweep here on top of the one TraktManager.run() had
+            # already made. Same data, served from trakt/history/episodes (24h).
+            #
+            # The `or []` is deliberate and stays: the cached call returns None when the
+            # fetch failed AND no last-good copy exists, and this method's contract is to
+            # degrade to a no-op merge rather than fail -- "a Trakt outage must not cost a
+            # profile the Tautulli history it already had". Empty here means "no household
+            # layer this run", not "nobody watched anything".
+            ident, rec, ser = trakt_episode_identities(hm.get_full_watch_history_cached() or [])
+            if ser:
+                self.logger.log_info(
+                    f"[Playlists] household Trakt episode feed: {len(ser)} series, "
+                    f"{len(ident)} episode identities - applied to every profile, "
+                    f"per-series precedence to each user's own newer position.")
+            return ident, rec, ser
+        except Exception as e:
+            self.logger.log_debug(f"[Playlists] household Trakt feed unavailable: {e}")
+            return set(), {}, {}
+
+    # ── Saga progress (read-only projection) ──────────────────────────────────
+
+    def _series_stats_for_progress(self) -> tuple:
+        """``({tvdb: {title, episode_count, runtime_minutes}}, {norm_title: tvdb})``.
+
+        Read straight off the Sonarr series LIBRARY cache shards, which carry
+        ``statistics.episodeCount`` for EVERY episode that exists - owned or not. That is
+        the denominator saga progress needs: neither parquet has it (episode_files is
+        mostly pilot stubs; owned_episodes is a partial file inventory, 9 Blue Bloods rows
+        against Sonarr's 293).
+
+        The shards are first-letter keyed and include numeric and non-ASCII names, so the
+        directory is globbed rather than enumerated - verified consistent across ascii,
+        numeric and non-ASCII shards (always a list, tvdbId on 100% of rows).
+        """
+        import glob as _glob
+        import gzip as _gzip
+        import os as _os
+        from scripts.managers.machine_learning.likelihood.saga_progress import _norm as _pnorm
+
+        stats: dict = {}
+        by_title: dict = {}
+        inst = None
+        try:
+            _ef = self.registry.get("manager", "SonarrCacheEpisodeFilesManager") if self.registry else None
+            inst = _ef._resolve_instance(None) if _ef else None
+        except Exception:
+            inst = None
+        if not inst:
+            self.logger.log_debug("[SagaProgress] no Sonarr instance resolved; skipping.")
+            return stats, by_title
+        # ABSOLUTE, via the cache key_builder - the same resolution _parquet_path uses.
+        # A relative "scripts/support/cache/..." only resolves when the process CWD happens
+        # to be the repo root; it silently globbed nothing and the caller early-returned
+        # with no log at all.
+        try:
+            root = self.global_cache.key_builder.base_dir / "sonarr" / str(inst) / "library"
+        except Exception as e:
+            self.logger.log_debug(f"[SagaProgress] cache base_dir unavailable: {e}")
+            return stats, by_title
+        shards = sorted(_glob.glob(_os.path.join(str(root), "*.json.gz")))
+        if not shards:
+            self.logger.log_debug(f"[SagaProgress] no library shards under {root}")
+            return stats, by_title
+        for path in shards:
+            try:
+                with _gzip.open(path, "rt", encoding="utf-8") as f:
+                    rows = json.load(f)
+            except Exception:
+                continue
+            for r in (rows if isinstance(rows, list) else list((rows or {}).values())):
+                if not isinstance(r, dict):
+                    continue
+                tv = r.get("tvdbId")
+                try:
+                    tv = int(tv)
+                except (TypeError, ValueError):
+                    continue
+                st = r.get("statistics") or {}
+                # totalEpisodeCount, NOT episodeCount. Sonarr's ``episodeCount`` counts
+                # MONITORED episodes and tracks episodeFileCount exactly - on a pilot-only
+                # series it is 1. Aqua Teen Hunger Force reports episodeCount=1 against
+                # totalEpisodeCount=319; Powerpuff Girls 1 against 184. With ~93% of this
+                # library pilot-only, using it made the denominator 1 for nearly every
+                # show, which is the opposite of "progress through everything that exists,
+                # owned or not".
+                stats[tv] = {"title": r.get("title"),
+                             "episode_count": (st.get("totalEpisodeCount")
+                                               or st.get("episodeCount")),
+                             "runtime_minutes": r.get("runtime")}
+                t = _pnorm(r.get("title"))
+                if t:
+                    by_title.setdefault(t, tv)
+        self.logger.log_info(
+            f"[SagaProgress] series stats: {len(stats)} series from {len(shards)} shard(s).")
+        return stats, by_title
+
+    def _movie_stats_for_progress(self) -> tuple:
+        """``({tmdb: {title, runtime_minutes}}, {watched tmdb}, {(norm_title, year): tmdb})``
+        across EVERY Radarr instance.
+
+        A universe's films can live on any instance (a 4K copy on ultra, the baseline on
+        standard), so all are merged - reading one instance alone under-reports both the
+        catalogue and what has been watched.
+
+        The third map exists to resolve PER-USER film watches: Tautulli history identifies a
+        film by ratingKey and ``(title, year)`` (see ``movie_resolver.watched_movie_keys``),
+        never by tmdb, so the tmdb-keyed universe membership can only be joined through it.
+        The second (household) set stays as the fallback for a profile with no Tautulli id.
+        """
+        from scripts.managers.services.plex.playlists.movie_resolver import _norm as _mnorm
+
+        stats: dict = {}
+        watched: set = set()
+        by_title_year: dict = {}
+        by_title: dict = {}
+        try:
+            mfm = self.registry.get("manager", "RadarrCacheMovieFilesManager") if self.registry else None
+        except Exception:
+            mfm = None
+        if mfm is None or not hasattr(mfm, "load"):
+            self.logger.log_debug("[SagaProgress] no movie-files manager; films unresolved.")
+            return stats, watched, by_title_year, by_title, {}
+        # Enumerate from CONFIG, the way plan_summary._instances does. An earlier version
+        # called mfm._get_apis() - a method that exists on the *instance* managers but NOT
+        # on RadarrCacheMovieFilesManager. It raised, the except swallowed it, `instances`
+        # stayed empty, and EVERY film in EVERY universe silently read as unwatched.
+        try:
+            _cfg = (self.config or {}).get("radarr_instances", {}) or {}
+            instances = [k for k, v in _cfg.items()
+                         if k != "default_instance" and isinstance(v, dict)]
+        except Exception:
+            instances = []
+        if not instances:
+            try:
+                instances = [mfm._resolve_instance(None)]
+            except Exception:
+                instances = []
+        for inst in instances:
+            try:
+                df = mfm.load(inst)
+            except Exception:
+                continue
+            if df is None or getattr(df, "empty", True) or "tmdb_id" not in df.columns:
+                continue
+            for row in df.itertuples():
+                tm = getattr(row, "tmdb_id", None)
+                try:
+                    tm = int(tm)
+                except (TypeError, ValueError):
+                    continue
+                title = getattr(row, "title", "") or ""
+                if tm not in stats:
+                    stats[tm] = {"title": title,
+                                 "runtime_minutes": getattr(row, "runtime_minutes", None)}
+                _y = getattr(row, "year", None)
+                try:
+                    _y = int(_y)
+                except (TypeError, ValueError):
+                    _y = None
+                if title and _y is not None:
+                    by_title_year.setdefault((_mnorm(title), _y), tm)
+                if title:
+                    by_title.setdefault(_mnorm(title), tm)
+                if getattr(row, "is_watched", False) is True:
+                    watched.add(tm)
+        # ratingKey -> tmdb, inverted from the owned-movie inventory (tmdb -> ratingKey).
+        # Supplements the title match; see _watched_film_tmdbs_for for why neither alone.
+        by_rk: dict = {}
+        for _tm, _v in (self._cache_get(_MOVIE_INVENTORY_KEY, {}) or {}).items():
+            _rk = (_v or {}).get("rating_key") if isinstance(_v, dict) else None
+            if _rk is None:
+                continue
+            try:
+                _tmi = int(_tm)
+            except (TypeError, ValueError):
+                continue
+            by_rk.setdefault(str(_rk), _tmi)
+            _t = (_v or {}).get("title") if isinstance(_v, dict) else None
+            if _t:
+                by_title.setdefault(_mnorm(_t), _tmi)   # inventory titles too
+        self.logger.log_info(
+            f"[SagaProgress] film stats: {len(stats)} film(s) across "
+            f"{len(instances)} instance(s), {len(watched)} watched household-wide; "
+            f"{len(by_title)} title / {len(by_rk)} ratingKey resolver(s).")
+        return stats, watched, by_title_year, by_title, by_rk
+
+    def _saga_boost_for(self, safe_user, watched, prior_plan) -> dict:
+        """``{group_key: 0..1}`` completion boost for one profile, and persist the update.
+
+        Reads the profile's OWN universe progress from the saga-progress artifact the last
+        run published, so the boost is per-user rather than household-wide, then de-rates
+        each group by its skip history.
+
+        Keyed by the ordering's ``group_key``, which for a franchise group IS the universe
+        key - so a saga's completion lifts every member series in it. A series-keyed group
+        gets its own show's progress where that show belongs to a tracked universe.
+
+        Returns ``{}`` on any miss, which makes ordering byte-identical.
+        """
+        try:
+            from scripts.managers.machine_learning.playlists.engagement import (
+                saga_boost, update_engagement,
+            )
+        except Exception as e:
+            self.logger.log_debug(f"[Engagement] module unavailable: {e}")
+            return {}
+        try:
+            key = f"{_ENGAGEMENT_KEY}/{safe_user}"
+            state, st = update_engagement(
+                self._cache_get(key, None), prior_plan, watched,
+                now=datetime.now(tz=timezone.utc).isoformat())
+            if self.global_cache:
+                self.global_cache.set(key, state)
+            if st["surfaced"]:
+                self.logger.log_debug(
+                    f"[Engagement] {safe_user}: {st['surfaced']} group(s) surfaced last run — "
+                    f"{st['engaged']} engaged, {st['skipped']} skipped, {st['dormant']} dormant "
+                    f"(activity {st['activity']}, window_due={st['window_due']}).")
+            prog = ((self._cache_get(_SAGA_PROGRESS_KEY, {}) or {}).get("users") or {})
+            mine = (prog.get(safe_user) or {}).get("universes") or []
+            out: dict = {}
+            for u in mine:
+                b = saga_boost(u.get("pct"), state, u.get("universe"))
+                if b > 0:
+                    out[u.get("universe")] = b
+                    # A franchise group is keyed by the universe; its member SERIES groups
+                    # inherit the same boost so a saga lifts coherently rather than only
+                    # when the ordering happened to group it as a franchise.
+                    for s in (u.get("series") or []):
+                        out.setdefault(str(s.get("tvdb")), b)
+            return out
+        except Exception as e:
+            self.logger.log_warning(f"[Engagement] skipped: {type(e).__name__}: {e}")
+            return {}
+
+    def _refresh_rk_crosswalk(self, tracked, by_title=None) -> dict:
+        """Merge today's resolvable ratingKeys into the durable crosswalk and persist it.
+
+        Runs off the two owned inventories, which are rebuilt each run, so the crosswalk
+        tracks Plex without a single extra API call. On the FIRST build it is additionally
+        seeded from each tracked profile's history via ``by_title``: a live inventory can
+        only teach it keys Plex still issues, and 84% of this household's movie plays were
+        already pointing at retired ones.
+
+        Returns the crosswalk; ``{}`` on any failure, which leaves every caller on its
+        existing title fallback rather than losing a resolver.
+        """
+        try:
+            from scripts.support.utilities.rating_key_crosswalk import (
+                build_crosswalk, movie_rk_map, seed_from_history,
+            )
+            from scripts.managers.services.plex.playlists.movie_resolver import _norm as _mnorm
+        except Exception as e:
+            self.logger.log_debug(f"[Crosswalk] module unavailable: {e}")
+            return {}
+        try:
+            prior = self._cache_get(_RK_CROSSWALK_KEY, None)
+            first_build = not prior
+            now = datetime.now(tz=timezone.utc).isoformat()
+            cw, stats = build_crosswalk(
+                prior,
+                movie_inventory=self._cache_get(_MOVIE_INVENTORY_KEY, {}) or {},
+                episode_inventory=self._cache_get(_INVENTORY_KEY, {}) or {},
+                now=now,
+            )
+            seeded = 0
+            if first_build and by_title:
+                # ONE-TIME bootstrap. Title matching is used here to capture mappings for
+                # keys that churned before this existed; afterwards the mapping is permanent
+                # and no longer depends on Plex and *arr agreeing on a title.
+                for u in (tracked or []):
+                    uid = u.get("tautulli_user_id")
+                    if uid is None:
+                        continue
+                    try:
+                        hm = self.registry.get("manager", "TautulliWatchHistoryManager")
+                        if hm is None:
+                            taut = self.registry.get("manager", "TautulliManager")
+                            hm = getattr(taut, "watch_history", None) if taut else None
+                        if not hm or not hasattr(hm, "get_all_history_cached"):
+                            continue
+                        seeded += seed_from_history(
+                            cw, hm.get_all_history_cached(uid) or [], by_title,
+                            now=now, norm=_mnorm)["seeded"]
+                    except Exception:
+                        continue
+            if self.global_cache:
+                self.global_cache.set(_RK_CROSSWALK_KEY, cw)
+            # Plain concatenation, not a nested f-string: same-quote nesting only parses
+            # on 3.12+ (PEP 701) and this should not carry a version floor for a log line.
+            _extra = ""
+            if seeded:
+                _extra += f", +{seeded} seeded from history"
+            _recycled = stats["movies_conflict"] + stats["shows_conflict"]
+            if _recycled:
+                _extra += f", {_recycled} recycled key(s)"
+            self.logger.log_info(
+                f"[Crosswalk] ratingKey map: {stats['movies_total']} film(s) / "
+                f"{stats['shows_total']} show(s) (+{stats['movies_new']} film / "
+                f"+{stats['shows_new']} show new{_extra}).")
+            return cw
+        except Exception as e:
+            self.logger.log_warning(f"[Crosswalk] refresh failed: {type(e).__name__}: {e}")
+            return {}
+
+    def _watched_film_tmdbs_for(self, user_id, by_title_year, by_title=None, by_rk=None) -> set:
+        """``{tmdb}`` a single user has FINISHED, from their own Tautulli history.
+
+        Three resolvers, because no single identity survives on its own:
+
+        * **TITLE** — the workhorse. Tautulli history movie rows carry NO ``year`` field at
+          all (0 of 282 on a real profile), so ``watched_movie_keys``' ``(title, year)``
+          identity is NEVER produced for films and matching only on it resolved nothing for
+          every user — which silently pushed all five onto the household fallback and made
+          the progress table show everyone in the same place.
+        * **ratingKey** — exact when fresh, but Plex re-scans churn it: only 19 of 178
+          finished plays still resolved this way on a real profile, against 46 by title.
+          Kept as a supplement since it catches titles that differ between Plex and Radarr.
+        * **(title, year)** — retained for any source that does supply a year.
+
+        Empty set on any miss; the caller then falls back to the household set.
+        """
+        if user_id is None or not self.registry:
+            return set()
+        try:
+            from scripts.managers.services.plex.playlists.movie_resolver import (
+                _norm as _mnorm, watched_movie_keys,
+            )
+            hm = self.registry.get("manager", "TautulliWatchHistoryManager")
+            if hm is None:
+                taut = self.registry.get("manager", "TautulliManager")
+                hm = getattr(taut, "watch_history", None) if taut else None
+            if not hm or not hasattr(hm, "get_all_history_cached"):
+                return set()
+            hist = hm.get_all_history_cached(user_id) or []
+            keys = watched_movie_keys(hist) or set()
+        except Exception:
+            return set()
+        out: set = set()
+        for k in keys:
+            if isinstance(k, tuple) and len(k) == 2:
+                tm = (by_title_year or {}).get(k)
+                if tm is not None:
+                    out.add(tm)
+            elif isinstance(k, str) and by_rk:
+                tm = by_rk.get(k)
+                if tm is not None:
+                    out.add(tm)
+        # Title pass, over the SAME finished rows watched_movie_keys admits.
+        if by_title:
+            try:
+                _pct = 85.0
+                for row in hist:
+                    if not isinstance(row, dict):
+                        continue
+                    if str(row.get("media_type", "")).lower() != "movie":
+                        continue
+                    try:
+                        if float(row.get("percent_complete") or 0) < _pct:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                    tm = by_title.get(_mnorm(row.get("title")))
+                    if tm is not None:
+                        out.add(tm)
+            except Exception:
+                pass
+        return out
+
+    def _emit_saga_progress(self, tracked, watched_by_user, recency_by_user) -> None:
+        """Build, persist and log the per-user universe progress artifact.
+
+        Persisted under ONE stable key so a future web layer can render it without
+        re-deriving anything - every value is a plain scalar or list.
+        """
+        from scripts.managers.machine_learning.likelihood.saga_progress import (
+            build_progress_artifact,
+        )
+        from scripts.managers.services.plex.playlists.universe_order import saga_display_name
+        series_stats, title_to_tvdb = self._series_stats_for_progress()
+        if not series_stats:
+            self.logger.log_warning(
+                "[SagaProgress] no series stats - skipping universe progress.")
+            return
+        movie_stats, household_films, by_title_year, by_title, by_rk = \
+            self._movie_stats_for_progress()
+        # Durable ratingKey map, refreshed and persisted before the per-user resolve so
+        # this run already benefits. It SUPERSETS the live inventory map built above:
+        # every key valid today, plus every key ever seen valid on a previous run.
+        try:
+            from scripts.support.utilities.rating_key_crosswalk import movie_rk_map
+            _cw = self._refresh_rk_crosswalk(tracked, by_title=by_title)
+            _cw_rk = movie_rk_map(_cw) if _cw else {}
+            if _cw_rk:
+                _cw_rk.update(by_rk)      # a live key wins on any disagreement
+                by_rk = _cw_rk
+        except Exception as e:
+            self.logger.log_debug(f"[Crosswalk] not applied to film resolve: {e}")
+        universes = (self._cache_get(_UNIVERSE_SRC_KEY, {}) or {}).get("universes") or {}
+        if not universes:
+            self.logger.log_warning(
+                "[SagaProgress] universe source cache is empty - skipping.")
+            return
+        names = [u["safe_user"] for u in (tracked or [])]
+        # PER-USER film sets. A profile Tautulli can identify gets its own; one it cannot
+        # (no tautulli_user_id, or no movie history yet) falls back to the HOUSEHOLD set,
+        # which over-reports that individual but never under-reports the remainder.
+        films_by_user: dict = {}
+        _own = 0
+        for u in (tracked or []):
+            mine = self._watched_film_tmdbs_for(u.get("tautulli_user_id"), by_title_year,
+                                                by_title, by_rk)
+            if mine:
+                _own += 1
+            films_by_user[u["safe_user"]] = mine or household_films
+        self.logger.log_debug(
+            f"[SagaProgress] film watch-sets: {_own}/{len(names)} profile(s) resolved "
+            f"per-user, remainder on the household set of {len(household_films)}.")
+        art = build_progress_artifact(
+            names, universes, series_stats,
+            watched_by_user=watched_by_user,
+            recency_by_user=recency_by_user,
+            title_to_tvdb=title_to_tvdb,
+            movie_stats=movie_stats,
+            watched_tmdbs_by_user=films_by_user,
+            # The project's OWN key->name map: 'star' -> "Star Wars Universe", not the
+            # entry's chronologically-first member ("The Acolyte").
+            canonical_name=saga_display_name,
+            generated_at=datetime.now(tz=timezone.utc).isoformat(),
+        )
+        if self.global_cache:
+            self.global_cache.set(_SAGA_PROGRESS_KEY, art)
+        self._log_saga_progress(art, tracked)
+
+    def _log_saga_progress(self, art, tracked, *, top=12, min_items=10) -> None:
+        """Universe ledger: one parent row per universe, one indented row per user.
+
+        Same shape as the space plan ledger - NBSP indents and an ASCII marker, because
+        ordinary spaces are collapsed by _strip_decor and a unicode arrow is dropped by the
+        cp1252 encoder AFTER the column width is measured, which leaves child rows short.
+        """
+        users = (art or {}).get("users") or {}
+        if not users:
+            return
+        label = {u["safe_user"]: (u.get("title") or u["safe_user"]) for u in (tracked or [])}
+        _L1 = "\u00a0\u00a0> "
+
+        def _eta(days, rate):
+            """Readable finish estimate. Past ~2 years the number is arithmetically correct
+            and practically meaningless - 13028d is 36 years - so it collapses rather than
+            implying a precision the trailing 90-day rate cannot support."""
+            if days is None:
+                return "no rate"
+            if days > 3650:
+                return f"10y+ @ {rate:g}/d"
+            if days > 730:
+                return f"{days / 365.0:.1f}y @ {rate:g}/d"
+            return f"{days:.0f}d @ {rate:g}/d"
+        # Universe totals are user-independent, but WHICH universes to show is not.
+        # Ranking purely by size surfaced the twelve biggest - all of them untouched -
+        # and pushed every universe anyone was actually part-way through off the table.
+        # So: STARTED universes first (by best progress across the household), then the
+        # unstarted by how much is left. A progress report should lead with progress.
+        totals: dict = {}
+        best_pct: dict = {}
+        for _n, blob in users.items():
+            for u in blob.get("universes") or []:
+                totals.setdefault(u["universe"], u)
+                _k = u["universe"]
+                if u["pct"] > best_pct.get(_k, 0.0):
+                    best_pct[_k] = u["pct"]
+        ranked = [u for u in totals.values() if u["items_total"] >= min_items]
+        ranked.sort(key=lambda u: (-(best_pct.get(u["universe"], 0.0) > 0),
+                                   -best_pct.get(u["universe"], 0.0),
+                                   -u["items_remaining"]))
+        rows = []
+        for uni in ranked[:top]:
+            key = uni["universe"]
+            # Parent row carries the universe TOTAL under its own header; the user rows
+            # below carry what each has actually watched. An earlier version put the total
+            # in the "watched" column, which read as though the household had seen all 953
+            # Star Trek episodes.
+            rows.append([uni["display"][:26],
+                         f"{uni['shows_in_universe']}sh/{uni['movies_in_universe']}mv",
+                         f"{uni['items_total']}", "", "", ""])
+            for name, blob in sorted(users.items()):
+                mine = next((x for x in (blob.get("universes") or [])
+                             if x["universe"] == key), None)
+                if mine is None:
+                    continue
+                rate = (blob.get("rate") or {}).get("episodes_per_day") or 0
+                rows.append([f"{_L1}{label.get(name, name)[:20]}", "",
+                             f"{mine['items_watched']}",
+                             f"{mine['pct']:.1f}%",
+                             f"{mine['remaining_hours']:.0f}h",
+                             _eta(mine["eta_days"], rate)])
+        if not rows:
+            return
+        try:
+            self.logger.log_grid(
+                ["universe / user", "members", "items / watched", "pct", "left", "finish in"],
+                rows, title="Universe progress - per user", cap=28)
+        except Exception as e:
+            self.logger.log_debug(f"[SagaProgress] ledger skipped: {e}")
+
+    def _resume_cfg(self):
+        """(enabled, order, weight) from plex.playlists.resume_boost - lift an IN-PROGRESS
+        series toward the front. Mirrors ``movie_builder._resume_cfg`` exactly so a saga and
+        a show rank on the same axis. order in {recency (default), progress}; weight in [0,1]
+        (default 0.35 = moderate: an in-progress show wins ties and gaps up to the weight, a
+        clearly-higher-affinity standalone still overtakes). OFF -> byte-identical."""
+        rc = self._pl_cfg().get("resume_boost", {}) or {}
+        order = str(rc.get("order", "recency")).strip().lower()
+        try:
+            weight = min(1.0, max(0.0, float(rc.get("weight", 0.35))))
+        except (TypeError, ValueError):
+            weight = 0.35
+        return (bool(rc.get("enabled", False)),
+                (order if order in ("recency", "progress") else "recency"), weight)
 
     def _watched_episode_recency_for(self, user_id) -> dict:
         """{episode-identity: latest unix watch ts} for this user — tv_inputs aggregates it per

@@ -567,6 +567,7 @@ def enrich_pool(
     dry_run: bool,
     label_map: dict | None = None,
     show_items: bool = False,
+    fetch_map: dict | None = None,
 ) -> tuple[int, int, int, bool]:
     """Walk one pool from its cursor, fetching every bucket in *scope* per item
     until *budget* endpoint-calls are spent (cached buckets cost 0). The cursor
@@ -576,9 +577,22 @@ def enrich_pool(
     When *show_items* is set, logs one line per item naming the title and which
     data buckets were grabbed (interactive visibility).
 
+    ``fetch_map`` maps the pool's item id (tmdbId / tvdbId — which is what the BUCKET
+    is keyed by) to the id used in the Trakt URL. These differ and MUST be kept apart:
+    Trakt's ``movies/{id}`` and ``shows/{id}`` paths resolve a Trakt id, slug or IMDB
+    id — NOT a TMDB/TVDB id. Passing an external id there silently resolves whatever
+    Trakt record happens to carry that number: ``movies/1271`` (300's tmdbId) returned
+    Trakt movie 1271, an unrelated film, while 300's real Trakt id is 884. Everything
+    cached before this parameter existed was subject to that collision.
+
+    An item with no entry in *fetch_map* is SKIPPED rather than fetched by its external
+    id — a missing mapping means "we can't address this title unambiguously", and a
+    wrong blob is worse than an absent one.
+
     Returns (calls_used, items_completed, buckets_skipped_cached, stop_requested).
     """
     label_map = label_map or {}
+    fetch_map = fetch_map or {}
     sorted_ids = sorted(set(item_ids))
     if not sorted_ids:
         return 0, 0, 0, False
@@ -590,7 +604,7 @@ def enrich_pool(
         last_id = -1
         log.info(f"  [{kind}:{cursor_key}] cursor cycled - restarting from beginning")
 
-    calls = skipped = completed = 0
+    calls = skipped = completed = unaddressable = 0
     last_complete = last_id
     stop = False
     i = start
@@ -601,6 +615,16 @@ def enrich_pool(
             stop = True
             break
         item_id = sorted_ids[i]
+        fetch_id = fetch_map.get(item_id)
+        if fetch_id is None:
+            # No unambiguous Trakt-addressable id for this title. Advance past it rather
+            # than fall back to the external id, which is exactly how the cache was
+            # poisoned in the first place. Radarr/Sonarr carry imdbId for ~98%/96% of
+            # titles, so this strands a small tail rather than a meaningful share.
+            unaddressable += 1
+            last_complete = item_id
+            i += 1
+            continue
         item_complete = True
         grabbed: list[str] = []        # buckets fetched (or, in dry_run, would-fetch) for this item
         for bucket in scope:
@@ -619,7 +643,7 @@ def enrich_pool(
                 calls += 1            # simulate the call without writing
                 grabbed.append(bucket)
                 continue
-            raw = trakt.get(ep.format(id=item_id))
+            raw = trakt.get(ep.format(id=fetch_id))
             calls += 1
             if trakt.rate_limited:
                 # Trakt is rate-limiting us: stop spending calls so the inter-cycle
@@ -657,6 +681,8 @@ def enrich_pool(
         else:
             break                      # resume at this item next cycle
 
+    if unaddressable:
+        log.debug(f"  [{kind}:{cursor_key}] {unaddressable:,} item(s) skipped — no imdb/trakt id")
     cursor[cursor_key] = {
         "last_tmdb_id": last_complete,
         "position":     i,
@@ -729,6 +755,141 @@ def watched_show_tvdb_ids(series: list[dict]) -> set[int]:
         for s in series if s.get("tvdbId") and s.get("title")
     }
     return {title_to_tvdb[t] for t in watched_titles if t in title_to_tvdb}
+
+
+# ── Watchlist tier ───────────────────────────────────────────────────────────────
+_PLEX_CACHE = CACHE_TRAKT.parent / "plex"
+
+
+def _trakt_addressable_id(ids: dict):
+    """The id to put in a Trakt URL, from any payload carrying an ``ids`` block.
+
+    Trakt paths take a Trakt id, a Trakt slug or an IMDB id — NOT a tmdb/tvdb id. Trakt's
+    own id is preferred where the payload has one (it is what the API is keyed on);
+    IMDB is the portable fallback that Plex and the *arrs both supply. Returns None when
+    neither exists, which callers must treat as "do not fetch" rather than falling back
+    to the external id — see enrich_pool's fetch_map.
+    """
+    ids = ids or {}
+    trakt = ids.get("trakt")
+    if isinstance(trakt, int) or (isinstance(trakt, str) and trakt.isdigit()):
+        return int(trakt)
+    imdb = ids.get("imdb")
+    return imdb if isinstance(imdb, str) and imdb.startswith("tt") else None
+
+
+def watchlist_index() -> tuple[dict[int, tuple], dict[int, tuple]]:
+    """({movie tmdbId: (label, fetch_id)}, {show tvdbId: (label, fetch_id)}) across EVERY
+    watchlist the household keeps — every Trakt account cached under
+    ``cache/trakt/<user>/watchlist/`` and every Plex managed user under
+    ``cache/plex/users/<user>/watchlist.json``.
+
+    The key stays the EXTERNAL id because that is what the daemon's cache buckets are
+    named after; ``fetch_id`` is the Trakt-addressable id the URL needs. Keeping both is
+    the whole point — conflating them is what filed Beverly Hills Cop's cast under 8 Mile.
+
+    WHY this tier exists. Every other pool in this daemon is derived from the Radarr /
+    Sonarr libraries, so the people-matrix only ever covered titles the household already
+    OWNS — which is exactly the set ``AcquisitionScorer`` discards as "already in library".
+    The ``people_affinity`` signal could therefore never fire for a single acquisition
+    candidate: measured on a live run, 0 of 237 resolved candidates carried it, while 359
+    of 663 watchlisted movies (the owned ones) were in the matrix. Enriching watchlists is
+    what makes the cast/crew signal reachable for the titles it was built to rank.
+
+    Ids are taken per ``type`` — movies by tmdbId, shows by tvdbId — matching the Radarr /
+    Sonarr keys the rest of the daemon pools on. Plex rows carry BOTH ids regardless of
+    medium, so keying off ``type`` rather than "whichever id is present" matters here.
+
+    Best-effort per file: an unreadable, absent or empty watchlist contributes nothing
+    rather than failing the cycle. Returning labels (not bare ids) means ``--show-items``
+    can name watchlist titles, which the library label maps can't cover.
+    """
+    movies: dict[int, tuple] = {}
+    shows: dict[int, tuple] = {}
+
+    def _load(path: Path) -> list:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return []
+        if isinstance(data, dict):
+            data = data.get("value", [])
+        return data if isinstance(data, list) else []
+
+    def _add(kind: str, inner: dict) -> None:
+        key = "tmdb" if kind == "movie" else "tvdb"
+        ids = inner.get("ids") or {}
+        try:
+            ext = int(ids.get(key))
+        except (TypeError, ValueError):
+            return
+        title = inner.get("title") or "?"
+        year = inner.get("year")
+        label = f"{title} ({year})" if year else title
+        (movies if kind == "movie" else shows).setdefault(
+            ext, (label, _trakt_addressable_id(ids)))
+
+    # Trakt — one directory per account; the title nests under a "movie"/"show" key.
+    for wl in CACHE_TRAKT.glob("*/watchlist/*.json"):
+        for row in _load(wl):
+            if not isinstance(row, dict):
+                continue
+            inner = row.get("movie") or row.get("show")
+            kind = "movie" if "movie" in row else ("show" if "show" in row else None)
+            if kind and isinstance(inner, dict):
+                _add(kind, inner)
+
+    # Plex — one file per managed user; rows are flat with an explicit "type".
+    for wl in (_PLEX_CACHE / "users").glob("*/watchlist.json"):
+        for row in _load(wl):
+            if isinstance(row, dict) and row.get("type") in ("movie", "show"):
+                _add(row["type"], row)
+
+    return movies, shows
+
+
+def recommendation_index() -> tuple[dict[int, tuple], dict[int, tuple]]:
+    """({movie tmdbId: (label, fetch_id)}, {show tvdbId: (label, fetch_id)}) from every
+    account's cached Trakt recommendations —
+    ``cache/trakt/<user>/recommendations/{movies,shows}.json``.
+
+    Rides along in the watchlist tier rather than getting its own pool: the feed is capped
+    by ``CandidateGatherer.limit`` and holds ~10 titles per medium, which does not justify
+    a second cursor. It is worth enriching at all because a recommendation arrives as
+    Trakt's opinion; credits are what let Glidearr form its own — scoring it on household
+    cast/crew overlap instead of taking the suggestion on trust.
+
+    Unlike the watchlist payloads these rows are FLAT (no ``movie``/``show`` wrapper), so
+    the medium comes from the filename.
+    """
+    movies: dict[int, tuple] = {}
+    shows: dict[int, tuple] = {}
+    for rec in CACHE_TRAKT.glob("*/recommendations/*.json"):
+        stem = rec.stem.lower()
+        if stem not in ("movies", "shows"):
+            continue
+        key, sink = ("tmdb", movies) if stem == "movies" else ("tvdb", shows)
+        try:
+            with open(rec, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            data = data.get("value", [])
+        for row in data if isinstance(data, list) else []:
+            if not isinstance(row, dict):
+                continue
+            inner = row.get("movie") or row.get("show") or row      # tolerate either shape
+            ids = (inner.get("ids") or {}) if isinstance(inner, dict) else {}
+            try:
+                ext = int(ids.get(key))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            title, year = inner.get("title") or "?", inner.get("year")
+            label = f"{title} ({year})" if year else title
+            sink.setdefault(ext, (label, _trakt_addressable_id(ids)))
+    return movies, shows
 
 
 # ── Common Sense Media age enrichment (MDBList) ──────────────────────────────────
@@ -930,8 +1091,11 @@ def run_cycle(cfg: dict, loader: ConfigLoader, cursor: dict, dry_run: bool,
     scope       = [s for s in (enrich_cfg.get("scope") or DEFAULT_SCOPE) if s in MOVIE_BUCKETS]
     if not scope:
         scope = list(DEFAULT_SCOPE)
-    owned_first   = bool(enrich_cfg.get("owned_first", True))
-    watched_first = bool(enrich_cfg.get("watched_first", True))
+    owned_first     = bool(enrich_cfg.get("owned_first", True))
+    watched_first   = bool(enrich_cfg.get("watched_first", True))
+    # Watchlist items are the ONLY pool that is not derived from the *arr libraries, and
+    # the only one the acquisition scorer can actually use — see watchlist_index().
+    watchlist_first = bool(enrich_cfg.get("watchlist_first", True))
 
     trakt = TraktClient(cfg, loader)
     if not trakt.client_id:
@@ -958,6 +1122,15 @@ def run_cycle(cfg: dict, loader: ConfigLoader, cursor: dict, dry_run: bool,
     }
     show_labels = {int(s["tvdbId"]): s.get("title", "?") for s in series if s.get("tvdbId")}
 
+    # tmdbId/tvdbId -> the id Trakt's URLs actually resolve. The *arrs already carry an
+    # imdbId (~98.5% of Radarr movies, ~96% of Sonarr series), so no lookup call is
+    # needed — the correct identifier was in the same payload the pools are built from.
+    # Titles without one are left out and enrich_pool skips them; see its fetch_map note.
+    movie_fetch = {int(m["tmdbId"]): m["imdbId"] for m in movies
+                   if m.get("tmdbId") and m.get("imdbId")}
+    show_fetch = {int(s["tvdbId"]): s["imdbId"] for s in series
+                  if s.get("tvdbId") and s.get("imdbId")}
+
     # ── Watched tier: Tautulli-watched items get enriched FIRST ──────────────────
     # Only library items are enrichable, so intersect the watched sets with the ids
     # we actually have, then REMOVE them from the owned/unowned pools so each id
@@ -980,11 +1153,55 @@ def run_cycle(cfg: dict, loader: ConfigLoader, cursor: dict, dry_run: bool,
         owned_show_ids    = [i for i in owned_show_ids    if i not in ws]
         unowned_show_ids  = [i for i in unowned_show_ids  if i not in ws]
 
+    # ── Watchlist tier: everything the household explicitly asked for ────────────
+    # NOT gated on library membership, unlike every pool above — an unowned watchlist
+    # title is precisely the one the acquisition scorer needs credits for. Ids are
+    # removed from the library pools so each id still lives in exactly ONE pool (the
+    # cursor invariant enrich_pool depends on); watched keeps priority over watchlist
+    # because the watched set is what DEFINES the household affinity the scorer
+    # measures candidates against.
+    watchlist_movie_ids: list[int] = []
+    watchlist_show_ids:  list[int] = []
+    if watchlist_first:
+        wl_movies, wl_shows = watchlist_index()
+        # Trakt's own suggestions ride in this pool too (~10 per medium — too few to be
+        # worth a second cursor). Watchlist labels win the setdefault on overlap.
+        rec_movies, rec_shows = recommendation_index()
+        for ext, rec in rec_movies.items():
+            wl_movies.setdefault(ext, rec)
+        for ext, rec in rec_shows.items():
+            wl_shows.setdefault(ext, rec)
+        # Name watchlist titles in --show-items logging; library labels win on conflict.
+        # Their fetch ids, though, are BETTER than the *arrs' — Trakt payloads carry
+        # Trakt's own id — so those overwrite rather than setdefault.
+        for ext, (label, fetch) in wl_movies.items():
+            movie_labels.setdefault(ext, label)
+            if fetch is not None:
+                movie_fetch[ext] = fetch
+        for ext, (label, fetch) in wl_shows.items():
+            show_labels.setdefault(ext, label)
+            if fetch is not None:
+                show_fetch[ext] = fetch
+        wlm = set(wl_movies) - set(watched_movie_ids)
+        wls = set(wl_shows) - set(watched_show_ids)
+        watchlist_movie_ids = sorted(wlm)
+        watchlist_show_ids  = sorted(wls)
+        owned_movie_ids   = [i for i in owned_movie_ids   if i not in wlm]
+        unowned_movie_ids = [i for i in unowned_movie_ids if i not in wlm]
+        owned_show_ids    = [i for i in owned_show_ids    if i not in wls]
+        unowned_show_ids  = [i for i in unowned_show_ids  if i not in wls]
+
     log.info(f"Library: watched movies={len(watched_movie_ids):,} shows={len(watched_show_ids):,} | "
+             f"watchlist movies={len(watchlist_movie_ids):,} shows={len(watchlist_show_ids):,} | "
              f"owned movies={len(owned_movie_ids):,} shows={len(owned_show_ids):,} | "
              f"unowned movies={len(unowned_movie_ids):,} shows={len(unowned_show_ids):,} | "
-             f"scope={scope} watched_first={watched_first} owned_first={owned_first}")
+             f"scope={scope} watched_first={watched_first} watchlist_first={watchlist_first} "
+             f"owned_first={owned_first}")
 
+    watchlist_pools = [
+        ("movies_watchlist", watchlist_movie_ids, "movie", scope, MOVIE_BUCKETS, MOVIE_ENDPOINTS),
+        ("shows_watchlist",  watchlist_show_ids,  "show",  SHOW_SCOPE, SHOW_BUCKETS, SHOW_ENDPOINTS),
+    ]
     watched_pools = [
         ("movies_watched", watched_movie_ids, "movie", scope, MOVIE_BUCKETS, MOVIE_ENDPOINTS),
         ("shows_watched",  watched_show_ids,  "show",  SHOW_SCOPE, SHOW_BUCKETS, SHOW_ENDPOINTS),
@@ -997,13 +1214,20 @@ def run_cycle(cfg: dict, loader: ConfigLoader, cursor: dict, dry_run: bool,
         ("movies_unowned", unowned_movie_ids, "movie", scope, MOVIE_BUCKETS, MOVIE_ENDPOINTS),
         ("shows_unowned",  unowned_show_ids,  "show",  SHOW_SCOPE, SHOW_BUCKETS, SHOW_ENDPOINTS),
     ]
-    # Priority tiers, fully worked top-down: watched (if enabled) → owned → unowned
+    # Priority tiers, fully worked top-down: watched → watchlist → owned → unowned
     # (owned_first preserved). WITHIN a tier the movie and show pools round-robin so
     # both make progress every cycle.
+    #
+    # Watchlist sits above the library tiers deliberately: an un-enriched watchlist means
+    # the acquisition scorer cannot rank ANY candidate on cast/crew, whereas an
+    # un-enriched library title only delays a signal for something already on disk.
     tiers = [owned_pools, unowned_pools] if owned_first else [unowned_pools, owned_pools]
+    if watchlist_first:
+        tiers = [watchlist_pools] + tiers
     if watched_first:
         tiers = [watched_pools] + tiers
-    pool_sizes = {p[0]: len(set(p[1])) for p in (watched_pools + owned_pools + unowned_pools)}
+    pool_sizes = {p[0]: len(set(p[1]))
+                  for p in (watched_pools + watchlist_pools + owned_pools + unowned_pools)}
 
     stats: dict = {}
     spent = 0
@@ -1026,9 +1250,11 @@ def run_cycle(cfg: dict, loader: ConfigLoader, cursor: dict, dry_run: bool,
                     break
                 slice_budget = min(INTERLEAVE_SLICE_CALLS, remaining)
                 labels = movie_labels if kind == "movie" else show_labels
+                fetches = movie_fetch if kind == "movie" else show_fetch
                 calls, completed, cached, pstop = enrich_pool(
                     trakt, ids, kind, pscope, buckets, endpoints, cursor_key, cursor,
                     slice_budget, dry_run, label_map=labels, show_items=show_items,
+                    fetch_map=fetches,
                 )
                 spent += calls
                 agg = stats.setdefault(cursor_key, {"calls": 0, "completed": 0, "cached": 0})
@@ -1077,16 +1303,21 @@ def run_cycle(cfg: dict, loader: ConfigLoader, cursor: dict, dry_run: bool,
 
 # ── Status report (read-only) ──────────────────────────────────────────────────
 
-# Friendly pool labels + the order they're worked (owned tier before unowned).
+# Friendly pool labels + the order they're worked: watched → watchlist → owned → unowned.
+# Both structures are hand-maintained, so a pool added to run_cycle but NOT added here is
+# invisible to --status rather than mislabelled — keep them in sync with the tier list.
 _POOL_LABELS = {
-    "movies_watched": "movies (watched)",
-    "shows_watched":  "shows (watched)",
-    "movies_owned":   "movies (owned)",
-    "shows_owned":    "shows (owned)",
-    "movies_unowned": "movies (unowned)",
-    "shows_unowned":  "shows (unowned)",
+    "movies_watched":   "movies (watched)",
+    "shows_watched":    "shows (watched)",
+    "movies_watchlist": "movies (watchlist)",
+    "shows_watchlist":  "shows (watchlist)",
+    "movies_owned":     "movies (owned)",
+    "shows_owned":      "shows (owned)",
+    "movies_unowned":   "movies (unowned)",
+    "shows_unowned":    "shows (unowned)",
 }
 _POOL_ORDER = ["movies_watched", "shows_watched",
+               "movies_watchlist", "shows_watchlist",
                "movies_owned", "shows_owned", "movies_unowned", "shows_unowned"]
 
 

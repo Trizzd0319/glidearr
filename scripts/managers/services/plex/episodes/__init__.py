@@ -176,6 +176,17 @@ class PlexEpisodesManager(BaseManager):
             "grandparent_rating_key": item.get("grandparentRatingKey"),
         }
 
+    # NO duration HERE. Plex reports ``duration`` on /library/metadata/{rk} but NOT on
+    # the /library/sections/{key}/all listing this scan pages through, so the field was
+    # None for all 14,574 episodes - a column that existed and always lied. It was added
+    # for a runtime-based "Tonight" shelf that has since been replaced by the weekday-habit
+    # model in machine_learning/playlists/habits.py, which needs no runtime at all.
+    #
+    # If a future consumer DOES need runtime, fetch it for the handful of candidates via
+    # a batched /library/metadata/{rk,rk,...} call (the pattern smart_shelves._sections_for
+    # already uses) rather than re-adding a field here - filling it for the whole library
+    # would cost ~292 calls per scan to answer a question about ten items.
+
     @staticmethod
     def _resolve_tvdb(meta, p):
         if not meta:

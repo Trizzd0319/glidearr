@@ -9,6 +9,10 @@ The service resolves the two inputs it owns (the pilot file-id set via
 
 Public API:
   * build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> frozenset
+  * build_protected_file_reasons(df, now, pilot_file_ids, *, recent_air_days)
+      -> dict[str, frozenset]   (GLD-ACQ-22: per-guard breakdown; the flat set above is
+      the union of these values, derived from the SAME masks so attribution can never
+      disagree with the guard)
   * build_pilot_file_ids(df) -> frozenset   (parquet-backed: real + de-facto pilots)
 """
 from __future__ import annotations
@@ -20,7 +24,22 @@ from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_P
 
 def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "frozenset":
     """Return the frozenset of ``episode_file_id`` values that must NEVER be deleted
-    because ANY episode row backed by that file hits a protective guard.
+    because ANY episode row backed by that file hits a protective guard. Thin union over
+    :func:`build_protected_file_reasons` — ONE mask source (GLD-ACQ-22), so the flat set
+    and the per-guard attribution cannot disagree."""
+    reasons = build_protected_file_reasons(
+        df, now, pilot_file_ids, recent_air_days=recent_air_days)
+    return frozenset().union(*reasons.values()) if reasons else frozenset()
+
+
+def build_protected_file_reasons(
+    df, now, pilot_file_ids, *, recent_air_days
+) -> "dict[str, frozenset]":
+    """GLD-ACQ-22 — ``{guard_name: frozenset(episode_file_id)}`` for every protective
+    guard, from the same masks the flat set unions. Guard names: ``pilot``,
+    ``keep_series``, ``keep_season``, ``recent_air``, ``household``, ``retention``,
+    ``watchlist``, ``universe``. A fid may appear under several guards (overlap is
+    real and reported as-is); absent columns simply yield empty sets.
 
     Whole-file protection: a single physical Sonarr file can back several episode
     rows (multi-episode files share one ``episodeFileId``). The per-row delete
@@ -36,7 +55,9 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
                       ``keep_season`` series.
       * recent-air  — file ids on rows that aired within ``recent_air_days``.
       * household   — file ids on rows where ``all_household_watched`` is present
-                      AND falsy (a household member still hasn't watched).
+                      AND falsy AND an active watcher is still approaching the
+                      episode (row ``retention_hold``; GLD-ACQ-18 — active
+                      watchers only, decision 2026-08-06).
       * retention   — file ids on rows inside SOME viewer's retention interval
                       (``retention_hold``; see lifecycle.viewer_retention). This is
                       the whole-file half of the per-viewer rule: a multi-episode
@@ -51,25 +72,28 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
                       DELETION just as ``plan_series_downgrades`` makes it resist a step-down;
                       byte-identical when the column is absent / cold, i.e. 0.0 < the floor).
     """
+    reasons: "dict[str, set]" = {
+        "pilot": set(), "keep_series": set(), "keep_season": set(),
+        "recent_air": set(), "household": set(), "retention": set(),
+        "watchlist": set(), "universe": set(),
+    }
     if "episode_file_id" not in df.columns:
-        return frozenset()
+        return {k: frozenset(v) for k, v in reasons.items()}
 
-    protected: set = set()
-
-    def _add_fids(mask: "pd.Series | None") -> None:
+    def _add_fids(name: str, mask: "pd.Series | None") -> None:
         if mask is None or not mask.any():
             return
         for f in df.loc[mask, "episode_file_id"].dropna():
-            protected.add(int(f))
+            reasons[name].add(int(f))
 
     # ── Pilots (real + de-facto) — passed in by the service ──────────────────
     for f in (pilot_file_ids or ()):
         if pd.notna(f):
-            protected.add(int(f))
+            reasons["pilot"].add(int(f))
 
     # ── Keep-policy guards ───────────────────────────────────────────────────
     if "keep_policy" in df.columns:
-        _add_fids(df["keep_policy"] == "keep_series")
+        _add_fids("keep_series", df["keep_policy"] == "keep_series")
 
         keep_season_mask = df["keep_policy"] == "keep_season"
         if keep_season_mask.any():
@@ -84,7 +108,8 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
                     continue
                 latest = int(non_special.max())
                 _add_fids(
-                    keep_season_mask & (_sid_num == sid) & (_sn_num >= latest)
+                    "keep_season",
+                    keep_season_mask & (_sid_num == sid) & (_sn_num >= latest),
                 )
 
     # ── Recently-aired guard ─────────────────────────────────────────────────
@@ -93,14 +118,29 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
         # (now - air) is a Timedelta Series; .dt.days floors to whole days,
         # matching the per-row guard's `(now - air).days`.
         days_since = (now - air).dt.days
-        _add_fids(air.notna() & (days_since < recent_air_days))
+        _add_fids("recent_air", air.notna() & (days_since < recent_air_days))
 
     # ── Household watch guard ────────────────────────────────────────────────
-    if "all_household_watched" in df.columns:
+    # ACTIVE WATCHERS ONLY (GLD-ACQ-18, decision 2026-08-06): "not all household
+    # watched" holds a file ONLY while a member who is actively watching the series
+    # will come upon the episode reasonably soon. That is precisely retention_hold's
+    # window (per-account [position − back, position + pace × horizon]; dormant
+    # accounts get no forward reach), so this guard INTERSECTS with it rather than
+    # growing a second definition of "approaching" — the watched-bar lesson (§8 P-C,
+    # six divergent definitions) applied prospectively. The column keeps its
+    # all-members meaning and is still computed every sync; only guard USAGE narrows.
+    # The old form (present & falsy alone) was near-unsatisfiable with six members —
+    # 571 all-watched of 12,637 rows — and froze 4,812 fids, which is what emptied
+    # the leapfrog recycle's pool for every actively-watched series (GLD-ACQ-21's
+    # first reason lines). By construction this branch now adds no fid the retention
+    # guard below hasn't already added; it stays for legibility and for the delete
+    # pass's named per-row skip. NaN ahw = legacy/no-household → not a guard; absent
+    # retention column ⇒ no active-watcher data ⇒ no household hold.
+    if "all_household_watched" in df.columns and "retention_hold" in df.columns:
         ahw = df["all_household_watched"]
-        # present (not NaN) AND falsy → a household member still hasn't watched;
-        # NaN = legacy row / no household config → not a guard.
-        _add_fids(ahw.notna() & ~ahw.astype(bool))
+        _rh_hh = df["retention_hold"]
+        _add_fids("household", ahw.notna() & ~ahw.astype(bool)
+                  & _rh_hh.notna() & _rh_hh.astype(bool))
 
     # ── Per-viewer retention guard ───────────────────────────────────────────
     # ``retention_hold`` is the per-run verdict stamped by
@@ -112,7 +152,7 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
     # falsy (the rule disabled).
     if "retention_hold" in df.columns:
         _rh = df["retention_hold"]
-        _add_fids(_rh.notna() & _rh.astype(bool))
+        _add_fids("retention", _rh.notna() & _rh.astype(bool))
 
     # ── Watchlist intent guard (GROUP A5) ────────────────────────────────────
     # ``watchlist_hold`` is the per-run verdict stamped by
@@ -127,7 +167,7 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
     # parquet) or all falsy (the term disabled / nothing watchlisted).
     if "watchlist_hold" in df.columns:
         _wh = df["watchlist_hold"]
-        _add_fids(_wh.notna() & _wh.astype(bool))
+        _add_fids("watchlist", _wh.notna() & _wh.astype(bool))
 
     # ── Hot franchise/universe credit guard ──────────────────────────────────
     # A hot saga (recency-decayed borrowed credit, broadcast per-series onto every
@@ -139,9 +179,9 @@ def build_protected_file_ids(df, now, pilot_file_ids, *, recent_air_days) -> "fr
     # when the column is absent or cold (0.0 everywhere < UNIVERSE_PROTECT_MIN).
     if "universe_credit" in df.columns:
         _uc = pd.to_numeric(df["universe_credit"], errors="coerce")
-        _add_fids(_uc.notna() & (_uc >= UNIVERSE_PROTECT_MIN))
+        _add_fids("universe", _uc.notna() & (_uc >= UNIVERSE_PROTECT_MIN))
 
-    return frozenset(protected)
+    return {k: frozenset(v) for k, v in reasons.items()}
 
 
 def build_pilot_file_ids(df) -> "frozenset":

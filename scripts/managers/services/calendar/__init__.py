@@ -86,7 +86,11 @@ class CalendarManager(BaseManager, ComponentManagerMixin):
         super().__init__(logger, config, global_cache, validator, registry, **kwargs)
         self.register()
         parent = kwargs.get("manager")
-        self.dry_run = kwargs.get("dry_run", getattr(parent, "dry_run", False) if parent else False)
+        # dry_run is resolved by BaseManager (explicit kwarg -> pre-super value ->
+        # kwargs["manager"] -> registry parent -> False). The local resolution that
+        # used to sit here defaulted to False, silently overwriting a
+        # parent-inherited True — in a manager that issues monitored=true PUTs to
+        # both *arrs.
         self.trakt = kwargs.get("trakt")
         self.sonarr = kwargs.get("sonarr")
         self.radarr = kwargs.get("radarr")

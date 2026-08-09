@@ -278,6 +278,36 @@ class SonarrSeriesRetrievalFetchManager(BaseManager, ComponentManagerMixin):
                 f"{stats['rewritten']} bucket(s) updated, {stats['skipped']} unchanged — "
                 f"+{stats['added']} series added, -{stats['removed']} removed"
             )
+            # ── SHORT-LIST GUARD ─────────────────────────────────────────
+            # THIS is the only place a short fetch is detectable. Downstream,
+            # ``validate_series_count`` compares the live list against the cache
+            # that was just written FROM it, so after this point both sides have
+            # already shrunk together and the comparison is a tautology. Here the
+            # PRE-sync count is still in hand and is genuinely independent of this
+            # run's fetch.
+            #
+            # A total failure is already handled above (`if not series` returns
+            # early and does NOT touch the cache, so the library survives). What
+            # this catches is the case that path cannot: Sonarr answering 200 with
+            # a SHORT list — a partial index, a restarting server, a proxy
+            # truncating the body. The client sees success; only the size betrays
+            # it.
+            #
+            # Warn, never block: a genuine bulk removal looks identical from here
+            # and is the operator's business. The threshold is deliberately loose
+            # (a fifth of the library vanishing in one run) so ordinary churn on a
+            # large library stays quiet.
+            _prior = len(cached_ids)
+            if _prior >= 50 and stats.get("removed", 0) > max(10, 0.20 * _prior):
+                self.logger.log_warning(
+                    f"⚠️ Series library SHRANK sharply for '{resolved}': "
+                    f"{_prior} cached → {len(series)} live "
+                    f"(-{stats['removed']}, {stats['removed'] / _prior:.0%}). "
+                    f"If you did not remove that many series, treat this fetch as "
+                    f"SUSPECT — Sonarr can answer 200 with a short list, and every "
+                    f"downstream count (validate_series_count included) is derived "
+                    f"from this same response, so nothing further will flag it."
+                )
         else:
             # No prior cache → full rebuild
             self.logger.log_info(

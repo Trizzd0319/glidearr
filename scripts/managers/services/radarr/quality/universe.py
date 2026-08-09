@@ -784,6 +784,14 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
             return stats
 
         changed = False
+        # Cooldown ledger: loaded once, mutated in the loop, saved once at the end. Same
+        # radarr/{instance}/stepdown_cooldown key the space-pressure pass uses, so a title
+        # backed off by one pass is honoured by the other.
+        from scripts.support.utilities.stepdown_cooldown import (
+            clear as _clear, cooldown_left as _cooldown_left, entry_key as _ekey,
+            stamp_failure as _stamp_failure, wait_days as _wait_days,
+        )
+        _ledger = RadarrSpacePressureManager._stepdown_ledger(self, instance)
 
         # Ledger: reset stale plan stamps THIS pass authored on a prior run (a movie
         # changed last run but no longer actionable would otherwise keep its stamp
@@ -906,6 +914,34 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                 stats["failed"] += 1
                 continue
 
+            # GLD-RAD-32 (operator ruling 2026-08-07): sub-2160 DOWNGRADES NEVER EXECUTE ON
+            # THE 4K INSTANCE. Ultra is 2160-only — a smaller target there is a PLACEMENT
+            # event, not a grab: the UhdReconcile demote/rehome machinery moves the title's
+            # presence to standard (make-before-break) and the ultra copy dies. This fired
+            # live 2026-08-07: Batman Begins (Ultra-HD → 1080p DoVi) and The Dark Knight
+            # realized ON ultra. Skip BEFORE the profile PUT — even flipping ultra's profile
+            # to a ≤1080 target is the violation — and before any indexer call is spent.
+            if action == "downgrade":
+                _uhd_inst = (self.config.get("radarr_instances_categorized") or {}).get("4K")
+                if _uhd_inst and instance == _uhd_inst:
+                    try:
+                        from scripts.managers.machine_learning.space.downgrade_planner import (
+                            _profile_max_res as _pmr0,
+                        )
+                        _t0 = _pmr0(target_profile)
+                    except Exception:
+                        _t0 = None
+                    if _t0 is None or int(_t0) < 2160:
+                        stats["uhd_deferred"] = stats.get("uhd_deferred", 0) + 1
+                        self.logger.log_info(
+                            f"  📦 [Universe] '{title}': sub-2160 downgrade on the 4K instance "
+                            f"'{instance}' — deferred to the UHD demote/rehome machinery "
+                            f"(profile unchanged, no grab).")
+                        _rows.append([str(title)[:24], "uhd_deferred", _from_to, _profile_from_to])
+                        df.at[idx, "quality_action"] = None
+                        self._stamp_universe_plan(df, idx, action, target_profile)
+                        continue
+
             movie_payload["qualityProfileId"] = target_id
 
             try:
@@ -941,30 +977,112 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                 # title loss — the availability check guarantees a copy always
                 # exists, so the never-delete pin (never LOSE the movie) holds.
                 _fid_row = df.at[idx, "movie_file_id"] if "movie_file_id" in df.columns else None
+                # COOLDOWN, checked BEFORE the interactive search so a backed-off title
+                # costs no indexer call at all.
+                _ck = _ekey(df.at[idx, "tmdb_id"] if "tmdb_id" in df.columns else movie_id,
+                            df.at[idx, "resolution"] if "resolution" in df.columns else None)
+                _cd = _cooldown_left(_ledger, _ck, self.config)
+                if _cd > 0:
+                    stats["cooldown_skipped"] = stats.get("cooldown_skipped", 0) + 1
+                    self.logger.log_debug(
+                        f"  ⏭️ [Universe] '{title}': step-down on cooldown, {_cd:.0f}d left.")
+                    df.at[idx, "quality_action"] = None
+                    continue
                 releases = self.radarr_api._make_request(
                     instance, f"release?movieId={movie_id}", fallback=None) or []
+                # TARGET RESOLUTION, not just "anything smaller". downgrade_target picked a
+                # specific tier (2160 -> 1080) and the profile above was set to match it.
+                # Telling the picker only the CURRENT resolution let it grab 720p for a
+                # movie now on HD-1080p; Radarr then rejected the import or 404'd the guid,
+                # with the file already deleted. Six titles failed this way in one pass.
+                _target_res = None
+                try:
+                    from scripts.managers.machine_learning.space.downgrade_planner import (
+                        _profile_max_res as _pmr,
+                    )
+                    _target_res = _pmr(target_profile)
+                except Exception:
+                    _target_res = None
                 pick = _pick_stepdown_release(
                     releases,
                     current_res=df.at[idx, "resolution"] if "resolution" in df.columns else None,
                     allow_below_floor=exhaustive_downgrade(self.config),
+                    target_res=_target_res,
+                    # GLD-RAD-30: identity + language gates. The payload fetched above
+                    # carries the authoritative title/year/alternateTitles — anime saga
+                    # members especially need the alternates (romaji release names).
+                    movie_title=movie_payload.get("title") or title,
+                    movie_year=movie_payload.get("year"),
+                    alt_titles=tuple(
+                        (t or {}).get("title") for t in
+                        (movie_payload.get("alternateTitles") or []) if isinstance(t, dict)),
                 )
                 if not pick:
+                    # Same backoff the space-pressure step-down uses — shared helpers, so the
+                    # two passes cannot disagree about when a title is retryable. Without it
+                    # this branch re-probed every run forever: 31 titles on a real library
+                    # have no smaller encode at ANY indexer, and each cost an interactive
+                    # search per run indefinitely.
+                    _n = _stamp_failure(_ledger, _ck)
+                    _wait = _wait_days(_ledger, _ck, self.config)
                     self.logger.log_info(
                         f"  ⏸️ [Universe] '{title}': no smaller release available — file "
-                        f"kept ({_cur_label}; profile now {target_name}; re-probes next run)."
+                        f"kept ({_cur_label}; profile now {target_name}; attempt {_n}, "
+                        f"re-probes in {_wait:.0f}d)."
                     )
                     _rows.append([str(title)[:24], "no_release", _cur_label, _profile_from_to])
                     self._stamp_universe_plan(df, idx, action, target_profile)
                     stats["no_release"] += 1
                     continue
-                if _fid_row is not None and pd.notna(_fid_row):
-                    self.radarr_api._make_request(
-                        instance, f"moviefile/{int(_fid_row)}", method="DELETE")
+                if _fid_row is None or pd.isna(_fid_row):
+                    # FID UNKNOWN ⇒ NO DELETE POSSIBLE ⇒ NO GRAB. On the 2026-08-07 apply
+                    # 19 of 21 realize rows had an empty movie_file_id: the delete block
+                    # was silently SKIPPED, 'file deleted' printed with no delete even
+                    # attempted, and the grab was left to die on Radarr's cutoff-met
+                    # rejection against the still-present file. Root cause of the empty
+                    # column tracked separately (GLD-RAD-31).
+                    stats["fid_missing"] = stats.get("fid_missing", 0) + 1
+                    _stamp_failure(_ledger, _ck)
+                    self.logger.log_warning(
+                        f"  ⚠️ [Universe] '{title}': no movie_file_id on the row — cannot "
+                        f"delete-then-grab; grab SKIPPED, re-probes after backoff.")
+                    df.at[idx, "quality_action"] = None
+                    self._stamp_universe_plan(df, idx, action, target_profile)
+                    continue
+                # CHECKED: DELETE success now returns True (base contract fix). On the
+                # 2026-08-07 apply this exact line 500'd for The Scorpion King and the
+                # pass printed 'file deleted, grabbed Scorpion.King.4' anyway — wrong
+                # movie imported next to a file Radarr could not remove. On failure:
+                # keep the file, skip the grab, back off, re-probe next run.
+                _del_ok = bool(self.radarr_api._make_request(
+                    instance, f"moviefile/{int(_fid_row)}", method="DELETE"))
+                if not _del_ok:
+                    stats["delete_failed"] = stats.get("delete_failed", 0) + 1
+                    _stamp_failure(_ledger, _ck)
+                    self.logger.log_warning(
+                        f"  ⚠️ [Universe] '{title}': step-down delete FAILED (see "
+                        f"instance-manager error above) — file kept, grab SKIPPED; "
+                        f"re-probes after backoff.")
+                    df.at[idx, "quality_action"] = None
+                    self._stamp_universe_plan(df, idx, action, target_profile)
+                    continue
                 try:
-                    self.radarr_api._make_request(
+                    # CHECK THE RETURN VALUE, do not rely on an exception. ``fallback=None``
+                    # makes _make_request SWALLOW the HTTP error and return the fallback, so
+                    # the ``except`` here was UNREACHABLE: a 404 from POST /release ("Unable
+                    # to find matching movie") left the file deleted, no replacement grabbed,
+                    # no blind search queued - and the success line below printed anyway.
+                    # SEND THE movieId — without it Radarr re-parses the release title to
+                    # identify the movie, which fails on foreign-language and fansub names.
+                    # The search above was release?movieId=N, so the id is already known.
+                    _res = self.radarr_api._make_request(
                         instance, "release", method="POST", fallback=None,
-                        payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId")})
+                        payload={"guid": pick.get("guid"), "indexerId": pick.get("indexerId"),
+                                 "movieId": int(movie_id)})
+                    _grab_ok = bool(_res)
                 except Exception:
+                    _grab_ok = False
+                if not _grab_ok:
                     _blind_search_ids.append(movie_id)   # file is gone → blind search now works
 
                 _rows.append([str(title)[:24], str(action), _from_to, _profile_from_to])
@@ -972,11 +1090,25 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                 self._stamp_universe_plan(df, idx, action, target_profile)
                 stats[stat_key] += 1
                 _pick_gb = float(pick.get("size") or 0) / (1024 ** 3)
-                self.logger.log_info(
-                    f"  📉 [Universe] Realized downgrade: '{title}' ({_cur_profile} → "
-                    f"{target_name}) — file deleted, grabbed '{pick.get('title')}' "
-                    f"({_pick_gb:.1f} GB)."
-                )
+                if _grab_ok:
+                    _clear(_ledger, _ck)
+                    self.logger.log_info(
+                        f"  📉 [Universe] Realized downgrade: '{title}' ({_cur_profile} → "
+                        f"{target_name}) — file deleted, grabbed '{pick.get('title')}' "
+                        f"({_pick_gb:.1f} GB)."
+                    )
+                else:
+                    # LOUD. The file is GONE and the intended replacement did not grab.
+                    # Recoverable from the recycle bin until cleanup runs, so say so here
+                    # rather than letting a success line hide it.
+                    stats["grab_failed"] = stats.get("grab_failed", 0) + 1
+                    _stamp_failure(_ledger, _ck)
+                    self.logger.log_warning(
+                        f"  ⚠️ [Universe] '{title}' ({_cur_profile} → {target_name}): file DELETED "
+                        f"but the guid grab FAILED for '{pick.get('title')}' ({_pick_gb:.1f} GB) "
+                        f"— blind MoviesSearch queued. Restore from the recycle bin if that "
+                        f"finds nothing."
+                    )
             except Exception as e:
                 self.logger.log_warning(
                     f"[Universe] Failed to {action} '{title}' (id={movie_id}): {e}"
@@ -1004,6 +1136,9 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
         # dry_run (plan-only — no quality_profile_id was speculatively written above).
         if (changed and not self.dry_run) or (self.dry_run and _plan_changed):
             mfm.save(instance, df)
+        # Ledger saves regardless: a cooldown stamped this run must survive even when
+        # nothing else changed, or the backoff would reset every pass.
+        RadarrSpacePressureManager._save_stepdown_ledger(self, instance, _ledger)
 
         # Route per-title detail into the consolidated end-of-run summary (one Radarr block,
         # one row per title) instead of dumping the grid inline. Falls back to the inline

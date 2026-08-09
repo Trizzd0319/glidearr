@@ -122,6 +122,16 @@ def gated_plan(scored, *, level, cap, resolve, seen=None):
                 "rating_key": str(rk), "score": c.get("score"), "reason": c.get("why", ""),
                 "title": _title(c), "years_ago": c.get("years_ago"), "seen": is_seen,
                 "on_this_day": bool(c.get("on_this_day")),
+                # STABLE IDENTITY, captured HERE because here is the only place it is
+                # certainly correct. A ratingKey is a Plex-local handle that a re-scan
+                # RETIRES - measured at 11/117 on one series - so resolving tmdb/tvdb
+                # back from a ratingKey later either fails or, worse, succeeds against a
+                # DIFFERENT title that inherited the number. The candidate row already
+                # carries both ids (the net_new branch below has always kept them); the
+                # owned branch simply discarded them, which is why the recommendation
+                # ledger could record movies and silently dropped every show.
+                "tmdb_id": c.get("tmdb_id"), "tvdb_id": c.get("tvdb_id"),
+                "media": c.get("media"),
             })
         else:
             net_new.append({

@@ -79,6 +79,9 @@ class PlanSummary:
             return {}, []
 
         agg: dict = {}          # action -> [count, reclaim_gb_sum]
+        # action -> service -> instance -> [count, gb]. Populated from the SAME groupby
+        # pass as `agg`, so the subtotals below can never disagree with their parent row.
+        detail: dict = {}
         scores: list = []
         by_service: dict = {}   # service -> scores, for the threshold shadow report
         for _service, _inst, df in self._iter_frames():
@@ -91,13 +94,20 @@ class PlanSummary:
                     for action, grp in sub.groupby("planned_action"):
                         a = agg.setdefault(str(action), [0, 0.0])
                         a[0] += len(grp)
-                        if rc is not None:
-                            a[1] += float(rc.loc[grp.index].fillna(0).sum())
+                        _gb = (float(rc.loc[grp.index].fillna(0).sum())
+                               if rc is not None else 0.0)
+                        a[1] += _gb
+                        d = (detail.setdefault(str(action), {})
+                                   .setdefault(str(_service), {})
+                                   .setdefault(str(_inst), [0, 0.0]))
+                        d[0] += len(grp)
+                        d[1] += _gb
             if "watchability_score" in df.columns:
                 vals = list(pd.to_numeric(df["watchability_score"], errors="coerce").dropna())
                 scores += vals
                 by_service.setdefault(_service, []).extend(vals)
         self._scores_by_service = by_service
+        self._plan_detail = detail
         return agg, scores
 
     def itemize(self, cap_per_group: int = 25) -> list:
@@ -333,19 +343,47 @@ class PlanSummary:
                 self.logger.log_debug(f"[Plan] itemized change plan skipped: {e}")
 
         if agg:
+            # MEDIA LABEL for the subtotal rows. The ledger is keyed by the *arr service,
+            # which IS the media split - no extra derivation, and it cannot drift from the
+            # frames the counts came from.
+            _MEDIA = {"sonarr": "tv shows", "radarr": "movies"}
+            _detail = getattr(self, "_plan_detail", {}) or {}
+            # INDENT with NON-BREAKING spaces and an ASCII marker. Ordinary spaces are
+            # collapsed by _strip_decor (re.sub(r"[ \t]{2,}", " ")) and a unicode arrow is
+            # dropped by the cp1252 console encoder AFTER the column width was measured -
+            # either one leaves the subtotal rows visibly short of their parent.
+            _L1 = "\u00a0\u00a0> "
+            _L2 = "\u00a0\u00a0\u00a0\u00a0> "
             rows = []
             net = 0.0
             total = 0
             for action in sorted(agg, key=lambda a: -agg[a][1]):
                 cnt, gb = agg[action]
+                # TOTAL sums the PARENT rows only - the subtotals beneath are the same
+                # titles broken out, so folding them in would double-count every one.
                 net += gb
                 total += cnt
                 rows.append([action, cnt, f"{gb:+.1f}"])
+                _svcs = _detail.get(action, {})
+                for _svc in sorted(_svcs, key=lambda s: -sum(v[1] for v in _svcs[s].values())):
+                    _insts = _svcs[_svc]
+                    _c = sum(v[0] for v in _insts.values())
+                    _g = sum(v[1] for v in _insts.values())
+                    rows.append([f"{_L1}{_MEDIA.get(_svc, _svc)}", _c, f"{_g:+.1f}"])
+                    # Instance rows only where the media type actually has more than one -
+                    # a lone Sonarr instance repeating its parent row is just noise.
+                    if len(_insts) > 1:
+                        for _inst in sorted(_insts, key=lambda i: -_insts[i][1]):
+                            _ic, _ig = _insts[_inst]
+                            rows.append([f"{_L2}{_inst}", _ic, f"{_ig:+.1f}"])
             rows.append(["TOTAL", total, f"{net:+.1f}"])
             try:
-                self.logger.log_table(
+                # log_grid, not log_table: it sizes each column to its own widest cell and
+                # pads with NBSP, which is the only path here whose alignment survives
+                # _strip_decor intact.
+                self.logger.log_grid(
                     ["planned action", "count", "GB (+free/-use)"],
-                    rows, title="Dry-run plan ledger",
+                    rows, title="Dry-run plan ledger", cap=24,
                 )
             except Exception:
                 self.logger.log_info(f"[Plan] {dict((a, agg[a][0]) for a in agg)} (net {net:+.1f} GB)")
@@ -366,4 +404,128 @@ class PlanSummary:
         # What those same scores would mean as calibrated probabilities — the
         # shadow half of the §9 threshold-derivation rollout. Report only.
         self.log_thresholds()
+
+        # Has the score AXIS moved under the cutoffs? Report only, and separate
+        # from log_thresholds on purpose: that asks "what should the cutoff be?",
+        # this asks "does the cutoff still mean what it meant?". A household with
+        # no calibrator still needs the second question answered.
+        self.log_axis_drift()
         return agg
+
+    # ── axis drift ───────────────────────────────────────────────────
+
+    #: Where the reviewed baseline lives. ONE key, not one per run — see the
+    #: bootstrap rule in :meth:`log_axis_drift`.
+    _ANCHOR_KEY = "ml/thresholds/axis_anchor"
+
+    def _v2_cutoffs(self, service: str) -> dict:
+        """The live cutoffs for *service* that read the PERSISTED
+        ``watchability_score`` column — i.e. the ones on AXIS V2, which is the
+        axis the scores collected here actually sit on.
+
+        The AXIS LEGACY specs (``repair/anomaly.py``'s ``_score_owned``) must be
+        excluded: their scores are recomputed on the fly from raw Radarr dicts
+        and never enter this parquet, so comparing them against this distribution
+        would report a translation that is really a change of population — the
+        exact mistake ``drift.py``'s integration note warns about.
+
+        Detection is a string check on ``spec.note`` because the axis is recorded
+        there and nowhere structured. That is fragile; a ``ThresholdSpec.axis``
+        field would be better (GLD-DRIFT-02).
+        """
+        try:
+            from scripts.managers.machine_learning.thresholds.registry import (
+                THRESHOLD_SPECS, resolve_constant,
+            )
+        except Exception:
+            return {}
+        out = {}
+        for spec in THRESHOLD_SPECS:
+            if spec.service != service or not str(spec.note or "").startswith("AXIS V2"):
+                continue
+            try:
+                out[spec.name] = resolve_constant(spec, self.config)
+            except Exception:
+                continue
+        return out
+
+    def log_axis_drift(self):
+        """Compare this run's score distribution against the reviewed baseline and
+        log the verdict. Read-only, best-effort, never breaks the run.
+
+        WHY THIS EXISTS: Group D v2 translated the persisted axis ~13 points and
+        nothing noticed. The delete family needed re-anchoring 20 -> 17, and
+        ``likelihood.untouched_base`` 12 -> 25 — the latter only after untouched
+        titles reaching 1080p had collapsed 456 -> 8 (-98.2%), found by hand. See
+        ``thresholds/drift.py`` and ``registry.py``'s delete block.
+
+        THE ANCHOR IS NEVER AUTO-REFRESHED. It is captured once, on the first run
+        that finds none, and then left alone: a baseline that regenerates each run
+        measures nothing, because it drifts with the thing it is watching. After a
+        DELIBERATE re-anchor, delete the key so the next run recaptures it.
+
+        The bootstrap run therefore reports no verdict, and says so — a captured
+        baseline is not a clean bill of health, and the distribution it records
+        may already be drifted.
+        """
+        if not self.logger or not self.global_cache:
+            return
+        scores_by_service = getattr(self, "_scores_by_service", None) or {}
+        if not scores_by_service:
+            return
+
+        try:
+            from scripts.managers.machine_learning.thresholds import drift
+        except Exception as e:
+            self.logger.log_debug(f"[AxisDrift] unavailable: {e}")
+            return
+
+        try:
+            stored = self.global_cache.get(self._ANCHOR_KEY)
+        except Exception:
+            stored = None
+        stored = stored if isinstance(stored, dict) else {}
+
+        fresh = {}
+        for service, scores in sorted(scores_by_service.items()):
+            cuts = self._v2_cutoffs(service)
+            if not cuts:
+                continue
+            label = f"{service}.persisted_watchability"
+            anchor = stored.get(label)
+
+            if not isinstance(anchor, dict) or not anchor.get("fingerprint"):
+                # BOOTSTRAP — capture, do not judge.
+                fresh[label] = drift.build_anchor(scores, cuts, label=label)
+                self.logger.log_info(
+                    f"[AxisDrift] {label}: baseline CAPTURED (n={len(scores)}) — no "
+                    f"comparison this run. This records the CURRENT distribution, "
+                    f"which is not the same as a reviewed one. Re-capture (delete "
+                    f"'{self._ANCHOR_KEY}') after any deliberate re-anchor."
+                )
+                continue
+
+            try:
+                verdict = drift.assess(drift.compare(anchor, scores, cutoffs=cuts))
+            except Exception as e:
+                self.logger.log_debug(f"[AxisDrift] {label} skipped: {e}")
+                continue
+
+            emit = (self.logger.log_warning if verdict.get("drifted")
+                    else self.logger.log_info)
+            for line in drift.format_lines(verdict):
+                emit(line)
+            if verdict.get("drifted"):
+                emit(
+                    "[AxisDrift] A cutoff no longer admits the share it was chosen "
+                    "to admit. Re-derive the affected constants (registry.py's "
+                    "delete block documents the reconstruction) and CHECK "
+                    "likelihood.untouched_base too — it is on a different scale and "
+                    "has no ThresholdSpec, so a specs-only pass will miss it."
+                )
+
+        if fresh:
+            try:
+                self.global_cache.set(self._ANCHOR_KEY, {**stored, **fresh})
+            except Exception as e:
+                self.logger.log_debug(f"[AxisDrift] baseline not persisted: {e}")

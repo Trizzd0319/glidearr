@@ -12,6 +12,13 @@ unrecognised config age-override is logged once and then IGNORED (never honoured
 config typo must not silently un-gate a child). Fail-CLOSED for restricted profiles:
 an unknown/unrated cert is EXCLUDED for a kid (never show a child content we can't
 vouch for), but allowed for an adult.
+
+THE AMBIGUOUS INPUT. Plex frequently omits ``restrictionProfile``, so a managed CHILD
+profile and an unrestricted ADULT both arrive as ``None``/``""``. ``tier_level`` answered
+ADULT for both, which is correct for one of them and dangerous for the other. Pass
+``is_managed`` to make the case distinguishable, and use :func:`is_ungated_managed` to
+treat "we could not tell" as its own outcome. See ``tier_level``'s docstring for why the
+safe-looking fix (default everyone unknown to a kid tier) is more expensive than it looks.
 """
 from __future__ import annotations
 
@@ -79,14 +86,37 @@ def _warn_unknown_override(override) -> None:
         "A typo here would otherwise leave a managed (kid/teen) profile ungated.", val)
 
 
-def tier_level(restriction_profile=None, override=None) -> int:
+def tier_level(restriction_profile=None, override=None, *,
+               is_managed: bool = False, unknown_managed_tier=None) -> int:
     """Resolve a profile's age-tier level (0 little kid … 3 adult/unrestricted).
 
     A RECOGNISED config ``override`` wins; otherwise Plex's ``restriction_profile``; else
     unrestricted (ADULT). An ``override`` that is empty/whitespace counts as "not set" and
     falls through. An ``override`` that is set but names NO known tier (a config typo) is NOT
     honoured — letting it resolve to ADULT would silently un-gate a child — so it is IGNORED
-    (fall back to ``restriction_profile``) and logged once (see ``_warn_unknown_override``)."""
+    (fall back to ``restriction_profile``) and logged once (see ``_warn_unknown_override``).
+
+    ``is_managed`` / ``unknown_managed_tier`` — THE AMBIGUOUS CASE.
+    Plex's ``/api/v2/home/users`` frequently omits ``restrictionProfile`` entirely, so a
+    managed CHILD profile and an unrestricted ADULT both arrive here as ``None``/``""``.
+    Without ``is_managed`` this function cannot tell them apart and answers ADULT for both —
+    absent conflated with a known value, in the one gate that decides what a child sees.
+
+    Passing ``is_managed=True`` makes the case detectable; ``unknown_managed_tier`` then says
+    what to do about it. Default ``None`` keeps today's answer (ADULT) so nothing changes
+    until an operator opts in.
+
+    WHY THIS IS NOT SIMPLY DEFAULTED TO A KID TIER. ``cert_allowed`` fails CLOSED on an
+    unknown cert for any restricted profile, and roughly 41% of the library carries no
+    recognised certification. So gating an ungated profile at even TEEN removes every
+    uncertified title the Common Sense age fallback does not rescue — a large, silent loss
+    for a profile that may well be an adult guest. The safe-looking default is not cheap, and
+    the operator is better placed to know whether their ungated profiles are children.
+
+    Use :func:`is_ungated_managed` to detect the case and skip the profile entirely (the
+    house pattern for unusable input — PIN-less users are already SKIPPED and COUNTED rather
+    than guessed at), or set ``unknown_managed_tier`` to gate it.
+    """
     if override is not None and str(override).strip():
         tier = _resolve_tier(override)
         if tier is not None:
@@ -96,7 +126,33 @@ def tier_level(restriction_profile=None, override=None) -> int:
         tier = _resolve_tier(restriction_profile)
         if tier is not None:
             return tier
+    if is_managed and unknown_managed_tier is not None:
+        tier = _resolve_tier(unknown_managed_tier)
+        if tier is not None:
+            return tier
+        _warn_unknown_override(unknown_managed_tier)
     return ADULT
+
+
+def is_ungated_managed(restriction_profile=None, override=None, *, is_managed: bool = False) -> bool:
+    """True for the one genuinely ambiguous input: a MANAGED profile whose age tier could not
+    be resolved from either Plex or the config override.
+
+    This is the case :func:`tier_level` used to answer ADULT for, indistinguishably from a
+    real adult. Separating it lets a caller treat "we could not tell" as its own outcome —
+    skip the profile, warn, and count it — rather than choosing between over-gating an adult
+    and un-gating a child on data that supports neither.
+
+    An UNMANAGED profile is never ungated: the owner and full Home members are adults by
+    construction, and a missing restriction profile on them means exactly what it says.
+    """
+    if not is_managed:
+        return False
+    if override is not None and str(override).strip() and _resolve_tier(override) is not None:
+        return False
+    if restriction_profile is not None and _resolve_tier(restriction_profile) is not None:
+        return False
+    return True
 
 
 def csm_age_tier(csm_age) -> "int | None":

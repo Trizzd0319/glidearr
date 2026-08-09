@@ -17,6 +17,8 @@ the brain only ever sees resolvable, playable items.
 """
 from __future__ import annotations
 
+from datetime import datetime
+
 from scripts.managers.machine_learning.playlists.expansion import NEXT_UNWATCHED, expand_show
 from scripts.managers.machine_learning.playlists.models import PlaylistInput
 from scripts.managers.machine_learning.playlists.ordering import order_items
@@ -108,6 +110,113 @@ def watched_episode_recency(history: list, *, min_pct: float = 85.0) -> dict:
             k = (st, tt)
             out[k] = max(out.get(k, 0), ts)
     return out
+
+
+def _iso_to_unix(value) -> int:
+    """Trakt's ISO-8601 ``watched_at`` -> unix seconds. 0 on anything unparseable."""
+    if not value:
+        return 0
+    try:
+        return int(datetime.fromisoformat(str(value).strip().replace("Z", "+00:00")).timestamp())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _series_latest_from_recency(rec: dict) -> dict:
+    """``{normalised series title: latest unix ts}`` from a mixed-identity recency map.
+
+    Bare ratingKey strings carry no series, so only the tuple identities contribute -
+    which is fine, every tuple identity leads with the normalised series title.
+    """
+    out: dict = {}
+    for k, ts in (rec or {}).items():
+        if isinstance(k, tuple) and k and isinstance(k[0], str):
+            out[k[0]] = max(out.get(k[0], 0), ts or 0)
+    return out
+
+
+def trakt_episode_identities(rows: list):
+    """``(identities, recency, series_latest)`` from the HOUSEHOLD Trakt episode feed.
+
+    Trakt is a single master-profile feed: it records that the HOUSEHOLD watched an
+    episode, not who. Treated as valid for every Home profile, it recovers series that
+    pre-date the Tautulli history window entirely - the case where a profile shows
+    ``watched=0 ep`` yet the show was demonstrably watched.
+
+    Emits the SAME mixed identities as :func:`watched_episode_keys` MINUS the ratingKey,
+    which Trakt does not carry. That costs nothing: ``(series, season, episode)`` is the
+    identity that actually matches (11/117 by ratingKey vs 117/117 by tuple on a real
+    library). ``_norm`` / ``_coerce_int`` are reused verbatim so a Trakt identity and a
+    Tautulli identity for the same episode are byte-identical - normalisation drift here
+    would silently double-count instead of merging.
+
+    A Trakt scrobble carries NO completion figure (its scrobbler applied one upstream
+    before the row existed), so every row counts as finished.
+    """
+    ident: set = set()
+    rec: dict = {}
+    ser: dict = {}
+    for row in rows or []:
+        if not isinstance(row, dict) or row.get("type") != "episode":
+            continue
+        st = _norm((row.get("show") or {}).get("title"))
+        if not st:
+            continue
+        ep = row.get("episode") or {}
+        ts = _iso_to_unix(row.get("watched_at"))
+        season = _coerce_int(ep.get("season"))
+        number = _coerce_int(ep.get("number"))
+        if season is not None and number is not None:
+            k = (st, season, number)
+            ident.add(k)
+            rec[k] = max(rec.get(k, 0), ts)
+        tt = _norm(ep.get("title"))
+        if tt:
+            k = (st, tt)
+            ident.add(k)
+            rec[k] = max(rec.get(k, 0), ts)
+        ser[st] = max(ser.get(st, 0), ts)
+    return ident, rec, ser
+
+
+def merge_household_history(user_watched, user_recency,
+                            trakt_watched, trakt_recency, trakt_series_latest):
+    """Fold the household Trakt feed into ONE user's history, deciding per SERIES.
+
+    PRECEDENCE. If the USER's own latest watch of a series is MORE RECENT than the
+    household's, their position stands and the household marks are NOT applied to that
+    series - even when Trakt is further ahead. Someone who watched S02E01 last night
+    resumes at S02E02, not at S03E06 because the master profile ran ahead months ago.
+    Otherwise the household marks are unioned in and the user advances to the household
+    position.
+
+    The gate is per SERIES, not per episode: a naive identity union would mark S03E05
+    watched and jump the user forward regardless of how recently they were watching
+    earlier in the run.
+
+    Returns ``(watched, recency, stats)``.
+    """
+    u_ser = _series_latest_from_recency(user_recency)
+    held = {st for st, t_ts in (trakt_series_latest or {}).items()
+            if u_ser.get(st, 0) > (t_ts or 0)}
+    watched = set(user_watched or ())
+    recency = dict(user_recency or {})
+    added = 0
+    for k in (trakt_watched or ()):
+        if not (isinstance(k, tuple) and k) or k[0] in held:
+            continue
+        if k not in watched:
+            added += 1
+        watched.add(k)
+    for k, ts in (trakt_recency or {}).items():
+        if not (isinstance(k, tuple) and k) or k[0] in held:
+            continue
+        recency[k] = max(recency.get(k, 0), ts or 0)
+    return watched, recency, {
+        "trakt_series": len(trakt_series_latest or {}),
+        "held_series": len(held),
+        "added": added,
+    }
 
 
 def tv_inputs(owned_eps: list, owned_inventory: dict, watched, series_scores: dict,
@@ -202,16 +311,34 @@ def build_tv_plan(owned_eps: list, owned_inventory: dict, watched, series_scores
                   *, family: str = "up_next", episode_cap: int = 25, max_items: int = 300,
                   mode: str = NEXT_UNWATCHED, franchise_by_series: dict | None = None,
                   series_timeline: dict | None = None,
-                  recency_boost: bool = False, window_days: int = 30):
+                  recency_boost: bool = False, window_days: int = 30,
+                  watch_recency: dict | None = None,
+                  resume_boost: bool = False, resume_order: str = "recency",
+                  resume_weight: float = 0.0, saga_boost=None):
     """Resolve + expand owned episodes (:func:`tv_inputs`) then hand them to the brain to
     order. Returns ``(PlaylistPlan, stats)``. ``recency_boost`` lifts a series you're caught up
     on the moment its freshest next-unwatched episode aired within ``window_days`` (see
-    :func:`order_items`); OFF (default) → byte-identical."""
+    :func:`order_items`); OFF (default) → byte-identical.
+
+    ``watch_recency`` ({episode-identity: unix ts} from :func:`watched_episode_recency`) is what
+    gives ``stats['series_recency']`` real timestamps - without it every series' last-watch reads
+    0 and the resume ordering below has nothing to sort on.
+
+    ``resume_boost`` / ``resume_order`` / ``resume_weight`` lift an IN-PROGRESS series toward the
+    front, ranked by when it was last watched. These mirror the movie side
+    (``movie_builder._resume_cfg`` -> ``plex.playlists.resume_boost``); they were previously not
+    passed through here at all, so the feature was configurable but inert for TV.
+    """
     expanded, stats = tv_inputs(owned_eps, owned_inventory, watched, series_scores,
                                 episode_cap=episode_cap, mode=mode,
                                 franchise_by_series=franchise_by_series,
-                                series_timeline=series_timeline)
+                                series_timeline=series_timeline,
+                                watch_recency=watch_recency)
     plan = order_items(expanded, family=family, max_items=max_items,
-                       recency_boost=recency_boost, window_days=window_days)
+                       recency_boost=recency_boost, window_days=window_days,
+                       resume_boost=resume_boost, resume_order=resume_order,
+                       resume_weight=resume_weight,
+                       series_recency=stats.get("series_recency"),
+                       saga_boost=saga_boost)
     stats["in_plan"] = len(plan.items)
     return plan, stats

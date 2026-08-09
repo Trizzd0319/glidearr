@@ -71,7 +71,12 @@ class SpaceCoordinatorManager(BaseManager, ComponentManagerMixin):
 
     # Last-resort pressure floor — only when free_space_limit is unset AND the shared
     # mount's total size is unreadable (otherwise the floor is 25% of the total drive).
-    PRESSURE_FALLBACK_GB = 1000.0
+    PRESSURE_FALLBACK_GB = 0.0   # NO last-resort floor: config free_space_limit, else 25% of the
+                                 # total drive, else nothing. Was 1000.0 -- 40x the other three
+                                 # managers' 25.0, in the manager with the largest blast radius,
+                                 # and it would have declared pressure on ANY drive with under a
+                                 # terabyte free the moment both config and disk size were
+                                 # unreadable. No operator chose it.
 
     # FORK-D: global_cache key for the cross-run "rehomed 4K copy awaiting eviction" ledger,
     # per 4K instance. {str(tmdb): {std_inst, uhd_movie_id, uhd_file_id, size_bytes, queued_at}}.

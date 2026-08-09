@@ -25,7 +25,18 @@ the space/viewer signals + the HD instance/root/profiles.
 """
 from __future__ import annotations
 
-from scripts.support.utilities.size_model import profile_max_quality, target_resolution_for_score
+# Direct brain->brain import. This read `scripts.support.utilities.size_model` -- the
+# ML-migration Step-5 compatibility SHIM -- which is a layering INVERSION: the brain
+# reaching outward through a services-era shim to reach its own neighbour two
+# directories away. Neither guard catches it (ARCHITECTURE.md rule 1 is "ml ->
+# contracts only" and brain_purity enforces it, but support.utilities is neither a
+# service nor a brain package, so the import falls through the check). It also made
+# this module break when that shim is deleted at MIGRATION Step 10, for no reason at
+# all -- the real implementation has always been one import away.
+from scripts.managers.machine_learning.sizing.size_model import (
+    profile_max_quality,
+    target_resolution_for_score,
+)
 
 HD_MAX_RES = 1080            # the HD baseline never exceeds this (else it is just a second 4K copy)
 DEFAULT_UHD_SCORE = 75       # watchability/likelihood at/above which a title warrants the 4K bonus —

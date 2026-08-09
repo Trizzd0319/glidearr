@@ -257,19 +257,28 @@ class TraktRatingsManager(BaseManager, ComponentManagerMixin):
         if not self.trakt_api:
             return {}
 
+        # Defensive input guards. A None/malformed entry in any of these three inputs used
+        # to abort the whole pass; the shows twin (auto_rate_watched_shows) has guarded its
+        # equivalents since it was written. Kept after the credits fix below because the
+        # cost is nil and the failure mode -- one bad row silently costing every rating --
+        # is not worth re-learning.
+
         # ── 1. Build collection index from Radarr library ─────────────────
         # {collection_tmdb_id: set of all movie tmdbIds in that collection}
         collection_members: dict[int, set[int]] = {}
         for m in movies:
+            if not isinstance(m, dict):
+                continue
             coll    = m.get("collection") or {}
-            coll_id = coll.get("tmdbId")
+            coll_id = coll.get("tmdbId") if isinstance(coll, dict) else None
             mid     = m.get("tmdbId")
             if coll_id and mid:
                 collection_members.setdefault(int(coll_id), set()).add(int(mid))
 
         # ── 2. Build tmdbId → movie dict for quick lookup ─────────────────
         movie_by_tmdb: dict[int, dict] = {
-            int(m["tmdbId"]): m for m in movies if m.get("tmdbId")
+            int(m["tmdbId"]): m for m in movies
+            if isinstance(m, dict) and m.get("tmdbId")
         }
 
         # ── 3. Already-rated movies — don't overwrite manual ratings ──────
@@ -277,7 +286,8 @@ class TraktRatingsManager(BaseManager, ComponentManagerMixin):
         already_rated: set[int] = {
             int(tmdb)
             for r in existing_ratings
-            if (tmdb := ((r.get("movie") or {}).get("ids") or {}).get("tmdb"))
+            if isinstance(r, dict)
+            and (tmdb := ((r.get("movie") or {}).get("ids") or {}).get("tmdb"))
         }
 
         # ── 4. Score each watched movie ───────────────────────────────────
@@ -286,7 +296,22 @@ class TraktRatingsManager(BaseManager, ComponentManagerMixin):
         skipped_no_data:   int = 0
 
         for tmdb_id, completion_data in completion_map.items():
-            tmdb_id = int(tmdb_id)
+            # A null/blank entry in the completion map kills the whole pass without this:
+            # ``completion_data.get("pct")`` raises AttributeError on None, the exception
+            # propagates out through RadarrOrchestrationManager.run_movie_ratings, and NO
+            # movie gets rated. auto_rate_watched_shows has guarded this since it was
+            # written (``if not progress: skipped_insufficient += 1; continue``) -- the
+            # movies twin simply never got the same treatment. isinstance rather than a
+            # bare falsy check because a malformed entry can be a float or a string, and
+            # both fail the same way one line later.
+            if not isinstance(completion_data, dict) or not completion_data:
+                skipped_no_data += 1
+                continue
+            try:
+                tmdb_id = int(tmdb_id)
+            except (TypeError, ValueError):
+                skipped_no_data += 1
+                continue
 
             if tmdb_id in already_rated:
                 skipped_rated += 1
@@ -297,21 +322,31 @@ class TraktRatingsManager(BaseManager, ComponentManagerMixin):
                 skipped_no_data += 1
                 continue
 
-            pct       = float(completion_data.get("pct", 0.0))
-            threshold = float(completion_data.get("threshold", 0.9))
+            try:
+                pct       = float(completion_data.get("pct", 0.0) or 0.0)
+                threshold = float(completion_data.get("threshold", 0.9) or 0.9)
+            except (TypeError, ValueError):
+                skipped_no_data += 1
+                continue
 
             # Require at least some engagement (< 50 % is an early walk-out)
             if pct < 0.25:
                 skipped_no_data += 1
                 continue
 
-            # Fetch Trakt credits for director / actor affinity
-            credits = None
+            # score_movie declares `credits: dict` positionally with NO default, and its
+            # docstring states the contract: "REQUIRED (pass {} if unavailable)". It then
+            # does credits.get("cast") unguarded. Passing None raised
+            # "'NoneType' object has no attribute 'get'" on the first movie with no cached
+            # credits and took the ENTIRE ratings pass with it -- every run, for months,
+            # for both Radarr instances. radarr/repair/anomaly.py honours the contract
+            # ("leaves credits={} rather than unbound"); this caller never did.
+            credits: dict = {}
             if people_manager:
                 try:
-                    credits = people_manager.get_people(tmdb_id)
+                    credits = people_manager.get_people(tmdb_id) or {}
                 except Exception:
-                    pass
+                    credits = {}
 
             rating = score_movie(
                 movie=movie,

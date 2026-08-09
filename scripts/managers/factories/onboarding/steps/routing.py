@@ -23,6 +23,46 @@ see exactly where every bucket lands, with a clear flag on any that has no folde
   * reorg_mode — off / log_only (classify + LOG, move nothing) / same_instance (actuate
     same-instance folder moves). Picking same_instance asks for relocation_consent.
 
+⚠ IF YOU RUN A KIDS OR ANIME BUCKET **AND** A 4K INSTANCE, READ THIS.
+``classify_movie`` puts CONTENT above RESOLUTION deliberately — its order is
+anime → kids → 4k → standard — so a 2160p Pixar film classifies as **kids** and a 2160p
+Ghibli film as **anime**, not 4k. That is what you want on the standard instance. But the
+dual-version reconcile relocates 4K companions onto the 4K INSTANCE, and if that instance
+has a single flat root then the film lands somewhere its own Plex library does not cover.
+For anime that is merely misfiled; for KIDS it is worse — a child's profile reaches only
+the Kids library, so from their side the film has simply **disappeared**, and nothing in
+the run reports it.
+
+Two supported ways to handle it, and the system picks the safe one on its own:
+
+  1. GIVE THE 4K INSTANCE PER-CATEGORY ROOTS via ``routing.movies.uhd_root_folders``
+     (e.g. ``{"kids": "/data/media/movies/4k/kids",
+              "anime": "/data/media/movies/4k/anime",
+              "standard": "/data/media/movies/4k/standard"}``), register each as a ROOT
+     FOLDER in the 4K Radarr instance, and ADD EACH PATH AS A FOLDER ON THE EXISTING PLEX
+     LIBRARY for that category. Plex libraries take multiple folders, so nobody needs new
+     library access and children never traverse libraries — their 4K films simply appear
+     alongside everything else in Kids.
+
+  2. DO NOTHING. Before creating a 4K companion for a kids or anime title, the reconcile
+     asks whether the configured 4K root is attached to THE SAME PLEX LIBRARY as that
+     category's standard root — i.e. it looks up which library already holds
+     ``/data/media/movies/kids`` and checks whether ``/data/media/movies/4k/kids`` is a
+     folder on that same library. **The library is identified by its FOLDERS, never by its
+     name**, so "Kids Movies", "Little Ones" or a non-English title all work, and no naming
+     convention is imposed. When the answer is no — including when Plex's section inventory
+     cannot be read at all — the title is **capped at 1080p** rather than given an
+     invisible 4K copy. The gate FAILS CLOSED on purpose: a kids film stuck at 1080p is
+     watchable and fixable next run, whereas a 2160p file the child cannot see is a silent
+     loss whose only symptom is a child saying a movie is gone.
+
+Both halves are checked and reported separately, because they have different fixes:
+``_validate_uhd_roots`` warns when a configured 4K root is not a REGISTERED root folder on
+the 4K Radarr instance (the directory existing on disk is not enough), and the library gate
+warns when it is registered in Radarr but not attached to the right Plex library.
+
+So the 4K upgrade for kids/anime content is opt-in by *making it reachable*, not by a flag.
+
 None of the preferences are secrets → plaintext config.json under ``routing`` +
 ``relocation_consent`` + the captured ``movieRootFolders`` / ``rootFolders``. Runtime
 gates live in machine_learning/space/routing_targets (reorg_mode / relocation_enabled).

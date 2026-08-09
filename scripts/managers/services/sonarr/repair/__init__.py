@@ -55,13 +55,29 @@ class SonarrRepairManager(BaseManager, ComponentManagerMixin):
         }
 
         critical_keys = {
-            "cache",
+            # MUST match the keys in all_component_classes above, verbatim. This read
+            # "cache" while the component is registered as "repair_cache", so the key
+            # matched nothing: SonarrRepairCacheManager silently fell to the
+            # NON-critical path (its failure left sonarr.repair_manager_initialized
+            # True) and became eligible for the parent_name filter to drop entirely.
+            # Second instance of this shape after sonarr/__init__.py's "quality";
+            # see GLD-SON-12 for the proposed assertion that would catch both.
+            "repair_cache",
             "filepaths",
             "instance",
             "monitoring",
             "storage",
             "validator",
         }
+        # Fail fast on a key that names no component — the failure mode above is
+        # silent by construction: an unmatched critical key simply never selects
+        # anything, so the component quietly loses its critical status.
+        _unknown = critical_keys - set(all_component_classes)
+        if _unknown:
+            raise KeyError(
+                f"{self.__class__.__name__}: critical_keys names component(s) that do not "
+                f"exist: {sorted(_unknown)}. Known: {sorted(all_component_classes)}."
+            )
 
         repair_init_kwargs = {
             "logger":           self.logger,

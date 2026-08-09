@@ -61,6 +61,9 @@ from scripts.managers.machine_learning.space.cross_instance_dedup import plan_de
 from scripts.managers.machine_learning.space.routing_targets import (
     cross_instance_dedup_enabled,
     cross_instance_move_enabled,
+    category_uhd_allowed,
+    category_library_paths,
+    category_library_titles,
     demote_4k_on_watchability_enabled,
     evict_uhd_first,
     proactive_4k_enabled,
@@ -68,6 +71,8 @@ from scripts.managers.machine_learning.space.routing_targets import (
     reorg_mode,
     shared_storage_mode,
     uhd_remote_play_ok,
+    uhd_root_folders,
+    UHD_INSTANCE_LABELS,
 )
 from scripts.managers.services.acquisition.gateway import ArrGateway
 from scripts.managers.services.radarr.storage.cross_instance_dedup_apply import CrossInstanceDedup
@@ -78,9 +83,11 @@ from scripts.support.utilities.size_model import profile_max_quality
 from scripts.support.utilities.space_targets import space_targets
 from scripts.support.utilities.watch_likelihood import watch_likelihood
 
-# Alias-aware: the role map writes "4K" while the folder bucket is "4k" (and operators may use
-# uhd/2160) — accept them all so a casing/naming split never silently disables the move.
-_UHD_LABELS = ("4K", "4k", "uhd", "UHD", "2160p", "2160")
+# The dedicated-4K instance labels live in routing_targets (the single source of truth for
+# these gates) so this reconcile and radarr/repair/anomaly's monitored-missing triage can
+# never disagree about which Radarr session is the 4K one. Both used to carry their own copy
+# of the tuple, coupled only by a comment.
+_UHD_LABELS = UHD_INSTANCE_LABELS
 _UHD_RES = 2160
 
 
@@ -243,6 +250,9 @@ class UhdReconcileManager:
                                      f"quality profile on the 4K instance).")
             return
         eff_dry = effective_dry_run(self.dry_run, self.global_cache)
+        # Per-category 4K roots (routing.movies.uhd_root_folders) must exist as REGISTERED root
+        # folders on the 4K instance, not merely as directories. Checked once per run.
+        self._validate_uhd_roots(gw, fourk)
         # DOWNLOAD-BASED dual-version (no cross-instance file move): the 4K instance ACQUIRES its own
         # 2160p (download) and the standard record is retuned to its ≤1080 baseline (Radarr grabs a
         # 1080p and replaces the 2160p on import). Actuates under the same gate the file-move used to —
@@ -538,7 +548,11 @@ class UhdReconcileManager:
         now = datetime.now(timezone.utc)
         now_iso = now.isoformat()
         present_tmdbs: set = set()
-        demoted = rehomed = recovered = 0
+        demoted = rehomed = recovered = sub2160 = 0
+        # Bound EARLY: both the sub-2160 branch and the classic demote leg consult the
+        # baselines-grabbed-this-run set; the original binding sat inside the demote leg,
+        # which made any earlier reference an UnboundLocalError (caught in sim).
+        grabbed = self.__dict__.setdefault("_baselines_grabbed", set())
 
         for mv in ultra:
             tmdb = mv.get("tmdbId")
@@ -552,6 +566,17 @@ class UhdReconcileManager:
             if not mv.get("hasFile"):
                 if (str(tmdb) in ledger and not mv.get("monitored")
                         and lk is not None and lk >= threshold and mv.get("id") is not None):
+                    # GLD-ACQ-30 UHD headroom gate: recovery is a fresh 2160p acquisition —
+                    # it waits until free space clears U × uhd_headroom_multiplier. The
+                    # shell stays ledgered, so a roomier run recovers it with no loss.
+                    if not self._uhd_headroom_ok(gw, fourk):
+                        self._log("log_info", f"[UHD] recover of '{mv.get('title')}' "
+                                              f"(watch {lk:.0f}) DEFERRED — free space below the "
+                                              f"4K headroom bar (U × multiplier); shell stays ledgered.")
+                        self._record_plan(mv.get("title"), tmdb, "standard", fourk, "recover-4k",
+                                          "deferred-headroom",
+                                          reason=f"watch {lk:.0f} >= {threshold}; free < U×mult")
+                        continue
                     if eff_dry:
                         self._log("log_info", f"[UHD] would re-acquire demoted 4K '{mv.get('title')}' "
                                               f"(watch {lk:.0f}) on {fourk}.")
@@ -570,9 +595,97 @@ class UhdReconcileManager:
             # A 4K record that HAS a file is no longer a demoted shell — drop any stale ledger entry.
             ledger.pop(str(tmdb), None)
 
+            # ── SUB-2160 RESIDENT on the 4K instance (GLD-RAD-32, operator ruling 2026-08-07):
+            # a ≤1080 FILE living on ultra violates the instance rule REGARDLESS of score —
+            # ultra is 2160-only. Same three-way machinery as the demote below (survivor →
+            # evict; no record → make-before-break baseline; record-no-file → wait), minus
+            # the score/dwell gates: this is a placement rule, not a watchability judgment.
+            # Keep/universe pins still hold. RECOVER composes for free: the evicted record
+            # becomes a ledgered shell, so a title whose score later crosses the UHD
+            # threshold re-monitors and searches — grabbing a PROPER 2160 this time. Live
+            # evidence: a Bluray-720p Encanto resident on ultra (the ENOSPC delete), plus
+            # 1080p Batman Begins / Dark Knight grabs the old step-down realized on ultra.
+            if self._res(mv) <= 1080:
+                if self._keep_pinned(mv, tag_label_map):
+                    continue
+                _lk_txt = f"watch {lk:.0f}" if lk is not None else "unscored"
+                _mres = self._res(mv)
+                if tmdb in survivors:
+                    cur_path = _norm_path(((mv.get("movieFile") or {}).get("path")) or "")
+                    if cur_path and cur_path == survivor_path.get(tmdb):
+                        self._log("log_warning", f"[UHD] sub-2160 '{mv.get('title')}' on {fourk} shares "
+                                                 f"ONE physical file with its standard baseline — "
+                                                 f"skipping rehome.")
+                        self._record_plan(mv.get("title"), tmdb, fourk, "standard",
+                                          "rehome-sub2160", "flag-same-path")
+                        continue
+                    mid = mv.get("id")
+                    fid = (mv.get("movieFile") or {}).get("id")
+                    if mid is None or fid is None:
+                        continue
+                    if eff_dry:
+                        self._log("log_info", f"[UHD] would rehome sub-2160 resident "
+                                              f"'{mv.get('title')}' ({_mres}p, {_lk_txt}) off {fourk}: "
+                                              f"delete file + unmonitor (baseline survives on standard).")
+                    else:
+                        try:
+                            gw.put(fourk, "movie/editor", {"movieIds": [mid], "monitored": False})
+                            if not bool(gw.delete(fourk, f"moviefile/{fid}")):
+                                self._log("log_warning", f"[UHD] sub-2160 rehome delete FAILED for "
+                                                         f"'{mv.get('title')}' on {fourk} (see "
+                                                         f"instance-manager error above) — re-monitoring, "
+                                                         f"will retry.")
+                                try:
+                                    gw.put(fourk, "movie/editor", {"movieIds": [mid], "monitored": True})
+                                except Exception:
+                                    pass
+                                continue
+                        except Exception as e:
+                            self._log("log_warning", f"[UHD] sub-2160 rehome failed for "
+                                                     f"'{mv.get('title')}' on {fourk}: {e}")
+                            continue
+                        ledger[str(tmdb)] = now_iso
+                        self._log("log_info", f"[UHD] rehomed sub-2160 resident '{mv.get('title')}' "
+                                              f"({_mres}p, {_lk_txt}) off {fourk}: file deleted + "
+                                              f"unmonitored; baseline survives on standard.")
+                    self._record_plan(mv.get("title"), tmdb, fourk, "standard", "rehome-sub2160",
+                                      "would-rehome" if eff_dry else "rehomed",
+                                      reason=f"{_mres}p resident on the 4K instance")
+                    sub2160 += 1
+                elif tmdb not in std_records and tmdb not in grabbed:
+                    # Sub-2160-ONLY title (no standard record at all) → make-before-break:
+                    # grab a ≤1080 baseline on standard NOW; once it imports, the survivor
+                    # branch above evicts this file next run. NEVER the last copy.
+                    if hd_pid is None or not std_root:
+                        self._log("log_warning", f"[UHD] cannot rehome sub-2160 '{mv.get('title')}' — "
+                                                 f"standard '{std_inst}' has no ≤1080 profile / root "
+                                                 f"folder.")
+                        continue
+                    if eff_dry:
+                        self._log("log_info", f"[UHD] would rehome sub-2160-only '{mv.get('title')}' "
+                                              f"({_mres}p, {_lk_txt}) → ≤1080 baseline on {std_inst}; "
+                                              f"ultra copy reclaimed once it lands.")
+                        sub2160 += 1
+                        self._record_plan(mv.get("title"), tmdb, fourk, std_inst, "rehome-sub2160",
+                                          "would-rehome", reason=f"{_mres}p, no standard record")
+                    elif self._grab_baseline(gw, std_inst, mv, hd_pid, std_root):
+                        sub2160 += 1
+                        grabbed.add(tmdb)
+                        self._log("log_info", f"[UHD] rehoming sub-2160-only '{mv.get('title')}' "
+                                              f"({_mres}p, {_lk_txt}) → ≤1080 baseline searching on "
+                                              f"{std_inst}; ultra copy reclaimed once it lands.")
+                        self._record_plan(mv.get("title"), tmdb, fourk, std_inst, "rehome-sub2160",
+                                          "rehomed", reason=f"{_mres}p, no standard record")
+                    else:
+                        self._log("log_warning", f"[UHD] sub-2160 baseline grab failed for "
+                                                 f"'{mv.get('title')}' on {std_inst}; ultra copy left "
+                                                 f"intact, will retry.")
+                else:
+                    pass   # standard record exists, file not landed yet — wait for the import
+                continue
             # ── DEMOTE candidacy: 2160p, scored, not keep/universe-pinned, BELOW the demote floor.
-            if self._res(mv) <= 1080 or lk is None:
-                continue                                   # not a 2160p copy, or unscored → keep
+            if lk is None:
+                continue                                   # unscored 2160p → keep
             if self._keep_pinned(mv, tag_label_map):
                 continue                                   # keep/universe pin → keep 4K (clock resets)
             if lk >= demote_floor:
@@ -612,7 +725,19 @@ class UhdReconcileManager:
                     # error we keep the clock and retry next run rather than ledger a non-demotion.
                     try:
                         gw.put(fourk, "movie/editor", {"movieIds": [mid], "monitored": False})
-                        gw.delete(fourk, f"moviefile/{fid}")
+                        # CHECKED: DELETE success returns True (base contract fix — the except
+                        # below never saw swallowed HTTP failures; the 2026-08-07 apply's UHD
+                        # delete span proved it). On failure: re-monitor, keep the clock, retry.
+                        if not bool(gw.delete(fourk, f"moviefile/{fid}")):
+                            self._log("log_warning", f"[UHD] demote delete FAILED for "
+                                                     f"'{mv.get('title')}' on {fourk} (see instance-"
+                                                     f"manager error above) — re-monitoring, will retry.")
+                            try:
+                                gw.put(fourk, "movie/editor", {"movieIds": [mid], "monitored": True})
+                            except Exception:
+                                pass
+                            new_clock[str(tmdb)] = since_iso
+                            continue
                     except Exception as e:
                         self._log("log_warning", f"[UHD] demote failed for '{mv.get('title')}' on {fourk}: {e}")
                         new_clock[str(tmdb)] = since_iso
@@ -670,10 +795,11 @@ class UhdReconcileManager:
                     self.global_cache.set(_k, _v)
                 except Exception:
                     pass
-        if demoted or rehomed or recovered:
+        if demoted or rehomed or recovered or sub2160:
             verb = "would " if eff_dry else ""
             self._log("log_info", f"[UHD] watchability 4K routing on {fourk}: {verb}demote {demoted}, "
-                                  f"{verb}rehome {rehomed}, {verb}re-acquire {recovered} "
+                                  f"{verb}rehome {rehomed}, {verb}re-acquire {recovered}, "
+                                  f"{verb}rehome {sub2160} sub-2160 resident(s) "
                                   f"(band {demote_floor}-{threshold}, dwell {dwell_days}d; baseline always survives).")
 
     def _under_pressure(self, gw, inst) -> bool:
@@ -696,6 +822,35 @@ class UhdReconcileManager:
             return False
         return free < U
 
+    def _uhd_headroom_ok(self, gw, inst) -> bool:
+        """GLD-ACQ-30 UHD sub-policy (operator ruling 2026-08-07): re-acquiring a 4K
+        title — shell recovery included — requires free space to clear the pressure
+        band's upper edge by ``routing.movies.uhd_headroom_multiplier`` (default 1.25,
+        the operator's "25% higher than the floor"). Demotes/rehomes are NEVER gated
+        here — they free space and must run precisely when it is tight. FAIL-OPEN like
+        ``_space_pressured``: unknown free ⇒ ok (no speculative blocking)."""
+        im = getattr(gw, "im", None)
+        if im is None:
+            return True
+        try:
+            free = float(im.disk_free_gb(inst))
+        except Exception:
+            return True
+        try:
+            total = im.disk_total_gb(inst)
+        except Exception:
+            total = None
+        try:
+            _, U = space_targets(self.config, total_gb=total)
+        except Exception:
+            return True
+        try:
+            mult = float((((self.config.get("routing") or {}).get("movies") or {})
+                          .get("uhd_headroom_multiplier", 1.25)) or 1.25)
+        except (TypeError, ValueError, AttributeError):
+            mult = 1.25
+        return free >= U * mult
+
     @staticmethod
     def _grab_baseline(gw, std_inst, src_movie, hd_pid, std_root) -> bool:
         """Add a fresh ≤1080 baseline of a 4K-only title to the standard instance (monitored, search
@@ -715,6 +870,189 @@ class UhdReconcileManager:
             return False
 
     # ── per standard instance ──────────────────────────────────────────────────
+    def _category_of(self, mv) -> str:
+        """Which movie CATEGORY this title already occupies on the standard instance, derived
+        from its root folder rather than re-classified.
+
+        Deliberately a REVERSE LOOKUP against ``movieRootFolders`` instead of a second
+        ``classify_movie`` call: the standard copy has already been routed by the resolver or
+        the re-organizer, so its folder IS the answer, and re-deriving it here would create a
+        second classification that can disagree with the first (the exact drift the shared
+        classify/plan_moves split exists to prevent). It also honours a manual move - if the
+        operator dragged a title into /kids, its 4K companion follows it.
+
+        Falls back to "standard" when the path matches nothing.
+        """
+        path = _norm_path(mv.get("path") or mv.get("folderName") or
+                          ((mv.get("movieFile") or {}).get("path")) or "")
+        if not path:
+            return "standard"
+        best, best_len = "standard", -1
+        for cat, root in (self._mrf or {}).items():
+            r = _norm_path(root)
+            # Longest match wins so /movies/kids beats /movies when both are configured.
+            if r and (path == r or path.startswith(r + "/")) and len(r) > best_len:
+                best, best_len = str(cat), len(r)
+        return best
+
+    def _library_paths_for(self, category: str):
+        """Locations of the Plex MOVIE library that already holds this category's STANDARD
+        root — i.e. the library the category's films are actually in.
+
+        IDENTIFIED BY FOLDER, NOT BY NAME. ``movieRootFolders[category]`` (e.g.
+        ``/data/media/movies/kids``) is already attached to exactly one Plex movie library;
+        that library IS the kids library, whatever it is called locally. The earlier version
+        matched section TITLES against ``kid``/``child``/``family`` tokens, which is a guess
+        that fails on "Little Ones", "Family Movies (4K)", or any non-English install — and
+        fails SILENTLY, by capping content it should have allowed.
+
+        Returns None when the inventory is unreadable (→ *unverifiable*), [] when it is
+        readable but no movie library holds the category root (→ *not-in-library*).
+        """
+        std_root = (self._mrf or {}).get(category)
+        if not std_root:
+            return []                         # category has no standard root -> nothing to match
+        gc = self.global_cache
+        if gc is None:
+            return None
+        try:
+            secs = gc.get("plex/sections")
+        except Exception:
+            return None
+        return category_library_paths(secs, std_root)
+
+    def _library_titles_for(self, category: str) -> list:
+        """Names of the Plex movie libraries holding this category's standard root, for
+        operator-facing messages. Naming the library is what makes the warning actionable:
+        on a single-shelf household the answer is 'Movies', not 'the kids library'."""
+        std_root = (self._mrf or {}).get(category)
+        gc = self.global_cache
+        if not std_root or gc is None:
+            return []
+        try:
+            return category_library_titles(gc.get("plex/sections"), std_root)
+        except Exception:
+            return []
+
+    def _dest_root_for(self, mv, default_root: str) -> str:
+        """The 4K-instance root this title should land in, honouring per-category roots
+        (``routing.movies.uhd_root_folders``).
+
+        Fallback order matters. The caller's ``default_root`` is
+        ``movieRootFolders["4k"]`` — historically the FLAT ``/movies/4k``. Once an operator
+        splits that into per-category subfolders, the flat parent typically stops being a
+        REGISTERED root folder on the 4K instance, so falling straight back to it would point
+        an add at a path Radarr no longer manages. Preferring the configured ``standard`` 4K
+        root first keeps the fallback on a root we have just validated exists
+        (``_validate_uhd_roots``); ``default_root`` remains last so a single-root install is
+        byte-identical.
+        """
+        roots = uhd_root_folders(self.config)
+        return str(roots.get(self._category_of(mv)) or roots.get("standard") or default_root)
+
+    def _uhd_blocked(self, mv) -> tuple[str, str]:
+        '''``(reason, category)`` when this title must NOT take a 4K companion, else ``("", cat)``.
+
+        ``classify_movie`` puts CONTENT above RESOLUTION (anime -> kids -> 4k -> standard), so a
+        2160p Pixar film is categorised "kids" and a 2160p Ghibli film "anime" - each belongs on
+        its own Plex shelf. But this reconcile relocates 4K companions onto the 4K INSTANCE, and
+        a flat 4K root takes them off that shelf. Capping at 1080p keeps the title where its
+        audience actually browses.
+
+        Only CONTENT_CATEGORIES are ever blocked; a standard-category 4K copy belongs in the
+        flat root and passes straight through.
+        '''
+        cat = self._category_of(mv)
+        allowed, reason = category_uhd_allowed(self.config, cat, self._library_paths_for(cat))
+        return ("" if allowed else reason), cat
+
+    def _uhd_capped(self, mv, tmdb, std_inst, fourk) -> bool:
+        """True when this title must NOT take a 4K companion — logs once per category+reason
+        and records the plan row. False means proceed.
+
+        ⚠️ CALL ONLY WHERE A 4K COPY WOULD OTHERWISE BE CREATED. This originally ran once per
+        movie, before any eligibility test, so it capped every kids/anime title in the library
+        rather than the handful that were 4K candidates: **999 kids + 346 anime rows in one
+        run**, for titles that would never have received a 4K copy under any configuration.
+        That is not a harmless surplus — it buries the real caps, inflates the plan file 19x,
+        and tells the operator to fix a Plex library for content that was never going there.
+
+        The gate is a veto on an action, so it belongs at the action, not at the top of the
+        loop.
+        """
+        reason, cat = self._uhd_blocked(mv)
+        if not reason:
+            return False
+        # Warn once per category+reason, not per title — a whole library capping is one
+        # problem with one fix, and 400 identical warnings would bury it.
+        seen = self.__dict__.setdefault("_uhd_cap_logged", set())
+        if reason != "unconfigured" and (cat, reason) not in seen:
+            seen.add((cat, reason))
+            _std = (self._mrf or {}).get(cat)
+            _uhd = uhd_root_folders(self.config).get(cat)
+            # Name the library rather than describe it -- "add it to 'Movies'" is actionable,
+            # "add it to the kids library" is not when the household runs one big shelf, or
+            # calls it something else entirely.
+            _libs = ", ".join(f"'{t}'" for t in self._library_titles_for(cat)) or "?"
+            if reason == "not-in-library":
+                # WARN for kids (a restricted profile loses the film), INFO for anime (an adult
+                # can still find it in the 4K library — filed wrong, not lost).
+                self._log("log_warning" if cat == "kids" else "log_info",
+                          f"[UHD] the {cat} 4K root '{_uhd}' is not a folder on the Plex library "
+                          f"that holds '{_std}' ({_libs}) — capping {cat} titles at 1080p so they "
+                          f"stay where their audience browses. Add '{_uhd}' as a second folder on "
+                          f"{_libs} and it will upgrade next run.")
+            elif reason == "category-not-in-plex":
+                self._log("log_warning",
+                          f"[UHD] no Plex MOVIE library contains '{_std}', so the {cat} films are "
+                          f"not in Plex at all — capping {cat} titles at 1080p. This is a bigger "
+                          f"problem than 4K: check that the folder is added to a library, and that "
+                          f"movieRootFolders['{cat}'] matches the path Plex actually has.")
+            elif reason == "unverifiable":
+                self._log("log_warning",
+                          f"[UHD] cannot read Plex's section inventory ('plex/sections' is missing "
+                          f"or cold), so the {cat} 4K root cannot be confirmed reachable — capping "
+                          f"{cat} titles at 1080p. This is a stale-cache problem, not a Plex "
+                          f"mis-configuration; it clears once the Plex libraries pass has run.")
+        self._record_plan(mv.get("title"), tmdb, std_inst, fourk,
+                          f"{cat}-cap-1080", f"capped:{reason}")
+        return True
+
+    def _validate_uhd_roots(self, gw, fourk):
+        """Warn once per run about per-category 4K roots the 4K instance does not actually have
+        registered as root folders.
+
+        Creating ``/movies/4k/kids`` on disk is only half the job — Radarr must also know it as
+        a ROOT FOLDER, or the add payload's ``rootFolderPath`` points at something the instance
+        has no configuration for. This is the Radarr-side twin of the Plex visibility check:
+        both catch "I made the folder but did not tell the application about it", and both fail
+        in a way nothing else in the run would surface.
+
+        Silent when nothing is configured (the single-root default) or when the root list
+        cannot be read — an unreadable list is not evidence of a missing root.
+        """
+        roots = uhd_root_folders(self.config)
+        if not roots:
+            return
+        try:
+            known = {_norm_path(f.get("path")).casefold()
+                     for f in (gw.root_folders(fourk) or [])
+                     if isinstance(f, dict) and f.get("path")}
+        except Exception:
+            return
+        if not known:
+            return                              # could not read -> do not claim they are missing
+        missing = {c: p for c, p in roots.items()
+                   if p and _norm_path(p).casefold() not in known}
+        if missing:
+            pretty = ", ".join(f"{c} -> {p}" for c, p in sorted(missing.items()))
+            self._log("log_warning",
+                      f"[UHD] {len(missing)} configured per-category 4K root(s) are NOT registered "
+                      f"root folders on '{fourk}': {pretty}. Create them in Radarr (Settings > "
+                      f"Media Management > Root Folders) — the directory existing on disk is not "
+                      f"enough, and an add pointed at an unregistered root can fail or land in an "
+                      f"unmanaged path.")
+
     def _reconcile_instance(self, gw, actuator, std_inst, fourk, dest_root, dest_pid,
                             present, hasfile, uhd_paths=None, uhd_res=None, can_remote_play=True,
                             uhd_ids=None, shared_ok=False):
@@ -765,7 +1103,11 @@ class UhdReconcileManager:
             if proactive and not dest_present and res < _UHD_RES and dual_version.wants_uhd(
                     keep_tagged=False, score=lk, space_allows=space_ok_4k,
                     uhd_threshold=threshold, can_remote_play=can_remote_play):
-                ast = actuator.acquire(mv, to_inst=fourk, dest_root=dest_root,
+                # Content-library gate, checked HERE rather than at the top of the loop: this is
+                # the first point at which a 4K copy would actually be created for this title.
+                if self._uhd_capped(mv, tmdb, std_inst, fourk):
+                    continue
+                ast = actuator.acquire(mv, to_inst=fourk, dest_root=self._dest_root_for(mv, dest_root),
                                        dest_profile_id=dest_pid, from_inst=std_inst).get("status")
                 if ast not in ("skip", "noop"):
                     acted += 1
@@ -782,6 +1124,11 @@ class UhdReconcileManager:
             already_baseline = (mv.get("qualityProfileId") == hd_pid) or (mv.get("hasFile") and 0 < res <= 1080)
             if already_baseline or not (res >= _UHD_RES or dest_hasfile):
                 continue                                       # already a 1080p baseline, or nothing to do
+            # Content-library gate for the dual-version path. Reached only once the title is a
+            # genuine 4K candidate (it holds a 2160p, or the 4K side already has a file), so a cap
+            # here means a copy really would have been created.
+            if self._uhd_capped(mv, tmdb, std_inst, fourk):
+                continue
             # MAKE-BEFORE-BREAK ACROSS INSTANCES: standard's existing 2160p is the only in-hand 4K copy,
             # so it is downgraded to 1080p ONLY once the 4K instance genuinely holds its OWN 2160p file —
             # never before. `uhd_has_2160` is that gate; until it's true the standard 2160p is held.
@@ -807,7 +1154,7 @@ class UhdReconcileManager:
                         self._log("log_info", f"[UHD] {std_inst}: '{mv.get('title')}'{watch} → {fourk} "
                                               f"relocate pending (import in flight)")
                 if shared_ok and not relocated:
-                    rst = actuator.relocate(mv, to_inst=fourk, dest_root=dest_root,
+                    rst = actuator.relocate(mv, to_inst=fourk, dest_root=self._dest_root_for(mv, dest_root),
                                             dest_profile_id=dest_pid, from_inst=std_inst,
                                             dest_id=uhd_ids.get(tmdb)).get("status")
                     if rst in ("relocating", "would-relocate"):
@@ -825,7 +1172,7 @@ class UhdReconcileManager:
                     # 'relocating' — so a slow probe can't trigger a re-download.
                 if not relocated:                              # not shared, or genuinely no 2160p to relocate
                     if not dest_present:                       # no 4K record yet → add it (search ON)
-                        ast = actuator.acquire(mv, to_inst=fourk, dest_root=dest_root,
+                        ast = actuator.acquire(mv, to_inst=fourk, dest_root=self._dest_root_for(mv, dest_root),
                                                dest_profile_id=dest_pid, from_inst=std_inst).get("status")
                     else:                                      # 4K record exists but no 2160p → drive it
                         ast = actuator.ensure_acquiring(uhd_ids.get(tmdb), inst=fourk,

@@ -10,7 +10,6 @@ import pytest
 
 from scripts.managers.machine_learning.space.space_targets import (
     PRESSURE_FALLBACK_FRACTION,
-    PRESSURE_FALLBACK_GB,
     _CONSENT_ENV_VARS,
     deletions_consented,
     deletions_disabled_reason,
@@ -48,11 +47,16 @@ def test_unset_limit_defaults_to_25pct_of_total():
     assert PRESSURE_FALLBACK_FRACTION == 0.25
 
 
-def test_unset_limit_total_unknown_uses_last_resort_constant():
-    # total inf / None / 0 -> the constant last resort, NOT a fraction of inf.
+def test_unset_limit_total_unknown_means_NO_floor():
+    # No configured floor AND no readable total -> 0.0, i.e. NO floor at all, so `free < T`
+    # is never true and nothing reclaims. The module-level PRESSURE_FALLBACK_GB (25.0) that
+    # used to be returned here is GONE: four managers each declared their own last resort and
+    # they disagreed (25 / 25 / 1000, plus 25 under the name PRESSURE_THRESHOLD_GB). A
+    # wrongly-LOW floor does nothing; a wrongly-HIGH one declares pressure on a healthy disk
+    # and starts reclaiming -- so with no basis for a floor, we assert none.
     for tg in (float("inf"), None, 0):
         T, U = space_targets({}, total_gb=tg)
-        assert (T, U) == (PRESSURE_FALLBACK_GB, PRESSURE_FALLBACK_GB), tg
+        assert (T, U) == (0.0, 0.0), tg
 
 
 def test_explicit_fallback_gb_honored_when_total_unknown():

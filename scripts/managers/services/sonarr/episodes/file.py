@@ -27,7 +27,9 @@ class SonarrEpisodesFileManager(BaseManager, ComponentManagerMixin):
         self.global_cache = global_cache or getattr(self.manager, "global_cache", None)
         self.sonarr_cache = kwargs.get("cache_manager") or getattr(self.manager, "sonarr_cache", None)
 
-        self.dry_run = kwargs.get("dry_run", getattr(self.manager, "dry_run", False))
+        # dry_run is resolved by BaseManager (explicit kwarg -> pre-super value ->
+        # kwargs["manager"] -> registry parent -> False). The local resolution that used
+        # to sit here defaulted to False, silently overwriting a parent-inherited True.
 
         if not self.logger:
             raise ValueError("❌ SonarrEpisodesFileManager could not initialize without logger")

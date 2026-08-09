@@ -331,6 +331,31 @@ class Main(BaseManager, ComponentManagerMixin):
     def run(self):
         summary = RunSummaryCollector(dry_run=self.dry_run)
 
+        # ── Cross-pass planned-reclaim ledger: cleared ONCE, here ────────────────
+        # Every space pass (Radarr per instance, Sonarr TV, the coordinator) reads the
+        # SAME free-space figure from the SAME shared mount, so each used to plan its
+        # full deficit independently — 396 + 205 + 476 GB of reclaim against one 922 GB
+        # pool, none aware the others had already committed to part of it. Each pass now
+        # ADDS what earlier passes planned to its effective free space, so the chain
+        # drains one shared deficit and deletion (last in the chain) only ever sees what
+        # shrinking could not cover.
+        #
+        # THE RESET BELONGS HERE, NOT IN A SERVICE. Sonarr runs BEFORE Radarr in Phase 2,
+        # so a reset inside RadarrOrchestrationManager.run() would wipe Sonarr's entry
+        # mid-run and hand Radarr a deficit Sonarr had already claimed. One reset, before
+        # any service, is the only placement that works regardless of phase order.
+        #
+        # Not resetting at all fails in the dangerous direction: last run's plan would be
+        # credited to this one, every pass would conclude the deficit was already covered,
+        # and nothing would be reclaimed — silently, looking exactly like a healthy disk.
+        try:
+            from scripts.managers.machine_learning.space.reclaim_ledger import (
+                reset_planned_reclaim,
+            )
+            reset_planned_reclaim(self.global_cache)
+        except Exception as e:
+            self.logger.log_debug(f"[Main] planned-reclaim ledger reset skipped: {e}")
+
         # ── Pre-destructive backups (real runs only) ──────────────────────────────
         # Before any service can delete or re-grab a file, snapshot each Radarr/Sonarr DB+config
         # via its native Backup command and validate the result is loadable. On ANY failure the
@@ -675,6 +700,18 @@ class Main(BaseManager, ComponentManagerMixin):
                         global_cache=self.global_cache).log(detailed=True)
         except Exception as e:
             self.logger.log_debug(f"[Main] plan summary skipped: {e}")
+        # EXCEPTION SUMMARY, printed beside the deletions banner. A pass that RAISED did not
+        # do its job, and every number above it that depended on that pass is incomplete --
+        # but the run still finishes normally and still prints its usual summaries, so a
+        # broken pipeline is indistinguishable from a quiet one unless it is restated HERE.
+        # (A NameError once aborted the whole Sonarr sync and went unnoticed for five runs:
+        # it was logged at ERROR, it was on stdout, and it was still missed.) Silent when
+        # nothing raised, so a clean run stays clean.
+        try:
+            self.logger.log_run_exception_summary()
+        except Exception:
+            pass
+
         self._warn_if_deletions_disabled()
 
     def _start_radarr_library_prefetch(self):

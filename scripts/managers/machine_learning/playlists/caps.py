@@ -18,6 +18,36 @@ from __future__ import annotations
 from scripts.managers.machine_learning.playlists.models import PlaylistInput
 
 
+def limit_per_group(blocks: list[list[PlaylistInput]], max_per_group: int | None):
+    """Trim each group to its first ``max_per_group`` members. Returns
+    ``(trimmed_blocks, dropped_count)``.
+
+    APPLIED BEFORE :func:`apply_size_cap`, and the order matters: trimming first
+    means the size cap then budgets against the trimmed groups, so a formerly
+    oversized group can now FIT rather than being skipped whole. Cap first and
+    trim second would waste the budget on members about to be discarded.
+
+    TAKES THE FIRST N, never a sample. ``blocks`` arrive in spoiler-safe
+    (season, episode) order, so the first member is the one the viewer must see
+    next; any other choice would offer S01E05 while S01E01 is unwatched.
+
+    WHY THIS EXISTS. "Touch & Go" is the STANDALONE list - low-commitment
+    one-offs - and it shipped with five consecutive Suits episodes at positions
+    3-7. Group contiguity is correct behaviour for Up Next, where following one
+    show is the point; for a one-offs list it defeats the entire premise. The
+    difference is a per-FAMILY policy, not a bug in the ordering.
+
+    ``None`` or a non-positive value is a no-op, so a family that has not opted
+    in behaves exactly as before.
+    """
+    if not max_per_group or max_per_group <= 0:
+        return blocks, 0
+    n = int(max_per_group)
+    trimmed = [b[:n] for b in blocks]
+    dropped = sum(len(b) for b in blocks) - sum(len(b) for b in trimmed)
+    return trimmed, dropped
+
+
 def apply_size_cap(blocks: list[list[PlaylistInput]], max_items: int | None):
     """``blocks`` are groups already in final ranked order. Returns
     (kept_items_flat, truncated_count). ``kept`` is the concatenation of the whole

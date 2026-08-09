@@ -56,6 +56,41 @@ _SOURCE_LABEL = {100: "watchlist", 65: "suggested", 60: "playlist", 58: "hubs", 
 _COMPONENT_LABEL = {"genre_affinity": "genre", "trakt_rating": "rating",
                     "popularity": "popular", "recency": "recent", "people_affinity": "cast"}
 
+# The explicit-intent source tier (see _SOURCE_SCORE): the household literally put this
+# title on a watchlist. Used to suppress production-year recency — see score().
+_EXPLICIT_INTENT_SOURCE = 100
+
+# Per-genre ceiling for the noisy-OR below. Keeps a SINGLE matched genre under 100 so a
+# multi-genre match can actually outrank it; at 0.80 the household's #1 genre alone scores
+# 80.0 and leaves headroom for corroborating genres to push toward 100.
+_GENRE_SATURATION = 0.80
+
+
+def _genre_affinity(hits: list) -> float:
+    """Combine per-genre household affinities (0–1 each) into one 0–100 score.
+
+    Noisy-OR — ``1 - Π(1 - wᵢ·S)`` — treating each matched genre as independent evidence
+    that the household wants this title.
+
+    This REPLACED an unweighted mean, which had the aggregator backwards: dividing by the
+    match count meant every additional genre the household liked dragged the score DOWN.
+    Measured on the live watchlist, ``[adventure]`` scored 100.0 while
+    ``[adventure, action, drama]`` scored 86.1 — a title matching the #1, #3 and #5
+    household genres ranked BELOW one matching only the #1, and 131 of 663 movies won
+    purely by carrying a single broad tag. The top 10 was 8 drama-only films as a result.
+
+    Two properties the mean lacked:
+
+    * **Monotonic.** An extra matched genre can only raise the score, never lower it.
+    * **No penalty for breadth.** A genre the household has no weight for never enters
+      ``hits``, so a film tagged with six genres of which two match is scored on the two —
+      the four non-matching tags cost it nothing.
+    """
+    miss = 1.0
+    for w in hits:
+        miss *= 1.0 - min(1.0, max(0.0, float(w))) * _GENRE_SATURATION
+    return 100.0 * (1.0 - miss)
+
 
 class AcquisitionScorer:
     def __init__(self, global_cache, logger, config=None, *, weight_overrides=None):
@@ -116,12 +151,14 @@ class AcquisitionScorer:
 
     def taste_profile(self, k: int = 5) -> dict:
         """The household taste profile the affinity signals are measured against — the top
-        genres + cast/crew BY NAME, read from the same ``tautulli/affinity`` cache the genre
-        signal uses (its ``actors``/``directors`` maps are name-keyed and pre-sorted desc;
-        see :func:`aggregate_affinity`). This is the nameable cast/crew context for the
-        acquisition "why" breakdown: a candidate's OWN credits aren't reachable (the *arr
-        lookup carries none and the people-matrix is id-only by design), but the household's
-        favourite people are. Lazy-cached once per run; ``[]`` lists when affinity is absent."""
+        genres + cast/crew BY NAME (actors, directors, composers, producers), read from the
+        same ``tautulli/affinity`` cache the genre signal uses (its people maps are
+        name-keyed and pre-sorted desc; see :func:`aggregate_affinity`, which tallies all
+        four roles). This is the nameable cast/crew context for the acquisition "why"
+        breakdown: a candidate's OWN credits aren't reachable (the *arr lookup carries none
+        and the people-matrix is id-only by design), but the household's favourite people
+        are. Lazy-cached once per run; ``[]`` lists when affinity is absent — roles the
+        metadata source never supplies simply come back empty and print nothing."""
         if self._aff_people is None:
             aff = (self.gc.get("tautulli/affinity") if self.gc else None) or {}
             aff = aff if isinstance(aff, dict) else {}
@@ -132,7 +169,10 @@ class AcquisitionScorer:
 
             self._aff_people = {"genres": _top("genres"),
                                 "directors": _top("directors"),
-                                "actors": _top("actors")}
+                                "actors": _top("actors"),
+                                "writers": _top("writers"),
+                                "composers": _top("composers"),
+                                "producers": _top("producers")}
         return self._aff_people
 
     def score(self, cand: dict) -> dict:
@@ -142,7 +182,7 @@ class AcquisitionScorer:
         weights = self._affinity()
         cand_genres = [str(g).lower() for g in (cand.get("genres") or [])]
         hits = [weights[g] for g in cand_genres if g in weights]
-        matrix["genre_affinity"] = round(100 * (sum(hits) / len(hits)), 1) if hits else None
+        matrix["genre_affinity"] = round(_genre_affinity(hits), 1) if hits else None
         # Which genres matched (name + normalized 0–1 household weight), descending — the
         # nameable evidence behind genre_affinity. Reuses the `weights` lookup above (no
         # extra cost) and dedups via dict. Captured in `evidence`, never folded into `matrix`.
@@ -165,13 +205,33 @@ class AcquisitionScorer:
         else:
             matrix["popularity"] = None
 
-        # recency
+        # recency — production age, and ONLY for candidates the household did not ask for
+        # by name.
+        #
+        # `100 - age*8` reaches 0 at ~12.5 years, so on a watchlist full of older films it
+        # is not a soft signal, it is a constant: 503 of 663 watchlisted movies are >=13y
+        # old and all scored exactly 0.0, at weight 0.15. It could not separate a 1951 film
+        # from a 2013 one, and it silently taxed the back catalogue by 15% of the total.
+        #
+        # For explicit-intent sources that tax is also WRONG in principle. Putting a title
+        # on a watchlist is a deliberate act; when it was produced says nothing about how
+        # much the household wants it now. So watchlisted titles carry no production-recency
+        # term at all and rank equally on that axis — _weighted() renormalizes on the
+        # signals present, so dropping it redistributes the weight rather than zeroing it.
+        #
+        # Discovery feeds (recommendations, seasonal, hubs) keep the signal: nobody asked
+        # for those by name, and there "it came out recently" is genuine information.
+        # `year` is read unconditionally — `evidence` below reports it even when the
+        # recency SIGNAL is suppressed, so the breakdown still names the production year.
         year = cand.get("year")
-        if isinstance(year, int) and year:
-            age = max(0, _CURRENT_YEAR - year)
-            matrix["recency"] = round(max(0.0, 100 - age * 8), 1)  # ~12y to reach 0
-        else:
+        if matrix["source"] >= _EXPLICIT_INTENT_SOURCE:
             matrix["recency"] = None
+        else:
+            if isinstance(year, int) and year:
+                age = max(0, _CURRENT_YEAR - year)
+                matrix["recency"] = round(max(0.0, 100 - age * 8), 1)  # ~12y to reach 0
+            else:
+                matrix["recency"] = None
 
         # people affinity (cast/crew overlap with household taste). Only ADDED to the
         # matrix when the people_matrix is built AND this candidate's people are known

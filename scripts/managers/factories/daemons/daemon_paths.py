@@ -83,6 +83,10 @@ PEOPLE_NAMES_PATH:    Path = CACHE_TRAKT / "people_names.json.gz"       # {tmdb_
 # stores {tvdb: mtime_ns} alongside each show's routed roles so a repeat run re-reads
 # ONLY the shows the daemon actually rewrote. Same pattern as owned_episodes.fingerprints.
 PEOPLE_SHOWS_SIDECAR: Path = CACHE_TRAKT / "people_matrix.shows.json.gz"
+# Same trick for the MOVIE supplement (daemon credits for titles the Radarr relational
+# tables don't cover). Measured at ~12k such titles, so re-reading them on every rebuild
+# is not affordable — the sidecar keeps it to the files whose mtime actually moved.
+PEOPLE_MOVIES_SIDECAR: Path = CACHE_TRAKT / "people_matrix.movies.json.gz"
 # Build fingerprints (movie-half + show-half + inputs) — lets a run whose credits and
 # watched-set are unchanged skip the rebuild entirely.
 PEOPLE_MATRIX_STATE:  Path = CACHE_TRAKT / "people_matrix.state.json"

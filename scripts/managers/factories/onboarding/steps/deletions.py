@@ -60,10 +60,21 @@ class DeletionsStep(Step):
 
         # The floor governs WHEN to reclaim (with consent) and WHEN to pause
         # acquisition (without consent), so capture it either way.
+        #
+        # SECOND ASKING, DELIBERATELY. steps/library.py (phase 2) also writes
+        # ``free_space_limit`` -- so an operator running the full wizard is asked for the
+        # same number twice, and THIS answer wins. That is the right precedence (the floor
+        # matters most where deletion is armed, and this step explains what it arms), but a
+        # silent second prompt reads like a bug: answer differently here and phase 2's value
+        # is overwritten with no indication it existed. Say so.
         try:
             cur_floor = int(cfg.get("free_space_limit", 0) or 0)
         except (TypeError, ValueError):
             cur_floor = 0
+        if cur_floor > 0:
+            prompter.notice(
+                f"   You already set a free-space floor of {cur_floor} GB earlier (Library & "
+                f"routing). Press Enter to keep it — a different value here REPLACES it.")
         floor = prompter.integer(
             "free_space_limit",
             "Free-space floor in GB to keep available (0 = unset; arms deletion / acquisition pause)",

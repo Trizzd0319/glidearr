@@ -88,8 +88,13 @@ class SonarrStorageSpaceManager(BaseManager, ComponentManagerMixin):
 
         instance = config.get_default_sonarr_instance_name()
         manager = SonarrStorageSpaceManager(logger=logger, config=config, global_cache=cache)
+        # Substitute <instance> before writing — get_root_folders() above reads the FORMATTED
+        # key (cache_manager.format_cache_key(..., instance=...)), so passing the raw template
+        # here warmed a literal "sonarr/<instance>/storage/space_estimates" key that nothing
+        # ever read. Mirrors RadarrStorageSpaceManager.warm_cache.
+        key = CacheKeyPaths.sonarr.SPACE_ESTIMATES.replace("<instance>", instance or "default")
         cache.get_or_generate_cache(
-            key=CacheKeyPaths.sonarr.SPACE_ESTIMATES,
+            key=key,
             generator_function=lambda: manager.get_root_folders(instance),
             expiration_time=300,
         )

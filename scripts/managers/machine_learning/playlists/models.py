@@ -98,4 +98,10 @@ class PlaylistPlan:
     considered: int = 0                   # candidates seen (pre watched-filter)
     dropped_watched: int = 0              # removed because the user already watched
     truncated: int = 0                    # dropped by the size cap
+    per_group_dropped: int = 0            # dropped by the per-group limit (one-offs
+                                          # families cap a series at N members).
+                                          # SEPARATE from `truncated` on purpose: "the
+                                          # playlist was full" and "this series may only
+                                          # contribute once" are different facts, and one
+                                          # number covering both hides which policy acted.
     coverage: dict = field(default_factory=dict)  # group_kind → count (degradation signal)

@@ -31,12 +31,45 @@ class SonarrSyncTagsManager(BaseManager, ComponentManagerMixin):
         self.master_tag_set = set()
         self.global_tag_map = {}
         self.keep_tagged_series = set()
+        self.keep_tag_ids: dict = {}     # instance -> {int tag id(s)} for 'keep' (GLD-ACQ-31)
         self._keep_set_loaded = False
 
         if not self.logger:
             raise ValueError(f"❌ {class_name} could not initialize without logger")
 
         self.logger.log_debug(f"🧰 Initialized {class_name} (Parent: {self.parent_name})")
+
+    def ensure_keep_tag_id(self, instance):
+        """GLD-ACQ-31 — the INTEGER Sonarr tag id for 'keep' on ``instance``, resolving
+        in order: the ids persisted by ``ensure_keep_set`` → a live ``GET /tag`` lookup
+        → CREATING the tag (``POST /tag``) as a last resort. Returns ``None`` only when
+        every path fails — callers must then SKIP tagging (never send the label string:
+        Sonarr series carry integer tag ids, and a string 400s the whole PUT)."""
+        ids = self.keep_tag_ids.get(instance)
+        if ids:
+            return next(iter(ids))
+        if not self.sonarr_api:
+            return None
+        try:
+            for t in (self.sonarr_api._make_request(instance, "tag", fallback=[]) or []):
+                if str(t.get("label", "")).lower() == "keep" and t.get("id") is not None:
+                    tid = int(t["id"])
+                    self.keep_tag_ids.setdefault(instance, set()).add(tid)
+                    return tid
+        except Exception:
+            pass
+        try:
+            created = self.sonarr_api._make_request(
+                instance, "tag", method="POST", payload={"label": "keep"}, fallback=None)
+            tid = (created or {}).get("id")
+            if tid is not None:
+                tid = int(tid)
+                self.keep_tag_ids.setdefault(instance, set()).add(tid)
+                self.logger.log_info(f"🏷️ Created 'keep' tag on '{instance}' (id {tid}).")
+                return tid
+        except Exception:
+            pass
+        return None
 
     def _normalize_tags(self, tag_list):
         """Ensures tag values are stringified consistently."""
@@ -107,6 +140,11 @@ class SonarrSyncTagsManager(BaseManager, ComponentManagerMixin):
                     }
                 except Exception:
                     keep_ids = set()
+            # GLD-ACQ-31: PERSIST the resolved ids — they used to be computed here and
+            # discarded, leaving every writer with no id accessor; four sync sites then
+            # added the LABEL string into the ids array, 400-ing series PUTs on the
+            # first-run path ($.tags[i] could not be converted to System.Int32).
+            self.keep_tag_ids[inst] = {int(k) for k in keep_ids if k is not None}
 
             try:
                 series_iter = series_mgr.iter_all_series(inst)

@@ -245,11 +245,25 @@ class TraktMoviePeopleManager(BaseManager, ComponentManagerMixin):
 
     @LoggerManager().log_function_entry
     @timeit("get_people")
-    def get_people(self, tmdb_id: int) -> dict | None:
+    def get_people(self, tmdb_id: int, imdb_id: str | None = None) -> dict | None:
         """
-        Return normalised credits dict for tmdb_id.
-        Checks disk cache first; fetches from Trakt API on miss.
-        Returns None if Trakt is not configured or the movie has no credits.
+        Return normalised credits dict for tmdb_id (the CACHE key).
+
+        Checks disk cache first; fetches from Trakt API on miss. Returns None if Trakt
+        is not configured or the movie has no credits.
+
+        ``imdb_id`` is the id used in the URL, and the live path now REQUIRES it.
+        Trakt's ``movies/{id}`` resolves a Trakt id, slug or IMDB id — never a TMDB id —
+        so the previous ``movies/{tmdb_id}/people`` silently fetched whichever Trakt
+        record happened to carry that number: ``movies/105`` returned a Danish film
+        rather than Back to the Future, and the result was cached under tmdb 105 as if
+        correct. That poisoned both this cache AND everything downstream of it, since
+        ``build_relations_from_movies`` is fed from here — the Radarr relational
+        credits parquet is a DERIVATIVE of this data, not an independent source.
+
+        Without an imdb id the live fetch is skipped rather than guessed. Callers that
+        have the Radarr payload can pass ``movie["imdbId"]`` (present on ~98.5% of the
+        library); the enrich daemon does the same thing via its ``fetch_map``.
         """
         cached = self.cache.get(tmdb_id)
         if cached is not None:
@@ -259,7 +273,14 @@ class TraktMoviePeopleManager(BaseManager, ComponentManagerMixin):
         if self.cache_only:
             return None
 
-        raw = self._make_request(f"movies/{tmdb_id}/people")
+        if not (isinstance(imdb_id, str) and imdb_id.startswith("tt")):
+            self.logger.log_debug(
+                f"[TraktPeople] tmdb {tmdb_id}: no imdb id — skipping live fetch "
+                "(a tmdb id in a Trakt path resolves the wrong title)."
+            )
+            return None
+
+        raw = self._make_request(f"movies/{imdb_id}/people")
         if raw is None:
             return None
 

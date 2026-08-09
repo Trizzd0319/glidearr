@@ -430,7 +430,17 @@ class BaseInstanceManager(BaseManager, ComponentManagerMixin):
                             write_lock.release()
 
                     if method_upper == "DELETE":
-                        return None
+                        # A successful DELETE used to return None — INDISTINGUISHABLE from
+                        # a swallowed failure returning the default fallback (None). No call
+                        # site could check a delete result, so none did: the 2026-08-07
+                        # apply counted 30 failed movie deletes as freed GB, funded a
+                        # recycle whose 6 deletes all 500'd, and "realized" downgrades whose
+                        # old file was never removed. Success now returns True; failure
+                        # still returns the fallback. No existing check can break: under
+                        # the old contract both outcomes were None, so no result check
+                        # could ever have been functional. Callers passing a custom DELETE
+                        # fallback must treat truthy as success.
+                        return True
                     # Memoize a successful full-library snapshot (never the fallback)
                     # and hand the caller a list() copy so the cached list is never
                     # aliased (its inner dicts remain shared / read-only).

@@ -25,6 +25,16 @@ demotes a show OUT of Kids, but a low/absent CSM age never routes it INTO Kids o
 is an adult drama, so a borderline age must be corroborated). A kids *certificate* alone
 (TV-G/…) does NOT override anime/reality/documentary — it applies only when nothing else matched.
 
+SCOPE OF THE ANIME BUCKET — DELIBERATELY BROADER THAN "JAPANESE".
+The household runs ONE animation shelf for Asian-origin animated content, so Korean
+(Pinkfong), Chinese (The Legend of Silk Boy, The Royal Cat) and Japanese titles all land
+there together. That is intended, not a mis-classification: an original-language signal
+outside English on an animated title is enough to reach it. If you are reading this
+because Pinkfong sitting next to One Piece looked wrong — it is not, and narrowing the
+language test would scatter that shelf across Kids and Standard. Splitting the bucket
+would also mean RENAMING a root folder, which triggers a full relocation of everything
+inside it; the bucket name is load-bearing, not cosmetic.
+
 Signals, in precedence order:
   • preschool   — the 'Preschool' GENRE only (NOT a cert). TOP precedence: beats anime and
                   the lifestyle veto, so genuine toddler content always reaches Kids.

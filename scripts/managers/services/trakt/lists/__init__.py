@@ -1,3 +1,37 @@
+"""
+trakt/lists — the operator's own Trakt lists. DEAD, and its summary is half-empty.
+================================================================================
+Constructed by nothing (removed from trakt/api's sub-manager map, session 94).
+Unlike sync/universe/analytics this is NOT purely redundant — see "worth keeping"
+below — but nothing reaches it and one method returns a partly-unpopulated shape.
+
+🔴 ``_generate_unified_summary`` DECLARES FIVE FIELDS AND WRITES THREE.
+``title`` ("") and ``in_library`` (False) are set in the defaultdict factory and
+then never assigned by anything — so every entry reports an empty title and claims
+the show is not in the library, whatever the truth. A caller trusting either would
+be reading a constant, not data. Only ``lists``, ``episodes_watched`` and
+``last_watched`` are real.
+
+⚠️ It also returns ``lists`` as a ``set()``, which is not JSON-serialisable —
+caching the result would depend on ``make_json_safe`` coercing it.
+
+⚠️ And the summary quietly includes EVERY watched series, not just list members:
+``show_data`` is a defaultdict, so ``show_data[tvdb_id]`` in the history loop CREATES
+an entry for a series that is on no list at all (with ``lists`` left empty).
+Defensible for a "unified" view, but it means most rows are watch-stats-only.
+
+WORTH KEEPING (the reason this is documented rather than simply deleted):
+``get_user_lists`` / ``get_list_items`` read the operator's OWN Trakt lists, and
+nothing else in the repo does. The enrich daemon's ``lists`` scope is a different
+thing (which lists a TITLE appears on); acquisition sources are watchlist +
+recommendations only; the playlist universes come from mdblist. "Acquire from my
+Trakt list X" is a real gap this could fill.
+
+SUPERSEDED, though: ``get_collected_shows`` duplicates writeback/trakt_collection's
+own collection fetch, and ``get_user_watched`` duplicates trakt/history.
+
+See GLD-TRK-20.
+"""
 from collections import defaultdict
 from datetime import datetime
 
@@ -19,7 +53,7 @@ class TraktListsManager(BaseManager, ComponentManagerMixin):
         self.register()
 
         parent         = kwargs.get("manager")
-        self.dry_run   = kwargs.get("dry_run", getattr(parent, "dry_run", False) if parent else False)
+        # dry_run resolved by BaseManager. Fifteenth instance of the local clobber.
         self.trakt_api = kwargs.get("trakt_api")
 
         # Optional Sonarr integration — injected externally if needed

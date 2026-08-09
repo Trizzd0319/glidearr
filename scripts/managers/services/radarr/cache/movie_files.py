@@ -77,9 +77,17 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         "composer_names",           # Original Music Composer
         "cinematographer_names",    # Director of Photography
         "editor_names",
+        # cast_* are THREE PARALLEL ARRAYS: index i of each describes the same actor.
+        # Nothing structurally enforces that -- they are three independent pipe-joined
+        # strings -- so any writer must rewrite all three together or clear the ones it
+        # cannot supply. _extract_people builds them from one sorted list (safe);
+        # refresh_enrichment used to rewrite only cast_names (not safe -- see ENRICH_COLS).
+        # A literal "|" in a name or character would also shift one array relative to the
+        # others; not observed, but the encoding permits it.
         "cast_names",               # top 10 billed actors
         "cast_characters",          # parallel pipe-separated
-        "cast_order",               # parallel billing integers
+        "cast_order",               # parallel billing integers -- read by people_matrix's
+                                    # billing decay, so a shift silently mis-weights affinity
         # Studio
         "studio", "production_companies",  # JSON array string
         # Release
@@ -767,7 +775,22 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
         if not cols_by_tmdb:
             return 0
 
-        ENRICH_COLS = ("cast_names", "director_names", "producer_names", "writer_names",
+        # cast_characters + cast_order are PARALLEL ARRAYS to cast_names -- position i in
+        # each describes the same actor. They must be rewritten together or not at all.
+        #
+        # THE BUG THIS FIXES: this list used to carry cast_names WITHOUT its two parallels,
+        # so every enrichment pass replaced the cast list with Trakt's while leaving
+        # Radarr's characters and billing positions in place. Different source, different
+        # ordering, different length -- misaligned by construction, on every run. Downstream
+        # that means `people_matrix`'s billing decay (1/(1+0.25*rank)) weights TRAKT's
+        # actors by RADARR's billing order, and any actor->character zip pairs the wrong two.
+        #
+        # Including them here is correct whether or not flatten_trakt_people supplies them:
+        # if it does, all three are rewritten from one source; if it does not, `.get()`
+        # returns None and the stale parallels are CLEARED rather than left describing a
+        # cast list that no longer exists. Both outcomes are aligned; the old one never was.
+        ENRICH_COLS = ("cast_names", "cast_characters", "cast_order",
+                       "director_names", "producer_names", "writer_names",
                        "composer_names", "trakt_rating", "trakt_vote_count")
         _t = pd.to_numeric(df["tmdb_id"], errors="coerce")
         for col in ENRICH_COLS:

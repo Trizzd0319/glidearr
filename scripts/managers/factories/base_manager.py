@@ -42,6 +42,52 @@ class BaseManager:
         self.cli_flags = kwargs.get("cli_flags", {})
         self.timestamp = datetime.now().isoformat()
 
+        # ── dry_run: resolved ONCE, here, for every manager ───────────────────
+        # Historically BaseManager did NOT capture dry_run, so ~40 managers each
+        # re-implemented the capture and a manager that forgot silently defaulted
+        # to FALSE — i.e. LIVE. That footgun has already fired: see the inline
+        # record in sonarr/__init__.py, where the episode-file cache "ran LIVE
+        # even in dry_run=True sessions".
+        #
+        # PRECEDENCE, and why this order:
+        #   1. explicit kwarg   — the caller said so. Must win outright, because
+        #                         __new__ is a SINGLETON registry: __init__ can run
+        #                         a second time on an existing instance, and a
+        #                         later explicit False has to be able to override
+        #                         an earlier True.
+        #   2. a value this instance already carries — a subclass that resolved
+        #                         dry_run BEFORE calling super() (e.g.
+        #                         radarr/repair/anomaly.py, which walks its own
+        #                         manager chain). Never clobber a deliberate
+        #                         upstream resolution.
+        #   3. the CONSTRUCTING manager (kwargs["manager"]) — NOT the same thing as
+        #                         the registry parent below. parent_name has
+        #                         several semantics across the codebase and the
+        #                         registry lookup can miss, while the manager that
+        #                         actually built this object is always right there
+        #                         in kwargs. This rung is what makes the old
+        #                         per-subclass `kwargs.get("dry_run", getattr(
+        #                         parent, "dry_run", False))` lines redundant.
+        #   4. the registry parent — the remaining case: built without a manager
+        #                         kwarg but linked by name. Previously the parent
+        #                         link below copied logger/config/global_cache/
+        #                         validator and simply omitted dry_run.
+        #   5. False             — today's behaviour, kept so this change is
+        #                         byte-identical for every manager that already
+        #                         passes the kwarg explicitly.
+        #
+        # Step 4 is applied in the parent block further down, once `parent` is
+        # known; steps 1-3 are resolved here so the value exists before any
+        # subclass code runs.
+        _dry_run = kwargs.get("dry_run")
+        if _dry_run is None:
+            _dry_run = getattr(self, "dry_run", None)
+        if _dry_run is None:
+            # getattr tolerates both None and the `{}` null-object some managers
+            # pass for a missing parent.
+            _dry_run = getattr(kwargs.get("manager"), "dry_run", None)
+        self.dry_run = None if _dry_run is None else bool(_dry_run)
+
         # Auto-resolve parent name
         self.parent_name = kwargs.get("parent_name") or self._infer_parent_from_path()
 
@@ -80,6 +126,14 @@ class BaseManager:
                 self.global_cache = getattr(parent, "global_cache", None) or self.global_cache
                 self.validator = getattr(parent, "validator", self.validator)
                 self.manager = getattr(parent, "manager", parent)
+                # dry_run inherits the same way — but ONLY when nothing more
+                # specific supplied it (see the precedence note above). This is the
+                # line whose absence made dry_run a distributed invariant: every
+                # other shared field was already inherited here.
+                if self.dry_run is None:
+                    _p = getattr(parent, "dry_run", None)
+                    if _p is not None:
+                        self.dry_run = bool(_p)
             else:
                 # self.logger.log_debug(f"⚠️ No parent found for {self.name}; standalone init")
                 pass
@@ -88,6 +142,29 @@ class BaseManager:
 
         # Always attempt deferred link if initial link failed
         self._resolve_deferred_parent()
+
+        # ── dry_run, final step ───────────────────────────────────────────────
+        # Nothing supplied one: kwargs silent, no pre-super value, no parent (or a
+        # parent that carries none). Fall back to False — today's behaviour for
+        # every manager, so this whole block is a no-op wherever dry_run was
+        # already being passed.
+        #
+        # NOT a raise. sonarr/series/space_pressure.py is right to refuse to
+        # construct without an explicit value, but that is a judgement a manager
+        # that MOVES FILES gets to make; a base class shared by read-only managers
+        # cannot. Managers with a destructive blast radius should keep their own
+        # stricter resolution on top of this.
+        #
+        # KNOWN LIMITATION — a subclass that runs
+        #     self.dry_run = kwargs.get("dry_run", False)
+        # AFTER super().__init__() still overwrites a parent-inherited True with
+        # False. This block fixes managers that never captured dry_run at all; it
+        # cannot fix ones that actively overwrite. Those lines should be DELETED
+        # now that the base class resolves it. Known sites: services/writeback,
+        # services/calendar, radarr/quality/selector (all two-level, defaulting
+        # False) — see GLD-WB-03 / GLD-CAL-01 / GLD-RQ-11.
+        if self.dry_run is None:
+            self.dry_run = False
 
     def _init_summary_data(self):
         pass  # superseded by BaseInstanceManager._finalize

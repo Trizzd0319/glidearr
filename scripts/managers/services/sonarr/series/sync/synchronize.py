@@ -71,8 +71,15 @@ class SonarrSeriesSyncSynchronizeManager(BaseManager, ComponentManagerMixin):
             updated_tags = set(current_tags)
 
             if self.tag_monitor and self.tag_monitor.is_series_tagged_keep(series_id):
-                updated_tags.add("keep")
-                self.logger.log_info(f"🔒 Ensuring 'keep' tag on '{title}' ({instance_name})")
+                # GLD-ACQ-31: integer tag id, never the label (a string 400s the PUT).
+                _kid = (self.tag_monitor.ensure_keep_tag_id(instance_name)
+                        if hasattr(self.tag_monitor, "ensure_keep_tag_id") else None)
+                if _kid is not None:
+                    updated_tags.add(int(_kid))
+                    self.logger.log_info(f"🔒 Ensuring 'keep' tag on '{title}' ({instance_name})")
+                else:
+                    self.logger.log_warning(
+                        f"⚠️ 'keep' tag id unresolvable on '{instance_name}' — skipping for '{title}'.")
 
             original_monitored = series.get("monitored", False)
             new_payload = {
@@ -151,6 +158,17 @@ class SonarrSeriesSyncSynchronizeManager(BaseManager, ComponentManagerMixin):
                     raise RuntimeError("series not found")
 
                 new_tags = list(want_tags) if want_tags is not None else series.get("tags", [])
+                # GLD-ACQ-31 belt: Sonarr tags are INTEGER ids — coerce and drop anything
+                # else loudly, so one leaked label can never 400 the whole series PUT again.
+                _clean = []
+                for _t in new_tags:
+                    try:
+                        _clean.append(int(_t))
+                    except (TypeError, ValueError):
+                        self.logger.log_warning(
+                            f"⚠️ Dropping non-integer tag {_t!r} from '{title}' payload — "
+                            f"Sonarr tags must be ids.")
+                new_tags = _clean
                 new_mon  = bool(want_mon) if want_mon is not None else series.get("monitored", False)
 
                 if (set(series.get("tags", [])) == set(new_tags)
@@ -162,9 +180,14 @@ class SonarrSeriesSyncSynchronizeManager(BaseManager, ComponentManagerMixin):
 
                 series["tags"]      = new_tags
                 series["monitored"] = new_mon
-                self.sonarr_api._make_request(
+                # GLD-ACQ-31: _make_request swallows HTTP errors and returns the None
+                # fallback WITHOUT raising — the 400s on the first-run path were being
+                # logged as "✅ Synced" (P-D). A falsy result is a FAILURE.
+                _res = self.sonarr_api._make_request(
                     instance_name, f"series/{sid}", method="PUT", payload=series
                 )
+                if _res is None:
+                    raise RuntimeError("series PUT rejected by Sonarr (validation/transport)")
                 applied += 1
                 self.logger.log_info(f"✅ Synced '{title}' on {instance_name}")
             except Exception as e:

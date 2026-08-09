@@ -1,9 +1,63 @@
 """
-RadarrRepairAnomalyManager
-===========================
-Detects anomalous movie states in Radarr:
-- Movies in the wrong instance (resolution mismatch vs. instance policy)
-- Movies with missing files but still monitored
+RadarrRepairAnomalyManager — the owned-movie lifecycle engine.
+================================================================================
+DESPITE THE NAME, THIS IS NOT A REPORTER. It demotes, unmonitors, deletes, restores
+and 4K-routes owned movies, and it owns four of the delete-family thresholds. The
+previous docstring listed two diagnostic scans and nothing else, which is how a
+reader could come away believing the module was read-only.
+
+WHAT IT ACTUALLY DOES
+---------------------
+  triage_monitored_missing      Monitored, no file. Decides search / unmonitor / wait
+                                per ``lifecycle.monitor_policy.triage_action``, and
+                                routes 4K-worthy titles to the dedicated UHD instance
+                                (``space.dual_version``).
+  repair_unmonitored_with_files Owns a file but is unmonitored. Re-monitors when the
+                                score clears ``movie_monitor``.
+  demote_stale_monitored        TWO-STAGE PRUNE, and the destructive path:
+                                  stage 1  unmonitor after ``owned_demote_dwell_days``
+                                  stage 2  DELETE the movie file after the delete dwell
+                                Gated by space pressure, a delete-cohort budget
+                                (``lifecycle.stale_prune_policy.budget_delete_cohort``),
+                                franchise/universe exemptions, keep-policy, and the
+                                watched-set guard. Honours ``dry_run`` and the
+                                coordinator hand-off (``space_targets``).
+  restore_recovered_deletions   Re-adds a previously deleted movie whose score has
+                                recovered above ``movie_restore``. Hysteresis PARTNER of
+                                the demote floor — see ``_resolve_prune_floors``.
+
+THRESHOLDS IT OWNS (all AXIS LEGACY — see below)
+------------------------------------------------
+  movie_demote / movie_restore / movie_unmonitor   20
+  movie_monitor                                    30
+  uhd_dual                                         75  (the only UHD gate that reads
+                                                        the watchability score)
+
+AXIS LEGACY — WHY 20 AND NOT 17
+-------------------------------
+``_score_owned`` calls ``score_movie`` on the RAW Radarr dict with **no**
+``transcode_profile`` (and no ``platform_usage`` / ``target_resolution`` /
+``video_codec``), so Group D v2's transcode-risk penalty is unreachable and this axis
+was NOT translated by SCORER_REVISION 4. The persisted ``watchability_score`` column
+WAS, which is why space_pressure sits at 17 and this file sits at 20. The two axes
+measured on this library: anomaly mean 7.4 / max 36, persisted mean 9.3 / max 58,
+agreeing on ~84% of delete-eligibility calls. Re-anchoring this to match
+space_pressure would tighten a floor against a distribution that never moved. See
+``machine_learning/thresholds/registry.py``'s delete block for the full two-axis table.
+
+HYSTERESIS
+----------
+Deletion fires at ``score < demote_floor``; restore at ``score > restore_floor``. If
+restore ever drops below demote, every movie in the gap is deleted one run and
+re-acquired the next, forever (``owned_restore_min_age_days`` defaults to 0, so
+nothing damps it). Both floors are therefore resolved together by
+``_resolve_prune_floors``, which clamps the DELETE side down if they cross.
+
+STATE IT KEEPS
+--------------
+  radarr/{inst}/monitor_demote_clock   per-movie dwell clock; RESET on recovery, and
+                                       advanced even under dry_run so elapsed time is real
+  radarr/{inst}/demote_deleted         the deleted-set restore_recovered_deletions reads
 """
 
 from __future__ import annotations
@@ -34,12 +88,16 @@ from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.support.utilities.space_targets import (
     coordinator_owns_deletion, deletions_enabled, space_targets,
 )
+from scripts.managers.machine_learning.space.routing_targets import UHD_INSTANCE_LABELS
 
 
-# Alias-aware 4K/UHD instance labels — MUST match UhdReconcileManager._UHD_LABELS so the
-# monitored-missing triage and the dual-version reconcile agree on which Radarr session is the
-# dedicated 4K instance (the role map writes "4K" while the folder bucket is "4k").
-_UHD_LABELS = ("4K", "4k", "uhd", "UHD", "2160p", "2160")
+# The dedicated-4K instance labels live in routing_targets (the single source of truth for
+# these gates). This module and services/routing/uhd_reconcile both used to declare the tuple
+# themselves, coupled only by a comment reading "MUST match UhdReconcileManager._UHD_LABELS"
+# -- a requirement in prose with nothing enforcing it. Drift would have meant the
+# monitored-missing triage below and the dual-version reconcile disagreeing about which
+# Radarr session is the 4K one.
+_UHD_LABELS = UHD_INSTANCE_LABELS
 
 
 # ── Grid-cell formatters (shared by every Radarr movie table) ────────────────────
@@ -96,7 +154,12 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         parent = kwargs.get("manager")
         self.radarr_api      = kwargs.get("radarr_api") or getattr(parent, "radarr_api", None)
         self.instance_manager = kwargs.get("instance_manager") or getattr(parent, "instance_manager", None)
-        self.dry_run = kwargs.get("dry_run", getattr(parent, "dry_run", False) if parent else False)
+        # dry_run is resolved by BaseManager (explicit kwarg -> pre-super value ->
+        # kwargs["manager"] -> registry parent -> False). The local resolution that
+        # used to sit here defaulted to False, silently overwriting a
+        # parent-inherited True — in the manager that DELETES MOVIE FILES
+        # (demote_stale_monitored stage 2). Highest-stakes of the four sites this
+        # pattern appeared in; do not reinstate it.
 
         self.logger.log_debug(f"Initialized {self.__class__.__name__}")
 
@@ -704,6 +767,62 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
     _DELETE_CLOCK_KEY = "radarr/{inst}/monitor_demote_clock"
     _DELETED_SET_KEY  = "radarr/{inst}/demote_deleted"
 
+    def _resolve_prune_floors(self) -> tuple[int, int]:
+        """Resolve the demote and restore floors TOGETHER and enforce the hysteresis
+        invariant ``restore_floor >= demote_floor``. Returns ``(demote, restore)``.
+
+        WHY THESE CANNOT BE RESOLVED SEPARATELY.
+        Deletion fires at ``score < demote_floor``; restore fires at
+        ``score > restore_floor``. If restore ever drops BELOW demote, the interval
+        ``(restore_floor, demote_floor)`` is a band in which the same movie is
+        deleted one run and re-acquired the next, forever -- and
+        ``owned_restore_min_age_days`` defaults to 0, so nothing damps it. At
+        ``restore == demote`` the band is empty (both tests are strict), which is
+        why equality is allowed.
+
+        The two constants were previously resolved in different methods, each
+        through its own ``get_threshold`` call, with nothing comparing them. Both
+        ship at 20 so the band is closed today -- but the calibrator derives each
+        spec independently, so ONE re-anchor of either side opens the loop with no
+        human in the loop. That is what this method exists to prevent.
+
+        WHICH SIDE MOVES, and why it is the demote floor:
+        clamping DEMOTE DOWN deletes strictly less; clamping RESTORE UP would keep
+        deleting at the same rate while stranding every title in the band as
+        deleted-and-never-restored. Per the fail-direction rule (see
+        machine_learning/discovery), on inconsistent input prefer the outcome that
+        changes nothing -- so the delete side yields.
+        """
+        cfg = self.config or {}
+
+        def _cfg_int(key: str, default: int) -> int:
+            try:
+                return int(cfg.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        demote  = get_threshold("movie_demote", self.config,
+                                _cfg_int("owned_demote_score_threshold", 20),
+                                logger=getattr(self, "logger", None))
+        restore = get_threshold("movie_restore", self.config,
+                                _cfg_int("owned_restore_score_threshold", 20),
+                                logger=getattr(self, "logger", None))
+        try:
+            demote, restore = int(demote), int(restore)
+        except (TypeError, ValueError):
+            return 20, 20            # both unusable -> ship defaults, band closed
+
+        if restore < demote:
+            self.logger.log_warning(
+                f"⚠️ Prune floors CROSSED: movie_demote={demote} > movie_restore={restore}. "
+                f"Scores in ({restore}, {demote}) would be deleted one run and re-acquired "
+                f"the next, indefinitely. Clamping the DELETE floor down to {restore} for "
+                f"this run (deletes less; never strands a title). These two thresholds are "
+                f"a hysteresis PAIR -- re-anchor them together or not at all."
+            )
+            demote = restore
+        return demote, restore
+
     def _score_owned(self, movie: dict, ctx: dict, score_movie) -> tuple[int, bool]:
         """Score an owned/known movie. Returns (score, credits_present). credits_present
         is False when Trakt credits aren't cached yet — callers DEFER on that so a movie
@@ -793,9 +912,11 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         # they agree on only ~84% of delete-eligibility calls. A 17 here would tighten a
         # floor against a distribution that never moved. See registry.py's delete block for
         # the full two-axis table and for why threading a profile in here does NOT fix it.
-        floor          = _int("owned_demote_score_threshold", 20)
-        floor          = get_threshold("movie_demote", self.config, floor,
-                                       logger=getattr(self, "logger", None))
+        #
+        # Resolved via _resolve_prune_floors so the DELETE floor and the RESTORE floor are
+        # decided together — they are a hysteresis pair, and separating them opens a
+        # delete/re-acquire loop. See that method's docstring.
+        floor, _restore_floor = self._resolve_prune_floors()
         unmonitor_days = _int("owned_demote_dwell_days", 30)
         delete_days    = _int("owned_delete_dwell_days", 90)
         # HARD SAFETY GATE folded into delete_enabled: with no operator-set
@@ -1156,12 +1277,11 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
         # (``owned_restore_min_age_days`` defaults to 0, so nothing damps it). The two move
         # together or not at all. NOTE the Sonarr twin no longer shares this key — it reads
         # ``tv_restore_score_threshold`` because it sits on the OTHER axis; see registry.py.
-        try:
-            restore_floor = int(self.config.get("owned_restore_score_threshold", 20) if self.config else 20)
-        except (TypeError, ValueError):
-            restore_floor = 20
-        restore_floor = get_threshold("movie_restore", self.config, restore_floor,
-                                      logger=getattr(self, "logger", None))
+        #
+        # That constraint is now ENFORCED rather than merely documented: both floors are
+        # resolved by _resolve_prune_floors, which clamps the delete side down if a
+        # calibrator ever derives them independently and they cross.
+        _demote_floor, restore_floor = self._resolve_prune_floors()
         try:
             restore_min_age = int(self.config.get("owned_restore_min_age_days", 0) if self.config else 0)
         except (TypeError, ValueError):

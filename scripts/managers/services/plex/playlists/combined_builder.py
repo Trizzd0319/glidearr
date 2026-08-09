@@ -43,6 +43,56 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
         Touch & Go) alongside the blended Up Next. Default OFF → byte-identical (nothing built)."""
         return bool((self._pl_cfg().get("mood_lists", {}) or {}).get("enabled", False))
 
+    def _touchgo_max_per_group(self) -> int:
+        """``plex.playlists.mood_lists.touchgo_max_per_group`` — default 1.
+
+        ONE, because "Touch & Go" IS the one-offs list: low-commitment standalones
+        you can start and leave. It shipped with FIVE consecutive Suits episodes at
+        positions 3-7 - which is group contiguity doing exactly what it should for Up
+        Next, and exactly the wrong thing here. A series offering its single next
+        episode is the entire premise of the family.
+
+        THE LONG GLIDE DELIBERATELY HAS NO SUCH CAP: it is the in-progress list,
+        where following one saga run-on is the whole point. Same ordering engine,
+        opposite policy - which is why this is a per-family argument rather than a
+        global setting.
+
+        0 or negative disables the trim, restoring the previous behaviour.
+        """
+        cfg = (self._pl_cfg().get("mood_lists", {}) or {})
+        try:
+            return int(cfg.get("touchgo_max_per_group", 1))
+        except (TypeError, ValueError):
+            return 1
+
+    def _warmth_cfg(self) -> dict:
+        """``plex.playlists.warmth`` — the session-warmth knobs for the blended Up Next
+        (GLD-PLY-17). All default to the LEGACY behaviour, so an absent block is byte-identical:
+
+        * ``weight`` (0.0) — how hard a just-watched group is lifted, on the same normalised
+          0..1 axis as watchability. 0 disables warmth entirely.
+        * ``halflife_hours`` (18.0) — the lift halves every this-many hours since the last watch,
+          so "this afternoon" pulls hard and "last week" is back to baseline.
+        * ``recency_mode`` ("tier") — "tier" keeps the legacy short-circuit where ``recency_boost``
+          outranks and BYPASSES resume/saga/warmth entirely; "blend" makes them additive so the
+          signals compose. Warmth cannot reach the ranking axis while this is "tier".
+        * ``recency_weight`` (0.35) — the additive value of the caught-up+fresh boost under
+          "blend", replacing the hard tier it had under "tier".
+        """
+        w = (self._pl_cfg().get("warmth", {}) or {})
+
+        def _f(key, default):
+            try:
+                return float(w.get(key, default))
+            except (TypeError, ValueError):
+                return float(default)
+
+        mode = str(w.get("recency_mode", "tier")).strip().lower()
+        return {"weight": max(0.0, _f("weight", 0.0)),
+                "halflife_hours": max(1e-6, _f("halflife_hours", 18.0)),
+                "recency_weight": max(0.0, _f("recency_weight", 0.35)),
+                "recency_mode": mode if mode in ("tier", "blend") else "tier"}
+
     # ── run (I/O gather → tested core) ──────────────────────────────────────────
     def run(self) -> dict:
         tracked = self._tracked_users()
@@ -76,6 +126,7 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
             universe_membership=self._movie_universe_membership(owned_movies),
             franchise_by_series=franchise_by_series, series_timeline=series_timeline,
             resume_boost=resume_on, resume_order=resume_order, resume_weight=resume_weight,
+            warmth=self._warmth_cfg(),
             movie_recency=movie_recency, episode_recency=episode_recency)
 
     def _build_for_users(self, tracked, owned_eps, owned_movies, tv_inv, movie_inv,
@@ -85,6 +136,7 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                          universe_order=None, universe_membership=None,
                          franchise_by_series=None, series_timeline=None,
                          resume_boost=False, resume_order="recency", resume_weight=0.0,
+                         warmth=None,
                          movie_recency=None) -> dict:
         if not tv_inv and not movie_inv:
             self.logger.log_warning("[ComboPlaylists] no owned_inventory (TV or movie) — "
@@ -152,11 +204,16 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                                        watch_recency=(movie_recency or {}).get(u["safe_user"], {}))
 
             recency_on, recency_window = self._recency_cfg()
+            _w = warmth or {}
             plan, stats = build_combined_plan([tv_items, mv_items], family="up_next",
                                               max_items=self._max_items(),
                                               resume_boost=resume_boost, resume_order=resume_order,
                                               resume_weight=resume_weight,
                                               recency_boost=recency_on, window_days=recency_window,
+                                              recency_mode=_w.get("recency_mode", "tier"),
+                                              recency_weight=_w.get("recency_weight", 0.35),
+                                              warmth_weight=_w.get("weight", 0.0),
+                                              warmth_halflife_hours=_w.get("halflife_hours", 18.0),
                                               series_recency=series_recency)   # lift in-progress TV too
             if self.global_cache:
                 self.global_cache.set(f"{_PLAN_KEY}/{u['safe_user']}", self._serialize(plan))
@@ -184,7 +241,8 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                     progress_filter="in", series_recency=series_recency)
                 touchgo, t_stats = build_combined_plan(
                     [tv_items, mv_items], family="touchgo", max_items=self._max_items(),
-                    progress_filter="out", series_recency=series_recency)
+                    progress_filter="out", series_recency=series_recency,
+                    max_per_group=self._touchgo_max_per_group())
                 if self.global_cache:
                     self.global_cache.set(f"{_GLIDE_PLAN_KEY}/{u['safe_user']}", self._serialize(glide))
                     self.global_cache.set(f"{_TOUCHGO_PLAN_KEY}/{u['safe_user']}", self._serialize(touchgo))

@@ -17,7 +17,11 @@ class SonarrEpisodesManager(BaseManager, ComponentManagerMixin):
         super().__init__(logger, config, global_cache, validator, registry, **kwargs)
         self.register()
 
-        self.dry_run = kwargs.get("dry_run", False)
+        # dry_run is resolved by BaseManager (explicit kwarg -> pre-super value ->
+        # kwargs["manager"] -> registry parent -> False). The local
+        # `kwargs.get("dry_run", False)` that used to sit here was the WEAKEST form found
+        # -- one level, no parent fallback -- and it is passed down to every subcomponent
+        # through init_args below, so it set the mode for the whole episodes subtree.
         self.load_summary = {}
         self.parent_name = self.__class__.__name__
 
@@ -72,18 +76,12 @@ class SonarrEpisodesManager(BaseManager, ComponentManagerMixin):
             except Exception as e:
                 self.logger.log_warning(f"⚠️ Non-critical episode component '{name}' failed to initialize: {e}")
 
-        # sharding has parent_name="SonarrEpisodes" which doesn't match the
-        # split_components parent_name_match="SonarrEpisodesManager", so it is
-        # silently dropped from both dicts.  Load it explicitly here.
-        if not getattr(self, "sharding", None):
-            try:
-                self.sharding = SonarrEpisodesShardingManager(**init_args)
-                self.logger.log_debug("🧩 SonarrEpisodesShardingManager loaded explicitly.")
-            except Exception as e:
-                self.logger.log_warning(f"⚠️ Sharding manager failed to initialize: {e}")
-                self.sharding = None
-
         # Completion flag
+        # NOTE (GLD-EPI-04): this counts CRITICALS only, and critical_keys is {"retrieval"},
+        # so it evaluates 1 == 1 and reports success even when a noncritical component
+        # fails. Left as-is deliberately: `sonarr.episodes_manager_initialized` gates the
+        # parent's load, and tightening it here would turn a noncritical failure into a
+        # failed service. Fix the flag and its consumers together, not one of them.
         self.all_components_loaded = len(critical_components) == len(critical_instances)
         self.registry.set_flag("sonarr.episodes_manager_initialized", self.all_components_loaded)
 
