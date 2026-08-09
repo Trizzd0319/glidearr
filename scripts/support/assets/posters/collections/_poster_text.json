@@ -1,0 +1,76 @@
+{
+  "up_next": {
+    "kicker": "GLIDEARR",
+    "why": "next up in your series",
+    "title": "Up Next"
+  },
+  "the_long_glide": {
+    "kicker": "GLIDEARR",
+    "why": "continuing your sagas",
+    "title": "The Long Glide"
+  },
+  "touch_and_go": {
+    "kicker": "GLIDEARR",
+    "why": "one-offs in every genre",
+    "title": "Touch &amp; Go"
+  },
+  "hidden_gems": {
+    "kicker": "GLIDEARR",
+    "why": "owned, unplayed - your taste",
+    "title": "Hidden Gems"
+  },
+  "fresh_arrivals": {
+    "kicker": "GLIDEARR",
+    "date": "SINCE 9 JUL",
+    "why": "12 just landed this week",
+    "title": "Fresh Arrivals"
+  },
+  "anniversary_picks": {
+    "kicker": "GLIDEARR",
+    "date": "2 - 8 AUG",
+    "why": "8 picks from this week in history",
+    "title": "Anniversary Picks"
+  },
+  "on_this_week": {
+    "kicker": "GLIDEARR",
+    "date": "2 - 8 AUG",
+    "why": "6 shows with an anniversary this week",
+    "title": "On This Week"
+  },
+  "shelf_just_landed": {
+    "kicker": "GLIDEARR",
+    "why": "12 added \u00b7 since 9 JUL",
+    "title": "Just Landed Library"
+  },
+  "shelf_this_week": {
+    "kicker": "GLIDEARR",
+    "why": "8 \u00b7 2 - 8 AUG",
+    "title": "This Week In History Library"
+  },
+  "franchise_run": {
+    "kicker": "GLIDEARR",
+    "why": "all of the sagas you follow",
+    "title": "Franchise Run"
+  },
+  "tonight": {
+    "kicker": "GLIDEARR",
+    "date": "SAT 8 AUG",
+    "why": "7 for tonight - something easy",
+    "title": "Tonight"
+  },
+  "because_you_watched": {
+    "kicker": "GLIDEARR",
+    "why": "because you watch things like these",
+    "title": "Because You Watched"
+  },
+  "household_picks": {
+    "kicker": "GLIDEARR",
+    "why": "something for everyone in the house",
+    "title": "Household Picks"
+  },
+  "kids_safe": {
+    "kicker": "GLIDEARR",
+    "why": "rated PG and below",
+    "title": "Kids Safe"
+  }
+}
