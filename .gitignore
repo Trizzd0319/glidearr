@@ -70,3 +70,8 @@ scripts/support/profiles/trash/
 scripts/support/profiles/**/_pre_apply_snapshot/
 
 scripts/support/tools/_acquire_preview_snapshots/
+
+# Working artifacts, not source
+*.patch
+Recommendarr_Audit_Checklist.xlsx
+README.glidarr-draft.md
