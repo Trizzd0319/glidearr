@@ -299,6 +299,7 @@ class PlaylistWritebackManager(BaseManager):
         # here rather than in __init__ so a manager reused across runs cannot carry
         # one run's server state into the next.
         self._sort_memo = {}
+        self._watched_memo = {}
         # safe_user → de-identified handle, so run-log lines below never print the real profile
         # name (the dedicated playlists.log preview keeps it). Built once from the tracked order.
         self._anon_by_safe = {u.get("safe_user"): self._anon(u, i)
@@ -399,7 +400,7 @@ class PlaylistWritebackManager(BaseManager):
         # GLD-PLY-15: rate-limit the ITEM write to once per interval unless the churn is a genuine
         # overhaul. Title/poster stay OUTSIDE the gate -- they are one-time, version-gated
         # migrations and holding them back for a day buys nothing.
-        if self._cadence_defer(safe, suffix, plan, current, desired_rks, stats):
+        if self._cadence_defer(safe, suffix, plan, current, desired_rks, stats, user=user):
             self._apply_branding(safe, suffix, rk, token, armed, stats)
             return
         n_changes = len(plan["add"]) + len(plan["remove"]) + len(plan["move"])
@@ -600,9 +601,14 @@ class PlaylistWritebackManager(BaseManager):
 
     # ── re-resolution (P0 #4) ─────────────────────────────────────────────────
     def _desired_items(self, safe, valid_rks, keys=None) -> list:
-        """The user's desired playlist as ``[{"rating_key": str}]`` AFTER re-resolving the
+        """The user's desired playlist as ``[{"rating_key": str, ...}]`` AFTER re-resolving the
         cached plan against the FRESH owned inventory (P0 #4). ``keys`` is the family's cache-key
         precedence (default Up Next = combined > tv > movie); a mood/fresh family passes its own.
+
+        Each entry ALWAYS carries ``rating_key`` (the only field the Plex write needs) and
+        additionally carries whatever stable identity the plan held — ``tmdb_id`` /
+        ``tvdb_join_key`` / ``media`` — so `_record_surfaced` can write a ledger row. See the
+        comment at the copy site for why that is not optional.
 
         Re-resolution: each plan item's ratingKey must still exist in the fresh inventory's
         resolved-key set (``valid_rks``) — a stale key means the item was re-scanned / removed
@@ -618,7 +624,24 @@ class PlaylistWritebackManager(BaseManager):
         for it in items:
             rk = str(it.get("rating_key")) if it.get("rating_key") is not None else None
             if rk is not None and rk in valid_rks:
-                kept.append({"rating_key": rk})
+                # CARRY THE STABLE IDENTITY THROUGH. This used to append
+                # ``{"rating_key": rk}`` and nothing else, which is sufficient for
+                # the Plex write - a playlist is built from ratingKeys - and threw
+                # away every id the builders captured at selection time
+                # (`GLD-PLY-24`). The recommendation ledger then received items
+                # with no tmdb/tvdb and reported "all 108 pick(s) lacked a stable
+                # id" on a live run, with the counts matching exactly because the
+                # ITEMS survived and only their identity did not.
+                #
+                # Copied by name rather than passing ``it`` through: the write path
+                # below iterates these dicts and nothing else should start
+                # depending on plan-shaped extras it does not own.
+                entry = {"rating_key": rk}
+                for field in ("tmdb_id", "tvdb_id", "tvdb_join_key", "media",
+                              "title", "year", "taste_score", "rank", "ordinal"):
+                    if it.get(field) is not None:
+                        entry[field] = it[field]
+                kept.append(entry)
             else:
                 dropped += 1
         total = len(items)
@@ -833,7 +856,27 @@ class PlaylistWritebackManager(BaseManager):
         except Exception:
             pass
 
-    def _cadence_defer(self, safe, suffix, plan, current, desired_rks, stats) -> bool:
+    def _watched_now(self, user) -> set:
+        """This profile's watched ratingKeys, memoised for the run.
+
+        Memoised because `_cadence_defer` runs once per FAMILY while the history
+        read is per PROFILE - without it one profile costs eight identical
+        lookups. The memo lives on the instance and is reset in `run()`, so it can
+        never serve one run's watch state to the next.
+        """
+        safe = str((user or {}).get("safe_user") or "")
+        memo = getattr(self, "_watched_memo", None)
+        if memo is None:
+            memo = self._watched_memo = {}
+        if safe not in memo:
+            try:
+                memo[safe] = {str(w) for w in
+                              (self._watched_for((user or {}).get("tautulli_user_id")) or ())}
+            except Exception:
+                memo[safe] = set()
+        return memo[safe]
+
+    def _cadence_defer(self, safe, suffix, plan, current, desired_rks, stats, user=None) -> bool:
         """True when this playlist was rewritten INSIDE the interval and the pending diff is only
         routine churn -- re-ranking noise, which can wait for the daily rewrite.
 
@@ -851,6 +894,29 @@ class PlaylistWritebackManager(BaseManager):
         age_h = (time.time() - last) / 3600.0
         if age_h >= hours:
             return False                          # interval elapsed -> the daily rewrite
+
+        # STALENESS OVERRIDE - always on, no config key, by design.
+        #
+        # Every override below measures the SIZE of a diff. That is the right
+        # question for re-ranking noise and the wrong one for a watch: two watched
+        # episodes out of a 100-item Up Next is 2% churn, far under any sensible
+        # ratio, while the list is now wrong at exactly the position the viewer is
+        # looking at. Observed live - two Big Bang Theory episodes watched, the
+        # family deferred, the playlist left offering what had just been seen.
+        #
+        # "Something IN this playlist was watched" is a different signal from "the
+        # diff is large", and it is deliberately NOT tunable: a list that still
+        # offers what you just finished is broken regardless of how anybody has
+        # configured their intervals.
+        watched = self._watched_now(user) if user is not None else set()
+        if watched:
+            hit = {str(rk) for rk in (current or ())} & watched
+            if hit:
+                self._detail(
+                    f"[Writeback] '{suffix}' written {age_h:.1f}h ago, but {len(hit)} item(s) "
+                    f"in it have been WATCHED - writing through the {hours:.0f}h interval.")
+                stats["stale_override"] = stats.get("stale_override", 0) + 1
+                return False
         ratio = self._cadence_cfg("churn_override_ratio", _CHURN_OVERRIDE_RATIO)
         add_frac = len(plan["add"]) / max(len(desired_rks), 1)
         rem_frac = len(plan["remove"]) / max(len(current), 1)
@@ -987,7 +1053,10 @@ class PlaylistWritebackManager(BaseManager):
         self.logger.log_info(
             f"[Writeback] {state}: {stats['created']} create / {stats['updated']} update "
             f"({stats.get('recreated', 0)} of them full recreates) / "
-            f"{stats['deleted']} delete / {stats.get('deferred', 0)} deferred / "
+            f"{stats['deleted']} delete / {stats.get('deferred', 0)} deferred "
+            + (f"({stats['stale_override']} written through on watch) "
+               if stats.get("stale_override") else "")
+            + "/ "
             f"{stats['skipped']} skipped / {stats.get('branded', 0)} branded "
             f"/ {stats.get('retitled', 0)} retitled "
             + (f"({stats['sort_repaired']} sort key(s) REPAIRED after server drift) "
