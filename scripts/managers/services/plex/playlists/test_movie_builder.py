@@ -43,7 +43,12 @@ class _Cache:
 
 
 def _mgr(cache=None, config=None):
-    m = MoviePlaylistBuilderManager.__new__(MoviePlaylistBuilderManager)
+    # object.__new__, NOT the class's: BaseManager.__new__ singletons on (cls,
+    # singleton_key) and nothing here passes one, so every _mgr() in this module used
+    # to hand back the SAME object - attributes set by one test (plex_api especially)
+    # leaked into the next, making results depend on selection order.
+    m = object.__new__(MoviePlaylistBuilderManager)
+    m.plex_api = None
     m.global_cache = cache
     m.logger = _Log()
     m.config = config if config is not None else {}
