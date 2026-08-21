@@ -93,9 +93,11 @@ from scripts.managers.machine_learning.lifecycle.viewer_retention import (
 from scripts.managers.machine_learning.lifecycle.restore_policy import (
     RELEASE_FIELDS,
     episode_key,
+    history_release_record,
     ledger_releases,
     match_release,
     merge_ledger_entry,
+    merge_release_records,
     release_record,
 )
 from scripts.managers.machine_learning.lifecycle.stale_prune_policy import (
@@ -1152,6 +1154,27 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         by_series: dict[int, dict] = {}
         for r in regrab:
             by_series.setdefault(int(r["series_id"]), {}).setdefault(int(r["episode_file_id"]), r)
+
+        # Attempt ledger: a bloat re-grab is a SEARCH, and Sonarr grabs only on UPGRADE, so a
+        # smaller replacement is never one. A file that is mis-SIZED rather than mis-GRADED is
+        # therefore searched every run with no effect and, until now, no detector (measured: the
+        # same 38 episodes searched on two consecutive runs, 496 anomalies unchanged). Bound the
+        # loop. Read is best-effort; a cache that cannot answer must not block remediation, but it
+        # is logged rather than swallowed silently so a permanently-unreadable ledger is visible.
+        _now_ts = now.timestamp()
+        _max_attempts = cfg.get("max_regrab_attempts", 3)
+        _retry_days = cfg.get("regrab_retry_days", 7)
+        _akey = size_anomaly.attempts_key(instance)
+        try:
+            _ledger = (self.global_cache.get(_akey) if self.global_cache else None) or {}
+            if not isinstance(_ledger, dict):
+                _ledger = {}
+        except Exception as e:
+            _ledger = {}
+            self.logger.log_warning(f"[SizeAnomaly] could not read the re-grab attempt ledger for "
+                                    f"'{instance}' ({e}); this cycle is unbounded.")
+        _ledger_dirty = False
+
         for sid, fid_rows in by_series.items():
             eps = self.sonarr_api._make_request(instance, f"episode?seriesId={sid}", fallback=[]) or []
             ep_by_coord = {(e.get("seasonNumber"), e.get("episodeNumber")): e
@@ -1161,6 +1184,19 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 if fid in protected:
                     stats["skipped_guard"] += 1
                     self.logger.log_info(f"[SizeAnomaly] skip re-grab '{label}' — whole-file guarded.")
+                    continue
+                # Retry budget. Checked BEFORE the monitored/resolvable work so an abandoned file
+                # costs nothing, and before the dry-run branch so a preview reports what an armed
+                # run would really do.
+                _ok, _why_attempt = size_anomaly.should_attempt(
+                    _ledger.get(str(fid)), r.get("size_bytes"), _now_ts,
+                    max_attempts=_max_attempts, retry_days=_retry_days)
+                if not _ok:
+                    stats[_why_attempt] = stats.get(_why_attempt, 0) + 1
+                    self.logger.log_debug(
+                        f"[SizeAnomaly] skip re-grab '{label}' — {_why_attempt} "
+                        f"({_ledger.get(str(fid), {}).get('attempts', 0)} prior attempt(s), "
+                        f"size unchanged).")
                     continue
                 # EVERY episode this file backs (not just the anomaly row's) must be monitored AND
                 # resolvable, or deleting the file would orphan a sibling. Fall back to the row's own
@@ -1173,37 +1209,100 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                         coords = set()
                 backing = [ep_by_coord.get(c) for c in coords]
                 eids = [b["id"] for b in backing if isinstance(b, dict) and b.get("id")]
-                all_ok = bool(coords) and all(
-                    isinstance(b, dict) and b.get("monitored") and b.get("id") for b in backing)
-                if not all_ok:
-                    stats["skipped_unmonitored"] += 1
-                    self.logger.log_info(f"[SizeAnomaly] skip re-grab '{label}' — file backs an "
-                                         f"unmonitored or unresolved episode (would orphan it).")
+                # GLD-SON-19 - UNMONITORED and UNRESOLVED are different problems and
+                # used to share one counter and one message, so 38 skips could be 38
+                # policy states, 38 broken mappings, or any mix, and the log could not
+                # say which.
+                #
+                #   unresolved  the file backs a coord Sonarr does not know. Searching
+                #               cannot help - there is nothing to search FOR. Report it.
+                #   unmonitored the episode exists and is simply not being tracked.
+                #               Under GLD-SON-18 this is now SEARCHABLE: the search is
+                #               inert rather than destructive, so it is attempted.
+                resolved = bool(coords) and all(isinstance(b, dict) and b.get("id")
+                                                for b in backing)
+                if not resolved:
+                    stats["skipped_unresolved"] = stats.get("skipped_unresolved", 0) + 1
+                    self.logger.log_info(
+                        f"[SizeAnomaly] skip re-grab '{label}' - file backs an episode Sonarr "
+                        f"cannot resolve; a search has nothing to look for (GLD-SON-19).")
                     continue
+                monitored = all(b.get("monitored") for b in backing)
+                if not monitored:
+                    # GLD-SON-18 - NO LONGER A SKIP. The orphan risk was created by
+                    # DELETE-then-search: Sonarr will not search for an unmonitored
+                    # episode, so the command was accepted, did nothing, and left the
+                    # file deleted with no replacement. Searching in place cannot
+                    # orphan anything - at worst the search finds nothing and the
+                    # household keeps exactly what it had.
+                    #
+                    # It is still recorded separately, because an unmonitored episode
+                    # is the one case where the search is EXPECTED to be inert: it
+                    # tells the operator this file needs `monitored: true` before the
+                    # bloat can actually be corrected.
+                    stats["searched_unmonitored"] = stats.get("searched_unmonitored", 0) + 1
                 if eff_dry:
                     self.logger.log_info(
                         f"[SizeAnomaly] [dry_run] would re-grab '{label}' "
                         f"({r.get('size_gb')} GB {r.get('quality_name')} -> profile target, "
-                        f"~{r.get('reclaim_gb')} GB reclaim): delete file {fid} + EpisodeSearch "
-                        f"{len(eids)} ep(s).")
+                        f"~{r.get('reclaim_gb')} GB reclaim): EpisodeSearch {len(eids)} ep(s), "
+                        f"file {fid} left in place"
+                        + (" [UNMONITORED - the search will be inert until it is monitored]"
+                           if not monitored else "") + ".")
                     continue
                 try:
-                    self.sonarr_api._make_request(instance, f"episodefile/{fid}", method="DELETE")
+                    # SEARCH ONLY - the file stays. Sonarr replaces it on import if and
+                    # only if it finds a release matching the profile, so there is never
+                    # a window where the episode has no file. The previous armed path
+                    # was `DELETE episodefile/{fid}` THEN EpisodeSearch, which is what
+                    # made the orphan guard necessary in the first place; removing the
+                    # delete removes the hazard rather than guarding it.
+                    #
+                    # The bloated file is NOT reclaimed at this moment. It is reclaimed
+                    # when the replacement imports and Sonarr retires the old one into
+                    # the recycle bin - which is the same path every upgrade takes, and
+                    # the one `bin_forecast` already accounts for.
                     self.sonarr_api._make_request(instance, "command", method="POST",
-                                                  payload={"name": "EpisodeSearch", "episodeIds": eids})
+                                                  payload={"name": "EpisodeSearch",
+                                                           "episodeIds": eids})
                     stats["regrabbed"] += 1
-                    self.logger.log_info(f"[SizeAnomaly] re-grabbing '{label}': deleted bloated file, "
-                                         f"searching {len(eids)} ep(s) at profile target.")
+                    _ledger[str(fid)] = size_anomaly.record_attempt(
+                        _ledger.get(str(fid)), r.get("size_bytes"), _now_ts)
+                    _ledger_dirty = True
+                    self.logger.log_info(
+                        f"[SizeAnomaly] searching {len(eids)} ep(s) at profile target for "
+                        f"'{label}' - bloated file kept until a replacement imports"
+                        + (" [UNMONITORED - search is inert until monitored]"
+                           if not monitored else "") + ".")
                 except Exception as e:
                     stats["failed"] += 1
                     self.logger.log_warning(f"[SizeAnomaly] re-grab failed for '{label}': {e}")
 
+        # Persist the ledger, pruned to files still anomalous THIS run — a file that dropped out
+        # of the anomaly set was fixed (or removed), so its history should not survive to penalise
+        # a future, unrelated size problem on the same id.
+        if _ledger_dirty and self.global_cache is not None and not eff_dry:
+            try:
+                self.global_cache.set(_akey, size_anomaly.prune_attempts(
+                    _ledger, {r.get("episode_file_id") for r in regrab}))
+            except Exception as e:
+                self.logger.log_warning(f"[SizeAnomaly] could not persist the re-grab attempt "
+                                        f"ledger for '{instance}' ({e}); retries stay unbounded.")
+
         acted = stats["rescanned"] + stats["regrabbed"]
-        if acted or stats["skipped_unmonitored"] or stats["skipped_guard"]:
+        if acted or stats["skipped_unmonitored"] or stats["skipped_guard"] \
+                or stats.get("skipped_unresolved") or stats.get("abandoned") \
+                or stats.get("cooling"):
             self.logger.log_info(
                 f"[SizeAnomaly] '{instance}' remediation: {stats['rescanned']} rescanned, "
-                f"{stats['regrabbed']} re-grabbed, {stats['skipped_unmonitored']} skipped "
-                f"(unmonitored), {stats['skipped_guard']} skipped (guarded), {stats['failed']} failed."
+                f"{stats['regrabbed']} searched"
+                + (f" ({stats['searched_unmonitored']} of them UNMONITORED - inert until "
+                   f"monitored)" if stats.get("searched_unmonitored") else "")
+                + f", {stats.get('skipped_unresolved', 0)} skipped (unresolvable), "
+                f"{stats['skipped_guard']} skipped (guarded), "
+                f"{stats.get('cooling', 0)} cooling, "
+                f"{stats.get('abandoned', 0)} abandoned (searched "
+                f"{_max_attempts}x, size never moved), {stats['failed']} failed."
             )
         return stats
 
@@ -1422,7 +1521,29 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             except Exception:
                 return False
 
+        # GLD-ACQ-29 - COUNT the cooldown suppressions. `eligible` silently discarded
+        # every file inside the re-try window, so the summary reported `881 legacy-codec
+        # file(s), 67 eligible` and left 814 unexplained. The entry recorded it as
+        # "822 -> 2+752 (68 unaccounted)": a residue that looks like a leak and is
+        # actually the cooldown working exactly as designed. An uncounted suppression
+        # is indistinguishable from a lost file *(P-D)*.
+        _cooled = [r for r in legacy if _recent(r["episode_file_id"])]
         eligible = interleave_by_series([r for r in legacy if not _recent(r["episode_file_id"])])
+        # `no_release` is the sub-population worth separating: those files were searched
+        # and NOTHING modern exists for them, so they will re-suppress every run until
+        # the indexers change. That is a permanent-ish state, not a transient backoff,
+        # and it is the reason the same handful re-spill run after run.
+        _no_release = sum(1 for r in _cooled
+                          if (ledger.get(str(r["episode_file_id"])) or {}).get("status")
+                          == "no_release")
+        if _cooled:
+            self.logger.log_info(
+                f"[LegacyRegrab] '{instance}': {len(_cooled)} file(s) suppressed by the "
+                f"{cooldown.days}-day re-try cooldown"
+                + (f" ({_no_release} of them because no modern release was found last time "
+                   f"- these will keep re-suppressing until the indexers change)"
+                   if _no_release else "")
+                + f"; {len(eligible)} of {len(legacy)} eligible this run.")
         if not eligible:
             self.logger.log_info(
                 f"[LegacyRegrab] '{instance}': {len(legacy)} legacy-codec file(s), all within the "
@@ -1471,11 +1592,28 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         else:
             cap = max(1, int(cp.get("legacy_regrab_budget", 10) or 10))
         batch = eligible[:cap]
+        # GLD-ACQ-30 - the space floor this lane never had. Read the SAME figures
+        # the pressure passes and the other acquire lanes use, so all four agree
+        # on what "below the floor" means rather than each deciding separately.
+        # Legacy re-grab issues a DIRECT `POST release` by guid; on 2026-08-07 it
+        # was one of the lanes still grabbing into a 98% array while the pressure
+        # pass was trying to reclaim, which is how SAB reached
+        # `complete_dir not writable`.
+        _lr_free = self._get_free_space_gb(instance)
+        _lr_total = self._get_total_space_gb(instance)
+        _, _lr_floor = space_targets(
+            self.config, fallback_gb=self.MIN_FREE_SPACE_GB, total_gb=_lr_total,
+        )
         result = run_legacy_regrab(
             make_request=self.sonarr_api._make_request, logger=self.logger,
             global_cache=self.global_cache, instance=instance, items=batch,
             max_workers=1, dry_run=self.dry_run,
+            free_gb=_lr_free, acquire_floor_gb=_lr_floor,
         )
+        if result.get("skipped_space"):
+            return {"legacy": len(legacy), "checked": 0, "grabbed": 0, "previewed": 0,
+                    "no_release": 0, "failed": 0,
+                    "skipped_space": result["skipped_space"]}
         prefix = "[dry_run] " if self.dry_run else ""
         self.logger.log_info(
             f"[LegacyRegrab] {prefix}'{instance}': {len(legacy)} legacy-codec file(s); checked "
@@ -2607,6 +2745,17 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if not recorded_by_eid or self.sonarr_api is None:
             return grabbed
         for eid, recorded in recorded_by_eid.items():
+            # GLD-RST-03 — STRENGTHEN THE KEY BEFORE SEARCHING WITH IT.
+            # The ledger identity is lifted off the parquet row at delete time, where
+            # `scene_name` is absent on every entry in this library. That leaves
+            # match_release scoring at most 3 (group + quality + resolution) when the
+            # release TITLE alone is worth +3 exact / +2 substring. Sonarr's own grab
+            # history knows that title, so one cheap read here decides whether the
+            # search below can tell two same-quality encodes apart or has to guess on
+            # size. This is an IDENTITY source, not a grab source — the guid is
+            # deliberately not carried (see restore_policy: dead in hours, and a dead
+            # guid is worse than none because it looks actionable).
+            recorded = self._enrich_recorded_from_history(instance, eid, recorded)
             try:
                 releases = self.sonarr_api._make_request(
                     instance, f"release?episodeId={int(eid)}", fallback=None)
@@ -2633,6 +2782,39 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     f"  🎯 Restored ep {eid} on its recorded release: "
                     f"{str(best.get('title'))[:64]}")
         return grabbed
+
+    def _enrich_recorded_from_history(self, instance: str, eid, recorded) -> dict:
+        """*recorded*, with any gaps filled from this episode's Sonarr grab history — GLD-RST-03.
+
+        BEST-EFFORT BY CONSTRUCTION. History is an optimisation on the match KEY, never a
+        precondition for the restore: an unreachable endpoint, an empty history, or a
+        series whose grabs predate the retention window all return *recorded* unchanged,
+        and the caller proceeds exactly as it did before. Enrichment must never be able to
+        cost a restore it was added to improve.
+
+        The ledger stays authoritative — ``merge_release_records`` gives it every field it
+        actually holds — because it describes the FILE that was on disk while history
+        describes what was GRABBED, and a repack, manual import or external replacement
+        makes those differ. In practice history contributes ``scene_name``, plus
+        ``video_codec`` on entries written before GLD-RST-01.
+        """
+        try:
+            raw = self.sonarr_api._make_request(
+                instance, f"history?episodeId={int(eid)}&pageSize=50", fallback=None)
+        except Exception:
+            return recorded
+        # Sonarr returns a bare list on some routes and a paged {records:[...]} envelope on
+        # others; tolerate both rather than betting on one.
+        rows = raw.get("records") if isinstance(raw, dict) else raw
+        from_history = history_release_record(rows if isinstance(rows, list) else [])
+        if not from_history:
+            return recorded
+        merged = merge_release_records(recorded, from_history) or recorded
+        if merged.get("scene_name") and not (recorded or {}).get("scene_name"):
+            self.logger.log_debug(
+                f"  [Restore] ep {eid}: identity strengthened from grab history — "
+                f"'{str(merged['scene_name'])[:64]}'")
+        return merged
 
     # ── Schema normalisation ────────────────────────────────────────────────────
 
@@ -2704,6 +2886,69 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             "last_synced_at":        datetime.now(tz=timezone.utc).isoformat(),
         }
 
+    # Columns whose ONLY source is the Sonarr ``/episodefile`` record — GLD-EPF-14.
+    # Everything NOT listed here is accumulated state the sync must never overwrite:
+    # watch stats, grace marks (`marked_for_deletion`, `available_until`), plan stamps,
+    # `keep_policy`, `watchability_score`, `row_origin`, `next_episode`, `is_pilot`.
+    # The re-point below copies THIS LIST ONLY, so a widened schema can never quietly
+    # start clobbering a lifecycle field — a new column is opted in deliberately or
+    # not at all.
+    _FILE_DERIVED_COLUMNS = (
+        "episode_file_id", "relative_path", "path", "size_bytes", "date_added",
+        "quality_name", "quality_source", "resolution", "video_codec", "video_bitrate",
+        "video_fps", "video_bit_depth", "width", "height", "runtime_seconds",
+        "scan_type", "hdr", "hdr_type", "audio_codec", "audio_channels",
+        "audio_languages", "subtitles", "release_group", "scene_name",
+        "quality_cutoff_not_met",
+    )
+
+    def _repoint_file_fields(self, df, row_idx, file_rec, fid) -> bool:
+        """Re-point an EXISTING row at the file Sonarr holds for it now — GLD-EPF-14.
+
+        Returns True when the row was actually re-pointed.
+
+        THE BUG THIS CLOSES. ``sync_from_tautulli`` resolved the episode file only on
+        the branch that CREATES a row. A row that already existed had its watch stats
+        refreshed and ``last_synced_at`` stamped, and its file columns — resolution,
+        size_bytes, quality_name, video_codec, episode_file_id — were never read again
+        for the life of the row. So file facts froze at first insertion: every upgrade,
+        manual import or external replacement after that point was invisible, and the
+        row kept describing a file that had been deleted.
+
+        Observed live on Loki 2026-08-13: Sonarr held 12 files, all WEBDL-2160p,
+        67.4 GB, imported 08-12. The parquet held 6 rows at 480p/720p/1080p totalling
+        6.7 GB whose ids (35843, 35845, 35848, 41044, 41052, 51457) had ALL been
+        deleted — zero overlap with reality, a 10x understatement, wearing a
+        four-minute-old ``last_synced_at``. Both caches were correct at the time; the
+        row simply was not re-read. Textbook P-C: the row's PRESENCE was treated as
+        equivalent to its CONTENTS being current.
+
+        Why it hid so well: every symptom pointed at the cache. The timestamp was
+        fresh, the API payloads were fresh, and rows created AFTER an upgrade (See,
+        Silo, Yellowstone) showed 2160p correctly — so the library looked partially
+        right rather than uniformly wrong, which reads as a data gap rather than a bug.
+        """
+        try:
+            stored = df.at[row_idx, "episode_file_id"]
+        except Exception:
+            return False
+        try:
+            same = stored is not None and stored == stored and int(stored) == int(fid)
+        except (TypeError, ValueError):
+            same = False
+        if same:
+            return False
+        fresh = self._normalise(
+            raw=file_rec, series_id=int(df.at[row_idx, "series_id"]),
+            series_title=df.at[row_idx, "series_title"],
+            season_number=df.at[row_idx, "season_number"],
+            episode_number=df.at[row_idx, "episode_number"],
+        )
+        for col in self._FILE_DERIVED_COLUMNS:
+            if col in df.columns and col in fresh:
+                df.at[row_idx, col] = fresh[col]
+        return True
+
     # ── Sonarr API helpers ──────────────────────────────────────────────────────
 
     @timeit("_get_free_space_gb")
@@ -2717,8 +2962,72 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return float("inf")
         return self.sonarr_api.disk_free_gb(instance)
 
-    # 24-hour TTL for on-disk episode list cache per series
-    EPISODES_CACHE_TTL_S: int = 86_400
+    # ── per-series Sonarr cache freshness (GLD-CACHE-14) ─────────────────────
+    # Two payloads, ONE clock, because the join between them is what the parquet is
+    # built from and a join is only as fresh as its stalest half:
+    #
+    #   EPISODES  (episode?seriesId=)     the season/episode list — and, critically,
+    #                                     each episode's ``episodeFileId``. That POINTER
+    #                                     changes on every grab, upgrade and manual
+    #                                     import, so this payload is NOT slow-moving
+    #                                     reference data however much the name suggests it.
+    #   EPISODEFILES (episodefile?seriesId=)  the FILE FACTS — resolution, size_bytes,
+    #                                     quality_name, video_codec, video_bitrate, hdr.
+    #                                     Every space decision reads these cells
+    #                                     (_build_row -> the parquet -> the step-down floor
+    #                                     check, the size-anomaly pass, plan_reclaim_gb),
+    #                                     so a stale one is a wrong plan, not a slow one.
+    #                                     Mirrors Radarr's ``radarr_movie_library_max_age_s``
+    #                                     (900 s); Radarr re-pulls its library every run.
+    #
+    # WHY THEY MUST MATCH — THIS SHIPPED WRONG ONCE. These were first split 86400/900 on
+    # the reasoning that a season list "moves when a season airs, a day is generous". It
+    # does not: _resolve_episode_file reads episodeFileId from the EPISODE record and
+    # looks it up in the FILE list, so a stale episode half yields RETIRED file ids that
+    # match nothing in the fresh half. The resolve then returns (None, None, None) and the
+    # caller leaves the old row in place — while still stamping ``last_synced_at`` with
+    # now. Observed live on Loki 2026-08-13: Sonarr held 12 files, all WEBDL-2160p, 67.4 GB,
+    # imported 08-12; the parquet held 6 rows at 480p/720p/1080p totalling 6.7 GB whose ids
+    # (35843, 35845, 35848, 41044, 41052, 51457) had ALL been deleted — zero overlap, a 10x
+    # understatement, carrying a four-minute-old sync timestamp. A wrong number wearing a
+    # fresh timestamp defeats the obvious staleness check, so the invariant is enforced in
+    # _episodes_ttl_s rather than left to whoever edits the config next.
+    #
+    # BOTH are passed ``regenerate_on_expiry=True`` at the call sites. Without that opt-in
+    # ``get_or_generate_cache`` logs the expiry and serves the stale copy ANYWAY, which
+    # froze these keys at first write — observed live: every by_series payload stamped
+    # 2026-08-08 17:33 and still being served 2026-08-13, read daily, rewritten never.
+    EPISODES_CACHE_TTL_S: int = 900        # sonarr_episode_list_max_age_s
+    EPISODE_FILES_CACHE_TTL_S: int = 900      # sonarr_episode_files_max_age_s
+
+    def _episodes_ttl_s(self) -> int:
+        """Episode-LIST cache max age (seconds). Config: ``sonarr_episode_list_max_age_s``.
+
+        CLAMPED to never exceed the episode-FILE age. The two payloads are joined on
+        episodeFileId, so a longer clock here silently reintroduces the retired-id
+        mismatch above no matter what the file half is set to. Two independent knobs for
+        one matched pair is a footgun; taking the min makes the pairing structural instead
+        of conventional, and a config that violates it is corrected rather than obeyed.
+        """
+        return min(
+            self._ttl_cfg("sonarr_episode_list_max_age_s", self.EPISODES_CACHE_TTL_S),
+            self._episode_files_ttl_s(),
+        )
+
+    def _episode_files_ttl_s(self) -> int:
+        """Episode-FILE cache max age (seconds). Config: ``sonarr_episode_files_max_age_s``."""
+        return self._ttl_cfg("sonarr_episode_files_max_age_s", self.EPISODE_FILES_CACHE_TTL_S)
+
+    def _ttl_cfg(self, key: str, default: int) -> int:
+        """Positive int from config, else *default*. A 0 / negative / unparseable value means
+        'not configured' rather than 'never cache' — an accidental 0 would turn every walk
+        into a per-series API storm, so it falls back instead of being taken literally."""
+        try:
+            raw = self.config.get(key, default) if getattr(self, "config", None) else default
+            val = int(raw)
+            return val if val > 0 else int(default)
+        except (TypeError, ValueError, AttributeError):
+            return int(default)
 
     @timeit("_get_all_episodes")
     def _get_all_episodes(self, instance: str, series_id: int,
@@ -2746,14 +3055,20 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
         if self.global_cache:
             try:
+                # fallback=None (NOT []) so a FAILED fetch is distinguishable from a
+                # genuinely-empty series — the house idiom (see base_instance_manager
+                # ~line 542). This matters ONLY now that regenerate_on_expiry is on: the
+                # generator actually runs on expiry, and get_or_generate_cache treats
+                # ``None`` as "serve the last-good copy" but caches ``[]`` as real data.
+                # With the old ``or []`` a single Sonarr blip would have overwritten a good
+                # payload with an empty list — P-C, absent conflated with empty.
                 all_eps = self.global_cache.get_or_generate_cache(
                     key=cache_key,
-                    generator_function=lambda: (
-                        self.sonarr_api._make_request(
-                            instance, f"episode?seriesId={series_id}", fallback=[]
-                        ) or []
+                    generator_function=lambda: self.sonarr_api._make_request(
+                        instance, f"episode?seriesId={series_id}", fallback=None
                     ),
-                    expiration_time=self.EPISODES_CACHE_TTL_S,
+                    expiration_time=self._episodes_ttl_s(),
+                    regenerate_on_expiry=True,
                     log_miss=log_miss, log_expired=log_expired,
                 ) or []
                 self.logger.log_debug(
@@ -2783,14 +3098,16 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             files_cache_key = f"sonarr/{instance}/episodefiles/by_series/{series_id}"
             try:
                 if self.global_cache:
+                    # Short TTL + real regeneration: these are the FILE FACTS every space
+                    # decision reads. fallback=None for the same reason as the episode list
+                    # above — never overwrite a good payload with an empty list on a blip.
                     cached_files = self.global_cache.get_or_generate_cache(
                         key=files_cache_key,
-                        generator_function=lambda: (
-                            self.sonarr_api._make_request(
-                                instance, f"episodefile?seriesId={series_id}", fallback=[]
-                            ) or []
+                        generator_function=lambda: self.sonarr_api._make_request(
+                            instance, f"episodefile?seriesId={series_id}", fallback=None
                         ),
-                        expiration_time=self.EPISODES_CACHE_TTL_S,
+                        expiration_time=self._episode_files_ttl_s(),
+                        regenerate_on_expiry=True,
                         log_miss=log_miss, log_expired=log_expired,
                     ) or []
                     files_session_cache[series_id] = cached_files
@@ -4061,6 +4378,207 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"deletion still decided by the coordinator's ranked pool.")
         return df
 
+    # ---- GLD-INV-01: inventory is not the same question as reclaim -------------
+    def _inventory_cfg(self) -> dict:
+        """``inventory_scan`` config with safe defaults (disabled unless asked for)."""
+        raw = {}
+        try:
+            got = (self.config or {}).get("inventory_scan")
+            if isinstance(got, dict):
+                raw = got
+        except (AttributeError, TypeError):
+            raw = {}
+        def _i(k, d):
+            try:
+                v = int(raw.get(k, d))
+                return v if v > 0 else int(d)
+            except (TypeError, ValueError):
+                return int(d)
+        return {"enabled": bool(raw.get("enabled", False)),
+                "max_series_per_run": _i("max_series_per_run", 25),
+                "min_episodes": _i("min_episodes", 2),
+                "rescan_days": _i("rescan_days", 30)}
+
+    @timeit("_ingest_inventory_tv")
+    def _ingest_inventory_tv(self, df, instance, season_ep_cache, files_session_cache):
+        """Enumerate owned episodes for series nothing else enumerates - GLD-INV-01.
+
+        THE GAP. Three passes write rows: the watch sync (Tautulli-driven), the pilot
+        batch, and next-up stubs. A series NOBODY HAS WATCHED gets only a pilot row --
+        one representative file from ``_pick_representative_file``, ``episode_number=None``,
+        intended as a codec/quality FINGERPRINT. The space planner then reads that row's
+        ``size_bytes`` and ``resolution`` as if they described the series. Observed live:
+        Marvel's Daredevil, 39 episodes of 4K HDR on disk per Plex, represented by one
+        0.4 GB 480p row; across the library 12,075 pilot rows carry 5,160 GB of
+        single-file sizes standing in for whole series.
+
+        WHY ``_ingest_cold_tv`` DOESN'T COVER IT, AND WHY WIDENING IT WOULD BE WRONG.
+        That pass already enumerates exactly the right thing, but it is gated on
+        ``score_floor`` (20) because its purpose is DELETE reachability -- it ingests only
+        series it might want to remove. The five Netflix Marvel shows score 24-43, so they
+        are deliberately skipped. Lowering that floor would make good series delete-eligible
+        to fix a SIZE-VISIBILITY problem: enumeration and delete-eligibility are different
+        questions, and coupling them is what hid this.
+
+        So this pass ingests regardless of score and is structurally incapable of causing a
+        deletion: rows are stamped ``row_origin='inventory_scan'`` with
+        ``marked_for_deletion=False`` and ``available_until=None``, and unlike cold rows
+        they carry no window that could ever expire into a mark. They exist to be SEEN --
+        by the step-down ladder, the size-anomaly pass, and plan_reclaim_gb.
+
+        Reuses ``_resolve_episode_file`` + ``_normalise`` (one row builder, no duplicate --
+        P-E) and skips any (series, season, episode) that already has a row, so it can never
+        double-count against the watch sync or the cold scan. Capped per run like its twin;
+        byte-identical when ``inventory_scan.enabled`` is unset.
+        """
+        cfg = self._inventory_cfg()
+        if not cfg["enabled"] or df is None or df.empty or "is_pilot" not in df.columns:
+            return df
+        now_iso = datetime.now(tz=timezone.utc).isoformat()
+        _sid = pd.to_numeric(df.get("series_id"), errors="coerce")
+        _pilot = df["is_pilot"].infer_objects(copy=False).fillna(False).astype(bool)
+        _epno = pd.to_numeric(df.get("episode_number"), errors="coerce")
+
+        # Series that have a pilot row but NO real episode rows: exactly the population
+        # nothing enumerates. A series the watch sync or cold scan already reached has
+        # real rows and is left alone.
+        have_real, title_by_sid, score_by_sid, keep_by_sid, owns_by_sid = set(), {}, {}, {}, {}
+        for i in df.index:
+            s = _sid.at[i]
+            if pd.isna(s):
+                continue
+            s = int(s)
+            if _pilot.at[i]:
+                title_by_sid[s] = df.at[i, "series_title"]
+                score_by_sid[s] = df.at[i, "watchability_score"]
+                if "keep_policy" in df.columns:
+                    keep_by_sid[s] = df.at[i, "keep_policy"]
+                # A pilot row with no file facts is a METADATA-ONLY pilot — the series
+                # owns nothing, so enumerating it can never yield a row. 7,098 of the
+                # 12,075 pilot series are in this bucket; without this filter they sit
+                # at the FRONT of the target order and the capped walk re-examines them
+                # every run before reaching anything productive.
+                try:
+                    _sz = df.at[i, "size_bytes"] if "size_bytes" in df.columns else None
+                    owns_by_sid[s] = bool(pd.notna(_sz) and float(_sz) > 0)
+                except (TypeError, ValueError):
+                    owns_by_sid[s] = False
+            elif pd.notna(_epno.at[i]):
+                have_real.add(s)
+        # THE WALK MUST REMEMBER WHERE IT HAS BEEN. A productive series drops out of the
+        # pool naturally (it gains real rows), but an examined series that yielded fewer
+        # than min_episodes writes NOTHING — so without a marker it is re-examined every
+        # run, and the capped walk advances only by last run's productive count. Observed
+        # live 2026-08-14: the second pass re-walked the same ~1,000 thin targets, moved
+        # ~59 positions deeper, ingested 0, and logged nothing. The marker is scan
+        # PROGRESS, not action state, so it is written even in dry_run, and it expires
+        # (rescan_days) so a series that acquires files later is not hidden forever.
+        scan_key = f"sonarr/{instance}/inventory_scanned"
+        try:
+            scanned = dict(self.global_cache.get(scan_key) or {})
+        except Exception:
+            scanned = {}
+        _cutoff = (datetime.now(tz=timezone.utc) - timedelta(days=cfg["rescan_days"])).isoformat()
+
+        eligible = [s for s in title_by_sid if s not in have_real and owns_by_sid.get(s)]
+        skipped_recent = sum(1 for s in eligible if str(scanned.get(str(s), "")) >= _cutoff)
+        targets = [s for s in eligible
+                   if not str(scanned.get(str(s), "")) >= _cutoff][: cfg["max_series_per_run"]]
+        if not targets:
+            self.logger.log_info(
+                f"\U0001f4e6 [InventoryTV] '{instance}': target pool exhausted — every "
+                f"file-owning pilot series is enumerated or was scanned within "
+                f"{cfg['rescan_days']}d ({skipped_recent} deferred). Nothing to do.")
+            return df
+
+        existing = set()
+        _sn = pd.to_numeric(df.get("season_number"), errors="coerce")
+        for i in df.index:
+            s, sn, en = _sid.at[i], _sn.at[i], _epno.at[i]
+            if pd.notna(s) and pd.notna(sn) and pd.notna(en):
+                existing.add((int(s), int(sn), int(en)))
+
+        new_rows, stats = [], {"ingested": 0, "series": 0, "gb": 0.0}
+        examined = 0
+        for sid in targets:
+            examined += 1
+            scanned[str(sid)] = now_iso
+            try:
+                seasons = self._get_all_episodes(
+                    instance, sid, season_ep_cache, files_session_cache,
+                    log_miss=False, log_expired=False)
+            except Exception:
+                continue
+            found, series_gb = 0, 0.0
+            for sn, eps in (seasons or {}).items():
+                for ep in eps or []:
+                    en = ep.get("episodeNumber")
+                    if sn in (None, 0) or en is None:
+                        continue                       # specials + malformed
+                    if not ep.get("hasFile") or not ep.get("episodeFileId"):
+                        continue
+                    if (sid, int(sn), int(en)) in existing:
+                        continue
+                    file_rec, _, air_utc = self._resolve_episode_file(
+                        instance, sid, int(sn), int(en), files_session_cache, season_ep_cache)
+                    if not file_rec:
+                        continue
+                    row = self._normalise(
+                        raw=file_rec, series_id=sid, series_title=title_by_sid.get(sid, f"series {sid}"),
+                        season_number=int(sn), episode_number=int(en),
+                        is_pilot=False, watch_count=0, last_watched_at=None,
+                        percent_complete=0, air_date_utc=air_utc,
+                        all_household_watched=False, household_last_watched_at=None)
+                    row["row_origin"] = "inventory_scan"
+                    row["is_watched"] = False
+                    row["watchability_score"] = score_by_sid.get(sid)
+                    row["keep_policy"] = keep_by_sid.get(sid)
+                    # NO available_until: a cold row's window expires into a mark, and this
+                    # pass must never be able to reach that state.
+                    row["available_until"] = None
+                    row["marked_for_deletion"] = False
+                    row["last_synced_at"] = now_iso
+                    new_rows.append(row)
+                    existing.add((sid, int(sn), int(en)))
+                    series_gb += float(file_rec.get("size") or 0) / (1024 ** 3)
+                    found += 1
+            if found >= cfg["min_episodes"]:
+                stats["series"] += 1
+                stats["ingested"] += found
+                stats["gb"] += series_gb   # KEPT rows only — the per-row accumulator once
+                                           # counted trimmed rows too, so the first live
+                                           # log claimed 970.8 GB while 591.5 GB landed.
+            elif found:
+                # Below min_episodes: drop them again rather than leave a second partial
+                # fingerprint alongside the pilot row.
+                new_rows = new_rows[:-found]
+
+        if new_rows:
+            df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+        try:
+            self.global_cache.set(scan_key, scanned)
+        except Exception:
+            pass
+        # Logged UNCONDITIONALLY while enabled: a silent pass is ambiguous between
+        # "disabled", "pool empty", and "examined plenty, kept nothing" — and that
+        # ambiguity cost a diagnosis round when the second pass ingested 0 silently.
+        self.logger.log_info(
+            f"\U0001f4e6 [InventoryTV] '{instance}': {stats['ingested']} owned episode(s) "
+            f"across {stats['series']} series made visible ({stats['gb']:.1f} GB kept); "
+            f"examined {examined} of {len(eligible)} eligible (cap "
+            f"{cfg['max_series_per_run']}, {skipped_recent} deferred as recently scanned); "
+            f"~{max(0, len(eligible) - skipped_recent - examined)} eligible series remain. "
+            f"Never delete-eligible.")
+        return df
+
+    # Row origins that are FEATURE STATE, not orphans. Every deliberately-ingested,
+    # unwatched origin must join this set or _do_cleanup_non_essential culls it in the
+    # same run its feature creates it — observed live 2026-08-13 with 'inventory_scan'
+    # (GLD-INV-01): 989 rows / 970.8 GB ingested, gone before the parquet write, while
+    # the InventoryTV log reported success. A string-equality test against ONE origin is
+    # how that slipped through; the set makes the next origin a one-line opt-in.
+    _PROTECTED_ROW_ORIGINS = frozenset({"cold_scan", "inventory_scan"})
+
     @timeit("_do_cleanup_non_essential")
     def _do_cleanup_non_essential(self, df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
         """
@@ -4069,9 +4587,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         Keep:
         * Pilots (``is_pilot=True``) — codec / quality fingerprint.
         * Next-episode rows (``next_episode=True``) — ingestion target.
-        * Cold-inventory rows (``row_origin='cold_scan'``, GLD-ACQ-24) — deliberately
-          ingested unwatched rows carrying the cold-reclaim lifecycle (grace window +
-          mark); removing them here would silently disable the feature every run.
+        * Deliberately-ingested origins (``row_origin`` in ``_PROTECTED_ROW_ORIGINS``):
+          ``'cold_scan'`` (GLD-ACQ-24) carries the cold-reclaim lifecycle;
+          ``'inventory_scan'`` (GLD-INV-01) IS the owned inventory for never-watched
+          series. Inventory rows match the orphan profile on every watch-derived axis
+          (unwatched, no window, never marked) — that is exactly why the exemption is
+          by ORIGIN, not by lifecycle state. Removing either silently disables its
+          feature every run.
         * ALL watched rows (``is_watched=True``), regardless of grace-period
           status — rows marked for deletion must remain until
           ``_do_purge_sonarr_deleted`` confirms the file is gone from Sonarr.
@@ -4091,19 +4613,20 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         is_pilot  = _col("is_pilot")
         is_next   = _col("next_episode")
         is_watched = _col("is_watched")
-        # GLD-ACQ-24: cold-inventory rows are unwatched BY DEFINITION — without this
-        # exemption the cleanup would delete the feature's own state every run.
-        is_cold = (df["row_origin"] == "cold_scan") if "row_origin" in df.columns \
-            else pd.Series(False, index=df.index)
+        # Deliberately-ingested rows are unwatched BY DEFINITION — without this
+        # exemption the cleanup deletes each feature's own state every run.
+        is_protected = (df["row_origin"].isin(self._PROTECTED_ROW_ORIGINS)
+                        if "row_origin" in df.columns
+                        else pd.Series(False, index=df.index))
 
-        keep_mask = is_pilot | is_next | is_watched | is_cold.fillna(False)
+        keep_mask = is_pilot | is_next | is_watched | is_protected
         removed   = int((~keep_mask).sum())
 
         if removed:
             df = df[keep_mask].reset_index(drop=True)
             self.logger.log_info(
                 f"🧹 Non-essential cleanup: {removed} orphaned row(s) removed "
-                "(not pilot, not next-episode, and never watched)."
+                "(not pilot, not next-episode, never watched, no protected origin)."
             )
 
         return df, removed
@@ -7067,6 +7590,44 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                             f"run (re-probe next run; never whole-series searched)"
                         )
                 if climb_items:
+                    # GLD-ACQ-30 - the space floor the CLIMB path never had.
+                    #
+                    # The floor at the top of this method sits inside
+                    # `if pilot_best_tier:`, which is `(not pilot_climb) and ...` -
+                    # i.e. the LEGACY escape hatch only. `pilot_climb` defaults to
+                    # TRUE, so the default path reached here with `pilot_free_gb`
+                    # and `pilot_reserve_gb` still None and dispatched searches with
+                    # no disk check at all. The comment further up claiming "disk
+                    # safety on grab is owned by the space-pressure coordinator +
+                    # the JIT reserve" is inside that same legacy branch and does
+                    # not describe this one.
+                    #
+                    # Pilot search is named in the 2026-08-07 incident. It is also
+                    # the WORST lane to leave open, because it dispatches to a
+                    # background worker (or the standalone daemon) that keeps
+                    # searching after the run process has moved on - so a run that
+                    # decided to grab at 98% full keeps grabbing even once the
+                    # pressure pass notices.
+                    #
+                    # Gated HERE rather than inside the worker: one check, before
+                    # dispatch, covering the interactive, in-process and daemon
+                    # routes identically. Checking inside three workers would be
+                    # three chances to diverge.
+                    _cl_total = self._get_total_space_gb(instance)
+                    _, _cl_floor = space_targets(
+                        self.config, fallback_gb=self.MIN_FREE_SPACE_GB, total_gb=_cl_total,
+                    )
+                    _cl_free = self._get_free_space_gb(instance)
+                    if _cl_free is not None and _cl_free < _cl_floor:
+                        stats["skipped_space"] = len(climb_items)
+                        self.logger.log_info(
+                            f"[PilotSearch] PAUSED on '{instance}': {_cl_free:,.1f} GB free is "
+                            f"below the {_cl_floor:,.0f} GB acquisition floor "
+                            f"({_cl_floor - _cl_free:,.1f} GB short). {len(climb_items)} pilot "
+                            f"search(es) held - a pilot is never deleted, only re-probed when "
+                            f"space frees (GLD-ACQ-30).")
+                        climb_items = []
+                if climb_items:
                     if interactive:
                         # One manual search per stub: grab the lowest available resolution, or flag
                         # UNACQUIRABLE. Pass title/tvdb so the worker labels logs + the ledger.
@@ -7664,14 +8225,16 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if self.global_cache:
             try:
                 cache_key = f"sonarr/{instance}/episodes/by_series/{series_id}"
+                # Same key as _get_all_episodes — keep the freshness policy identical, or
+                # whichever path ran first would decide the key's fate for the run (this one
+                # previously served stale and never rewrote, re-freezing the key).
                 cached = self.global_cache.get_or_generate_cache(
                     key=cache_key,
-                    generator_function=lambda: (
-                        self.sonarr_api._make_request(
-                            instance, f"episode?seriesId={series_id}", fallback=[]
-                        ) or []
+                    generator_function=lambda: self.sonarr_api._make_request(
+                        instance, f"episode?seriesId={series_id}", fallback=None
                     ),
-                    expiration_time=self.EPISODES_CACHE_TTL_S,
+                    expiration_time=self._episodes_ttl_s(),
+                    regenerate_on_expiry=True,
                     log_miss=log_cache_miss, log_expired=log_expired,
                 ) or []
                 for ep in cached:
@@ -8457,7 +9020,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         """
         import json
 
-        stats = {"checked": 0, "restored": 0, "failed": 0, "no_snapshot": 0}
+        stats = {"checked": 0, "restored": 0, "failed": 0, "no_snapshot": 0,
+                 "skipped_floor": 0, "would": 0}
+
+        # Honours the run's dry_run AND the backup gate, like every other mutating pass
+        # in this file. This method PUTs to Sonarr; before GLD-SON-20 it checked neither,
+        # so a dry run issued live writes -- the one promise the flag exists to make.
+        eff_dry = effective_dry_run(self.dry_run, self.global_cache)
 
         df = self.load(instance)
         if df.empty or "upgraded_for_watching" not in df.columns:
@@ -8520,7 +9089,16 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 q_inner = q_block.get("quality") or {}
                 q_inner["name"]       = original.get("quality_name")   or q_inner.get("name")
                 q_inner["source"]     = original.get("quality_source") or q_inner.get("source")
-                q_inner["resolution"] = original.get("resolution")     or q_inner.get("resolution")
+                # Sonarr rejects a non-integer resolution with a 400 ('The JSON value
+                # could not be converted to System.Int32'). The snapshot is JSON off the
+                # parquet, so the value can arrive as "720"/720.0/numpy int -- coerce, and
+                # if it will not coerce leave the CURRENT value rather than sending junk.
+                _res = original.get("resolution")
+                try:
+                    _res = int(float(_res))
+                except (TypeError, ValueError):
+                    _res = None
+                q_inner["resolution"] = _res if _res is not None else q_inner.get("resolution")
                 q_block["quality"]    = q_inner
                 current["quality"]    = q_block
 
@@ -8559,15 +9137,37 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                                 df.at[idx, "upgraded_for_watching"] = False
                                 df.at[idx, "pre_upgrade_quality"]   = None
                                 changed = True
-                                stats["restored"] += 1
+                                stats["skipped_floor"] += 1   # NOT a restore: nothing was rolled back
                                 continue
                     except Exception:
                         pass  # on any error, proceed with normal restore
 
-                self.sonarr_api._make_request(
+                if eff_dry:
+                    stats["would"] += 1
+                    self.logger.log_info(
+                        f"  [dry_run] would JIT restore '{title}' S{sn:02d}E{en:02d} -> "
+                        f"{original.get('quality_name', '?')} (file {int(fid)} unchanged)"
+                    )
+                    continue      # nothing written, so the snapshot MUST survive
+
+                # _make_request LOGS transport/HTTP failures and returns the fallback --
+                # it does not raise -- so the `except` below can never see a 400. Before
+                # GLD-SON-20 the result was ignored: four failed PUTs counted as four
+                # restores, the parquet was rewritten to the pre-upgrade quality Sonarr
+                # had rejected, and `pre_upgrade_quality` was cleared, destroying the only
+                # record needed to retry. Falsy result now means FAILED, and on failure
+                # the snapshot and the JIT flag are left INTACT so the next run retries.
+                resp = self.sonarr_api._make_request(
                     instance, f"episodefile/{int(fid)}",
-                    method="PUT", payload=current,
+                    method="PUT", payload=current, fallback=None,
                 )
+                if not resp:
+                    stats["failed"] += 1
+                    self.logger.log_warning(
+                        f"  JIT restore REJECTED by Sonarr for '{title}' "
+                        f"S{sn:02d}E{en:02d} (file {int(fid)}) - snapshot kept, will retry"
+                    )
+                    continue
                 df.at[idx, "upgraded_for_watching"]  = False
                 df.at[idx, "pre_upgrade_quality"]    = None
                 df.at[idx, "quality_name"]   = original.get("quality_name")
@@ -8598,17 +9198,24 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         self.logger.log_table(
             ["Outcome", "Count"],
             [
-                ["restored",    stats["restored"]],
-                ["no-snapshot", stats["no_snapshot"]],
-                ["failed",      stats["failed"]],
+                ["checked",       stats["checked"]],
+                ["restored",      stats["restored"]],
+                ["would-restore", stats["would"]],
+                ["skipped-floor", stats["skipped_floor"]],
+                ["no-snapshot",   stats["no_snapshot"]],
+                ["failed",        stats["failed"]],
             ],
-            title=f"[JIT] Restore pass '{instance}'",
+            title=f"[JIT] Restore pass '{instance}'"
+                  + (" [dry_run]" if eff_dry else ""),
             caption="Per-pass outcome of the JIT file-quality restore: how many upgraded "
                     "episodes were rolled back to their pre-upgrade file.",
             descriptions=[
-                "episodes restored to their pre-upgrade file",
+                "watched episodes carrying a JIT upgrade, considered this pass",
+                "episodes Sonarr ACCEPTED the rollback for",
+                "rollbacks withheld (dry run / backup gate disarmed) - snapshots kept",
+                "skipped: pre-upgrade quality sits below the pilot-successful floor",
                 "episodes skipped: no pre-upgrade snapshot recorded",
-                "restore search calls that errored",
+                "PUTs Sonarr REJECTED - snapshot kept, retried next run",
             ],
         )
         return stats
@@ -8753,6 +9360,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 )
                 df.at[row_idx, "all_household_watched"]     = _all_hh
                 df.at[row_idx, "household_last_watched_at"] = _hh_ts
+                # GLD-EPF-14 — re-read the FILE too, not just the watch stats. Without
+                # this the branch below is the only place a file is ever resolved, so an
+                # existing row's resolution/size/codec froze at insertion while the line
+                # after this one went on stamping it as freshly synced.
+                _fr, _fid, _ = self._resolve_episode_file(
+                    instance, sid, season, episode, files_session_cache, season_ep_cache
+                )
+                if _fr and _fid and self._repoint_file_fields(df, row_idx, _fr, _fid):
+                    stats["repointed"] = stats.get("repointed", 0) + 1
                 df.at[row_idx, "last_synced_at"]           = datetime.now(tz=timezone.utc).isoformat()
                 updated_idxs.append(row_idx)
                 stats["updated"] += 1
@@ -8833,6 +9449,21 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             files_session_cache=files_session_cache,
         )
         self.logger.log_info(f"[⏱️] cold_inventory — {time.time()-_ps:.1f}s")
+
+        # GLD-INV-01: owned episodes for series NOTHING else enumerates. Runs directly
+        # after the cold scan because it is the same question asked without the reclaim
+        # gate — cold_inventory ingests only series below `score_floor` (delete
+        # reachability), leaving every higher-scoring unwatched series represented by a
+        # single pilot FINGERPRINT that the space planner then read as if it were the
+        # whole series. Must land BEFORE _compute_next_episodes and the space passes so
+        # the rows it writes are visible to them this run. No-op unless
+        # inventory_scan.enabled; writes rows that can never be delete-marked.
+        df = self._ingest_inventory_tv(
+            df, instance,
+            season_ep_cache=season_ep_cache,
+            files_session_cache=files_session_cache,
+        )
+        self.logger.log_info(f"[⏱️] inventory_scan — {time.time()-_ps:.1f}s")
 
         df = self._compute_next_episodes(df, instance, files_session_cache, season_ep_cache=season_ep_cache)
         self.logger.log_info(f"[⏱️] compute_next_episodes — {time.time()-_ps:.1f}s")
