@@ -298,6 +298,57 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     # ── Init ────────────────────────────────────────────────────────────────────
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    # SECTION INDEX — §1..§20, in FILE ORDER
+    # ══════════════════════════════════════════════════════════════════════════════
+    # Numbered by POSITION, not by subsystem, so a banner can never disagree with
+    # where the code actually is. Several subsystems are split across two ranges
+    # (the file accreted); the "→" note on each names the submanager it would become,
+    # so sections sharing a target are the ones that merge on extraction.
+    #
+    #   §1  Construction, instance plumbing, parquet I/O ...... → stays (owns the frame)
+    #   §2  Score refresh, shields, universe/saga credits ..... → SonarrEpisodeScoringManager
+    #   §3  Size-anomaly report + remediation ................. → SonarrEpisodeSizeAnomalyManager
+    #   §4  Codec routing reports + legacy re-grab ............ → SonarrEpisodeCodecManager
+    #   §5  Enrichment + show score map ...................... → SonarrEpisodeScoringManager (with §2)
+    #   §6  Delete candidates, deletion, restore ............. → SonarrEpisodeRetentionManager
+    #   §7  Free space + TTL config .......................... → stays (shared helpers)
+    #   §8  Sonarr episode/file fetch + cache ................ → stays (owns the frame)
+    #   §9  Next-episode computation ......................... → SonarrEpisodeNextUpManager
+    #   §10 Grace period, purge, inventory ingestion ......... → SonarrEpisodeRetentionManager (with §6)
+    #   §11 Acquisition + recycle-to-fund .................... → SonarrEpisodeAcquireManager
+    #   §12 Delete execution + public delete entrypoints ..... → SonarrEpisodeRetentionManager (with §6)
+    #   §13 Watch history ingestion + household resolution ... → SonarrEpisodeHistoryManager
+    #   §14 Viewer retention ................................. → SonarrEpisodeRetentionManager (with §6)
+    #   §15 Pilot search, batch, workers, offload ............ → SonarrEpisodePilotManager
+    #   §16 Sizing + episode-id helpers ...................... → stays (shared helpers)
+    #   §17 JIT quality upgrades + workers ................... → SonarrEpisodeJitManager
+    #   §18 JIT quality restore .............................. → SonarrEpisodeJitManager (with §17)
+    #   §19 Tautulli sync .................................... → SonarrEpisodeHistoryManager (with §13)
+    #   §20 Run summary ...................................... → stays
+    #
+    # EXTRACTION ORDER, smallest-risk first (each is a MOVE, tests green either side):
+    #   §4 legacy re-grab (already has legacy_regrab.py) → §3 size anomaly → §15 pilot
+    #   (already has pilot_720_upgrade.py / pilot_interactive.py) → §17+§18 JIT (already
+    #   has jit_search.py + space/jit_planner.py) → §13+§19 history → §6+§10+§12+§14
+    #   retention LAST: it is the delete path and the most cross-cutting.
+    #
+    # WHAT MUST NOT BE SPLIT: every section below reads and writes the SAME parquet
+    # (marked_for_deletion, is_watched, upgraded_for_watching, pre_upgrade_quality,
+    # quality_action, plan_reason). That is a shared mutable SCHEMA, not incidental
+    # coupling. Radarr's answer is the one to copy — ONE manager owns the frame and
+    # the others borrow it via a getter (RadarrSpacePressureManager calls
+    # _get_movie_files_manager()). Peer managers each loading their own copy would
+    # either duplicate the read or lose the ordering that matters (grace → delete,
+    # JIT upgrade → JIT restore), and that ordering is currently visible only because
+    # these live in one file.
+    # ══════════════════════════════════════════════════════════════════════════════
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §1  FOUNDATION — construction, instance plumbing, parquet I/O
+    #     Owns the DataFrame every other section reads and writes. STAYS on extraction.
+    # ══════════════════════════════════════════════════════════════════════════════
+
     def __init__(
         self,
         logger=None,
@@ -482,6 +533,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     # ── Pilot-file ID helpers ────────────────────────────────────────────────────
 
+    # ── §1.2  Protected / pilot file-id sets ──────────────────────────────────────
+    # Guard sets consulted before anything deletes or re-grabs. Built once per pass.
+
     @staticmethod
     @timeit("_build_pilot_file_ids")
     def _build_pilot_file_ids(df: "pd.DataFrame") -> "frozenset":
@@ -648,6 +702,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         "planned_action", "plan_reason", "pre_upgrade_quality",
     )
 
+    # ── §1.3  Parquet load / save ─────────────────────────────────────────────────
+
     @LoggerManager().log_function_entry
     @timeit("load_episode_files")
     def load(self, instance: str) -> pd.DataFrame:
@@ -717,6 +773,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return False
 
     # ── Watchability scoring (per-series) ────────────────────────────────────────
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §2  SCORING — score refresh, watchlist shield, universe & saga credits
+    #     → SonarrEpisodeScoringManager (merges with §5)
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @LoggerManager().log_function_entry
     @timeit("refresh_scores")
@@ -1003,6 +1064,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_debug(f"[Universe] saga quality credit skipped: {e}")
         return out
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §3  SIZE ANOMALY — report + remediation (rescan vs search routing)
+    #     Policy lives in machine_learning/sizing/anomaly.py; this is the service half.
+    #     → SonarrEpisodeSizeAnomalyManager
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @timeit("report_size_anomalies")
     def report_size_anomalies(self, instance: str, df=None) -> list:
@@ -1305,6 +1372,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"{_max_attempts}x, size never moved), {stats['failed']} failed."
             )
         return stats
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §4  CODEC ROUTING & LEGACY RE-GRAB — reports + the legacy-codec replacement pass
+    #     Pure core already extracted to sonarr/cache/legacy_regrab.py; these are the
+    #     wrappers. SMALLEST extraction target — start here.
+    #     → SonarrEpisodeCodecManager
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @timeit("report_codec_routing")
     def report_codec_routing(self, instance: str, df=None) -> list:
@@ -1612,16 +1686,51 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         )
         if result.get("skipped_space"):
             return {"legacy": len(legacy), "checked": 0, "grabbed": 0, "previewed": 0,
-                    "no_release": 0, "failed": 0,
+                    "no_release": 0, "empty_search": 0, "failed": 0,
                     "skipped_space": result["skipped_space"]}
         prefix = "[dry_run] " if self.dry_run else ""
+        # empty_search is its OWN outcome, not a miss. `legacy_regrab` deliberately
+        # refuses to record a zero-release search as `no_release` because that costs a
+        # 14-day cooldown (GLD-SON-02: 814 of 881 files were once benched that way on
+        # evidence never gathered). It was counted and named per title, but omitted
+        # HERE -- so a run where every search came back empty printed
+        # "0 grabbed, 0 no modern release, 0 failed (of 69 checked)" and read as though
+        # nothing had happened, when in fact all 69 landed in a bucket the summary did
+        # not show. Same shape as GLD-ACQS-20's "0 refused" while 122 were capped.
+        _empty = int(result.get("empty_search") or 0)
+        # GLD-SON-25 - `checked` counts LOOP ITERATIONS, not searches, so these three
+        # outcomes have to be printed or the line lies by omission. On 2026-08-19/20 all
+        # 69 eligible rows were stale pointers: every one returned before searching, the
+        # summary printed "0 grabbed, 0 no modern release, 0 failed (of 69 checked)", and
+        # the run took ONE SECOND - a single interactive search takes about four.
+        _sup  = int(result.get("superseded") or 0)
+        _nof  = int(result.get("episode_no_file") or 0)
+        _unr  = int(result.get("unresolved") or 0)
+        _searched = int(result["checked"]) - _sup - _nof - _unr
         self.logger.log_info(
             f"[LegacyRegrab] {prefix}'{instance}': {len(legacy)} legacy-codec file(s); checked "
-            f"{result['checked']} (inline cap {cap}) — {result['grabbed']} grabbed, "
+            f"{result['checked']} (inline cap {cap}), {_searched} actually searched — "
+            f"{result['grabbed']} grabbed, "
             f"{result['previewed']} would-grab, {result['no_release']} no modern release, "
-            f"{result['failed']} failed"
+            + (f"{_empty} empty search (indexer returned nothing — NOT recorded as a miss, "
+               f"retried next run), " if _empty else "")
+            + (f"{_sup} superseded (file already replaced; stale pointer retired), "
+               if _sup else "")
+            + (f"{_nof} episode has no file, " if _nof else "")
+            + (f"{_unr} unresolved (no episode matched), " if _unr else "")
+            + f"{result['failed']} failed"
             + (f"; {len(eligible) - len(batch)} more need the daemon" if len(eligible) > len(batch) else "")
             + ".")
+        if _empty and _empty == result.get("checked"):
+            # EVERY search came back empty. That is an indexer-side signal, not a
+            # library one -- a disabled/unconfigured/rate-limited provider looks
+            # identical to "no release exists", and concluding the latter from a
+            # whole-batch zero is how a backlog gets written off wholesale.
+            self.logger.log_warning(
+                f"[LegacyRegrab] '{instance}': ALL {_empty} search(es) returned zero "
+                f"releases. That points at indexer health (disabled, unconfigured or "
+                f"rate-limited), not at the library — check Prowlarr before treating "
+                f"these as having no modern release.")
         if result["preview"]:
             self.logger.log_grid(
                 ["Episode", "Current", "-> Modern release", "Res", "State"],
@@ -1629,6 +1738,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 title=f"Legacy-codec re-grab - '{instance}' (dry-run preview)", cap=24)
         return {"legacy": len(legacy), "checked": result["checked"], "grabbed": result["grabbed"],
                 "previewed": result["previewed"], "no_release": result["no_release"],
+                "empty_search": _empty,
+                # GLD-SON-25 - carried out so a caller can tell a pass that SEARCHED and
+                # found nothing from one that never searched at all. `checked` alone
+                # cannot: it counts loop iterations.
+                "searched": _searched, "superseded": _sup,
+                "episode_no_file": _nof, "unresolved": _unr,
                 "failed": result["failed"]}
 
     def _maybe_offload_legacy_regrab(self, instance: str, items: list) -> bool:
@@ -1683,6 +1798,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"[LegacyRegrab] Could not offload to the search daemon ({e}); "
                 f"falling back to the capped inline path for this run.")
             return False
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §5  ENRICHMENT & SHOW SCORING — metadata enrichment + the show score map
+    #     _build_show_score_map (402 lines) is pure computation over the frame and is
+    #     a candidate for machine_learning/ rather than a submanager.
+    #     → SonarrEpisodeScoringManager (merges with §2)
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @timeit("refresh_enrichment")
     def refresh_enrichment(self, instance: str) -> int:
@@ -2309,6 +2431,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     # How long a deletion record may stay unresolved (coords not matching any current
     # Sonarr episode) before restore stops retrying and drops it. 30 days.
     _RESTORE_TRACK_MAX_AGE_S = 30 * 24 * 3600
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §6  DELETE CANDIDATES & RESTORE — selection, the selected-file delete, recovery
+    #     THE DELETE PATH. Extract LAST, and only with tests green either side.
+    #     → SonarrEpisodeRetentionManager (merges with §10, §12, §14)
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @timeit("build_episode_delete_candidates")
     def build_delete_candidates(self, instance: str, df=None) -> list[dict]:
@@ -2951,6 +3079,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     # ── Sonarr API helpers ──────────────────────────────────────────────────────
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §7  SPACE & TTL — free-space probe and the episode/file cache TTL knobs
+    #     Shared by §9, §11, §15, §17. STAYS on extraction.
+    # ══════════════════════════════════════════════════════════════════════════════
+
     @timeit("_get_free_space_gb")
     def _get_free_space_gb(self, instance: str) -> float:
         """
@@ -3028,6 +3161,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return val if val > 0 else int(default)
         except (TypeError, ValueError, AttributeError):
             return int(default)
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §8  SONARR FETCH & CACHE — episode/file retrieval, prewarm, resolution
+    #     The read side of the frame. STAYS on extraction — every section depends on it.
+    #     ⚠️ `_resolve_episode_file` is where GLD-SON-25's stale-pointer class lives:
+    #        an episode_file_id is a HANDLE any replacement invalidates, not an identity.
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @timeit("_get_all_episodes")
     def _get_all_episodes(self, instance: str, series_id: int,
@@ -3409,6 +3549,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 r["_group"] = key
                 walk.append(r)
         return walk
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §9  NEXT-EPISODE COMPUTATION — which episode each series owes the household next
+    #     507 lines of pure computation over the frame. Brain primitives already live in
+    #     machine_learning/acquisition/next_episode_planner.py (12 symbols imported).
+    #     → SonarrEpisodeNextUpManager — or push the computation itself into the brain.
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @timeit("_compute_next_episodes")
     def _compute_next_episodes(
@@ -3916,6 +4063,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             df = self._safe_concat(df, df_new)
 
         return df
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §10  RETENTION: GRACE, PURGE, INVENTORY — what becomes deletable, and when
+    #      Grace expiry is what MARKS a row; §12 is what acts on the mark. The ordering
+    #      grace → delete is only visible because these share a file.
+    #      → SonarrEpisodeRetentionManager (merges with §6, §12, §14)
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @timeit("_apply_grace_period")
     def _apply_grace_period(
@@ -4754,6 +4908,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
         return df
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §11  ACQUISITION & RECYCLE — acquire the next episode, recycle watched to fund it
+    #      `_recycle_to_fund_acquisition` is a DELETE path, but a different act from §12:
+    #      "I finished this episode, spend it on the next one" — own consent, own gate.
+    #      → SonarrEpisodeAcquireManager
+    # ══════════════════════════════════════════════════════════════════════════════
+
     @timeit("_do_acquire_next_episodes")
     def _do_acquire_next_episodes(
         self, instance: str, df: pd.DataFrame, *, season_ep_cache: dict | None = None
@@ -5353,6 +5514,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                                  title=f"Self-funded acquisition - '{instance}'{prefix}", cap=24)
         return funded
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §12  DELETE EXECUTION — the marked-file delete plus the public entrypoints
+    #      Gated by deletions_consent AND the backup gate. Nothing here runs unless both
+    #      are armed. → SonarrEpisodeRetentionManager (merges with §6, §10, §14)
+    # ══════════════════════════════════════════════════════════════════════════════
+
     @timeit("_do_delete_marked_files")
     def _do_delete_marked_files(
         self, instance: str, df: pd.DataFrame
@@ -5804,6 +5971,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     _EPISODE_HISTORY_PAGE      = 1000
     _EPISODE_HISTORY_MAX_PAGES = 250
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §13  WATCH HISTORY & HOUSEHOLD — Trakt + Tautulli ingestion, who watched what
+    #      Feeds is_watched, the JIT watcher map, and viewer positions. §19 is the same
+    #      subsystem at the far end of the file.
+    #      → SonarrEpisodeHistoryManager (merges with §19)
+    # ══════════════════════════════════════════════════════════════════════════════
+
     def _get_episode_history_pages(self, api, inst_name: str) -> list:
         """Every EPISODE history row for one Tautulli instance, paginated."""
         rows: list = []
@@ -6245,6 +6419,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         except Exception:
             return {}
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §14  VIEWER RETENTION — hold episodes a household member is mid-way through
+    #      A protection, not a reclaim: it KEEPS files §12 would otherwise take.
+    #      → SonarrEpisodeRetentionManager (merges with §6, §10, §12)
+    # ══════════════════════════════════════════════════════════════════════════════
+
     @timeit("_apply_viewer_retention")
     def _apply_viewer_retention(
         self, df: "pd.DataFrame", history: dict, instance: str
@@ -6503,6 +6683,15 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         except (TypeError, ValueError):
             v = self.PILOT_STALE_RECHECK_CAP
         return v if v and v > 0 else 0
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §15  PILOT SEARCH — first-episode acquisition, the ladder, workers and offload
+    #      LARGEST section, and `run_pilot_search` alone is ~900 lines. Cores already
+    #      extracted: pilot_720_upgrade.py, pilot_interactive.py, acquisition/pilot_stepping
+    #      (11 symbols). What remains here is orchestration — split it into phases
+    #      (select → plan → offload → spawn) BEFORE moving it, or the move is unreviewable.
+    #      → SonarrEpisodePilotManager
+    # ══════════════════════════════════════════════════════════════════════════════
 
     def run_pilot_batch(
         self,
@@ -8118,6 +8307,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             anime_ladder=anime_ladder, anime_sids=anime_sids,
         )
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §16  SIZING & ID HELPERS — total space, measured rates, profile ceiling, episode id
+    #      Small shared utilities used by §11, §15 and §17. STAY on extraction.
+    # ══════════════════════════════════════════════════════════════════════════════
+
     def _get_total_space_gb(self, instance: str) -> float:
         """
         Total disk capacity in GB across the mounts that host Sonarr root
@@ -8265,6 +8459,14 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         except Exception:
             pass
         return None
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §17  JIT QUALITY UPGRADES — bump the profile just before the household watches
+    #      Decision primitives already in the brain (space/jit_planner, 7 symbols;
+    #      jit_row_skip / choose_jit_profile / pilot_floor_hold). Search payload already
+    #      in sonarr/cache/jit_search.py. What remains is the selection loop.
+    #      → SonarrEpisodeJitManager (merges with §18)
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @LoggerManager().log_function_entry
     @timeit("run_jit_quality_upgrades")
@@ -9004,6 +9206,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 time.sleep(delay_s)
         return set()
 
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §18  JIT QUALITY RESTORE — roll a watched episode back to its pre-upgrade file
+    #      The other half of §17: up before the watch, back after. Snapshot-backed, so a
+    #      failed PUT must NOT clear pre_upgrade_quality (GLD-SON-20).
+    #      → SonarrEpisodeJitManager (merges with §17)
+    # ══════════════════════════════════════════════════════════════════════════════
+
     @LoggerManager().log_function_entry
     @timeit("run_jit_quality_restores")
     def run_jit_quality_restores(self, instance: str) -> dict:
@@ -9219,6 +9428,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             ],
         )
         return stats
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §19  TAUTULLI SYNC — pull play history and stamp watched-state onto the frame
+    #      Same subsystem as §13, separated only by where it landed in the file.
+    #      → SonarrEpisodeHistoryManager (merges with §13)
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @LoggerManager().log_function_entry
     @timeit("sync_from_tautulli")
@@ -9635,6 +9850,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         return stats
 
     # ── Reporting / ML helpers ──────────────────────────────────────────────────
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # §20  RUN SUMMARY — what this manager reports at the end of a run. STAYS.
+    # ══════════════════════════════════════════════════════════════════════════════
 
     @LoggerManager().log_function_entry
     @timeit("get_episode_file_summary")

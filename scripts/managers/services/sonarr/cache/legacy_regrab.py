@@ -71,7 +71,15 @@ def run_legacy_regrab(*, make_request, logger, global_cache, instance, items,
     items = [i for i in (items or [])
              if i.get("series_id") is not None and i.get("episode_file_id") is not None]
     stats = {"checked": 0, "grabbed": 0, "previewed": 0, "no_release": 0, "failed": 0,
-             "skipped_space": 0, "empty_search": 0, "preview": []}
+             "skipped_space": 0, "empty_search": 0,
+             # GLD-SON-25 - the three ways a row can end without a search. All three
+             # used to be a bare `return` inside `_one`, incrementing nothing, so a
+             # whole batch of them printed as "0 grabbed, 0 no release, 0 failed"
+             # and read as though the pass had done nothing at all.
+             "superseded": 0,        # row's file id is stale; the episode has a DIFFERENT file now
+             "episode_no_file": 0,   # row's file id is stale and the episode has no file at all
+             "unresolved": 0,        # row maps to no episode by id OR by season/episode
+             "preview": []}
     if not items:
         return stats
 
@@ -93,19 +101,46 @@ def run_legacy_regrab(*, make_request, logger, global_cache, instance, items,
     lkey = ledger_key(instance)
     ledger = dict((global_cache.get(lkey) if global_cache else None) or {})
 
-    def _episode(sid, fid):
+    def _episode(sid, fid, sn=None, en=None):
+        """Resolve the live episode for a parquet row -> ``(episode, how)``.
+
+        ``how`` is ``"fid"`` (the row's ``episode_file_id`` still exists), ``"coords"``
+        (it does not, but season/episode matched) or ``None``.
+
+        WHY TWO KEYS. ``episode_file_id`` is a POINTER, and every lane that replaces a
+        file invalidates it: a legacy re-grab, an upgrade, a size-anomaly remediation,
+        a space-pressure step-down. The parquet is rebuilt on a per-series freshness
+        clock (``GLD-CACHE-14``), so between a replacement and that series' next
+        refresh the row still carries the OLD id and can never resolve. Measured
+        2026-08-21 on the live library: of the 70 rows eligible that run, 69 were dead
+        pointers and 67 of those episodes still had a file - just under a new id
+        (Dragon Ball Kai S01E30: parquet 44437, Sonarr 64041). Season/episode is the
+        stable identity Sonarr answers authoritatively, so it is the fallback."""
         with lock:
-            emap = ep_cache.get(sid)
-        if emap is None:
+            maps = ep_cache.get(sid)
+        if maps is None:
             eps = make_request(instance, f"episode?seriesId={sid}", fallback=[]) or []
-            emap = {}
+            by_fid, by_coord = {}, {}
             for e in eps:
                 f = e.get("episodeFileId")
                 if f is not None:
-                    emap.setdefault(int(f), e)
+                    by_fid.setdefault(int(f), e)
+                try:
+                    by_coord.setdefault((int(e.get("seasonNumber")), int(e.get("episodeNumber"))), e)
+                except (TypeError, ValueError):
+                    pass                      # specials / unaired rows carry no usable coords
+            maps = (by_fid, by_coord)
             with lock:
-                ep_cache[sid] = emap
-        return emap.get(int(fid))
+                ep_cache[sid] = maps
+        by_fid, by_coord = maps
+        hit = by_fid.get(int(fid))
+        if hit is not None:
+            return hit, "fid"
+        try:
+            hit = by_coord.get((int(sn), int(en)))
+        except (TypeError, ValueError):
+            hit = None
+        return (hit, "coords") if hit is not None else (None, None)
 
     def _persist(fid, result):
         if global_cache is None:
@@ -119,9 +154,48 @@ def run_legacy_regrab(*, make_request, logger, global_cache, instance, items,
 
     def _one(item):
         sid, fid = int(item["series_id"]), int(item["episode_file_id"])
-        ep = _episode(sid, fid)
-        eid = ep.get("id") if ep else None
+        label0 = str(item.get("series_title") or "?")[:28]
+        ep, how = _episode(sid, fid, item.get("season_number"), item.get("episode_number"))
+        if ep is None:
+            # Neither the file id nor the coords matched anything Sonarr knows. NOT
+            # persisted: a failed `episode?seriesId=` fetch lands here too, and benching
+            # a file for 14 days on a transient error is the mistake GLD-SON-02 fixed
+            # on the search side. Counted and named so it cannot read as "nothing found".
+            with lock:
+                stats["unresolved"] += 1
+            logger.log_info(
+                f"  [LegacyRegrab] {label0}: row matches no episode in Sonarr by file id "
+                f"OR by season/episode - skipped, not benched (GLD-SON-25).")
+            return
+        eid = ep.get("id")
         if not eid:
+            with lock:
+                stats["unresolved"] += 1
+            return
+        if how == "coords":
+            live_fid = ep.get("episodeFileId")
+            if live_fid:
+                # THE ROW DESCRIBES A FILE THAT NO LONGER EXISTS. Some lane already
+                # replaced it, so the legacy codec this row reports is stale evidence -
+                # on the live library every sampled replacement was already x264. A
+                # search here would re-grab a file that is ALREADY modern, which is the
+                # opposite of the point. Retire the dead pointer instead: the ledger is
+                # keyed by file id, so recording THIS id leaves the live file's own id
+                # completely free to be picked up on the next parquet refresh.
+                with lock:
+                    stats["superseded"] += 1
+                _persist(fid, "superseded")
+                logger.log_info(
+                    f"  [LegacyRegrab] {label0} S{item.get('season_number')}"
+                    f"E{item.get('episode_number')}: file {fid} was already replaced "
+                    f"(now {live_fid}) - stale parquet pointer retired, no search "
+                    f"(GLD-SON-25).")
+                return
+            # Coords matched but the episode holds no file at all: it was deleted, not
+            # replaced. Nothing to upgrade, and re-acquiring is the acquisition lane's
+            # job, not this one. Not persisted - a delete can be undone.
+            with lock:
+                stats["episode_no_file"] += 1
             return
         releases = make_request(instance, f"release?episodeId={eid}", fallback=None)
         if releases is None:
