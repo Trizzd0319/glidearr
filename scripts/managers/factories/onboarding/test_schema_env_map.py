@@ -112,7 +112,41 @@ def test_backup_and_size_anomaly_schema_defaults():
     assert cfg["size_anomaly"] == {
         "enabled": True, "remediate": False, "over_ratio": 3.0,
         "under_ratio": 0.3, "min_samples": 8, "report_limit": 25,
+        # Re-grab attempt-ledger bounds (GLD-SON-13): a bloated file Sonarr will never
+        # upgrade-replace stops being re-searched after 3 unchanged attempts, 7 days apart.
+        "max_regrab_attempts": 3, "regrab_retry_days": 7,
     }
+
+
+def test_space_budget_schema_defaults_ship_disabled():
+    """The byte budget must ship OFF in generated configs so a fresh install keeps the
+    legacy count-cap slice byte-identically; the block is present (discoverable, overlay-
+    mergeable) with the module's own defaults so schema and module cannot drift apart."""
+    sb = empty_config()["acquisition"]["space_budget"]
+    assert sb == {
+        "enabled": False, "shared_pool": True, "committed_ttl_hours": 72,
+        "default_movie_gb": 15.0, "default_episode_gb": 2.0, "hard_max_adds": 0,
+    }
+    from scripts.managers.machine_learning.acquisition.space_budget import DEFAULTS
+    assert sb == DEFAULTS                     # onboarding == module, one source of truth
+
+
+def test_skeleton_overlay_preserves_space_budget_overrides():
+    merged = deep_merge(empty_config(),
+                        {"acquisition": {"space_budget": {"enabled": True, "hard_max_adds": 50}}})
+    sb = merged["acquisition"]["space_budget"]
+    assert sb["enabled"] is True and sb["hard_max_adds"] == 50   # operator override wins
+    assert sb["committed_ttl_hours"] == 72                       # untouched default fills in
+
+
+def test_household_affinity_seed_ships_off_and_doc_leaf_exists():
+    """family_only must ship OFF so a fresh install keeps the legacy all-accounts
+    household affinity byte-identically; the doc leaf makes it reachable headlessly."""
+    cfg = empty_config()
+    assert cfg["household_affinity"] == {"family_only": False}
+    merged = deep_merge(empty_config(), {"household_affinity": {"family_only": True}})
+    assert merged["household_affinity"]["family_only"] is True
+    assert "household_affinity.family_only" in _doc_paths()
 
 
 def test_skeleton_overlay_preserves_size_anomaly_overrides():
@@ -125,7 +159,9 @@ def test_skeleton_overlay_preserves_size_anomaly_overrides():
 def test_doc_leaves_cover_backup_and_size_anomaly():
     paths = _doc_paths()
     for p in ("backup_before_destructive", "backup_deep_validate",
-              "size_anomaly.enabled", "size_anomaly.remediate"):
+              "size_anomaly.enabled", "size_anomaly.remediate",
+              "size_anomaly.max_regrab_attempts", "size_anomaly.regrab_retry_days",
+              "acquisition.space_budget.enabled", "acquisition.space_budget.hard_max_adds"):
         assert p in paths
 
 

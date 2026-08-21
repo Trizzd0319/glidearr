@@ -260,9 +260,14 @@ def empty_config() -> dict:
         "backup_max_age_hours": 24,
         # Wildly-out-of-size-profile detector (read-only report by default): flags files whose
         # bitrate is wildly inconsistent with their graded quality (e.g. a 45 GiB "720p" carries a
-        # 4K-remux bitrate). remediate (opt-in, DESTRUCTIVE) acts: rescan mis-graded files to fix
-        # the label, re-grab genuinely-bloated ones at their profile target (delete + research);
-        # monitored-only and gated by the backup gate + dry_run.
+        # 4K-remux bitrate). remediate (opt-in) acts: RESCAN mis-graded files to fix the label
+        # (broadcast HDTV tiers route here too - a bloated broadcast grade is a mis-graded disc
+        # source), and SEARCH genuinely-bloated ones for a right-sized replacement at their profile
+        # target - the file is KEPT until the replacement imports (Sonarr retires it to the recycle
+        # bin on import; nothing is deleted up front). Searches are bounded by a per-file attempt
+        # ledger (max_regrab_attempts / regrab_retry_days; a size CHANGE resets the budget) so a
+        # file Sonarr will never upgrade-replace cannot be re-searched forever. Monitored-only and
+        # gated by the backup gate + dry_run.
         "size_anomaly": {
             "enabled": True,
             "remediate": False,
@@ -270,6 +275,8 @@ def empty_config() -> dict:
             "under_ratio": 0.3,
             "min_samples": 8,
             "report_limit": 25,
+            "max_regrab_attempts": 3,
+            "regrab_retry_days": 7,
         },
         # Watch-likelihood-gated quality upgrades (Radarr universe + active-watcher,
         # Sonarr JIT). Likelihood = max(engagement floor, affinity propensity):
@@ -689,16 +696,68 @@ def empty_config() -> dict:
         # demand, on-deck, ratings, watchlist, this-week) EXCEPT affinity — an ignored user is dropped
         # from the tracked roster, but the Tautulli-keyed affinity pipelines still count its watches.
         "ignored_users": [],
+        # Household-affinity scoping. family_only=true keeps NON-Home accounts (shared
+        # friends streaming remotely) OUT of the household genre/actor/director maps that
+        # drive acquisition genre scoring, playlists and watch-likelihood -- their watches
+        # still build their own per-user matrices, they just stop steering the family's.
+        # Family = Plex HOME membership, resolved to Tautulli user_ids via the identity
+        # map the Plex users pass persists each run. Fail-OPEN, loudly: an absent or
+        # id-less map (e.g. the first run after enabling) skips scoping for that run
+        # rather than emptying the aggregate the whole system reads.
+        "household_affinity": {"family_only": False},
+        # Tautulli accounts that are the SAME PERSON (a managed Plex profile plus that
+        # person's own login, say). Each group is graded as ONE viewer: their plays merge
+        # into a single affinity matrix and EVERY member receives it, so both profiles get
+        # the same recommendations instead of two thinner, divergent ones. First member is
+        # the PRIMARY; members may be usernames (case-insensitive) or Tautulli user_ids.
+        # Empty = off (byte-identical). Example: [["owner_login", "Mom"]].
+        # NOTE this does NOT change family/household scoping - family means Plex HOME
+        # membership, and a link must never drag a non-Home account into the family maps.
+        "account_links": [],
         "dry_run": True,
         "notifications": {"discord": dict(_DISCORD_DEFAULTS)},
         # Phase-3 capabilities — all OFF by default; honour dry_run when enabled.
         "acquisition": {
             "enabled": False,
-            "sources": {"trakt_recommendations": True, "trakt_watchlist": True, "mal": True},
+            "sources": {"trakt_recommendations": True, "trakt_watchlist": True, "mal": True,
+                        "people_cooccurrence": True},
             "monitored": True,
             "search_on_add": False,
             "max_adds_per_run": 10,
             "recommendation_limit": 20,
+            # BYTE-priced space budget (module default OFF - a bare config keeps the legacy
+            # count-cap slice byte-identically). When enabled, selection funds candidates in
+            # priority order out of max(0, free-U) minus the committed-bytes ledger's in-flight
+            # GB, instead of truncating to max_adds_per_run; the count cap survives only as the
+            # bounded FALLBACK when the budget cannot read its inputs (unreadable free space /
+            # corrupt ledger - never falls back to unlimited). shared_pool=true treats every
+            # instance as ONE pool (min headroom) - right for a single array behind TRaSH
+            # hardlinks, where per-instance pools would double-spend the same free space.
+            # Unknown candidate sizes price at the default_*_gb values, never 0; shows charge
+            # ONE pilot episode. hard_max_adds (0 = off) is an optional count seatbelt on top.
+            "space_budget": {
+                "enabled": False,
+                "shared_pool": True,
+                "committed_ttl_hours": 72,
+                "default_movie_gb": 15.0,
+                "default_episode_gb": 2.0,
+                "hard_max_adds": 0,
+            },
+            # Grab-time size ceiling written into Radarr/Sonarr quality definitions:
+            # maxSize (MB/min) = this library's own measured MiB/min x over_ratio, so a
+            # mislabelled disc image (a 50 GiB "720p") is refused BEFORE it downloads
+            # rather than flagged after it imports. OFF by default - it writes *arr
+            # CONFIGURATION, which outlives the run and governs every future grab,
+            # including ones Glidearr never initiates. Caps only ever TIGHTEN, tiers
+            # with fewer than min_samples measured files are left alone (a ceiling from
+            # noise starves a tier silently), and nothing is written on a dry run.
+            "quality_caps": {
+                "enabled": False,
+                "over_ratio": 3.0,
+                "min_samples": 30,
+                "min_headroom_ratio": 1.5,
+                "floor_mb_per_min": 5.0,
+            },
             "quality_profile": "",
             "min_score": 0,
             # Weighted share of cast/crew (people) overlap in the ADD score: how strongly a
