@@ -21,6 +21,11 @@ class BaseManager:
     # __init__, so a per-instance warning would emit ~40 times a run.
     _warned_missing_cache_memory = False
 
+    # Same once-per-process discipline for the SHIM case (`GLD-MGR-12`), tracked
+    # separately so a daemon's supported shim can never consume the budget of the
+    # real contract-change warning, or vice versa.
+    _noted_cache_shim = False
+
     def __new__(cls, *args, **kwargs):
         key = kwargs.get("singleton_key")
         inst_key = (cls, key)
@@ -261,23 +266,73 @@ class BaseManager:
         Absent conflated with empty (P-C), in the one field whose entire job is
         to say what the cache is holding.
 
-        A missing `memory` now WARNS once rather than returning a silent `[]`,
-        because it would mean the cache contract changed -- which is exactly the
-        condition that went unnoticed here. An empty MemoryManager still returns
-        `[]`, and that answer is now trustworthy (`GLD-MGR-11`).
+        TWO DIFFERENT ABSENCES, and conflating them is `GLD-MGR-12`:
+
+        * A **shim** -- any cache-like object that is not a `GlobalCacheManager`.
+          Both daemons pass one deliberately (`pilot_search_daemon.LedgerCache`,
+          a `CacheKeyBuilder`-backed JSON reader/writer), because the one-
+          `GlobalCacheManager`-per-process invariant (`GLD-CACHE-13`) means a
+          second process must NOT construct one. A shim has no `MemoryManager`
+          and never will. That is the documented design, not a fault, so it is a
+          DEBUG line naming the type.
+        * A real `GlobalCacheManager` **without** `.memory` -- that genuinely is a
+          contract change, and the condition this guard was written for. Still a
+          once-per-process WARNING.
+
+        The first version warned on both, so a supported shim produced
+        "That is a CONTRACT CHANGE" every daemon run. A diagnostic that cries
+        wolf at an intentional, documented arrangement is one an operator learns
+        to skip -- which is precisely what would hide the real contract change it
+        exists to catch.
+
+        An empty MemoryManager still returns `[]`, and that answer is
+        trustworthy (`GLD-MGR-11`).
         """
         if not self.global_cache or self.name == "GlobalCacheManager":
             return []
 
         memory = getattr(self.global_cache, "memory", None)
         if memory is None:
-            # Once per process: this runs from __init__, i.e. ~40 times a run.
-            if not BaseManager._warned_missing_cache_memory:
-                BaseManager._warned_missing_cache_memory = True
-                self.logger.log_warning(
-                    "⚠️ global_cache exposes no `memory` MemoryManager — cache-key previews "
-                    "will be empty. That is a CONTRACT CHANGE, not an empty cache "
-                    "(GLD-MGR-11)."
+            # Identify by DUCK TYPE, not by import: importing GlobalCacheManager
+            # here would be a factories->factories cycle at class-definition time,
+            # and the property that matters is "does this object claim to be the
+            # full cache", which its own class name answers.
+            _cls = type(self.global_cache).__name__
+            if _cls == "GlobalCacheManager":
+                if not BaseManager._warned_missing_cache_memory:
+                    BaseManager._warned_missing_cache_memory = True
+                    self.logger.log_warning(
+                        "⚠️ GlobalCacheManager exposes no `memory` MemoryManager — cache-key "
+                        "previews will be empty. That is a CONTRACT CHANGE, not an empty "
+                        "cache (GLD-MGR-11)."
+                    )
+            elif not BaseManager._noted_cache_shim:
+                # Once per process, and DEBUG: a non-GlobalCacheManager cache is a
+                # supported arrangement, so this is orientation for whoever reads the
+                # log, not a problem to act on.
+                #
+                # CARRIES THE CALLER (GLD-MGR-13). The first time this fired in
+                # production, answering "which code path built this stack?" cost three
+                # wrong attributions -- the daemon (it never constructs this manager),
+                # the first-run backfill (its marker was a month old), the threshold
+                # report (it has no bootstrap at all). None of that guesswork was
+                # necessary: the stack that CONSTRUCTED the manager is on the Python
+                # stack at this exact moment, and printing it is three lines. A
+                # diagnostic that names the condition but not the origin just relocates
+                # the investigation.
+                BaseManager._noted_cache_shim = True
+                try:
+                    import traceback as _tb
+                    _frames = [f"{f.filename.rsplit('/', 1)[-1].rsplit(chr(92), 1)[-1]}"
+                               f":{f.lineno} {f.name}"
+                               for f in _tb.extract_stack()[:-1][-6:]]
+                    _where = " <- ".join(reversed(_frames))
+                except Exception:
+                    _where = "unavailable"
+                self.logger.log_debug(
+                    f"Cache is a {_cls}, not a GlobalCacheManager — no MemoryManager, so "
+                    f"cache-key previews are empty by design (GLD-MGR-12). "
+                    f"Constructed by: {_where}"
                 )
             return []
 
