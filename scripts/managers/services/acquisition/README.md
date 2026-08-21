@@ -32,17 +32,21 @@ Config keys read (the `acquisition` block unless noted):
 - `acquisition.recommendation_limit` (default 20) — Trakt recs page size.
 - `acquisition.monitored` (default true), `acquisition.search_on_add` (default false) — passed to `Adder`.
 - `acquisition.defer_under_pressure` (default true) — gate for the new-add deferral path.
-- `acquisition.min_score` (default 0), `acquisition.max_adds_per_run` (default 10; ≤0 = unlimited).
+- `acquisition.min_score` (default 0), `acquisition.max_adds_per_run` (default 10; ≤0 = unlimited; under budget mode this key is only the FALLBACK bound — see `space_budget`).
+- `acquisition.space_budget.*` (`enabled` default false; `shared_pool` true; `committed_ttl_hours` 72; `default_movie_gb` 15; `default_episode_gb` 2; `hard_max_adds` 0) — the byte budget that replaces the count slice when enabled (`GLD-ACQS-13`).
 - `acquisition.quality_profile` — optional pinned profile name (handled by `Resolver`).
 - Disk-space gating reads via `space_targets(self.config, total_gb=…)` and `alert_unconfigured_floor(...)` (e.g. `free_space_limit`; falls back to 25%-of-total when unset). The `Resolver`/`AcquisitionScorer` read additional library-routing/affinity keys (documented in their own modules).
 
 `global_cache` keys read/written:
-- `acquisition/deferred_search` — list of deferred backlog items (read + written; capped at `_DEFERRED_MAX = 500`, keeping the newest).
+- `acquisition/deferred_search` — list of deferred backlog items (read + written; capped at `_DEFERRED_MAX = 500`, keeping the newest). Entries now carry `gb`, the byte price for the flush-time budget commit.
+- `acquisition/space_budget/committed` — the committed-bytes ledger (read at snapshot, TTL-reconciled, written on live runs; `GLD-ACQS-14`).
+- `acquisition/breakdown` — the elevation-breakdown frame payload (`breakdown.py`, SCHEMA v2) for the website generator.
 - `acquisition/run_stats` — per-run stats dict (written; failures swallowed).
 - `tautulli/affinity` — read by the scorer for genre-affinity weights.
 
 `dry_run` behavior:
 - Adds become "would-add" log lines; nothing POSTed (handled in `Adder.add`).
+- The space budget still SELECTS in budget mode (an accurate preview of what an armed run would fund/refuse) but commits nothing: ledger entries are written only for `added`, and the ledger persist is live-run-only.
 - Deferred-search flush logs "would search deferred …" and counts it as searched, but issues no command and does NOT rewrite the backlog (`global_cache.set` is skipped under dry_run).
 - New deferrals are NOT persisted under dry_run (the `if res.get("ok") and not self.dry_run` guard).
 
@@ -58,17 +62,18 @@ Lifecycle: `__init__` (inject deps, capture `dry_run`/`trakt`/`mal`/`sonarr`/`ra
 3. **Always flush the deferred backlog first** via `_flush_deferred(...)` — this is idempotent and space-gated, and runs even when `defer_under_pressure` is disabled, so titles already added-but-unsearched are never stranded.
 4. `gatherer.gather()` → raw candidates (Trakt watchlist gathered before recommendations so stronger intent wins de-dup).
 5. For each raw candidate: `resolver.prepare(cand)`; if it returns a `skip_reason` (e.g. "no instance available", "no lookup match", "already in library") tally it and skip. Otherwise `scorer.score(enriched)` sets `score` and `matrix`, then `resolver.resolve_quality(enriched, score)` re-picks the quality profile from the score (no-op if a profile is pinned).
-6. Filter to `score >= min_score`, sort by score descending, truncate to `max_adds_per_run`.
+6. Filter to `score >= min_score`, order (score-desc, or demand-ranked when `acquisition.demand.enabled`), then SELECT: under `space_budget.enabled`, fund candidates in priority order out of `max(0, free-U)` minus the committed ledger's in-flight bytes (skip-and-continue; refusals logged with sizes); otherwise truncate to `max_adds_per_run`. Budget mode that cannot build its snapshot (unreadable free space, corrupt ledger) falls back to the BOUNDED count cap — never to unlimited.
 7. For each selected item: determine the target service (`show`→sonarr, else radarr), and if `defer_under_pressure` and the gateway exists, compute the space band via `_space_band(...)` to set `under_pressure = free < U`. Call `adder.add(e, search=False if under_pressure else None)`. If under pressure and the result is "added"/"would-add", relabel the decision "deferred", and (live runs only) queue a backlog entry containing service/instance/`arr_id`/title/type/profile/`queued_at`/`attempts`.
 8. Persist new deferrals onto `acquisition/deferred_search` (bounded to the newest 500), render the decision table (`title, type, score, instance, profile, ~size, decision`), log skip tallies, and write `acquisition/run_stats`.
 
 Notable internal helpers:
 - `_space_band(gw, inst, cache)` — returns `(free_gb, U)` for an instance. **Fail-open:** an unreadable instance yields `free=inf` (so `free < U` is False and a transient error never blocks an add). Memoised per `(service, instance)` for the run. `U` is the band top from `space_targets` (floor + headroom, or 25%-of-total when `free_space_limit` is unset). Warns once per service+instance when the floor is being defaulted.
+- `_space_budget_context(eligible, acq, gateways, band_cache)` — the byte-budget snapshot: `('off'|'budget'|'fallback', BudgetContext, kept_ledger)`. Prices pools from the instances eligible candidates route to, TTL-reconciles the committed ledger, and nets in-flight bytes out of the min-headroom budget. **Fail direction inverted** relative to `_space_band`: any information gap → `'fallback'` (the bounded count cap), because "open" under an UNCAPPED budget would mean unlimited.
 - `_trigger_search(gw, inst, item)` — POSTs the deferred search. Returns True only on a truthy *arr response; a falsy/None result (the `_make_request` swallowed-error fallback) means the command failed and the item stays queued.
 - `_flush_deferred(gateways, band_cache)` — drains the backlog: items on unavailable/still-pressured instances stay queued (no attempt counted); items whose instance recovered above `U` are searched; an attempted-but-failed search increments `attempts` and is abandoned after `_DEFERRED_MAX_ATTEMPTS = 5`. Returns a stats dict (`pending/searched/abandoned/still_deferred`).
 - `_size_str(e)` — formats `~{gb}GB` (with `/ep` suffix for per-episode shows) for the decision table.
 
-Brain delegation: this manager delegates **no** decision into `machine_learning/`. The acquisition score is computed by the local sibling `AcquisitionScorer` (a service module, not a brain module). The only "value judgement" externalized is disk-space banding, which goes to the shared `space_targets` utility, not the brain.
+Brain delegation: the acquisition SCORE stays local (`AcquisitionScorer`, a service module), but three decisions are delegated into `machine_learning/`: demand-aware ordering (`acquisition.demand` → `demand_score`/`demand_priority`), space-tightness hysteresis (`space/tightness`), and — since `GLD-ACQS-13` — the byte budget itself (`acquisition/space_budget`: pricing, ledger reconciliation, `BudgetContext`, selection). Disk-space banding goes to the shared `space_targets` utility.
 
 ## Criteria & examples
 
@@ -97,4 +102,32 @@ The clever part is the "wait until there's room" rule. If your drive is getting 
   - `Adder` (`adder.py`) — builds the Sonarr v4 / Radarr add payload and POSTs it (or logs "would-add" under dry_run).
 - **Services it talks to:** Sonarr and Radarr (via their `instance_manager`s, through `ArrGateway`), Trakt (`trakt_api` watchlist/recommendations), and MAL (`acquisition_candidates()` once wired).
 - **Shared utilities:** `space_targets` and `alert_unconfigured_floor` (disk-space banding), `library_classifier` and `size_model` (via the `Resolver`).
-- **Brain modules:** none. Scoring is local to `AcquisitionScorer`; no decision is delegated into `machine_learning/`.
+- **Brain modules:** `machine_learning/acquisition/space_budget` (byte budget + committed ledger), `machine_learning/acquisition/demand` (breadth ordering, config-gated), `machine_learning/space/tightness` and `routing_targets`. Scoring itself stays local to `AcquisitionScorer`.
+
+---
+
+## Script inventory
+
+| Script | Size | Role | Tests |
+|---|---|---|---|
+| [`__init__.py`](./__init__.py) | ~56 KB | `AcquisitionManager` — orchestration, deferral, space budget wiring, decision table | ✅ `test_space_budget_selection.py`, `test_demand_acquisition.py`, `test_deferral.py` |
+| [`resolver.py`](./resolver.py) | ~29 KB | Metadata lookup, library bucket, instance/profile/root/size, UHD companion planning | ✅ |
+| [`scorer.py`](./scorer.py) | ~19 KB | Explainable 0–100 score + per-component matrix + evidence | ✅ |
+| [`breakdown.py`](./breakdown.py) | ~24 KB | Records-first elevation breakdown — canonical SCHEMA (v2, incl. `space_charge_gb`/`space_pool`), seven boxed tables, frame → `acquisition/breakdown` | ✅ `test_elevation_breakdown.py` |
+| [`candidates.py`](./candidates.py) | — | Trakt/MAL gathering, normalisation, intent-ordered dedup | ✅ |
+| [`gateway.py`](./gateway.py) | — | Cached per-instance *arr HTTP access | ✅ |
+| [`adder.py`](./adder.py) | — | Sonarr v4 / Radarr add payloads; dry-run "would-add" | ✅ |
+
+## Test coverage
+
+| Test | Covers |
+|---|---|
+| `test_space_budget_selection.py` | `_space_budget_context` — all three modes and every fallback trigger (inf free, corrupt/raising ledger), TTL release, min-headroom netting, per-instance pools |
+| `test_elevation_breakdown.py` | Breakdown records/tables/frame — P-C rendering, contribution sums, SCHEMA completeness |
+| `test_demand_acquisition.py`, `test_deferral.py`, `test_dual_emit.py`, others | Demand ordering, deferral lifecycle, dual-version emission, resolver/scorer/adder behaviour |
+
+## Navigation
+
+- **Up:** [`services/`](../README.md) · **Design:** [`DESIGN.md`](./DESIGN.md)
+- **Brain:** [`machine_learning/acquisition/`](../../machine_learning/acquisition/README.md) (demand, space budget)
+- **Consumes:** Trakt/MAL services · Sonarr/Radarr instance managers · `space_targets`

@@ -295,6 +295,10 @@ per-user affinities from the service.
 - ✅ Trigger-1 "return now" mapping to the ramp peak
 - ✅ Undated content structurally excluded from the top
 - ✅ Pilot profile stepping, next-episode budgeting, enrichment prioritisation
+- ✅ Byte-priced acquisition space budget (`space_budget.py`) — candidates funded in
+  priority order out of `max(0, free-U)` minus a cross-run committed-bytes ledger;
+  fail-direction deliberately INVERTED (incomplete information → the bounded count
+  cap, never unlimited), unknown sizes priced at conservative defaults, never 0
 - ✅ A matching test module for every source module, tests ≥ source size
 
 ## 9. Planned additions
@@ -311,6 +315,7 @@ per-user affinities from the service.
 | `GLD-ACQ-08` | **Surface resumption candidates before they are acquired** | The ramp decides re-acquisition with no preview | M | `GLD-WEB-02` |
 | `GLD-ACQ-09` | **Route the demand threshold through `thresholds/registry`** | A hand-set cutoff absent from `THRESHOLD_SPECS`, like `GLD-DIS-09` | S | `GLD-THR-01` |
 | `GLD-ACQ-10` | **Test the `t = 0` byte-identity claim** — I1 is the property that makes the roomy regime safe | Nothing pins it | S | `GLD-PLY-10` |
+| `GLD-ACQ-11` | Mirror of `GLD-ACQS-13`/`-14` (the byte budget + committed ledger live in this package as the pure `space_budget` module; the service wiring, invariants and open follow-ups are registered under §4.46 in the service's DESIGN and ENHANCEMENTS) | One brain module, one register home — avoid divergent duplicate histories (P-E) | — | `GLD-ACQS-13` |
 
 ## 10. Open questions
 

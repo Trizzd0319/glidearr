@@ -213,6 +213,49 @@ a signal it never had.
 
 ---
 
+### 3.8 🔴 The people-evidence gate is a live P-C — and the table conversion forced it
+
+`score()` only sets `evidence["people"]` when the candidate resolves in the
+people-matrix forward map:
+
+```python
+people_ev = None
+fwd, pweights = self._people_data()
+if fwd and pweights:
+    ...
+    if roles:                       # <- the gate
+        matrix["people_affinity"] = ...
+        people_ev = {"score": ..., "matched": ...}
+...
+if people_ev:
+    evidence["people"] = people_ev
+```
+
+So **absent** (`roles` empty — the title is not in the matrix, the signal was
+never computed) and **empty** (`roles` found, no person carries weight > 0 —
+`matched=0`) are two different facts. The prose breakdown distinguished them only
+by whether the `cast/crew:` line existed at all, which is invisible to anyone not
+reading two stanzas side by side.
+
+The move to tables is what made this load-bearing: **a table cell has no "absent"
+rendering by default.** A blank or `0` cell silently asserts *"we checked and
+found nobody"* — a claim the code never made. `breakdown.py` carries the
+distinction explicitly (`people_scored` as a separate boolean, `people_matched`
+and `people_affinity` left `None`), renders absent as the literal string
+`not scored`, and pins nullable pandas dtypes at the frame boundary so a stray
+`fillna(0)` in the website template cannot reintroduce it.
+
+🎯 **The cohort shape is the part worth chasing.** In the 2026-08-19 sample every
+MAL-sourced title was unscored and every Trakt-watchlist title was scored (10/10
+vs 15/15 — not random). The people-matrix forward map is library- and
+daemon-derived; the Trakt enrich daemon covers Trakt-known movies broadly and does
+not cover MAL anime. Because `_weighted()` uses a **dynamic denominator** over
+present signals (§3.1), the two cohorts are therefore normalised over different
+signal sets and then compete for the same `acquisition.max_adds_per_run` budget.
+Whether that biases anime up or down is **unmeasured** — `people_affinity` weight
+is only 0.08 — but the new signal-coverage and cohort tables surface it every run
+instead of hiding it inside the score. `GLD-ACQS-11`.
+
 ## 4. Key decisions & rationale
 
 | # | Decision | Rationale | Alternative rejected |
@@ -239,6 +282,9 @@ a signal it never had.
 | I5 | A config-less scorer scores identically to the pre-`people_affinity` version. |
 | I6 | Explicit-intent candidates receive no recency adjustment. |
 | I7 | Every score carries its component matrix. |
+| I8 | Under the byte budget, funded charges never exceed a pool's `max(0, free-U)` minus in-flight, in-run **and** across runs (the committed ledger nets what has not landed). |
+| I9 | The byte budget's fail direction is INVERTED from every other space gate: incomplete information (unreadable free space, corrupt/raising ledger) collapses to the **bounded count cap**, never to unlimited. A configured cap of 0 falls back to 10. |
+| I10 | A candidate with no usable `expected_size_gb` is priced at a conservative default, never 0 — the budget must not exempt exactly the titles it knows least about. |
 
 ---
 
@@ -264,6 +310,11 @@ itself.
 | Key | Default | Effect |
 |---|---|---|
 | `acquisition.people_affinity_weight` | `0.08` with a config; `0.0` without | Cast/crew overlap weight (§3.7) |
+| `acquisition.space_budget.enabled` | `false` (module) / `true` (this deployment) | Byte budget replaces the `max_adds_per_run` slice; the count cap survives only as the fallback bound (I9) |
+| `acquisition.space_budget.shared_pool` | `true` | One budget = MIN headroom across routed instances (one Unraid array behind TRaSH hardlinks; per-instance pools would double-spend the same free space) |
+| `acquisition.space_budget.committed_ttl_hours` | `72` | How long committed-but-unlanded bytes count against the budget; must cover add→pilot-search→download |
+| `acquisition.space_budget.default_movie_gb` / `default_episode_gb` | `15.0` / `2.0` | Price for a candidate with no usable `expected_size_gb` (I10); shows charge ONE pilot episode |
+| `acquisition.space_budget.hard_max_adds` | `0` (off) | Optional count ceiling on top of bytes — operator ruling 2026-08-20: bytes are the constraint |
 
 Component weights: `genre_affinity` 0.35 · `source` 0.25 · `trakt_rating` 0.15 ·
 `recency` 0.15 · `popularity` 0.10 · `people_affinity` 0.0/0.08.
@@ -283,6 +334,17 @@ Constants: `_GENRE_SATURATION` 0.80 · `_EXPLICIT_INTENT_SOURCE` 100 ·
 - ✅ Config-gated `people_affinity` with byte-identical no-config behaviour
 - ✅ Tier-keyed short labels for the "why" column
 - ✅ 13 test modules, ~90 KB — the best source-to-test ratio in `services/`
+- ✅ Records-first elevation breakdown (`breakdown.py`) — one canonical record per
+  acted-on title, seven boxed tables projected from it, run-constant context
+  (household genre weights, profile rationale) emitted once as aggregated legends
+  rather than repeated per row
+- ✅ Score decomposition surfaced — per-signal contribution in score points that
+  sums back to the total, with the dynamic denominator shown per row
+- ✅ Single breakdown frame (`SCHEMA`, 41 columns, `SCHEMA_VERSION`) persisted to
+  `acquisition/breakdown` for the website generator; every legend table is a pure
+  aggregation of it, so there is no second source of truth
+- ✅ P-C-safe rendering and nullable frame dtypes — *absent* is distinguishable
+  from *scored zero* in the log cell, the JSON payload, and the DataFrame
 
 ## 9. Planned additions
 
@@ -293,10 +355,18 @@ Constants: `_GENRE_SATURATION` 0.80 · `_EXPLICIT_INTENT_SOURCE` 100 ·
 | `GLD-ACQS-03` | **Record the aggregator-inversion precedent** in `DOCS_CONVENTIONS.md` — *"a mean over matched items penalises additional evidence"*, with the measured symptom (top-10 dominated by single-broad-tag items) | §3.2 is a fully-measured fix with a memorable diagnostic; one instance, so a precedent not a pattern | S | `GLD-DIS-04` |
 | `GLD-ACQS-04` | **Verify the all-signals-absent path** — what does a candidate with an empty denominator score? | §6 row 3 unverified | S | — |
 | `GLD-ACQS-05` | **Verify the unknown-feed default** — `_SOURCE_LABEL` carries a `50: "feed"` entry with no matching `_SOURCE_SCORE` key | §6 row 4; `next_watch` explicitly contributes 0.0 for unknown feeds, so the two may differ | S | `GLD-NXW-02` |
-| `GLD-ACQS-06` | **Track the component matrix over runs** — it is rendered and discarded | Would make §3.6's drift and §3.1's n/a rates visible; fourth package computing an explanation and dropping it | M | `GLD-SCO-06` |
+| `GLD-ACQS-06` | **Track the component matrix over runs** — it is rendered and discarded | 🟡 **Partly done** — `breakdown.py` now renders the matrix as a per-signal contribution table and persists the frame to `acquisition/breakdown`, so it is no longer discarded. What remains is *cross-run* history: the key is overwritten each run, so drift (§3.6) and n/a rates (§3.1) are visible per-run but not over time | M | `GLD-SCO-06` |
+| `GLD-ACQS-10` | **Split the add budget per medium** — `max_adds_per_run` caps one pool sorted by score, and `svc` is derived per candidate *after* the cap, so shows and movies compete for the same slots. A run whose top scorers are all films adds **zero** new series, and the pilot pipeline is starved by a knob that never mentions series | ⏸ **Superseded by `GLD-ACQS-13`** (operator ruling 2026-08-20: bytes are the constraint, not counts — under the byte budget the count cap no longer binds, so the medium competition it created dissolves; still latent for deployments running count-cap mode) | M | `GLD-ACQS-13` |
+| `GLD-ACQS-11` | 🔴 **Measure the people-signal cohort gap** — §3.8. Every MAL-sourced candidate is scored without `people_affinity`; every Trakt-watchlist one is scored with it. Quantify whether the dynamic denominator leaves the two cohorts comparable at weight 0.08, or whether MAL titles are systematically advantaged | Two cohorts ranked on different signal sets compete for one capped budget | M | `GLD-ACQS-01`, `GLD-ACQS-04` |
+| `GLD-ACQS-12` | **Give the breakdown frame a durable sink** — it is written to one global-cache key that the next run overwrites. A parquet keyed by run would make `GLD-ACQS-06`'s cross-run tracking and `GLD-ACQS-07`'s genre re-measurement fall out for free | The frame already exists and is schema-versioned; only the sink is missing | S | `GLD-ACQS-06` |
 | `GLD-ACQS-07` | **Re-measure the genre distribution** post-noisy-OR — the 131/663 and 8-of-10 figures justified the change and are unmonitored | The fix's own success metric has no watcher | S | `GLD-FND-04` |
 | `GLD-ACQS-08` | **Document the remaining modules** — `__init__.py` (54.5 KB), `resolver.py` (28.9 KB), `candidates.py`, `gateway.py`, `adder.py` | ~105 KB unread this pass | L | — |
 | `GLD-ACQS-09` | **Route `_GENRE_SATURATION` and the source tiers through `thresholds/registry`** | Hand-set cutoffs absent from `THRESHOLD_SPECS`, like `GLD-DIS-09` and `GLD-ACQ-09` | S | `GLD-THR-01` |
+| `GLD-ACQS-13` | ✅ **Byte-priced space budget** — selection funds candidates in priority order out of `max(0, free-U)` minus in-flight, skip-and-continue, with the 4K companion priced LIVE in the add loop (it is planned after selection and is the largest file class in the system). Fail direction inverted per I9; supply is now bounded by `recommendation_limit`, not the budget, on a roomy array | ✅ Done — §0.1 #58; `space_budget.py` (brain) + wiring | M | — |
+| `GLD-ACQS-14` | ✅ **Committed-bytes ledger** — `acquisition/space_budget/committed`; TTL-reconciled at snapshot, committed on `added` (never `would-add`), deferred adds commit at FLUSH time (that is when their bytes become in-flight; the queue record now carries its price in `gb`), pruned-on-write, loud warning on write failure (a silent miss = over-commit next run) | ✅ Done — §0.1 #58 | M | `GLD-ACQS-13` |
+| `GLD-ACQS-15` | **hasFile-based ledger reconciliation** — v1 is TTL-only (strictly conservative: early imports and dead grabs both under-grab until expiry). Clearing entries when the *arr record gains a file would tighten the budget's accuracy without changing its safety | The one wrong-direction TTL case — a download still in flight PAST the TTL — gets rarer too | M | `GLD-ACQS-14` |
+| `GLD-ACQS-16` | 🟡 **Bytes committed outside the budget's view** — saga/universe walks (`ensure_owned_and_grab`, `ensure_show_owned_and_grab`) and rehome re-adds band-gate per add but never write the ledger, so their in-flight bytes are invisible to the next run's budget. Direction is WRONG (undercounted in-flight → over-commit); magnitude bounded by the band headroom each path already respects | The band absorbs it today; a big universe cold-start would not be absorbed | M | `GLD-ACQS-14` |
+| `GLD-ACQS-17` | **Fairness/demand interplay under budget mode** — `_reserve_fairness` still receives the COUNT cap, so its guarantee is positional, not byte-aware; a user's reserved 40 GB pick can be funded-refused while cheap titles pass. Moot while `demand.enabled=false` (this deployment); decide before any tester enables demand + budget together | Positional fairness ≠ funded fairness | M | `GLD-ACQS-13` |
 
 ## 10. Open questions
 
@@ -306,6 +376,8 @@ Constants: `_GENRE_SATURATION` 0.80 · `_EXPLICIT_INTENT_SOURCE` 100 ·
 | Q2 | What does a candidate with every signal absent score? | `GLD-ACQS-04` |
 | Q3 | Do `_SOURCE_SCORE` and `INTENT_SOURCE_STRENGTH` handle an unknown feed the same way? | `GLD-ACQS-05` |
 | Q4 | Should recency use an injected `now`, or be dropped for unowned candidates entirely? | `GLD-ACQS-02` |
+| Q5 | Is a MAL-sourced candidate (4 signals, denominator 0.90) comparable to a Trakt-watchlist one (6 signals, denominator 1.08) when both compete for one capped budget? | `GLD-ACQS-11` |
+| Q6 | Should shows and movies draw from separate add budgets, or is one score-ordered pool the intended behaviour? | `GLD-ACQS-10` |
 
 **Q3 is worth a look despite the tables agreeing.** `next_watch` states that an
 unknown feed *"contributes nothing (0.0) rather than a guessed tier"*; this module

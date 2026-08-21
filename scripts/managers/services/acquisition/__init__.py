@@ -18,9 +18,12 @@ import math
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.acquisition.demand import demand_priority, demand_score
+from scripts.managers.machine_learning.acquisition import space_budget
+from scripts.managers.machine_learning.ledger.pending_plan import record_pending
 from scripts.managers.machine_learning.playlists.per_user import genre_match
 from scripts.managers.machine_learning.space.routing_targets import uhd_remote_play_ok
 from scripts.managers.machine_learning.space.tightness import tightness_with_hysteresis
+from scripts.managers.services.acquisition import breakdown as acq_breakdown
 from scripts.managers.services.acquisition.adder import Adder
 from scripts.managers.services.acquisition.candidates import CandidateGatherer
 from scripts.managers.services.acquisition.gateway import ArrGateway
@@ -283,6 +286,80 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         self.logger.log_info(f"[acquire] deferred search → '{item.get('title')}' ({inst})")
         return True
 
+    def _space_budget_context(self, eligible: list, acq: dict, gateways: dict,
+                              band_cache: dict) -> tuple:
+        """``(mode, ctx, kept_ledger)`` -- the per-run byte-budget snapshot.
+
+        mode: 'off' (feature disabled; legacy behaviour byte-identical),
+              'budget' (ctx + the TTL-surviving ledger to persist back), or
+              'fallback' (enabled but the snapshot could not be built --
+              unreadable free space or a corrupt/unreadable ledger -- so the
+              caller reverts to the BOUNDED count cap; see the fail-direction
+              note at the call site).
+
+        Pools are priced from the instances the eligible candidates actually
+        route to, via the same memoised ``_space_band`` every other gate uses.
+        Under ``shared_pool`` (default -- one Unraid array behind TRaSH
+        hardlinks) the single budget is the MINIMUM headroom across those
+        instances minus total in-flight: the most conservative read of a pool
+        that is physically one filesystem. An ABSENT ledger key is genuinely
+        'nothing ever committed' (first run) and reads as empty; a PRESENT but
+        wrong-typed value, or a read that raises, is unknown -- unknown
+        in-flight would be undercounted as zero, so both force the fallback."""
+        cfg = space_budget.config_for(acq)
+        if not cfg.get("enabled"):
+            return "off", None, None
+        pools: dict = {}
+        for e in eligible or []:
+            svc = "sonarr" if e.get("type") == "show" else "radarr"
+            gw = gateways.get(svc)
+            if gw is None or not getattr(gw, "available", True):
+                continue          # no gateway -> those adds fail downstream anyway
+            inst = str(e.get("instance"))
+            free, U = self._space_band(gw, inst, band_cache)
+            if math.isinf(free):
+                self.logger.log_warning(
+                    f"[Acquisition] space budget: free space unreadable for "
+                    f"{svc}/{inst} -- falling back to the count cap this run.")
+                return "fallback", None, None
+            pools[(svc, inst)] = max(0.0, float(free) - float(U))
+        try:
+            raw = self.global_cache.get(space_budget.LEDGER_KEY) if self.global_cache else None
+        except Exception as e:
+            self.logger.log_warning(
+                f"[Acquisition] space budget: committed ledger unreadable ({e}) -- "
+                f"falling back to the count cap this run.")
+            return "fallback", None, None
+        if raw and not isinstance(raw, list):
+            # Only a TRUTHY non-list is corruption. This cache returns {} for a MISSING key
+            # ({} is the documented missing sentinel in GlobalCacheManager.get's compat
+            # wrapper), so falsy values are the first-run-empty case, not damage. The first
+            # live run proved the distinction: the strict `is not None` check read the {}
+            # sentinel as corrupt, fell back to the count cap, and -- because fallback never
+            # persists the ledger -- could NEVER arm the budget on any subsequent run either.
+            # The tell that should have caught it: the deferred-queue read above does the
+            # tolerant `isinstance` coercion for exactly this reason.
+            self.logger.log_warning(
+                "[Acquisition] space budget: committed ledger is corrupt (not a list) -- "
+                "falling back to the count cap this run.")
+            return "fallback", None, None
+        now_ts = datetime.now(timezone.utc).timestamp()
+        kept, expired = space_budget.reconcile(
+            raw or [], now_ts, float(cfg["committed_ttl_hours"]) * 3600.0)
+        if expired:
+            self.logger.log_debug(
+                f"[Acquisition] space budget: {len(expired)} committed entr"
+                f"{'y' if len(expired) == 1 else 'ies'} expired past TTL and released.")
+        infl = space_budget.inflight_by_pool(
+            kept, bool(cfg.get("shared_pool", True)), float(cfg["default_movie_gb"]))
+        if cfg.get("shared_pool", True):
+            head = min(pools.values()) if pools else 0.0
+            budgets = {space_budget.SHARED_POOL:
+                       max(0.0, head - infl.get(space_budget.SHARED_POOL, 0.0))}
+        else:
+            budgets = {k: max(0.0, v - infl.get(k, 0.0)) for k, v in pools.items()}
+        return "budget", space_budget.BudgetContext(budgets, cfg, now_ts), kept
+
     def _flush_deferred(self, gateways: dict, band_cache: dict) -> dict:
         """Search any previously-deferred titles whose instance now has space (free >= U).
         Items on still-pressured instances stay queued (no attempt counted). A search that
@@ -319,6 +396,28 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 continue
             if self._trigger_search(gw, inst, item):
                 stats["searched"] += 1
+                # The deferred add pulls its bytes NOW, not when it was queued -- this is
+                # the moment they become in-flight, so this is where the budget's ledger
+                # learns about them. The queued record carries its price ('gb'); an old
+                # record from before that field existed prices at the module default.
+                _fc = space_budget.config_for(
+                    (self.config.get("acquisition", {}) if self.config else {}) or {})
+                if _fc.get("enabled") and self.global_cache is not None:
+                    _gb = item.get("gb")
+                    _cand = {"type": item.get("type"), "instance": inst,
+                             "ext_id": item.get("arr_id"), "title": item.get("title"),
+                             "expected_size_gb": _gb}
+                    _price, _ = space_budget.charge_gb(_cand, _fc)
+                    try:
+                        _led = self.global_cache.get(space_budget.LEDGER_KEY)
+                        _led = _led if isinstance(_led, list) else []
+                        _led.append(space_budget.make_entry(
+                            _cand, _price, datetime.now(timezone.utc).timestamp()))
+                        self.global_cache.set(space_budget.LEDGER_KEY, _led)
+                    except Exception as _fe:
+                        self.logger.log_warning(
+                            f"[acquire] space-budget commit for deferred "
+                            f"'{item.get('title')}' failed ({_fe}); in-flight undercount.")
                 continue
             # Attempted but failed — count it; abandon after the retry budget so a stale id
             # (e.g. the title was deleted) can't re-POST a doomed command every run forever.
@@ -730,7 +829,37 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         else:
             eligible.sort(key=lambda x: x["score"], reverse=True)
         cap = int(acq.get("max_adds_per_run", 10) or 0)
-        selected = eligible[:cap] if cap > 0 else eligible
+        # Byte budget (acquisition.space_budget.enabled): fund candidates in priority order
+        # out of max(0, free-U) minus the bytes RECENT runs committed that have not landed
+        # yet, instead of slicing the top N. FAIL DIRECTION IS INVERTED here: everywhere
+        # else space gates fail OPEN (free=inf on a read error so a transient never blocks
+        # an add) because "open" under a count cap still means at most N adds. Under an
+        # uncapped byte budget "open" would mean unlimited-with-no-budget, so any gap in
+        # the information the budget needs (unreadable free space, corrupt ledger) falls
+        # back to the BOUNDED legacy count cap -- and a configured cap of 0 (uncapped)
+        # falls back to 10, never to unlimited.
+        sb_mode, sb_ctx, sb_kept = self._space_budget_context(eligible, acq, gateways, band_cache)
+        if sb_mode == "budget":
+            selected, sb_skipped = space_budget.select(eligible, sb_ctx)
+            if sb_skipped:
+                skipped["space_budget"] = skipped.get("space_budget", 0) + len(
+                    [s for s in sb_skipped if s.get("skip_reason") == "space_budget"])
+                hm = len([s for s in sb_skipped if s.get("skip_reason") == "space_budget_hard_max"])
+                if hm:
+                    skipped["space_budget_hard_max"] = skipped.get("space_budget_hard_max", 0) + hm
+                worst = sorted((s for s in sb_skipped if s.get("space_charge_gb")),
+                               key=lambda s: -float(s["space_charge_gb"]))[:5]
+                if worst:
+                    self.logger.log_info(
+                        "[Acquisition] space budget refused "
+                        + ", ".join(f"'{s.get('title')}' (~{s['space_charge_gb']:.0f}GB)"
+                                    for s in worst)
+                        + (f" +{len(sb_skipped) - len(worst)} more" if len(sb_skipped) > len(worst) else "")
+                        + " -- retried next run as budget refreshes.")
+        else:
+            if sb_mode == "fallback":
+                cap = cap or 10   # enabled-but-unbuildable NEVER degrades to unlimited
+            selected = eligible[:cap] if cap > 0 else eligible
 
         # Stage-C remote-play gate (default OFF): when routing.movies.transcode_gate is on,
         # only emit the 4K bonus copy if a likely household device can DIRECT-PLAY a 2160p HEVC
@@ -805,13 +934,38 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                             "service": svc, "instance": e.get("instance"), "arr_id": aid,
                             "title": e.get("title"), "type": e.get("type"),
                             "profile": (e.get("quality_profile") or {}).get("name"),
+                            # The byte price for the flush-time ledger commit: a deferred add
+                            # pulls its bytes only when _flush_deferred finally searches it,
+                            # so the budget must charge THERE, and there is where this rides.
+                            "gb": e.get("space_charge_gb") or e.get("expected_size_gb"),
                             "queued_at": datetime.now(timezone.utc).isoformat(),
                             "attempts": 0,
                         })
             else:
                 added += action == "added"
                 would += action == "would-add"
+                if action == "added" and sb_ctx is not None:
+                    # Cross-run in-flight accounting -- only a REAL add commits bytes.
+                    sb_ctx.commit(e, e.get("space_charge_gb"))
             failed += action == "add-failed"
+
+            # Change-plan accounting (GLD-SPC-01). An acquisition has NO Parquet row to
+            # stamp -- the title is not in the library yet -- so the decision ledger
+            # structurally cannot see it, and the end-of-run grid was omitting the
+            # largest byte flow in the run while titling itself "every planned action".
+            # Recorded for would-add too: the grid is a PREVIEW, and a dry run that
+            # showed nothing here is exactly how the omission stayed invisible.
+            if action in ("added", "would-add", "deferred"):
+                _gb = e.get("space_charge_gb") or e.get("expected_size_gb")
+                try:
+                    _gb = -abs(float(_gb))          # signed: -GiB consumed
+                except (TypeError, ValueError):
+                    _gb = None
+                if _gb is not None:
+                    record_pending(
+                        self.global_cache, service=svc, instance=str(e.get("instance")),
+                        action="acquire", title=str(e.get("title") or e.get("ext_id")),
+                        gb=_gb, ext_id=e.get("ext_id"), reason=why)
 
             row = [
                 str(e.get("title") or e.get("ext_id"))[:34],
@@ -828,6 +982,11 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             rows.append(row)
             self.logger.log_debug(f"[acquire] '{e.get('title')}' matrix={e.get('matrix')}")
             if action in ("added", "would-add", "deferred"):
+                # Stamp the outcome onto the candidate BEFORE it joins `elevated`. `action` is a
+                # loop local and was never written back, so breakdown.SCHEMA's `decision` column
+                # would be null on every row -- a structurally-always-empty field in the frame the
+                # website reads, indistinguishable from "this run had no decisions".
+                e["decision"] = action
                 elevated.append(e)
 
             # Dual-version companion (4k_policy=='both'): add the 2160p copy on the 4K instance
@@ -844,23 +1003,45 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                     e, space_ok=lambda inst, _gw=gw: self._uhd_space_ok(_gw, inst, band_cache),
                     can_remote_play=uhd_crp)
                 if companion is not None:
-                    cres = adder.add(companion, search=True)
-                    caction = cres.get("action")
-                    added += caction == "added"
-                    would += caction == "would-add"
-                    failed += caction == "add-failed"
-                    crow = [
-                        str(companion.get("title") or companion.get("ext_id"))[:34],
-                        "movie", companion.get("score"),
-                        f"{companion.get('instance')} [4k]",
-                        (companion.get("quality_profile") or {}).get("name"),
-                        self._size_str(companion),
-                        f"{caction} [4k]",
-                        why,
-                    ]
-                    if has_saga:
-                        crow.insert(2, saga_cell)
-                    rows.append(crow)
+                    # The 4K copy is the single largest file class in the system and it is
+                    # planned HERE, after selection -- so the live budget must price it or
+                    # the budget governs everything except the biggest bytes.
+                    c_ok = True
+                    if sb_ctx is not None:
+                        c_ok, _c_gb, _c_def = sb_ctx.try_charge(companion)
+                    if not c_ok:
+                        crow = [
+                            str(companion.get("title") or companion.get("ext_id"))[:34],
+                            "movie", companion.get("score"),
+                            f"{companion.get('instance')} [4k]",
+                            (companion.get("quality_profile") or {}).get("name"),
+                            self._size_str(companion),
+                            "skipped [4k] (space budget)",
+                            why,
+                        ]
+                        if has_saga:
+                            crow.insert(2, saga_cell)
+                        rows.append(crow)
+                    else:
+                        cres = adder.add(companion, search=True)
+                        caction = cres.get("action")
+                        added += caction == "added"
+                        would += caction == "would-add"
+                        failed += caction == "add-failed"
+                        if caction == "added" and sb_ctx is not None:
+                            sb_ctx.commit(companion, companion.get("space_charge_gb"))
+                        crow = [
+                            str(companion.get("title") or companion.get("ext_id"))[:34],
+                            "movie", companion.get("score"),
+                            f"{companion.get('instance')} [4k]",
+                            (companion.get("quality_profile") or {}).get("name"),
+                            self._size_str(companion),
+                            f"{caction} [4k]",
+                            why,
+                        ]
+                        if has_saga:
+                            crow.insert(2, saga_cell)
+                        rows.append(crow)
 
         # Persist the new deferrals onto the backlog (live runs only), bounding its length
         # so chronic pressure can't grow it without limit (keep the newest).
@@ -871,6 +1052,28 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             if len(q) > self._DEFERRED_MAX:
                 q = q[-self._DEFERRED_MAX:]
             self.global_cache.set(self._DEFERRED_KEY, q)
+
+        # Persist the committed-bytes ledger: TTL-survivors from the read plus this run's
+        # commits, live runs only. A failed write is LOUD -- the next run would under-count
+        # in-flight bytes and over-commit, which is the exact failure this ledger prevents.
+        if sb_mode == "budget" and not self.dry_run and self.global_cache is not None \
+                and (sb_ctx.commits or sb_kept is not None):
+            try:
+                self.global_cache.set(space_budget.LEDGER_KEY, (sb_kept or []) + sb_ctx.commits)
+            except Exception as _sb_e:
+                self.logger.log_warning(
+                    f"[Acquisition] space-budget ledger write failed ({_sb_e}); next run "
+                    f"will under-count in-flight bytes (over-commit risk).")
+        if sb_mode == "budget":
+            s = sb_ctx.stats
+            self.logger.log_info(
+                f"[Acquisition] space budget: {s['funded']} funded (~{s['charged_gb']:.0f} GB"
+                + (f", {s['defaulted_charges']} at default price" if s['defaulted_charges'] else "")
+                + f"), {s['skipped_space']} refused (~{s['skipped_gb']:.0f} GB)"
+                + (f", {s['skipped_hard_max']} capped (hard_max_adds)"
+                   if s.get('skipped_hard_max') else "")
+                + (f", {s['uncharged_no_pool']} uncharged (no pool)" if s['uncharged_no_pool'] else "")
+                + f"; in-flight carried: {len(sb_kept or [])} entr{'y' if len(sb_kept or []) == 1 else 'ies'}.")
         if deferred:
             self.logger.log_info(
                 f"[Acquisition] {deferred} title(s) deferred under space pressure "
@@ -926,105 +1129,36 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
         suffix = "/ep" if e.get("size_unit") == "per-episode" else ""
         return f"~{size}GB{suffix}"
 
-    @staticmethod
-    def _fmt_votes(v) -> str:
-        """Humanize a vote count: 412000 -> '412K votes', 1500000 -> '1.5M votes'."""
-        try:
-            v = float(v)
-        except (TypeError, ValueError):
-            return ""
-        if v >= 1_000_000:
-            return f"{v / 1_000_000:.1f}M votes"
-        if v >= 1_000:
-            return f"{round(v / 1000)}K votes"
-        return f"{int(v)} votes"
-
-    @staticmethod
-    def _fmt_feed(feed) -> str:
-        """A source feed name as a friendly phrase: 'trakt_watchlist' -> 'Trakt watchlist'."""
-        if not feed:
-            return ""
-        head, _, tail = str(feed).partition("_")
-        svc = {"trakt": "Trakt", "plex": "Plex", "mal": "MAL"}.get(head, head.title())
-        return f"{svc} {tail.replace('_', ' ')}".strip()
+    # NB: the vote/feed humanizers that used to live here were the prose emitter's ONLY
+    # callers. They now live once in acquisition/breakdown.py (_fmt_votes / _fmt_feed /
+    # _short_feed) -- kept single-sourced deliberately so a label change cannot drift
+    # between the log tables and the website frame (P-E).
 
     def _log_elevation_breakdown(self, elevated: list, scorer) -> None:
-        """Plain-language "why was this elevated" breakdown, logged under the decision table.
+        """Render the "why was this elevated" breakdown and persist its frame.
 
-        Names the real score drivers per title — the matched genres + their 0–1 household
-        affinity weight, the source feed/intent, community rating, vote count, release year —
-        then, once, the household cast/crew taste profile (the nameable people signal; a
-        candidate's own credits aren't available). ASCII-only so cp1252 log sinks don't choke;
-        bounded by max_adds_per_run (one short stanza per acted-on title)."""
-        self.logger.log_info("[Acquisition] elevation breakdown (why each title was added):")
-        for e in elevated:
-            ev = e.get("evidence") or {}
-            title = str(e.get("title") or e.get("ext_id"))
-            self.logger.log_info(f"  {title}  (score {e.get('score')})")
+        Delegates to :mod:`acquisition.breakdown`: ONE canonical record per acted-on title
+        (``breakdown.SCHEMA``), projected into the boxed tables -- evidence, score
+        decomposition, profile rationale key, cohort roll-up, signal coverage, genre
+        affinity, taste profile. The prose stanzas this replaced repeated two RUN-CONSTANT
+        things on every row (the household genre weight and the ~110-char profile
+        rationale); both are now emitted once as legends aggregated off the same records,
+        and the score decomposition is strictly new (it was only ever a log_debug dump).
 
-            # Which saga drove/justifies the add (recommendation adds that are also saga members).
-            sagas = e.get("saga_names") or []
-            if sagas:
-                self.logger.log_info(f"    saga: part of {', '.join(sagas)}")
-
-            # WHY this quality profile was chosen (score->tier / pinned / HD baseline / 4K copy)
-            # and where it routed (instance + anime route, which decides anime profiles/folders).
-            qp = e.get("quality_profile") or {}
-            preason = e.get("profile_reason")
-            if qp.get("name") or preason:
-                anime = " [anime route]" if (e.get("route_category") == "anime"
-                                             or e.get("is_anime")) else ""
-                where = f" -> {e.get('instance')}" if e.get("instance") else ""
-                tail = f"  ({preason})" if preason else ""
-                self.logger.log_info(f"    profile: {qp.get('name')}{tail}{where}{anime}")
-
-            mg = ev.get("matched_genres") or []
-            if mg:
-                self.logger.log_info(
-                    "    genres: " + " + ".join(f"{g}({w:.2f})" for g, w in mg)
-                    + "   [household affinity 0-1]")
-            else:
-                self.logger.log_info("    genres: none matched household taste")
-
-            signals = []
-            feed = self._fmt_feed(ev.get("source_feed"))
-            if feed:
-                signals.append(feed)
-            if ev.get("rating10") is not None:
-                signals.append(f"rating {ev['rating10']:.1f}/10")
-            votes = self._fmt_votes(ev.get("votes")) if ev.get("votes") else ""
-            if votes:
-                signals.append(votes)
-            if ev.get("year") is not None:
-                signals.append(str(ev["year"]))
-            if signals:
-                self.logger.log_info("    signals: " + ", ".join(signals))
-
-            ppl = ev.get("people")
-            if ppl:
-                self.logger.log_info(
-                    f"    cast/crew: {ppl.get('matched')} household-favourite "
-                    f"people on this title (people-affinity {ppl.get('score')})")
-
-        # The named cast/crew context: the household taste profile the affinity is scored
-        # against. Shown once — it's household-wide, not per-title — and covers all four
-        # tallied roles (directors, cast, composers, producers); a role the metadata source
-        # never supplies comes back empty and prints nothing.
-        prof = scorer.taste_profile() if scorer is not None else {}
-        dirs = prof.get("directors") or []
-        actors = prof.get("actors") or []
-        composers = prof.get("composers") or []
-        producers = prof.get("producers") or []
-        if dirs or actors or composers or producers:
-            self.logger.log_info("  household taste profile (what affinity is scored against):")
-            if dirs:
-                self.logger.log_info("    top directors: " + ", ".join(dirs))
-            if actors:
-                self.logger.log_info("    top cast: " + ", ".join(actors))
-            writers = prof.get("writers") or []
-            if writers:
-                self.logger.log_info("    top writers: " + ", ".join(writers))
-            if composers:
-                self.logger.log_info("    top composers: " + ", ".join(composers))
-            if producers:
-                self.logger.log_info("    top producers: " + ", ".join(producers))
+        The records are also stashed on the global cache under ``acquisition/breakdown`` as
+        the single frame the website generator reads. Cache write failures are swallowed:
+        the log tables are the contract here, the frame is a by-product.
+        """
+        if not elevated:
+            return
+        weights = dict(getattr(scorer, "_weights", {}) or {})
+        taste = scorer.taste_profile() if scorer is not None else {}
+        records = acq_breakdown.build_records(elevated, weights)
+        acq_breakdown.render(records, taste, weights, self.logger)
+        if self.global_cache:
+            try:
+                self.global_cache.set(
+                    "acquisition/breakdown",
+                    acq_breakdown.to_payload(records, taste, weights))
+            except Exception:
+                pass

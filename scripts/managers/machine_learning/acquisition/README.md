@@ -32,6 +32,7 @@ and which of those should dominate depends on how much disk is left.
 |---|---|---|---|
 | [`pilot_stepping.py`](./pilot_stepping.py) | 24.3 KB | Pilot profile-ladder stepping | ✅ 18.4 KB |
 | [`next_episode_planner.py`](./next_episode_planner.py) | 13.3 KB | Next-episode budgeting | ✅ 14.0 KB |
+| [`space_budget.py`](./space_budget.py) | 11.6 KB | Byte-priced acquisition budget: `charge_gb`, `reconcile`, `inflight_by_pool`, `BudgetContext`, `select` | ✅ 7.5 KB |
 | [`enrichment_prioritizer.py`](./enrichment_prioritizer.py) | 7.0 KB | Trakt enrichment ordering | ✅ 7.6 KB |
 | [`resumption_planner.py`](./resumption_planner.py) | 4.4 KB | `ramp`, `priority`, `resumption_priority` | ✅ 4.5 KB |
 | [`demand.py`](./demand.py) | 2.8 KB | `demand_score`, `demand_priority` | ✅ 2.6 KB |
@@ -66,6 +67,29 @@ priority = watchability × demand^t          t from space/tightness
 The cold-start branch is the careful part: *"a user with NO affinity (cold start)
 contributes the `popularity` prior (0–1) instead of a flat zero, so a no-history
 account doesn't drag the breadth signal down."*
+
+---
+
+## Space budget — bytes as the constraint
+
+[`space_budget.py`](./space_budget.py) replaces the count cap as acquisition's
+governing limit when `acquisition.space_budget.enabled` is set (module default
+**off** — a bare config keeps legacy behaviour byte-identically):
+
+```
+budget = max(0, free − U) − in_flight
+```
+
+Candidates are funded in priority order, skip-and-continue; a committed-bytes
+ledger (`acquisition/space_budget/committed`, TTL 72h) nets what recent runs
+grabbed that has not landed yet, so consecutive runs cannot double-spend the
+same free-space snapshot. **The fail direction is deliberately inverted** from
+every other space gate: incomplete information (unreadable free space, corrupt
+ledger) collapses to the bounded count cap, never to unlimited — and unknown
+candidate sizes price at conservative defaults, never 0. The service wiring
+(selection, 4K-companion pricing, flush-time commits) lives in
+[`services/acquisition/`](../../services/acquisition/README.md); the module
+here is pure. `GLD-ACQS-13`/`-14`.
 
 ---
 

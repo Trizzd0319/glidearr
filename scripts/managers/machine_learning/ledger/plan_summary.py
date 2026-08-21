@@ -21,6 +21,8 @@ read-only by contract.
 """
 from __future__ import annotations
 
+from scripts.managers.machine_learning.ledger.pending_plan import fold_into, pending_rows
+
 
 class PlanSummary:
     _SOURCES = (
@@ -107,6 +109,18 @@ class PlanSummary:
                 scores += vals
                 by_service.setdefault(_service, []).extend(vals)
         self._scores_by_service = by_service
+        # Fold in planned actions on media with NO Parquet row -- acquisitions, which
+        # cannot be stamped because the title is not in the library yet. Without this
+        # the grid omits the largest byte flow in the run while its own title claims
+        # "every planned action": the 2026-08-20 run reported TOTAL +242.7 GB (reads
+        # as freeing space) against a true net of roughly -68 GB. See ledger/pending_plan.
+        try:
+            _n = fold_into(agg, detail, pending_rows(self.global_cache))
+            if _n and self.logger is not None:
+                self.logger.log_debug(
+                    f"[PlanSummary] folded {_n} pending (no-row) planned action(s).")
+        except Exception:
+            pass
         self._plan_detail = detail
         return agg, scores
 
@@ -165,6 +179,28 @@ class PlanSummary:
                     out.append([service, inst, str(action),
                                 f"... +{extra} more", f"{_rem:+.1f}",
                                 f"top {cap_per_group} by GB shown"])
+        # Per-title rows for media with no Parquet row (acquisitions). Same grouping
+        # and cap as above, applied per (service, instance, action) so a 97-movie add
+        # wave does not bury the rest of the grid.
+        try:
+            _pend: dict = {}
+            for r in pending_rows(self.global_cache):
+                _pend.setdefault(
+                    (str(r.get("service") or "?"), str(r.get("instance") or "?"),
+                     str(r.get("action") or "?")), []).append(r)
+            for (svc, inst, action), grp in sorted(_pend.items()):
+                grp.sort(key=lambda r: -abs(float(r.get("gb") or 0.0)))
+                for r in grp[:cap_per_group]:
+                    out.append([svc, inst, action, str(r.get("title") or "")[:44],
+                                f"{float(r.get('gb') or 0.0):+.1f}",
+                                str(r.get("reason") or "")[:48]])
+                _extra = len(grp) - min(len(grp), cap_per_group)
+                if _extra > 0:
+                    _rem = sum(float(r.get("gb") or 0.0) for r in grp[cap_per_group:])
+                    out.append([svc, inst, action, f"... +{_extra} more",
+                                f"{_rem:+.1f}", f"top {cap_per_group} by GB shown"])
+        except Exception:
+            pass
         return out
 
     # ── next-watch reminder (the machine_learning/next_watch consumer) ────────

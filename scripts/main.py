@@ -356,6 +356,20 @@ class Main(BaseManager, ComponentManagerMixin):
         except Exception as e:
             self.logger.log_debug(f"[Main] planned-reclaim ledger reset skipped: {e}")
 
+        # Same placement, same reasoning, for the ROWLESS half of the change plan
+        # (GLD-SPC-01): planned acquisitions, which have no Parquet row to stamp.
+        # This one fails in the OPPOSITE dangerous direction -- a stale entry would
+        # ADD last run's consumption to this run's total, making the array look like
+        # it is filling faster than it is, and the natural reaction to that is
+        # deleting media that did not need deleting.
+        try:
+            from scripts.managers.machine_learning.ledger.pending_plan import (
+                reset_pending,
+            )
+            reset_pending(self.global_cache)
+        except Exception as e:
+            self.logger.log_debug(f"[Main] pending-plan ledger reset skipped: {e}")
+
         # ── Pre-destructive backups (real runs only) ──────────────────────────────
         # Before any service can delete or re-grab a file, snapshot each Radarr/Sonarr DB+config
         # via its native Backup command and validate the result is loadable. On ANY failure the
