@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from scripts.managers.factories.config.__Init__ import ConfigManager, _DEFAULT_CONFIG
 
 
@@ -15,7 +17,13 @@ def test_default_config_path_is_absolute_under_scripts_support_config():
     assert _DEFAULT_CONFIG.parts[-3:] == ("support", "config", "config.json")
     # the package above support/ is the scripts package, NOT the repo root
     assert _DEFAULT_CONFIG.parents[2].name == "scripts"
-    assert _DEFAULT_CONFIG.exists()                         # the real config ships in the repo
+    # The installed config does NOT ship in the repo - it is gitignored
+    # (**/config/config.json), so it is absent on a fresh clone and in CI. The contract
+    # this test exists for - absolute and module-relative - is asserted above and runs
+    # everywhere; only the "and it is really installed" half needs the file. Same skip
+    # thresholds/test_installed_config_axis already uses.
+    if not _DEFAULT_CONFIG.exists():
+        pytest.skip(f"no installed config at {_DEFAULT_CONFIG} (fresh clone / CI)")
 
 
 def test_default_resolves_independently_of_cwd(monkeypatch, tmp_path):
@@ -25,6 +33,10 @@ def test_default_resolves_independently_of_cwd(monkeypatch, tmp_path):
     assert not (Path("support") / "config" / "config.json").exists()   # bare-relative would miss
     cm = ConfigManager()
     assert cm.path == _DEFAULT_CONFIG
+    # cwd-independence is proven by cm.path above and holds with or without an install;
+    # only "loaded a non-empty config" needs the gitignored file.
+    if not _DEFAULT_CONFIG.exists():
+        pytest.skip(f"no installed config at {_DEFAULT_CONFIG} (fresh clone / CI)")
     assert cm.config                                        # loaded the real, non-empty config
 
 
