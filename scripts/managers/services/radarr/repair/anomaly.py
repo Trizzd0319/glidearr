@@ -241,6 +241,13 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
 
     # ── Keep-policy resolution ───────────────────────────────────────────────────
 
+    # Instrumented — GLD-PERF-02. demote_stale_monitored burned 1336.7 s of SELF time
+    # on 2026-08-14 with ~0.1 s of instrumented children: none of its per-movie work
+    # was wrapped, so the timings tree could not say which of the three per-movie
+    # operations (keep resolve / scoring / people lookup) held the cost. These
+    # decorators exist so the next slow run names the line instead of costing an
+    # afternoon of inference (P-D: failure with no detector).
+    @timeit("_resolve_keep_policy")
     def _resolve_keep_policy(self, movie: dict, tag_label_map: dict[int, str]) -> str | None:
         """Resolve a movie's keep_policy from its Radarr tag labels — delegates to
         the brain (classification.keep_policy.resolve_keep_policy). Priority:
@@ -250,6 +257,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
 
     # ── Shared scoring context ───────────────────────────────────────────────────
 
+    @timeit("_build_scoring_context")
     def _build_scoring_context(self, instance: str) -> dict:
         """Gather the (read-only) global_cache inputs the watchability scorer needs,
         once, so triage_monitored_missing AND repair_unmonitored_with_files score
@@ -823,6 +831,7 @@ class RadarrRepairAnomalyManager(BaseManager, ComponentManagerMixin):
             demote = restore
         return demote, restore
 
+    @timeit("_score_owned")
     def _score_owned(self, movie: dict, ctx: dict, score_movie) -> tuple[int, bool]:
         """Score an owned/known movie. Returns (score, credits_present). credits_present
         is False when Trakt credits aren't cached yet — callers DEFER on that so a movie

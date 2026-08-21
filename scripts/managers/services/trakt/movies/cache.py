@@ -55,6 +55,42 @@ class TraktMovieCacheManager(BaseManager, ComponentManagerMixin):
         }
         self.logger.log_debug(f"[TraktMovieCache] dir={self.base_dir}, ttl={self.ttl}s")
 
+    def cached_ids(self, bucket: str = "people") -> "set[int] | None":
+        """Every tmdb id with a FRESH cached file in *bucket*, from ONE directory scan.
+
+        WHY. ``get()``/``get_people`` probe one gzip per call; under array IO pressure
+        each random stat ran ~1-2 s and ``demote_stale_monitored`` spent 1,336.7 s
+        doing 1,042 of them (2026-08-14, timings.json — self-time with ~0.1 s of
+        instrumented children, i.e. no API calls, just cache probes). ``os.scandir``
+        streams the directory in one pass — and on Windows each DirEntry carries its
+        stat data for free — so the whole presence set costs a single readdir even
+        when the box is thrashing. Freshness honours ``self.ttl`` exactly like
+        ``get()``: an expired file is ABSENT.
+
+        Returns None (never ``{}``) when the scan cannot answer — missing dir, first
+        run, PermissionError — so callers can tell "no credits cached" from "presence
+        unknown" and fall back to per-id probing. Absent is not empty (P-C).
+        """
+        try:
+            root = self._dirs.get(bucket, self.base_dir)
+            if not root.is_dir():
+                return None
+            fresh_after = time.time() - self.ttl
+            out: set[int] = set()
+            with os.scandir(root) as it:
+                for e in it:
+                    name = e.name
+                    if not name.endswith(".json.gz"):
+                        continue
+                    try:
+                        if e.is_file() and e.stat().st_mtime >= fresh_after:
+                            out.add(int(name[:-8]))
+                    except (OSError, ValueError):
+                        continue
+            return out
+        except OSError:
+            return None
+
     def _read_bucket(self, bucket: str, tmdb_id: int) -> dict | None:
         path = self._dirs[bucket] / f"{tmdb_id}.json.gz"
         try:

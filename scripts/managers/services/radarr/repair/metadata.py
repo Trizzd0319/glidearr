@@ -224,11 +224,28 @@ class RadarrRepairMetadataManager(BaseManager, ComponentManagerMixin):
         # ── Bucket 1: missing only imdbId ────────────────────────────────────────
         # Re-fetch each movie individually — the bulk /movie endpoint sometimes
         # omits imdbId while GET /movie/{id} returns it in full detail.
+        # BOUNDED — GLD-PERF-01. Observed 2026-08-14: 506 of these sequential probes
+        # against a busy host ran at ~5.9 s/call — 50.1 min of a 92.5-min run, resolved
+        # 0, and every movie was queued for RefreshMovie anyway. The probe is an
+        # OPTIMISATION, not a requirement: RefreshMovie repairs the record
+        # authoritatively, so an unprobed movie loses nothing — it takes the refresh
+        # path directly. Config: ``metadata_imdb_probe_per_run`` (default 50). The 24 h
+        # pending-skip (now recorded in dry_run too, below) keeps the same movies from
+        # re-paying either path every run.
         resolved_ids: list[int] = []
         still_needs_refresh: list[dict] = []
         _resolved_rows: list[list] = []
+        try:
+            _probe_budget = int(self.config.get("metadata_imdb_probe_per_run", 50) if self.config else 50)
+        except (TypeError, ValueError):
+            _probe_budget = 50
+        _probed = 0
 
         for m in needs_imdb_only:
+            if _probed >= _probe_budget:
+                still_needs_refresh.append(m)
+                continue
+            _probed += 1
             mid   = m["movie_id"]
             title = m["title"]
             try:
@@ -266,6 +283,14 @@ class RadarrRepairMetadataManager(BaseManager, ComponentManagerMixin):
                         f"(batch {i // BATCH_SIZE + 1})"
                     )
                     stats["refresh_queued"] += len(batch)
+                    # GLD-PERF-01 — record pending in dry_run TOO. The pending set arms
+                    # the 24 h skip at the top of this pass, and it was only written on
+                    # the live branch — so weeks of dry runs re-paid the full probe+queue
+                    # walk every run (P-B: the guard existed; the branch actually taken
+                    # bypassed the bookkeeping that arms it). Bookkeeping in dry_run
+                    # follows this module's own precedent: the demote/grace clocks
+                    # already advance in dry_run "so elapsed time is real".
+                    queued_this_run.extend(batch)
                     continue
                 # _make_request returns fallback (None) on failure rather than
                 # raising. SQLITE_BUSY retry/backoff + per-instance write
