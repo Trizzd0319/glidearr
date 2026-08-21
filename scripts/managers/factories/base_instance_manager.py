@@ -28,6 +28,8 @@ import time
 from urllib.parse import urlsplit
 from typing import Any
 
+from scripts.support.utilities.decorators.timing import timeit
+
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 
@@ -343,6 +345,7 @@ class BaseInstanceManager(BaseManager, ComponentManagerMixin):
 
     # ── _make_request ─────────────────────────────────────────────────────────
 
+    @timeit("_make_request")
     def _make_request(
         self,
         instance: str,

@@ -224,14 +224,15 @@ registry hardcodes nothing.
 - ✅ Thread-safe singleton with preserved store across re-construction
 - ✅ `register` / `get` / `set` / `remove` / `get_all` / `get_all_verbose`
 - ✅ `list_registered` with origin formatting
-- ✅ `find_by_attr` linear scan
+- ✅ `find_by_attr` linear scan — **fixed 2026-08-10** (`GLD-REG-13`); it returned `[]` unconditionally before, because it `getattr`'d the wrapper dict
 - ✅ Flags: `set_flag` / `get_flag` / `has_flag` / `clear_flags(prefix)`
 - ✅ Component health: `set_component_status` / `get_component_status` / `get_all_failed_components`
 - ✅ Origin tracing with infrastructure-frame skipping
 - ✅ `trace_real_caller()` climbing to the owning `*Manager`
 - ✅ `inject_dependencies_for_subtree` recursive dependency push
-- ✅ `auto_hot_swap_from_config` re-registration
-- ✅ `print_detailed_registry` PrettyTable with stale-checkout anomaly flag
+- ⚠️ `auto_hot_swap_from_config` re-registration — **a no-op as actually called** (`GLD-REG-12`, open)
+- ✅ `print_detailed_registry` PrettyTable with **outside-this-checkout** anomaly flag — the rule was inverted until 2026-08-10 (`GLD-REG-11`)
+- ✅ `print_tree_view` parent→child tree — added 2026-08-10 (`GLD-REG-03`)
 
 ## 9. Planned additions
 
@@ -239,7 +240,7 @@ registry hardcodes nothing.
 |---|---|---|---|---|
 | P1 | **Warn on name collision** in `register()` when replacing a different class | Closes §6 row 1, which is currently silent and returns the wrong object | S | — |
 | P2 | **Cycle detection** in `inject_dependencies_for_subtree` (visited set) | Prevents stack overflow on a malformed parent chain | S | — |
-| P3 | **Implement or remove `print_tree_view`** | Deletes the dead reference; a real tree view is genuinely useful for debugging parent links | S | — |
+| P3 | ~~**Implement or remove `print_tree_view`**~~ — ✅ **DONE 2026-08-10** (`GLD-REG-03`) | Implemented as a `parent_name` tree. The missing method was the smaller half: the call sat **inside the same `try` as registration and parent linking**, so turning `print_registry_tree` on would have raised before the link ran and cost every manager its inherited `logger`/`config`/`global_cache`/`validator`/**`dry_run`**, reported only as "failed to register" | S | — |
 | P4 | **Snapshot the registry to disk** at run end | Post-mortem "what was actually live?" | S | P3 |
 | P5 | **Registry view in the web UI** | Live tree, flags, failed components in the browser | M | [`web/`](../web/DESIGN.md) |
 | P6 | **Typed lookup** — `get(category, name, expect=SomeClass)` raising on mismatch | Catches wiring errors at the call site rather than three frames later | S | — |
@@ -247,17 +248,21 @@ registry hardcodes nothing.
 | P8 | **Registration timestamps** | Enables "what order did the tree actually build in?" — useful for the ordering bugs this layer keeps producing | S | — |
 | P9 | **Flag namespace validation** — reject flags without a known prefix | Prevents typo'd flags reading as permanently `False` | S | — |
 | P10 | **Deregistration on manager teardown** | Currently entries live until process exit; matters if the web layer hosts multiple runs | M | [`web/`](../web/DESIGN.md) |
-| P11 | **🔴 Fix the inverted anomaly heuristic** — remove the `pycharmprojects` substring rule and wire the already-written `_is_expected_path()` into the anomaly column | Restores D8/G6. Currently the column flags every row and would stay silent on a genuine stale-mirror import | S | §6.1 |
+| P11 | ~~**🔴 Fix the inverted anomaly heuristic**~~ — ✅ **DONE 2026-08-10** (`GLD-REG-11`) | The `pycharmprojects` substring rule is gone. Reference root now derives from `cli.py`'s own `__file__`, so it cannot come from the same config a suspect import would have read; ❌ = source outside that root (the stale-mirror case), ⚠️ = inside but not where the class name implies, "" = no origin or no rule. `_is_expected_path()` is wired, behind a three-state `_expected_subpaths()` | S | §6.1 |
+| P12 | **🔴 `GLD-REG-12` — decide what `auto_hot_swap_from_config` is FOR** | It is called as `auto_hot_swap_from_config(self.config.raw_data)` — a plain dict — by a method that wants a registered object, so it has done nothing on every manager init; and its own else-branch warning was guarded on `self.registry.logger`, which `RegistryManager` never defines, so the no-op was undetectable. Either delete the call site or write the feature. It now warns once per process so the next run supplies evidence | S | operator ruling |
+| P13 | ~~Two entry shapes, three readers assuming the wrong one~~ — ✅ **DONE 2026-08-10** (`GLD-REG-13`) | `register()` stores `{instance, origin, parent_name}`; `set()` stores the bare object. `find_by_attr` and `load_config_and_propagate` read the wrapper and so matched nothing, `get_all` would raise on a `set()` row, and the CLI dump's dict branch read `"class"`/`"source"` — keys nothing writes. One `_unwrap()` now serves all four | S | — |
+| P14 | ~~Origin overwritten by the registering mixin~~ — ✅ **DONE 2026-08-10** (`GLD-REG-14`) | `ComponentManagerMixin.register()` calls `RegistryCore.register`, and `factories/mixins/` was not in `utility_keywords`, so the walk stopped on the mixin and recorded `component_manager.py`. It also registers **after** `BaseManager`, so the correct origin was written first and then overwritten. The Source column named one wrapper file for dozens of rows | S | — |
 
 ## 10. Open questions
 
 | # | Question | Blocking |
 |---|---|---|
 | Q1 | Should a name collision be fatal, or a warning? Fatal is correct but may break existing accidental reuse. | P1 |
-| Q2 | Is `find_by_attr`'s linear scan ever hot enough to need an index? | — |
+| Q2 | ~~Is `find_by_attr`'s linear scan ever hot enough to need an index?~~ **Superseded: it never returned a row at all** (`GLD-REG-13`) — re-ask once it has real callers | — |
 | Q3 | Should the six mixins be documented individually? They are currently summarised in [README.md](./README.md) because their names do not end in `Manager`. | — |
 | Q4 | ~~Does the anomaly rule produce false positives now the canonical repo is under `PycharmProjects`?~~ **Answered: yes, confirmed — see §6.1.** | P11 |
-| Q5 | Should the canonical repo root be read from config rather than hardcoded, so the anomaly rule survives a future move? | P11 |
+| Q5 | ~~Should the canonical repo root be read from config rather than hardcoded, so the anomaly rule survives a future move?~~ **Answered 2026-08-10: NO, and deliberately.** The root is derived from `cli.py`'s `__file__`. A config-supplied root would be read *by the very import under suspicion* — a stale mirror carries its own `config.json` and would declare itself canonical. Deriving from `__file__` means the check moves with the checkout for free and cannot be spoofed by the thing it is checking | ✅ Answered |
+| Q6 | Should the ⚠️ subpath half of the anomaly column stay? It has rules for four service prefixes only, so it is silent for most of the tree, and it depends on `GLD-REG-14`'s origin fix to avoid firing on every component | P11 |
 
 ## 11. Related designs
 

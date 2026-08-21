@@ -21,6 +21,11 @@ def _kb(tmp_path) -> CacheKeyBuilder:
 
 
 def _gc(tmp_path) -> GlobalCacheManager:
+    # The idempotent-init guard (GLD-CACHE-13) means a second construction in the
+    # same pytest process returns the FIRST instance untouched — which would carry
+    # the previous test's tmp_path-pointed handlers. Reset so every test builds a
+    # genuinely fresh cache before re-pointing it at its own throwaway dir.
+    GlobalCacheManager._reset_singleton()
     gc = GlobalCacheManager()
     # Point every path builder at the throwaway dir so we never touch the real cache.
     gc.key_builder.base_dir = Path(tmp_path)

@@ -18,10 +18,27 @@ class RegistryCore:
                 cls._instance._lock = threading.RLock()
         return cls._instance
 
+    @staticmethod
+    def _unwrap(entry):
+        """The registered OBJECT, whichever of the two stored shapes `entry` is.
+
+        TWO shapes exist and always have: `register()` stores a wrapper dict
+        {instance, origin, parent_name}; `set()` stores the bare object. Every
+        reader below picked one shape and was silently wrong for the other --
+        `get_all` raised on a set()-written entry, `find_by_attr` and
+        `load_config_and_propagate` getattr'd the WRAPPER and so could never
+        match anything, and the CLI dump read key names nothing writes. One
+        unwrap, used by all of them, so a shape change cannot desynchronise
+        them again (P-E).
+        """
+        if isinstance(entry, dict) and "instance" in entry:
+            return entry["instance"]
+        return entry
+
     def get_all(self, category):
         """Return a dict of name → instance (not the wrapped dictionary)"""
         return {
-            name: entry["instance"]
+            name: self._unwrap(entry)
             for name, entry in (self._registry.get(category) or {}).items()
         }
 
@@ -55,7 +72,18 @@ class RegistryCore:
             "utilities/logger",
             "utilities/decorators",
             "registry/core",
-            "factories/base_manager"
+            "factories/base_manager",
+            # ⬇️ Added after the Source column was found to be near-useless.
+            # ComponentManagerMixin.register() calls this method, and it was not
+            # skipped -- so for every component that calls self.register() (which
+            # is nearly all of them) the walk stopped on the MIXIN and recorded
+            # component_manager.py as the origin. Worse, the mixin registers
+            # AFTER BaseManager already did, so the correct origin was written
+            # first and then overwritten by the wrapper's. The column named the
+            # same file for dozens of rows and nobody could tell it was wrong,
+            # because a plausible path is indistinguishable from the right one.
+            "factories/mixins/",
+            "factories/base_instance_manager",
         ]
         try:
             for frame in inspect.stack():
@@ -143,9 +171,22 @@ class RegistryCore:
     @LoggerManager().log_function_entry
     @timeit("find_by_attr")
     def find_by_attr(self, attr_name, attr_value):
+        """Every (category, name, object) whose `attr_name` equals `attr_value`.
+
+        ⚠️ Returned [] unconditionally until the unwrap was added: `entries`
+        holds register()'s WRAPPER DICTS, and getattr(dict, "parent_name") is
+        always None, so no lookup could ever match and the emptiness was
+        indistinguishable from 'nothing has that attribute' (P-C).
+
+        "flags" is skipped deliberately -- its values are bools and strings,
+        not managers, and matching one would return a row no caller can use.
+        """
         results = []
         for cat, entries in self._registry.items():
-            for name, obj in entries.items():
+            if cat == "flags" or not isinstance(entries, dict):
+                continue
+            for name, entry in entries.items():
+                obj = self._unwrap(entry)
                 if getattr(obj, attr_name, None) == attr_value:
                     results.append((cat, name, obj))
         return results

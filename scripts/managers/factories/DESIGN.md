@@ -233,16 +233,36 @@ tree, not by position — so a new nested `api_key` is protected automatically.
 | P1 | **[`web/`](./web/DESIGN.md) — web interface** for config editing, plan review, run triggering, ledger browsing | Removes the JSON-editing barrier; makes dry-run plans reviewable | L | Read-only ledger access |
 | P2 | **Warn on unresolved parent link** after deferred retry | Converts §6 row 8 from silent to visible | S | — |
 | P3 | **Populate `load_summary` pre-`prepare()`** | Fixes the `instance_manager❌` / `radarr_cache❌` false negatives | S | — |
-| P4 | **Remove or implement `print_tree_view`** | Deletes a latent dead reference | S | — |
+| P4 | ~~**Remove or implement `print_tree_view`**~~ — ✅ **DONE 2026-08-10** (`GLD-REG-03`) | Implemented. The dead reference was the smaller half: the call sat inside `BaseManager`'s registration/parent-linking `try`, so enabling `print_registry_tree` would have cost every manager its inherited `dry_run` | S | — |
 | P5 | **Thread-safe `MemoryManager`** (`RLock` or `cachetools`) | Removes the last unguarded shared-mutable | S | — |
 | P6 | **Config schema validation on load**, using [`config/validator.py`](./config/validator.py) against a declared schema | Catches typo'd keys at startup instead of at first read | M | Schema definition |
 | P7 | **Cache size accounting + LRU eviction option** | `support/cache` grows unbounded today | M | [`cache/audit.py`](./cache/audit.py) |
-| P8 | **Config hot-reload** — watch `config.json`, re-propagate via `RegistryConfigSync` | Edit settings without restarting; prerequisite for P1's live editing | M | P1 |
+| P8 | **Config hot-reload** — watch `config.json`, re-propagate via `RegistryConfigSync` — ⚠️ **see the note below the table** | Edit settings without restarting; prerequisite for P1's live editing | M | P1 |
 | P9 | **Structured event bus** replacing ad-hoc `run_stats` keys | Live run streaming to the web layer | M | P1 |
 | P10 | **Secret rotation helper** — re-prompt and re-store one secret without re-running full onboarding | Currently requires the full wizard | S | [`onboarding/`](./onboarding/README.md) |
 | P11 | **Cache versioning / schema stamps** so a shape change invalidates rather than mis-parses | Prevents silent bad reads after a refactor | M | — |
 | P12 | **Registry snapshot dump to disk** at run end | Post-mortem debugging of the live tree | S | P4 |
 | P13 | **`Protocol` for the manager contract** so `prepare`/`run` conformance is statically checkable | Type safety at the seam | M | — |
+| P14 | ~~`cache_keys` in the init summary~~ — ✅ **DONE 2026-08-10** (`GLD-MGR-11`) | Read `memory_cache`, an attribute `GlobalCacheManager` has never had (it is `.memory`), with a `{}` default — so the field reported an empty cache on every manager and **could not have reported anything else**. Existed as two byte-identical copies (inline in `__init__` + `_preview_cache_keys`); now one implementation, and a missing `.memory` warns once rather than returning a silent `[]` | S | — |
+
+> ⚠️ **P8 note, 2026-08-10 (`GLD-REG-12`).** `RegistryConfigSync.auto_hot_swap_from_config`
+> looks like the seed of P8 and is **not usable as-is**. `BaseManager.__init__` calls it
+> with `config.raw_data` — a dict — while the method wants a registered object, so it has
+> been a no-op on every manager init; and its own else-branch warning was gated on
+> `self.registry.logger`, an attribute `RegistryManager` never defines, so the no-op was
+> undetectable. Passing `self` instead would ALSO be a no-op: `BaseManager` registers the
+> same object two lines earlier with identical arguments.
+>
+> **The harder half is not the registry write.** Managers hold DIRECT references to each
+> other (`self.manager`, the parent link, everything `inject_dependencies_for_subtree`
+> copies down), so replacing a registry entry updates the directory and reaches nobody
+> already holding the old object. Hot-reload is a tree-rewiring problem.
+>
+> **And for the CACHE case specifically it is unnecessary.** `MemoryManager._cache` is bound
+> once and mutated in place (`clear()` is `_cache.clear()`, not a rebind), and
+> `GlobalCacheManager.memory` is constructed once — so a regenerated cache is **already**
+> visible through every handle captured at init. On-demand invalidation is the correct shape
+> there and already exists: `GlobalCacheManager.invalidate_cache_key(key)`.
 
 ## 10. Open questions
 
@@ -254,6 +274,7 @@ tree, not by position — so a new nested `api_key` is protected automatically.
 | Q4 | Is `_infer_parent_from_path` worth keeping, or should `parent_name` become mandatory? | P2 |
 | Q5 | Should `MemoryManager` be thread-safe by default, or should callers coordinate? | P5 |
 | Q6 | Where does the web layer's auth boundary sit — local-bind only, or real sessions? | P1 |
+| Q7 | Does anything construct a SECOND `GlobalCacheManager` mid-run? If not, P8's object-swap half is unnecessary outright — in-place mutation covers every cache-reload case (`GLD-REG-12`). One grep settles it | P8 |
 
 ## 11. Related designs
 

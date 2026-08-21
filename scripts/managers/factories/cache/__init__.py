@@ -38,6 +38,27 @@ class GlobalCacheManager(BaseManager):
     @LoggerManager().log_function_entry
     @timeit("__init__")
     def __init__(self, logger: Optional[LoggerManager] = None, config: Optional[dict] = None, **kwargs):
+        # ── Idempotent init (GLD-CACHE-13) ────────────────────────────────────
+        # BaseManager.__new__ singletons on (cls, singleton_key) and nothing
+        # passes singleton_key here, so a second GlobalCacheManager(...) call
+        # returns THIS instance — and Python then re-runs __init__ on it, which
+        # would rebuild self.memory (in-RAM cache wiped) and self.run_summary
+        # (every per-title row recorded so far silently orphaned; the end-of-run
+        # tables then render empty/partial with no error — a P-D). Nothing
+        # in-tree constructs twice today (verified 2026-08-10: main.py __main__,
+        # the guarded Main.__init__ fallback, main_trakt.py — one per process;
+        # both daemons deliberately use CacheKeyBuilder shims instead), so this
+        # guard turns invariant I4 — one GlobalCacheManager per process — into a
+        # property of the class rather than a convention of its callers. The
+        # attempt WARNS rather than passing silently: a second construction is a
+        # bug at the call site, and swallowing it would just relocate the P-D.
+        if getattr(self, "_init_complete", False):
+            self.logger.log_warning(
+                "⚠️ GlobalCacheManager constructed a second time in this process — "
+                "ignored (memory/run_summary preserved). Pass the existing instance "
+                "instead of constructing (GLD-CACHE-13)."
+            )
+            return
         super().__init__(logger=logger, config=config, global_cache=None, **kwargs)
 
         self.key_builder = CacheKeyBuilder()
@@ -56,6 +77,19 @@ class GlobalCacheManager(BaseManager):
         self.compressor = CacheCompressor(logger=self.logger)
 
         self.logger.log_debug("✅ GlobalCacheManager initialized with all subcomponent handlers")
+        # Set LAST, so a first init that raised partway stays retryable instead
+        # of freezing a half-built singleton behind the guard (GLD-CACHE-13).
+        self._init_complete = True
+
+    @classmethod
+    def _reset_singleton(cls) -> None:
+        """TEST-ONLY: forget the process singleton so the next construction builds
+        a genuinely fresh instance. Production code must never call this — the fix
+        for wanting the cache "again" is to pass the existing instance around
+        (GLD-CACHE-13). Popping the BaseManager instance entry is sufficient: the
+        guard flag lives on the discarded object, so the next __new__ starts clean.
+        Keyed (cls, None) to mirror __new__'s key for a singleton_key-less call."""
+        BaseManager._instances.pop((cls, None), None)
 
     # ---------- JSON CACHE ----------
     def get(self, key: str):

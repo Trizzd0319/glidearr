@@ -16,6 +16,11 @@ class BaseManager:
     _singleton_instances = {}
     _singleton_lock = Lock()
 
+    # Set once per process by _preview_cache_keys() — see its docstring
+    # (`GLD-MGR-11`). Class-level because the read runs from every manager's
+    # __init__, so a per-instance warning would emit ~40 times a run.
+    _warned_missing_cache_memory = False
+
     def __new__(cls, *args, **kwargs):
         key = kwargs.get("singleton_key")
         inst_key = (cls, key)
@@ -91,13 +96,11 @@ class BaseManager:
         # Auto-resolve parent name
         self.parent_name = kwargs.get("parent_name") or self._infer_parent_from_path()
 
-        # Try to grab some cache summary without recursion
-        cache_keys = []
-        if self.global_cache and self.name != "GlobalCacheManager":
-            try:
-                cache_keys = list(getattr(self.global_cache, 'memory_cache', {}).keys())[:5]
-            except Exception as e:
-                self.logger.log_warning(f"⚠️ Could not read cache keys during init: {e}")
+        # Try to grab some cache summary without recursion.
+        # Delegates to _preview_cache_keys() -- this block used to be a second,
+        # byte-identical copy of it (P-E), which is why the wrong attribute name
+        # below had to be fixed in two places (`GLD-MGR-11`).
+        cache_keys = self._preview_cache_keys()
 
         self.dep_versions = {
             "config_version": getattr(self.config, 'version', 'n/a'),
@@ -109,9 +112,6 @@ class BaseManager:
 
         try:
             self.registry.register("manager", self.name, self)
-
-            if kwargs.get("print_registry_tree", False):
-                self.registry.print_tree_view(category="manager")
 
             self.registry.auto_hot_swap_from_config(self.config.raw_data)
 
@@ -139,6 +139,20 @@ class BaseManager:
                 pass
         except Exception as e:
             self.logger.log_warning(f"⚠️ Failed to register {self.name} with RegistryManager: {e}")
+
+        # Debug-only dump, deliberately OUTSIDE the block above (GLD-REG-03).
+        # print_tree_view did not exist on RegistryManager until now, and the call
+        # sat between registration and parent LINKING inside one try/except -- so
+        # switching this flag on would have raised AttributeError before the link
+        # ran and cost every manager its inherited logger, config, global_cache,
+        # validator AND dry_run, surfacing only as "failed to register". A debug
+        # print must not be able to disarm dry_run, so it gets its own guard and
+        # runs after linking is complete.
+        if kwargs.get("print_registry_tree", False):
+            try:
+                self.registry.print_tree_view(category="manager")
+            except Exception as e:
+                self.logger.log_warning(f"⚠️ Could not print registry tree: {e}")
 
         # Always attempt deferred link if initial link failed
         self._resolve_deferred_parent()
@@ -236,10 +250,39 @@ class BaseManager:
         self.logger.log_debug(f"[{self.name}] run() — no orchestration configured, no-op.")
 
     def _preview_cache_keys(self):
+        """The first few live cache keys, for the init summary. `[]` when there is none.
+
+        ⚠️ Reads `memory`, NOT `memory_cache`. This asked `global_cache` for
+        `memory_cache` -- an attribute `GlobalCacheManager` has never had, since
+        the `MemoryManager` is exposed as `.memory` -- and the `{}` default
+        turned that miss into an empty result. So `dep_versions["cache_keys"]`
+        and every init summary have reported an EMPTY CACHE on every manager
+        since the field was written, and could not have reported anything else.
+        Absent conflated with empty (P-C), in the one field whose entire job is
+        to say what the cache is holding.
+
+        A missing `memory` now WARNS once rather than returning a silent `[]`,
+        because it would mean the cache contract changed -- which is exactly the
+        condition that went unnoticed here. An empty MemoryManager still returns
+        `[]`, and that answer is now trustworthy (`GLD-MGR-11`).
+        """
         if not self.global_cache or self.name == "GlobalCacheManager":
             return []
+
+        memory = getattr(self.global_cache, "memory", None)
+        if memory is None:
+            # Once per process: this runs from __init__, i.e. ~40 times a run.
+            if not BaseManager._warned_missing_cache_memory:
+                BaseManager._warned_missing_cache_memory = True
+                self.logger.log_warning(
+                    "⚠️ global_cache exposes no `memory` MemoryManager — cache-key previews "
+                    "will be empty. That is a CONTRACT CHANGE, not an empty cache "
+                    "(GLD-MGR-11)."
+                )
+            return []
+
         try:
-            return list(getattr(self.global_cache, 'memory_cache', {}).keys())[:5]
+            return list(memory.keys())[:5]
         except Exception as e:
             self.logger.log_warning(f"⚠️ Could not read cache keys during init: {e}")
             return []

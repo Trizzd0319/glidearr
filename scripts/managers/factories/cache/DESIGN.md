@@ -143,7 +143,7 @@ on that. Generators must return `None` on failure.
 | I1 | A `None` generator result never overwrites an existing cache entry. |
 | I2 | An `[]` / `{}` generator result **is** written. |
 | I3 | Key → path is deterministic and collision-free (sanitised by `CacheKeyBuilder`). |
-| I4 | One `GlobalCacheManager` per process. |
+| I4 | One `GlobalCacheManager` per process — **enforced** since `GLD-CACHE-13`: a second construction is a warned no-op (idempotent `__init__`; the singleton's `memory`/`run_summary` survive). `_reset_singleton()` is the test-only escape. |
 | I5 | Cache writes are **not** gated on `dry_run`. |
 | I6 | The cache performs no FETCH and no APPLY — only the caller's generator may FETCH. |
 | I7 | A zero-byte or corrupt file is treated as a miss, never as empty data. |
@@ -159,6 +159,7 @@ on that. Generators must return `None` on failure.
 | Corrupt JSON | Parse error | Treated as miss, regenerated | One key |
 | Zero-byte file | [`test_json_handler_zero_byte.py`](./test_json_handler_zero_byte.py) | Treated as miss (I7) | One key |
 | Key collision | [`test_cache_key_collision.py`](./test_cache_key_collision.py) | Sanitised by `CacheKeyBuilder` | — |
+| Second in-process construction | Warned at the call site (`GLD-CACHE-13`) | Idempotent no-op — first init's `memory`/`run_summary` preserved; re-init can no longer orphan run-scoped rows | None |
 | Parquet engine missing | Write raises | CSV fallback | Format only |
 | Disk full | Write raises | Caller sees the error; free-space check fails **open** elsewhere | One write |
 | **Concurrent `MemoryManager` writes** | **None** | Plain dict, not thread-safe. The Radarr prefetch thread and the main thread both touch the cache | Race, unguarded |
@@ -199,6 +200,7 @@ configuration.
 - ✅ Cache audit (enumerate / wipe)
 - ✅ Compression helper
 - ✅ Zero-byte and key-collision hardening (tested)
+- ✅ Idempotent singleton `__init__` — a second in-process construction warns and no-ops instead of silently rebuilding `memory`/`run_summary` (`GLD-CACHE-13`; `_reset_singleton()` test hook, wired into [`test_cache_key_collision.py`](./test_cache_key_collision.py))
 
 ## 9. Planned additions
 
