@@ -81,6 +81,28 @@ ALARM_DELTA_PP = 20.0
 #: whose population is this small was not calibrated against anything either.
 MIN_SAMPLES = 50
 
+#: Fractional change in POPULATION SIZE beyond which selectivity is not
+#: comparable and no drift verdict is issued.
+#:
+#: SELECTIVITY IS A SHARE OF A POPULATION. Comparing it across two DIFFERENT
+#: populations answers a question nobody asked. Measured live 2026-08-10:
+#:
+#:     anchor 2026-08-05  n=2096  median=6.0   84.0% below 17.0
+#:     current            n= 986  median=12.0  71.3% below 17.0
+#:
+#: which this module reported as "a cutoff no longer admits the share it was
+#: chosen to admit" - i.e. as axis drift. But the current parquet held 938 rows
+#: with `has_file=True` for EVERY one and `has_file=False` for none, in a Radarr
+#: library that normally carries wanted-but-unowned titles. If the anchor counted
+#: those unowned candidates and the current set does not, then dropping ~1100
+#: LOW-scoring prospects halves n, RAISES the median, and LOWERS the share below
+#: a fixed cutoff. One population change; all three symptoms; no axis movement.
+#:
+#: 0.25 (a quarter) is deliberately loose. Ordinary library turnover moves the
+#: count by a few percent; this is meant to catch a change of KIND, not of size,
+#: and firing on normal churn would make it noise.
+MAX_POPULATION_DELTA = 0.25
+
 SEVERITY_OK = "ok"
 SEVERITY_WARN = "warn"
 SEVERITY_ALARM = "alarm"
@@ -244,20 +266,61 @@ def compare(anchor: dict, current_scores, *, cutoffs: "dict | None" = None) -> d
     }
 
 
+def population_shift(anchor_n, current_n) -> "float | None":
+    """Fractional change in population size, or None when it cannot be computed.
+
+    ``abs(current - anchor) / anchor``. None when the anchor count is missing or
+    zero - an unknown baseline cannot establish that the population held steady,
+    and must not be reported as if it had (P-C).
+    """
+    try:
+        a, c = float(anchor_n), float(current_n)
+    except (TypeError, ValueError):
+        return None
+    if a <= 0 or c != c or a != a:
+        return None
+    return abs(c - a) / a
+
+
+def rows_present(comparison) -> bool:
+    """True when there is anything to assess. Keeps the unknown-baseline guard from
+    manufacturing a verdict for an empty comparison."""
+    return bool((comparison or {}).get("rows"))
+
+
 def assess(comparison: dict, *, warn_pp: float = WARN_DELTA_PP,
-           alarm_pp: float = ALARM_DELTA_PP, min_samples: int = MIN_SAMPLES) -> dict:
+           alarm_pp: float = ALARM_DELTA_PP, min_samples: int = MIN_SAMPLES,
+           max_population_delta: float = MAX_POPULATION_DELTA) -> dict:
     """Turn a comparison into a verdict.
 
-    Severity is the WORST row's. A row is ``unknown`` — never ``ok`` — when
+    Severity is the WORST row's. A row is ``unknown`` - never ``ok`` - when
     either side lacks a share or the current sample is too small: "we could not
     tell" and "nothing moved" are different answers, and collapsing them is how
     a detector reports health it never established.
 
     A row whose CUTOFF changed is reported but does not drive severity: the
     delta then measures a deliberate edit, not axis movement.
+
+    A POPULATION that changed size beyond ``max_population_delta`` makes every
+    row ``unknown`` for the same reason. Selectivity is a share OF a population;
+    across two different populations the delta measures the membership change,
+    not the axis. Reporting that as drift sends someone to re-anchor a cutoff
+    that was never wrong - and a re-anchor would then BAKE IN the changed
+    population as the new normal. See ``MAX_POPULATION_DELTA`` for the live case
+    this was written from.
     """
     rows = (comparison or {}).get("rows") or {}
     cur_n = (comparison or {}).get("current_n") or 0
+    anc_n = (comparison or {}).get("anchor_n")
+    pop_shift = population_shift(anc_n, cur_n)
+    pop_changed = pop_shift is not None and pop_shift > float(max_population_delta)
+    # An UNKNOWABLE baseline is not a steady one. `population_shift` returns None
+    # when the anchor count is missing, zero or unparseable, and treating that as
+    # "nothing moved" would assert comparability this function never established -
+    # the exact absent-vs-empty conflation this module warns about elsewhere
+    # (P-C). Rows are downgraded to `unknown` for the same reason a changed
+    # population is: we cannot tell.
+    pop_unknown = pop_shift is None and rows_present(comparison)
 
     findings = []
     worst = SEVERITY_OK if rows else SEVERITY_UNKNOWN
@@ -269,7 +332,19 @@ def assess(comparison: dict, *, warn_pp: float = WARN_DELTA_PP,
     for name, row in sorted(rows.items()):
         delta = row.get("delta_pp")
         if row.get("cutoff_changed"):
-            sev, why = SEVERITY_OK, "cutoff changed since the anchor — not axis drift"
+            sev, why = SEVERITY_OK, "cutoff changed since the anchor - not axis drift"
+        elif pop_changed or pop_unknown:
+            # Checked BEFORE the delta thresholds: a real axis movement and a
+            # population swap produce the same delta, and only one of them is
+            # something to act on. Refusing to guess is the whole point.
+            sev = SEVERITY_UNKNOWN
+            why = (f"population changed {pop_shift:+.0%} (n={anc_n:,} -> {cur_n:,}) - "
+                   f"selectivity is a share OF a population and is not comparable "
+                   f"across two different ones; re-anchor only after confirming the "
+                   f"CURRENT population is the intended one") if pop_changed else (
+                   f"anchor population size is unknown (anchor_n={anc_n!r}) - cannot "
+                   f"establish that this is the same population, so the delta is not "
+                   f"attributable to the axis")
         elif delta is None or cur_n < min_samples:
             sev, why = SEVERITY_UNKNOWN, (
                 f"insufficient sample (n={cur_n} < {min_samples})" if delta is not None
@@ -294,8 +369,10 @@ def assess(comparison: dict, *, warn_pp: float = WARN_DELTA_PP,
         "severity": worst,
         "drifted": worst in (SEVERITY_WARN, SEVERITY_ALARM),
         "findings": findings,
-        "anchor_n": (comparison or {}).get("anchor_n"),
+        "anchor_n": anc_n,
         "current_n": cur_n,
+        "population_shift": pop_shift,
+        "population_changed": pop_changed,
         "anchor_median": (comparison or {}).get("anchor_median"),
         "current_median": (comparison or {}).get("current_median"),
     }

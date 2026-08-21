@@ -7,6 +7,10 @@ from scripts.managers.machine_learning.sizing.anomaly import (
     config_for,
     find_size_anomalies,
     implied_tier,
+    prune_attempts,
+    recommend_action,
+    record_attempt,
+    should_attempt,
 )
 
 
@@ -90,3 +94,119 @@ def test_config_for_merges_over_defaults():
     assert cfg["over_ratio"] == 2.5 and cfg["enabled"] is False
     assert cfg["under_ratio"] == 0.3 and cfg["min_samples"] == 8   # untouched defaults
     assert config_for({})["enabled"] is True                       # bare default
+    # ledger knobs ship with defaults so an existing config keeps the bound
+    assert config_for({})["max_regrab_attempts"] == 3
+    assert config_for({})["regrab_retry_days"] == 7
+
+
+# ── Grade routing: a bloated BROADCAST capture is mis-graded, not over-bitrated ──────
+
+def test_broadcast_grades_route_to_rescan_not_regrab():
+    """Broadcast bitrate is capped well below disc bitrate, so an HDTV-graded file at several
+    times its expected rate is a disc source labelled wrong. Re-grabbing cannot fix that — the
+    search asks for an UPGRADE and a smaller file is never one — so it must rescan."""
+    assert recommend_action("oversized", "HDTV-1080p") == "rescan"   # every Dragon Ball Z row
+    assert recommend_action("oversized", "HDTV-720p") == "rescan"
+    assert recommend_action("oversized", "SDTV") == "rescan"         # unchanged, junk/SD
+
+
+def test_disc_and_uhd_broadcast_grades_still_regrab():
+    """A disc tier IS the top of its resolution class, so a bloated file there is genuinely
+    over-bitrated. HDTV-2160p stays out of the mis-grade set: UHD broadcast is legitimately
+    high-bitrate and has no higher HDTV tier to be mistaken for."""
+    assert recommend_action("oversized", "Bluray-1080p") == "regrab"
+    assert recommend_action("oversized", "Bluray-2160p") == "regrab"
+    assert recommend_action("oversized", "HDTV-2160p") == "regrab"
+    assert recommend_action("oversized", "WEBRip-720p") == "regrab"  # deliberately unchanged
+
+
+def test_undersized_always_rescans_regardless_of_grade():
+    assert recommend_action("undersized", "Bluray-2160p") == "rescan"
+    assert recommend_action("undersized", "HDTV-1080p") == "rescan"
+    assert recommend_action("normal", "HDTV-1080p") == ""
+
+
+# ── Re-grab attempt ledger ────────────────────────────────────────────────
+
+_DAY = 86400.0
+_NOW = 1_760_000_000.0
+_BUDGET = {"max_attempts": 3, "retry_days": 7}
+
+
+def test_absent_entry_is_a_first_attempt():
+    assert should_attempt(None, 4_000_000_000, _NOW, **_BUDGET) == (True, "first")
+    assert should_attempt({}, 4_000_000_000, _NOW, **_BUDGET) == (True, "first")
+
+
+def test_cooldown_then_retry_then_abandon():
+    entry = record_attempt(None, 4_000_000_000, _NOW)
+    assert entry["attempts"] == 1
+    # same run / same week: too soon
+    assert should_attempt(entry, 4_000_000_000, _NOW + 60, **_BUDGET) == (False, "cooling")
+    # window elapsed, budget left
+    assert should_attempt(entry, 4_000_000_000, _NOW + 8 * _DAY, **_BUDGET) == (True, "retry")
+    # burn the budget
+    cur, t = None, _NOW
+    for _ in range(3):
+        cur = record_attempt(cur, 4_000_000_000, t)
+        t += 8 * _DAY
+    assert cur["attempts"] == 3
+    assert should_attempt(cur, 4_000_000_000, t, **_BUDGET) == (False, "abandoned")
+
+
+def test_a_size_change_resets_the_budget():
+    """The file that was failing to move has moved, so its history no longer describes it."""
+    spent = {"attempts": 3, "last_at": _NOW, "size_bytes": 4_000_000_000}
+    assert should_attempt(spent, 1_200_000_000, _NOW + 60, **_BUDGET) == (True, "changed")
+    assert record_attempt(spent, 1_200_000_000, _NOW)["attempts"] == 1
+
+
+def test_unknown_size_must_not_read_as_changed():
+    """P-C. Absent/unparseable is UNKNOWN, not 'different' — reading it as a change would reset
+    the budget on every run and restore the exact churn the ledger exists to stop."""
+    spent = {"attempts": 3, "last_at": _NOW, "size_bytes": 4_000_000_000}
+    assert should_attempt(spent, None, _NOW + 9 * _DAY, **_BUDGET) == (False, "abandoned")
+    no_prev = {"attempts": 3, "last_at": _NOW, "size_bytes": None}
+    assert should_attempt(no_prev, 4_000_000_000, _NOW + 9 * _DAY, **_BUDGET) == (False, "abandoned")
+
+
+def test_corrupt_entries_degrade_instead_of_raising():
+    for junk in ({"attempts": "x"}, {"last_at": "y", "attempts": 1}, {"size_bytes": "z"},
+                 {"size_bytes": object()}):
+        ok, why = should_attempt(junk, 4_000_000_000, _NOW, **_BUDGET)
+        assert isinstance(ok, bool) and isinstance(why, str)
+        assert record_attempt(junk, 4_000_000_000, _NOW)["attempts"] >= 1
+
+
+def test_zero_max_attempts_disables_the_bound():
+    spent = {"attempts": 99, "last_at": 0, "size_bytes": 1}
+    assert should_attempt(spent, 1, _NOW, max_attempts=0, retry_days=0)[0] is True
+
+
+def test_prune_drops_files_that_stopped_being_anomalous():
+    store = {"10": {"attempts": 3}, "20": {"attempts": 1}}
+    assert prune_attempts(store, [20]) == {"20": {"attempts": 1}}
+    assert prune_attempts(store, ["10", 20]) == store      # int/str ids both match
+    assert prune_attempts(store, []) == {}
+    assert prune_attempts(None, [1]) == {}
+
+
+def test_the_churn_converges():
+    """The measured failure was the same 38 episodes searched on consecutive runs forever.
+    With the ledger a stuck file is searched 3 times and then left alone."""
+    entry, t, searches = None, _NOW, 0
+    for _ in range(12):
+        ok, _why = should_attempt(entry, 4_100_000_000, t, **_BUDGET)
+        if ok:
+            searches += 1
+            entry = record_attempt(entry, 4_100_000_000, t)
+        t += 8 * _DAY
+    assert searches == 3
+
+
+def test_size_bytes_is_on_the_row_for_the_ledger():
+    """The ledger's change-detection needs an exact size, not the 2dp display GB."""
+    rows = find_size_anomalies(
+        pd.DataFrame([_row("Bloat", "Bluray-720p", 45, 30.0, resolution=720)]),
+        id_cols=("title",), runtime_col="runtime_minutes")
+    assert rows and rows[0]["size_bytes"] == int(30.0 * 1024 ** 3)

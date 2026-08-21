@@ -46,6 +46,14 @@ _CONFIG_DEFAULTS = {
     # would-grab release in the preview. 0 (default) defers all checks — the
     # size-anomaly grid already lists every candidate.
     "dry_run_search_budget": 0,
+    # Re-grab attempt ledger (see `should_attempt`). A bloat re-grab is a SEARCH, and
+    # Sonarr only grabs on UPGRADE — a smaller replacement is never an upgrade, so a
+    # genuinely-mis-sized file can be searched every run forever with no effect and no
+    # detector. These bound that: stop after `max_regrab_attempts` fruitless attempts,
+    # and wait `regrab_retry_days` between them. A file whose size CHANGES resets both
+    # (something worked; it is no longer the same file).
+    "max_regrab_attempts": 3,
+    "regrab_retry_days": 7,
 }
 
 
@@ -71,24 +79,132 @@ _REAL_TIERS = {
     if k not in {"Unknown", "WORKPRINT", "CAM", "TELESYNC", "TELECINE", "REGIONAL", "DVDSCR"}
 }
 
-# Junk / SD grades: a HUGE file carrying one of these is almost always MIS-GRADED (the file is
-# really HD), so the fix is a metadata RESCAN, not a re-grab. A bloated file graded as a real
-# HD/UHD tier is genuinely over-bitrated → RE-GRAB a properly-sized release at its profile.
-_JUNK_OR_SD_GRADES = {
+# Grades at which a HUGE file means MIS-GRADED, not genuinely bloated — so the fix is a
+# metadata RESCAN, not a re-grab.
+#
+# Two families qualify:
+#   * junk / SD / pre-release spellings — a multi-GB file simply is not one of these;
+#   * BROADCAST captures (HDTV-720p / HDTV-1080p) — broadcast bitrate is capped well below
+#     disc bitrate, so an HDTV-graded file at several times its expected rate is a Blu-ray
+#     source Sonarr labelled wrong. Sending those down the re-grab path cannot help: the
+#     search asks for an UPGRADE, a smaller file is not one, and the same file is re-searched
+#     every run (measured: the same 38 Dragon Ball Z episodes searched on two consecutive
+#     runs, 496 anomalies unchanged). A rescan re-reads mediainfo and can actually fix it.
+#
+# HDTV-2160p is deliberately NOT here: UHD broadcast is genuinely high-bitrate and there is
+# no higher HDTV tier for it to be mistaken for.
+#
+# A bloated file graded at a real disc tier (Bluray-*/Remux-*) IS over-bitrated for what it
+# claims → RE-GRAB a properly-sized release at its profile.
+_MISGRADE_WHEN_BLOATED = {
     "Unknown", "WORKPRINT", "CAM", "TELESYNC", "TELECINE", "REGIONAL", "DVDSCR",
     "SDTV", "DVD", "DVD-R", "WEBRip-480p", "WEBDL-480p", "Bluray-480p", "Bluray-576p",
+    "HDTV-720p", "HDTV-1080p",
 }
+
+# Back-compat alias — the old name described the set before the broadcast tiers joined it.
+_JUNK_OR_SD_GRADES = _MISGRADE_WHEN_BLOATED
 
 
 def recommend_action(verdict: str, quality_name: "str | None") -> str:
     """The remediation a service should take: 'rescan' (re-read mediainfo to fix a wrong grade —
-    non-destructive) or 'regrab' (replace a genuinely-bloated file at its profile target —
-    destructive). Undersized files rescan (verify the suspiciously-small file)."""
+    non-destructive) or 'regrab' (replace a genuinely-bloated file at its profile target).
+    Undersized files rescan (verify the suspiciously-small file)."""
     if verdict == "undersized":
         return "rescan"
     if verdict == "oversized":
-        return "rescan" if (quality_name in _JUNK_OR_SD_GRADES) else "regrab"
+        return "rescan" if (quality_name in _MISGRADE_WHEN_BLOATED) else "regrab"
     return ""
+
+
+# ── Re-grab attempt ledger (pure) ───────────────────────────────────────────
+#
+# A bloat re-grab fires an EpisodeSearch and keeps the file. Sonarr grabs only on UPGRADE,
+# and a SMALLER replacement is by definition not an upgrade — so for a file that is merely
+# mis-sized (rather than mis-graded) the search is accepted, does nothing, and re-fires on
+# every subsequent run. There was no detector for that: 496 anomalies and the same 38 episode
+# searches on two consecutive runs. These helpers bound the retry loop.
+#
+# State shape, per instance: {str(file_id): {"attempts": int, "last_at": epoch, "size_bytes": int}}
+# The service owns the read/write; everything below is pure so it can be tested without a cache.
+
+def attempts_key(instance: str) -> str:
+    """Global-cache key holding one instance's re-grab attempt ledger."""
+    return f"sonarr/size_anomaly/regrab_attempts/{instance}"
+
+
+def _as_int(v):
+    """``int(v)`` or None. A value that will not parse is UNKNOWN, never 0 — a corrupt ledger
+    entry must not read as "size changed" (which would reset the budget and restore the churn)
+    nor as "size 0" (which would look like a change every time)."""
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def should_attempt(entry, size_bytes, now_ts, *, max_attempts, retry_days) -> tuple:
+    """``(ok, reason)`` — may this file be searched again now?
+
+    Reasons: ``first`` (never tried), ``changed`` (the file was replaced since the last
+    attempt, so the loop is not stuck — start over), ``retry`` (cooldown elapsed, budget
+    left), ``cooling`` (too soon), ``abandoned`` (budget spent with no change).
+
+    An ABSENT entry and a zero-attempt entry mean the same thing here — never tried — so
+    they deliberately share the ``first``/``retry`` path. Stating that explicitly is the
+    P-C discipline: the two are only safe to conflate because the answer is genuinely the
+    same, unlike ``size_bytes`` below where absent must NOT read as "unchanged".
+    """
+    if not entry:
+        return True, "first"
+    prev_size = _as_int(entry.get("size_bytes"))
+    cur_size = _as_int(size_bytes)
+    # Only a KNOWN-and-different size proves a replacement landed. An absent or unparseable
+    # size is unknown, not "same" and not "changed" — treating it as changed would reset the
+    # budget forever and restore the exact churn this ledger exists to stop.
+    if prev_size is not None and cur_size is not None and prev_size != cur_size:
+        return True, "changed"
+    try:
+        attempts = int(entry.get("attempts") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    if max_attempts and attempts >= int(max_attempts):
+        return False, "abandoned"
+    try:
+        last = float(entry.get("last_at") or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    if retry_days and last and (float(now_ts) - last) < float(retry_days) * 86400.0:
+        return False, "cooling"
+    return True, "retry"
+
+
+def record_attempt(entry, size_bytes, now_ts) -> dict:
+    """The ledger entry after an attempt. A size change resets the counter to 1 — the file
+    that was failing to move has moved, so its history no longer describes this file."""
+    prev = dict(entry or {})
+    prev_size = _as_int(prev.get("size_bytes"))
+    cur_size = _as_int(size_bytes)
+    changed = prev_size is not None and cur_size is not None and prev_size != cur_size
+    try:
+        attempts = 0 if (changed or not prev) else int(prev.get("attempts") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    return {
+        "attempts": attempts + 1,
+        "last_at": float(now_ts),
+        "size_bytes": cur_size,
+    }
+
+
+def prune_attempts(store, live_file_ids) -> dict:
+    """Drop ledger entries for files that are no longer anomalous — remediation worked, or
+    the file is gone. Keeps the ledger from growing without bound and lets a file that
+    re-develops a size problem start with a clean budget."""
+    live = {str(f) for f in (live_file_ids or [])}
+    return {k: v for k, v in (store or {}).items() if str(k) in live}
 
 
 def implied_tier(actual_mb_per_min: float) -> str:
@@ -182,6 +298,7 @@ def find_size_anomalies(
         rec.update({
             "quality_name": qn or "",
             "runtime_min": round(rt_min, 1),
+            "size_bytes": int(size),
             "size_gb": round(size_gb, 2),
             "expected_gb": round(expected_gb, 2),
             "ratio": round(ratio, 1),
