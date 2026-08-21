@@ -69,6 +69,26 @@ class SizeCalibrator:
                 return default
         return default
 
+    def _outlier_ratio(self):
+        """The multiplier above a tier's own MEDIAN at which a file stops counting
+        as a sample of that tier (``GLD-SIZ-12``). Read from `size_anomaly.over_ratio`
+        so the calibrator and the anomaly detector cannot disagree about the same
+        file -- before this, the detector flagged a bloated file while the
+        calibrator averaged it in, and the resulting higher mean RAISED the very
+        threshold meant to catch the next one.
+
+        Returns None (rejection OFF, byte-identical) when `size_anomaly` is absent
+        or unusable: a deployment that has not opted into anomaly detection has
+        not told us what it considers anomalous, and inventing a number here would
+        silently reshape every size estimate it makes.
+        """
+        sa = self._cfg_get("size_anomaly", {}) or {}
+        try:
+            r = float((sa or {}).get("over_ratio"))
+        except (TypeError, ValueError):
+            return None
+        return r if r > 0 else None
+
     def _instance_names(self, service: str):
         insts = self._cfg_get(f"{service}_instances", {}) or {}
         return [k for k, v in insts.items()
@@ -99,7 +119,8 @@ class SizeCalibrator:
                 self._log("log_debug", f"[SizeCal] {service}/{inst} load failed: {e}")
                 continue
             total += self._add_stats(acc, size_model.measured_stats(
-                df, runtime_col=rt_col, runtime_unit=rt_unit, codec_col="video_codec"))
+                df, runtime_col=rt_col, runtime_unit=rt_unit, codec_col="video_codec",
+                outlier_ratio=self._outlier_ratio()))
         return total
 
     @staticmethod
@@ -137,7 +158,7 @@ class SizeCalibrator:
             if rows:
                 total += self._add_stats(acc, size_model.measured_stats(
                     pd.DataFrame(rows), runtime_col="runtime_minutes", runtime_unit="minutes",
-                    codec_col="video_codec"))
+                    codec_col="video_codec", outlier_ratio=self._outlier_ratio()))
         if total:
             self._log("log_debug", f"[SizeCal] radarr snapshot: {total} movie file(s) measured.")
         return total

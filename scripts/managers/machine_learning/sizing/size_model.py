@@ -369,6 +369,8 @@ def measured_stats(
     runtime_unit: str = "seconds",
     quality_col: str = "quality_name",
     codec_col: "str | None" = None,
+    outlier_ratio: "float | None" = None,
+    outlier_min_n: int = 5,
 ) -> dict:
     """
     Per-quality ``{quality_name: {"mean": mib_per_min, "n": sample_count}}``
@@ -410,10 +412,42 @@ def measured_stats(
         sub = sub[(sub["__mbpm"] >= MIN_MB_PER_MIN) & (sub["__mbpm"] <= MAX_MB_PER_MIN)]
         if sub.empty:
             return out
+        # ── Outlier rejection: stop the calibration ratchet (GLD-SIZ-12) ──────
+        # The bounds above are a UNITS guard ([0.5, 900] catches corrupt runtimes),
+        # NOT an outlier guard. A mislabelled disc image -- the real case: a 50.9
+        # GiB "Bluray-720p" at 321.7 MiB/min -- passes them comfortably, lands in
+        # the tier's mean, RAISES expected_size_gb, and therefore raises the
+        # anomaly threshold (over_ratio x expected) that is supposed to catch the
+        # next one. A ratchet that loosens itself: the detector calls the file an
+        # anomaly while the calibrator averages it in as a legitimate sample.
+        #
+        # Anchored on the tier's own MEDIAN, not its mean, because the mean is
+        # what the outlier is already corrupting. Rows above
+        # ``outlier_ratio x median`` are dropped before averaging.
+        #
+        # Only applied at ``n >= outlier_min_n``: you cannot identify an outlier
+        # in a sample of one, and at n=2 the median is just the midpoint. A thin
+        # tier is therefore NOT protected here -- that is what ``min_samples`` on
+        # the calibration table is for, and it is why a cap must never be derived
+        # from a thin tier (see quality_caps.plan_caps).
+        dropped_by_q: dict = {}
+        if outlier_ratio and float(outlier_ratio) > 0:
+            med = sub.groupby(quality_col)["__mbpm"].transform("median")
+            cnt = sub.groupby(quality_col)["__mbpm"].transform("size")
+            keep = (cnt < int(outlier_min_n)) | (sub["__mbpm"] <= med * float(outlier_ratio))
+            if not keep.all():
+                dropped_by_q = (
+                    sub.loc[~keep].groupby(quality_col)["__mbpm"].size().to_dict())
+                sub = sub[keep]
+            if sub.empty:
+                return out
         # Plain per-quality keys (unchanged — over ALL surviving rows).
         g = sub.groupby(quality_col)["__mbpm"]
         means, counts = g.mean(), g.size()
         out = {str(q): {"mean": float(means[q]), "n": int(counts[q])} for q in means.index}
+        for q, d in dropped_by_q.items():
+            if str(q) in out:
+                out[str(q)]["dropped"] = int(d)
         # Additive codec-qualified keys ("quality@codec"); rows with a blank codec drop out.
         if has_codec:
             sub["__codec"] = sub[codec_col].map(_norm_codec)

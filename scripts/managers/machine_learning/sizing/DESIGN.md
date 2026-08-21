@@ -309,6 +309,13 @@ Cache key written by the bridge: `size_model/calibration`.
 - ✅ Freshness check failing toward recompute
 - ✅ Size-based upgrade/downgrade classification with a no-opinion branch
 - ✅ Size-anomaly detection
+- ✅ Rescan-vs-regrab remediation routing (`recommend_action`) — broadcast tiers
+  (`HDTV-720p`/`-1080p`) route to RESCAN because a bloated broadcast grade is a
+  mis-graded disc source a re-grab cannot fix; `HDTV-2160p` deliberately excluded
+- ✅ Re-grab attempt ledger (`should_attempt`/`record_attempt`/`prune_attempts`) —
+  bounds the retry loop, size-change resets the budget, unknown sizes never read
+  as "changed" or as 0
+- ✅ Exact `size_bytes` on every anomaly row (change-detection needs more than 2dp GB)
 - ✅ Storage forecasting
 
 ## 9. Planned additions
@@ -325,6 +332,9 @@ Cache key written by the bridge: `size_model/calibration`.
 | `GLD-SIZ-08` | **Re-run `calibrate_sizes.py`** and refresh the cold-start table with current `n` | The table is dated to one measured run; the library has grown | S | — |
 | `GLD-SIZ-09` | **Warn when a size estimate hits the clamp** | The clamp silently rescues a units bug that should be fixed upstream | S | — |
 | `GLD-SIZ-10` | **Document the size model in `MATH_FOUNDATION.md`** and wrap the estimator in `foundation/` | It is the one production estimator absent from the formula index | S | `GLD-FND-02` |
+| `GLD-SIZ-11` | Mirror of `GLD-SON-13`/`-14` — the size-anomaly remediation-loop fixes live in this package's `anomaly.py` (routing set `_MISGRADE_WHEN_BLOATED`, attempt-ledger helpers, `size_bytes` on rows); the service wiring, measurements, and open follow-ups (`GLD-SON-15`/`-16`/`-17`) are registered under §4.20 and §0.1 #57 | One brain module, one register home (P-E avoidance) | — | `GLD-SON-13` |
+| `GLD-SIZ-12` | ✅ **The calibration ratchet** — `measured_stats` filtered only to `[MIN_MB_PER_MIN, MAX_MB_PER_MIN]`, which its own docstring calls a guard against CORRUPT RUNTIMES. A mislabelled disc image (the real case: 50.9 GiB "Bluray-720p" = 321.7 MiB/min) passes `[0.5, 900]` comfortably, enters the tier's plain `.mean()`, raises `expected_size_gb`, and therefore raises the `over_ratio x expected` threshold that is supposed to catch the NEXT one — a ratchet that loosens itself, with the detector calling the file an anomaly while the calibrator averages it in as a sample. Measured on a `Bluray-1080p`-shaped tier (n=18): **+20.8% mean, threshold 195 → 236 MiB/min from a single file**. Fixed with median-anchored rejection (`outlier_ratio`, `outlier_min_n=5`) — median because the mean is what the outlier is already corrupting; only at `n >= 5` because an outlier cannot be identified in a sample of one | S | ✅ **Fixed** — §0.1 #65 |
+| `GLD-SIZ-13` | ✅ **Grab-time size ceiling** (`quality_caps.py`) — turns the measured MiB/min model into *arr `qualitydefinition` `maxSize` in MB/min, at the same `over_ratio` the anomaly detector uses: *if we would flag it after the grab, refuse it before*. Caps may only TIGHTEN (a poisoned rate must never widen a ceiling — second guard on `GLD-SIZ-12`); thin tiers get no cap at all (too LOW a cap starves a tier silently, and the thin-sample check precedes the tighten check); `MIB_TO_MB` applied or every cap is 4.9% too tight; unlimited (`None`) never read as 0. **Pure planner only** — the service wiring (fetch/diff/dry-run/PUT) is `GLD-RAD-34` | M | ✅ **Fixed** — §0.1 #65 |
 
 ## 10. Open questions
 
