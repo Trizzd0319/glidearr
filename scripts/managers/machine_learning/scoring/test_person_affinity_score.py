@@ -8,8 +8,9 @@ WEIGHTS = {1245: 10, 3223: 5, 100: 8}        # int keys (must not hit affinity_t
 
 def test_top3_mean_scaled_to_cap():
     media = {"cast": [1245, 3223], "directors": [100]}
-    # contributions: 1.0, 0.5, 0.8 → top3 mean 0.7667 × cap4 ≈ 3.067
-    assert person_affinity_score(media, WEIGHTS, 4.0) == 3.067
+    # contributions: cast 1.0 and 0.5 at role weight 1.0; the director's 0.8 carries the
+    # 0.7 director weight -> 0.56. top3 mean (1.0+0.5+0.56)/3 = 0.6867 x cap4 = 2.747.
+    assert person_affinity_score(media, WEIGHTS, 4.0) == 2.747
 
 
 def test_cap_zero_is_byte_identical_zero():

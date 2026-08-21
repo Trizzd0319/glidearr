@@ -25,16 +25,17 @@ FWD = {
 
 def test_tallies_role_weighted_over_watched():
     w = aggregate_person_affinity({("movie", 24428)}, FWD)
-    # top-billed cast and the director both carry role weight 1.0 at full billing credit
+    # Top-billed cast carries role weight 1.0; the director carries 0.7 (operator ruling:
+    # "producer/writer affinity less impactful, casting higher"). Both at full billing credit.
     assert w[1245] == 1.0
-    assert w[100] == 1.0
+    assert w[100] == 0.7
     # second-billed cast keeps role weight 1.0 but only 1/(1+0.25) of the billing credit
     assert round(w[3223], 4) == 0.8
 
 
 def test_accumulates_across_titles_and_sorts_desc():
     w = aggregate_person_affinity({("movie", 24428), ("movie", 271110)}, FWD)
-    assert w[100] == 2.0                      # director of both
+    assert round(w[100], 4) == 1.4            # director of both, 0.7 each
     assert round(w[3223], 4) == 1.8           # 2nd-billed once (0.8) + 1st-billed once (1.0)
     assert w[1245] == 1.0
     assert list(w.values()) == sorted(w.values(), reverse=True)   # ranked descending
@@ -46,22 +47,25 @@ def test_all_seven_roles_are_weighted_and_ordered():
         "producers": [7], "cinematographers": [6], "editors": [5],
     }}
     w = aggregate_person_affinity({("movie", 1)}, fwd)
-    assert w[1] == 1.0 and w[2] == 1.0        # lead + director
-    assert w[9] == 0.6                        # writer
+    assert w[1] == 1.0 and w[2] == 0.7        # lead + director
+    assert w[9] == 0.375                      # writer (0.6 -> 0.3 -> 0.375, "split the difference")
     assert w[8] == 0.4                        # composer
-    assert w[7] == 0.3 and w[6] == 0.3        # producer, cinematographer
+    assert w[7] == 0.15 and w[6] == 0.3       # producer, cinematographer
     assert w[5] == 0.2                        # editor
     # Robert's requirement, asserted as an ordering rather than as magic numbers:
     # a lead / director must outweigh an editor.
     assert w[1] > w[5] and w[2] > w[5]
-    assert w[9] > w[8] > w[7] >= w[6] > w[5]
+    # Composer now outranks writer, and producer sits LAST: the measured producer/writer
+    # dominance was largely franchise continuation and graph density, already monetised
+    # by the saga/universe machinery - this table expresses PEOPLE-following.
+    assert w[8] > w[9] > w[6] > w[5] > w[7]
 
 
 def test_billing_order_decays_monotonically_for_cast_only():
     fwd = {("movie", 1): {"cast": [10, 11, 12, 13], "directors": [20, 21], **_EMPTY}}
     w = aggregate_person_affinity({("movie", 1)}, fwd)
     assert w[10] > w[11] > w[12] > w[13]      # cast decays with billing rank
-    assert w[20] == w[21] == 1.0              # crew order carries no billing meaning
+    assert w[20] == w[21] == 0.7              # crew order carries no billing meaning
 
 
 def test_billing_decay_can_be_disabled():
@@ -83,8 +87,8 @@ def test_billing_weight_shape():
 def test_engagement_scales_a_titles_whole_contribution():
     eng = {("movie", 24428): 2.0, ("movie", 271110): 0.25}
     w = aggregate_person_affinity(set(FWD) - {("show", 5)}, FWD, engagement=eng)
-    # director of both: 1.0*2.0 + 1.0*0.25
-    assert round(w[100], 4) == 2.25
+    # director of both: 0.7*2.0 + 0.7*0.25
+    assert round(w[100], 4) == 1.575
     assert round(w[1245], 4) == 2.0           # lead of the rewatched film only
 
 

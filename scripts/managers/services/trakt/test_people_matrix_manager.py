@@ -159,7 +159,7 @@ def test_builds_every_role_from_the_relational_table(tmp_path):
     assert set(aff) == {"10", "11", "20", "30", "40", "50", "60", "70"}
     assert aff["10"] == 1.0                       # top-billed lead, full engagement
     assert round(aff["11"], 4) == 0.8             # second-billed
-    assert aff["20"] == 1.0                       # director
+    assert aff["20"] == 0.7                       # director (operator ruling: cast over crew)
     assert aff["70"] == 0.2                       # editor — lowest weight, per Robert
     assert aff["10"] > aff["70"] and aff["20"] > aff["70"]
 
