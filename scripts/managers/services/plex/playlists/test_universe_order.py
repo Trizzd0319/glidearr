@@ -471,7 +471,11 @@ def test_stem_clusters_deny_blocks_regional_remakes():
 
 # ── tv_franchise_universes: the synthetic universe-source seam (Phase 1) ──────────────
 def test_tv_franchise_universes_emits_timeline_true_show_entries():
-    out = tv_franchise_universes(_FAM, catalog={})
+    # Layer-1 (owned same-stem clustering) is OFF by default - it groups by title
+    # SHAPE and manufactured families like "Blue" (Blue Bloods + Blue Planet II +
+    # six anime), and that credit feeds the watchability score AND the universe
+    # DELETE guard. These tests exercise Layer-1 itself, so they opt in explicitly.
+    out = tv_franchise_universes(_FAM, catalog={}, cluster_same_stem=True)
     lo = out["tvfran:laworder"]
     assert lo["timeline"] is True                              # REQUIRED — unified_universe_order skips falsy
     assert lo["movies"] == [] and lo["shows"] == [1, 2, 3]     # TV-only, input (debut) order
@@ -494,7 +498,7 @@ def test_tv_franchise_universes_catalog_tier_from_provenance():
 
 
 def test_tv_franchise_universes_stem_clusters_are_tier_1():
-    out = tv_franchise_universes(_FAM, catalog={})                # all Layer-1 owned-stem clusters
+    out = tv_franchise_universes(_FAM, catalog={}, cluster_same_stem=True)   # all Layer-1 owned-stem clusters
     assert out and all(v["tier"] == 1 for v in out.values())      # derived: below curated, above generated
 
 
@@ -502,7 +506,7 @@ def test_tv_franchise_universes_orders_members_by_debut():
     rows = [{"title": "Star Trek: Picard", "tvdbId": 3, "year": 2020},
             {"title": "Star Trek: The Next Generation", "tvdbId": 1, "year": 1987},
             {"title": "Star Trek: Voyager", "tvdbId": 2, "tvdb_first_aired": "1995-01-16"}]
-    e = tv_franchise_universes(rows, catalog={})["tvfran:startrek"]
+    e = tv_franchise_universes(rows, catalog={}, cluster_same_stem=True)["tvfran:startrek"]
     assert e["shows"] == [1, 2, 3]                             # 1987 < 1995 < 2020 (debut asc)
     assert [it["tvdb"] for it in e["items"]] == [1, 2, 3] and e["items"][0]["rank"] == 0
 
@@ -510,7 +514,8 @@ def test_tv_franchise_universes_orders_members_by_debut():
 def test_tv_franchise_universes_undated_members_sort_last_stable():
     rows = [{"title": "X: B", "tvdbId": 2},                    # undated
             {"title": "X: A", "tvdbId": 1, "year": 2000}]      # dated
-    assert tv_franchise_universes(rows, catalog={})["tvfran:x"]["shows"] == [1, 2]   # dated first
+    assert tv_franchise_universes(rows, catalog={},
+                                  cluster_same_stem=True)["tvfran:x"]["shows"] == [1, 2]  # dated first
 
 
 def test_tv_franchise_universes_empty_when_no_family_or_clustering_off():
@@ -558,7 +563,7 @@ def test_tv_franchise_universes_film_universe_deny_drops_catalog_and_cluster():
 
 def test_tv_franchise_universes_entries_round_trip_through_consumers():
     # the integration guard the seam-map flagged as missing: producer output → every consumer.
-    src = {"universes": tv_franchise_universes(_FAM, catalog={})}
+    src = {"universes": tv_franchise_universes(_FAM, catalog={}, cluster_same_stem=True)}
     # playlist grouping (build_universe_maps reads `shows`, stamps order because timeline True)
     _, _, fran, time = build_universe_maps(src, set(), {1: 100, 2: 101, 3: 102})
     assert fran == {100: "tvfran:laworder", 101: "tvfran:laworder", 102: "tvfran:laworder"}

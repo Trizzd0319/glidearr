@@ -350,7 +350,7 @@ def test_tv_franchise_maps_from_curated_when_enabled():
     assert timeline == {10: 0, 11: 1}                                    # saga order
 
 
-def test_refresh_synthetic_universes_writes_tvfran_and_curated_keeps_name():
+def test_refresh_synthetic_universes_writes_tvfran_and_curated_keeps_name(monkeypatch):
     import scripts.managers.services.plex.playlists.builder as B
     cache = _Cache()
     cache.set(B._UNIVERSE_SRC_KEY, {                                     # a prior mdblist list + a STALE tvfran ghost
@@ -358,9 +358,17 @@ def test_refresh_synthetic_universes_writes_tvfran_and_curated_keeps_name():
                       "tvfran:ghost": {"timeline": True, "movies": [], "shows": [999], "items": []}},
         "fetched": {"mcu": 5, "__tvfran__": 1}})
     m = _mgr(cache=cache, config=_ON)
+    # These families come from the Layer-2 CATALOG, which names members by tvdb. Layer-1
+    # (owned same-stem clustering) is off by default: it grouped by title SHAPE with no
+    # evidence two shows are related, and the credit it minted feeds the watchability
+    # score AND the universe DELETE guard. The seam under test - regenerate the cache,
+    # strip the stale ghost, keep the curated label for grouping - is the same either way.
+    monkeypatch.setattr(m, "_tv_franchise_catalog",
+                        lambda: {"csi": {"shows": [10, 11], "tier": 1},
+                                 "chicago": {"shows": [20, 21], "tier": 1}})
     owned = [
         {"series_id": 1, "series_title": "CSI: Crime Scene Investigation", "series_tvdb_id": 10},
-        {"series_id": 2, "series_title": "CSI: Miami", "series_tvdb_id": 11},   # non-curated stem → synthetic survives
+        {"series_id": 2, "series_title": "CSI: Miami", "series_tvdb_id": 11},   # non-curated → synthetic survives
         {"series_id": 3, "series_title": "Chicago Fire", "series_tvdb_id": 20},
         {"series_id": 4, "series_title": "Chicago P.D.", "series_tvdb_id": 21},  # curated → keeps "one chicago"
     ]
