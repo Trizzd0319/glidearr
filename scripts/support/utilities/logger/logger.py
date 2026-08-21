@@ -399,13 +399,28 @@ class LoggerManager:
             return "enrich_daemon_run"
         return log_name
 
-    def __init__(self, log_name="default", level=logging.INFO):
+    def __init__(self, log_name="default", level=None):
         if getattr(self, "_initialized", False):
             return
         self._initialized = True
 
         log_name = self._effective_log_name(log_name)
         self.log_name = log_name
+        # LEVEL FROM THE ENVIRONMENT, not from a caller. Nothing in-tree has ever
+        # passed `level`, and `set_level` has no callers, so DEBUG was unreachable
+        # without editing code -- which is a poor place for a switch you want to
+        # flip for one run and flip back.
+        #
+        # It lives HERE rather than in main.py because a run spawns SUBPROCESSES
+        # (the enrich daemon, the pilot-search daemon) that build their own
+        # LoggerManager. An env var is inherited by all of them; a constructor
+        # argument in main.py would light up exactly one process, and the code path
+        # you most want to see is often in one of the others (`GLD-MGR-13`).
+        #
+        # An explicit `level=` argument still wins, so tests can pin it.
+        if level is None:
+            _dbg = str(os.environ.get("GLIDEARR_DEBUG", "")).strip().lower()
+            level = logging.DEBUG if _dbg in {"1", "true", "yes", "on", "debug"} else logging.INFO
         self.level = level or logging.INFO
         self.logger = logging.getLogger(log_name)
         self.logger.setLevel(self.level)
