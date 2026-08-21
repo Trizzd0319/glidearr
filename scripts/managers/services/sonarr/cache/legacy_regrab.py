@@ -34,20 +34,59 @@ def ledger_key(instance: str) -> str:
 
 
 def run_legacy_regrab(*, make_request, logger, global_cache, instance, items,
-                      max_workers: int = 3, dry_run: bool = False) -> dict:
+                      max_workers: int = 3, dry_run: bool = False,
+                      free_gb=None, acquire_floor_gb=None) -> dict:
     """Process ``items`` — a list of dicts ``{series_id, episode_file_id, resolution, series_title,
     season_number, episode_number, video_codec}`` (already cooldown-filtered + ordered by the caller).
 
     For each: resolve the S/E id, interactive-search, pick the best modern replacement, and (live)
     grab it by guid + record the decision in the ledger. Returns
-    ``{checked, grabbed, previewed, no_release, failed, preview:[[label, current, release, res], ...]}``.
+    ``{checked, grabbed, previewed, no_release, failed, skipped_space, preview:[[label, current, release, res], ...]}``.
     Concurrency is bounded by ``max_workers`` (interactive searches are slow). Live writes the ledger
-    incrementally; dry-run records NOTHING (a preview must not burn cooldowns)."""
+    incrementally; dry-run records NOTHING (a preview must not burn cooldowns).
+
+    SPACE FLOOR (GLD-ACQ-30). ``free_gb`` / ``acquire_floor_gb`` are supplied by the
+    caller, which already reads them for the pressure passes; below the floor this
+    grabs NOTHING and says so with the figures.
+
+    This lane is named in the 2026-08-07 incident. The next-episode and pilot lanes
+    have since grown floors of their own (`_do_acquire_next_episodes`,
+    `run_pilot_search`); this one had none, and it issues a DIRECT
+    ``POST release`` by guid - the most immediate grab in the codebase, with no
+    Sonarr-side queue check between the decision and the download.
+
+    CHECKED ONCE, HERE, not per item: `_one` runs in a thread pool, so a per-item
+    check would be both racy and N API calls. Once at the top is the honest
+    granularity - free space cannot be meaningfully re-read between concurrent
+    grabs anyway.
+
+    UNKNOWN FREE SPACE DOES NOT BLOCK. Both parameters default to None, and a
+    caller that supplies neither gets exactly today's behaviour. That is a
+    deliberate difference from `acquire_gate.acquisition_space_ok`, which refuses
+    on unknown: this function is called from several places and silently disabling
+    a lane because a caller had not been updated would be a worse failure than the
+    one being fixed. The caller is responsible for passing the numbers; not
+    passing them is visible as an absent floor line in the log.
+    """
     items = [i for i in (items or [])
              if i.get("series_id") is not None and i.get("episode_file_id") is not None]
-    stats = {"checked": 0, "grabbed": 0, "previewed": 0, "no_release": 0, "failed": 0, "preview": []}
+    stats = {"checked": 0, "grabbed": 0, "previewed": 0, "no_release": 0, "failed": 0,
+             "skipped_space": 0, "empty_search": 0, "preview": []}
     if not items:
         return stats
+
+    if free_gb is not None and acquire_floor_gb is not None:
+        try:
+            _free, _floor = float(free_gb), float(acquire_floor_gb)
+        except (TypeError, ValueError):
+            _free = _floor = None
+        if _free is not None and _free < _floor:
+            stats["skipped_space"] = len(items)
+            logger.log_info(
+                f"  [LegacyRegrab] PAUSED on '{instance}': {_free:,.1f} GB free is below "
+                f"the {_floor:,.0f} GB acquisition floor ({_floor - _free:,.1f} GB short). "
+                f"{len(items)} re-grab(s) held — reclaim must run first (GLD-ACQ-30).")
+            return stats
 
     lock = threading.Lock()
     ep_cache: dict = {}
@@ -87,8 +126,30 @@ def run_legacy_regrab(*, make_request, logger, global_cache, instance, items,
         releases = make_request(instance, f"release?episodeId={eid}", fallback=None)
         if releases is None:
             return  # transient search failure — DON'T record, retry next run
-        best = best_modern_release(releases if isinstance(releases, list) else [],
-                                   int(item.get("resolution") or 0))
+        _rows = releases if isinstance(releases, list) else []
+        if not _rows:
+            # GLD-SON-02 - AN EMPTY LIST IS NOT A MISS. `releases is None` already
+            # catches an errored request, but a search that succeeds and returns
+            # ZERO rows is a different, ambiguous thing: a disabled indexer, an
+            # unconfigured category, or a rate-limited provider all look exactly
+            # like "no release exists for this episode".
+            #
+            # Recording it as `no_release` costs a 14-DAY COOLDOWN. Measured
+            # 2026-08-10: 814 of 881 legacy files were sitting in that window. A
+            # provider outage during one run would bench a large slice of the
+            # backlog for a fortnight on evidence that was never gathered.
+            #
+            # So it is NOT persisted. It counts and it is named, and the file is
+            # retried next run — the same conservative direction as the None branch
+            # above, for the same reason *(P-C: absent conflated with empty)*.
+            with lock:
+                stats["empty_search"] = stats.get("empty_search", 0) + 1
+            logger.log_info(
+                f"  [LegacyRegrab] {str(item.get('series_title') or '?')[:28]}: indexer "
+                f"returned ZERO releases — not recorded as 'no release' (could be a "
+                f"disabled/rate-limited indexer); retrying next run (GLD-SON-02).")
+            return
+        best = best_modern_release(_rows, int(item.get("resolution") or 0))
         sn, en = ep.get("seasonNumber"), ep.get("episodeNumber")
         label = (f"{str(item.get('series_title') or '?')[:24]} S{sn:02d}E{en:02d}"
                  if isinstance(sn, int) and isinstance(en, int)
