@@ -47,7 +47,10 @@ class _FakeApi:
                 raise RuntimeError("indexer exploded")
             return self._grab_result
         if endpoint.startswith("episodefile/") and method == "DELETE":
-            return None
+            # BASE CONTRACT: a successful DELETE returns True. It returned None here,
+            # which is what a SWALLOWED failure returns - and the realize path now
+            # checks the result, so None means "delete failed, keep the file".
+            return True
         return fallback
 
 
@@ -61,8 +64,15 @@ class _FakeEpisodeFiles:
         return self._m.get((int(sid), int(sn), int(en)))
 
 
-def _rel(res, gb, guid="g1"):
-    return {"guid": guid, "indexerId": 1, "title": guid, "size": gb * 1024 ** 3,
+def _rel(res, gb, guid="g1", ep="S01E02"):
+    """``guid`` is the short label; ``title`` must look like a real release NAME.
+
+    GLD-ACQ-27's identity gate runs BEFORE the picker and drops releases that do not
+    name THIS series and cover THIS episode - the raw endpoint returns fuzzy
+    strangers. A bare ``"g1"`` is rejected, so these name the show and the episode.
+    """
+    return {"guid": guid, "indexerId": 1, "title": f"Show.{ep}.{res}p.{guid}-GRP",
+            "size": gb * 1024 ** 3,
             "quality": {"quality": {"resolution": res}}}
 
 
@@ -89,7 +99,8 @@ def _cand(sid=1, title="Show", indices=(0,)):
 
 def _stats():
     return {"realized": 0, "realized_reclaim_gb": 0.0, "no_release": 0,
-            "grab_fallback": 0, "deferred": 0, "skipped_multi_ep": 0, "failed": 0}
+            "grab_fallback": 0, "deferred": 0, "skipped_multi_ep": 0, "failed": 0,
+            "identity_rejected": 0, "pinned_reclaim_gb": 0.0}
 
 
 _ROW = {"series_id": 1, "episode_file_id": 55, "resolution": 2160,
@@ -101,8 +112,14 @@ def test_happy_path_searches_then_deletes_then_grabs():
     m, st, fb = _mk(api), _stats(), []
     m._realize_stepdown_files("standard", _df([_ROW]), m._ef, _cand(), 720,
                               {55: 1}, budget=5, fallback_eids=fb, stats=st)
-    kinds = [(meth, ep.split("?")[0].split("/")[0]) for meth, ep in api.calls]
-    assert kinds == [("GET", "release"), ("DELETE", "episodefile"), ("POST", "release")]
+    # The contract is the ORDER of these three, not the absence of everything else:
+    # GLD-ACQ-27 hoists per-series metadata GETs (alternateTitles, the anime absolute
+    # map) and GLD-RST-02/-06 read history for the pre-delete archive and the seed
+    # gate. Pinning an exact call list froze all of that into an unrelated test.
+    kinds  = [(meth, ep.split("?")[0].split("/")[0]) for meth, ep in api.calls]
+    search, delete, grab = ("GET", "release"), ("DELETE", "episodefile"), ("POST", "release")
+    assert search in kinds and delete in kinds and grab in kinds
+    assert kinds.index(search) < kinds.index(delete) < kinds.index(grab)   # verify → delete → grab
     assert st["realized"] == 1 and st["no_release"] == 0
     assert round(st["realized_reclaim_gb"], 2) == 8.0    # reclaim = the DELETED file
     assert fb == []
@@ -154,7 +171,11 @@ def test_multi_episode_file_is_never_single_grabbed():
     m._realize_stepdown_files("standard", _df([_ROW]), m._ef, _cand(), 720,
                               {55: 3}, budget=5, fallback_eids=fb, stats=st)
     assert st["skipped_multi_ep"] == 1 and st["realized"] == 0
-    assert api.calls == []      # not even searched
+    # The per-series metadata GET is amortised across the series' files and runs
+    # before the per-FILE multi-ep guard, so "untouched" means no search, no delete
+    # and no grab — not a literally empty call list.
+    assert [c for c in api.calls
+            if not c[1].startswith("series/") and not c[1].startswith("episode?")] == []
 
 
 if __name__ == "__main__":

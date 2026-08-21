@@ -891,11 +891,27 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             self._archive_stepdown_release(
                 instance, sid, sn, en, df.loc[idx], eid,
                 from_res=res, to_res=int(target_res) if target_res else None)
+            # CHECK THE RETURN VALUE, do not rely on an exception. ``_make_request``
+            # SWALLOWS a failed call - it logs a warning and returns the fallback - so
+            # the ``except`` below never fires for an HTTP failure and this block used
+            # to count a FAILED delete as realized: its bytes were added to
+            # ``realized_reclaim_gb`` (which feeds the exhaustive loop's stop
+            # condition) and a replacement was grabbed for a file that still exists,
+            # which Sonarr then rejects as cutoff-met - the exact failure the delete
+            # exists to prevent. A successful DELETE returns True under the base
+            # contract; failure returns the fallback. Same check radarr's universe
+            # realize already makes, so the two passes cannot disagree.
+            _del_ok = False
             try:
-                self.sonarr_api._make_request(instance, f"episodefile/{fid}", method="DELETE")
+                _del_ok = bool(self.sonarr_api._make_request(
+                    instance, f"episodefile/{fid}", method="DELETE"))
             except Exception as e:
-                stats["failed"] += 1
                 self.logger.log_warning(f"  ⚠️ {label}: episode-file delete failed — file kept: {e}")
+            if not _del_ok:
+                stats["failed"] += 1
+                self.logger.log_warning(
+                    f"  ⚠️ {label}: episode-file delete FAILED — file kept, grab SKIPPED; "
+                    f"re-probes next run.")
                 continue
             # GLD-RST-05 — the file is UNLINKED from here on, which is not the same as
             # freed. An infohash in the grab record means qbit holds the other hardlink,

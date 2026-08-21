@@ -22,8 +22,16 @@ from scripts.managers.services.sonarr.series.space_pressure import SonarrSpacePr
 _GIB = 1024 ** 3
 
 
-def _rel(guid, res, size_gib):
-    return {"guid": guid, "indexerId": 3, "title": guid, "size": int(size_gib * _GIB),
+def _rel(guid, res, size_gib, sn=1, en=1):
+    """``guid`` is the short label; ``title`` must look like a real release NAME.
+
+    GLD-ACQ-27's identity gate runs BEFORE the picker and drops any release that does
+    not name THIS series and cover THIS episode, so a bare ``"e1101"`` never survives
+    to be ranked. These name the series the fixture builds ("S") and its episode.
+    """
+    return {"guid": guid, "indexerId": 3,
+            "title": f"S.S{sn:02d}E{en:02d}.{res}p.{guid}-GRP",
+            "size": int(size_gib * _GIB),
             "quality": {"quality": {"resolution": res}}}
 
 
@@ -52,7 +60,13 @@ class _Api:
         if endpoint.startswith("series/") and method == "GET":
             return {"id": int(endpoint.split("/")[1]), "qualityProfileId": 13}
         if endpoint.startswith("release?episodeId="):
-            return [_rel(f"e{endpoint.split('=')[1]}", 1080, self.pick_gib)]
+            # _Ef._get_episode_id is sid*1000 + sn*100 + en, so the season/episode the
+            # identity gate wants to see in the title are recoverable from the id.
+            _eid = int(endpoint.split("=")[1])
+            _sn, _en = (_eid // 100) % 10, _eid % 100
+            return [_rel(f"e{_eid}", 1080, self.pick_gib, sn=_sn, en=_en)]
+        if method == "DELETE":
+            return True          # base contract: a successful DELETE returns True
         return {}
 
 
@@ -117,10 +131,15 @@ def test_tv_regrab_cap_defers_the_remainder():
 
 def test_tv_below_floor_pick_is_counted():
     m, _ = _mgr(_series(1), U=10_000.0, pick_gib=5.0)
+    # Replaces the class fake wholesale, so it has to honour the same contracts:
+    # a successful DELETE returns True, and a grab returns a body.
     m.sonarr_api._make_request = (
         lambda inst, ep, method="GET", payload=None, fallback=None:
         ({"id": 1, "qualityProfileId": 13} if ep.startswith("series/") and method == "GET"
-         else [_rel("sd", 480, 1.0)] if ep.startswith("release?episodeId=") else {}))
+         else [_rel("sd", 480, 1.0)] if ep.startswith("release?episodeId=")
+         else True if method == "DELETE"
+         else {"id": 1} if ep == "release" and method == "POST"
+         else {}))
     st = m.run_downgrades("standard", 0.0)
     assert st["realized"] == 1 and st["below_floor_picks"] == 1
 
