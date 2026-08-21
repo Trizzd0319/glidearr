@@ -32,6 +32,14 @@ scripts/support/logs/
 *.log.gz
 *.jsonl
 
+# Generated poster renders — rasterised from the *.template.svg sources on every
+# run, so tracking them means binary churn in every diff. The shared base PNGs at
+# posters/playlists/ ARE kept: poster_render degrades rather than blocks, and they
+# are the fallback art when no SVG rasteriser is installed.
+scripts/support/assets/posters/playlists/by_user/
+scripts/support/assets/posters/shelves/
+scripts/support/assets/posters/playlists/_base.json
+
 # Cache files
 scripts/cache/
 scripts/support/cache/
