@@ -55,11 +55,30 @@ class _API:
             return self.releases.get(int(endpoint.split("=")[1]), [])
         if endpoint == "release" and method == "POST" and self.grab_error:
             raise RuntimeError("indexer rejected the grab")
+        if method == "DELETE":
+            # BASE CONTRACT: a successful DELETE returns True. It used to return None,
+            # indistinguishable from a swallowed failure returning the None fallback, so
+            # no call site could check a delete result. universe.py now checks it - and a
+            # double that answers {} reads as a FAILED delete, which skips the grab and
+            # logs "file kept" on a file that is gone.
+            return True
+        if endpoint == "release" and method == "POST":
+            return {"id": 1}          # Radarr returns a body on a successful grab
         return {}
 
 
 def _rel(guid, res, size_gb):
-    return {"guid": guid, "indexerId": 3, "title": guid, "size": int(size_gb * _GB),
+    """A release row. ``guid`` stays the short label the assertions match on; ``title``
+    has to look like a real release NAME.
+
+    GLD-RAD-30 gates the pick on the release title naming the movie (plus year and
+    alternate titles), so a bare ``"hd"`` is refused before size is even considered -
+    which is the gate working: the pick precedes the DELETE, and grabbing a release
+    that does not name the film is how you lose the file and replace it with something
+    else. These titles name the movie the fake serves (``"x"``).
+    """
+    return {"guid": guid, "indexerId": 3, "title": f"x.2020.{res}p.{guid}-GRP",
+            "size": int(size_gb * _GB),
             "quality": {"quality": {"resolution": res}}}
 
 
@@ -113,7 +132,7 @@ def test_live_downgrade_verifies_then_deletes_then_grabs_picked_guid():
     put_i    = calls.index(("movie/1", "PUT", {"id": 1, "qualityProfileId": 2, "title": "x"}))
     search_i = calls.index(("release?movieId=1", "GET", None))
     del_i    = calls.index(("moviefile/11", "DELETE", None))
-    grab_i   = calls.index(("release", "POST", {"guid": "hd", "indexerId": 3}))
+    grab_i   = calls.index(("release", "POST", {"guid": "hd", "indexerId": 3, "movieId": 1}))
     assert put_i < search_i < del_i < grab_i                   # verify BEFORE delete, grab AFTER
     assert all(p != {"name": "MoviesSearch", "movieIds": [1]}  # guid grab worked → no blind search
                for _e, _m, p in calls if isinstance(p, dict))
@@ -121,7 +140,9 @@ def test_live_downgrade_verifies_then_deletes_then_grabs_picked_guid():
     out = fake.saved
     r = out[out.movie_id == 1].iloc[0]
     assert r["quality_profile_id"] == 2 and r["quality_profile_name"] == "HD-1080p"
-    assert r["quality_action"] is None                         # realized → cleared
+    # pandas 3 stores None as NaN in a str column; every consumer reads this with
+    # .notna(), so isna IS the "cleared" contract - `is None` only held on object dtype.
+    assert pd.isna(r["quality_action"])                        # realized → cleared
     assert r["planned_action"] == "downgrade" and r["plan_reason"] == "universe downgrade"
 
 
@@ -148,7 +169,7 @@ def test_grab_error_falls_back_to_blind_search_after_delete():
     assert ("command", "POST", {"name": "MoviesSearch", "movieIds": [1]}) in calls
     assert stats["downgraded"] == 1 and stats["grab_fallback"] == 1
     r = fake.saved[fake.saved.movie_id == 1].iloc[0]
-    assert r["quality_action"] is None                         # blind search owns it now
+    assert pd.isna(r["quality_action"])                        # blind search owns it now
 
 
 def test_keep_universe_rows_get_the_same_realize_treatment():
@@ -159,7 +180,7 @@ def test_keep_universe_rows_get_the_same_realize_treatment():
     stats = m.apply_quality_actions("standard")
     calls = m.radarr_api.calls
     assert ("moviefile/11", "DELETE", None) in calls
-    assert ("release", "POST", {"guid": "hd", "indexerId": 3}) in calls
+    assert ("release", "POST", {"guid": "hd", "indexerId": 3, "movieId": 1}) in calls
     assert stats["downgraded"] == 1
     # …and with no release available, the keep-universe file is untouchable:
     m2, _ = _mgr([_row(2, 22, policy="keep_universe")], {2: []})
@@ -188,4 +209,4 @@ def test_live_upgrade_path_is_unchanged_no_search_no_delete():
     assert all(c[1] != "DELETE" for c in calls)                # nothing deleted
     assert stats["upgraded"] == 1
     r = fake.saved[fake.saved.movie_id == 1].iloc[0]
-    assert r["quality_action"] is None and r["plan_reason"] == "universe upgrade"
+    assert pd.isna(r["quality_action"]) and r["plan_reason"] == "universe upgrade"

@@ -26,8 +26,16 @@ _GIB = 1024 ** 3
 _pick = RadarrSpacePressureManager._pick_stepdown_release
 
 
-def _rel(guid, res, size_gib):
-    return {"guid": guid, "indexerId": 3, "title": guid, "size": int(size_gib * _GIB),
+def _rel(guid, res, size_gib, movie="M1"):
+    """``guid`` is the short label; ``title`` must look like a real release NAME.
+
+    GLD-RAD-30 gates the pick on the release title naming the movie, so a bare
+    ``"r1"`` is refused before size is considered - the pick precedes the DELETE, and
+    grabbing a release that does not name the film is how the wrong movie lands.
+    """
+    return {"guid": guid, "indexerId": 3,
+            "title": f"{movie}.2020.{res}p.{guid}-GRP",
+            "size": int(size_gib * _GIB),
             "quality": {"quality": {"resolution": res}}}
 
 
@@ -94,7 +102,10 @@ class _Api:
         if endpoint.startswith("movie/") and method == "GET":
             return {"id": int(endpoint.split("/")[1]), "qualityProfileId": 13}
         if endpoint.startswith("release?movieId="):
-            return [_rel(f"r{endpoint.split('=')[1]}", 1080, self.pick_gib)]
+            _mid = endpoint.split("=")[1]
+            return [_rel(f"r{_mid}", 1080, self.pick_gib, movie=f"M{_mid}")]
+        if method == "DELETE":
+            return True          # base contract: a successful DELETE returns True
         return {}
 
 
@@ -168,10 +179,15 @@ def test_regrab_cap_defers_the_remainder_and_keeps_their_files():
 
 def test_below_floor_pick_is_counted_and_logged():
     m, _ = _mgr(_lib(1), free=0.0, U=10_000.0, pick_gib=5.0)
+    # Replaces the class fake wholesale, so it has to honour the same contracts:
+    # a successful DELETE returns True, and a grab returns a body.
     m.radarr_api._make_request = (                                  # only an SD release exists
         lambda inst, ep, method="GET", payload=None, fallback=None:
         ({"id": 1, "qualityProfileId": 13} if ep.startswith("movie/") and method == "GET"
-         else [_rel("sd", 480, 2.0)] if ep.startswith("release?movieId=") else {}))
+         else [_rel("sd", 480, 2.0)] if ep.startswith("release?movieId=")
+         else True if method == "DELETE"
+         else {"id": 1} if ep == "release" and method == "POST"
+         else {}))
     st = m.run_downgrades("standard", 0.0)
     assert st["downgraded"] == 1 and st["below_floor_picks"] == 1
     assert any("BELOW 720" in msg for msg in m.logger.infos)
