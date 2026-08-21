@@ -50,11 +50,40 @@ class SonarrSyncMediaManager(BaseManager, ComponentManagerMixin):
                     self.logger.log_warning(f"⚠️ Invalid media management structure from {instance}. Skipping.")
                     continue
 
+                # Diff BEFORE the merge. `current.update(settings)` makes the two
+                # dicts agree, so a comparison taken afterwards always reports zero
+                # changed fields - a preview that says "nothing differs" on every
+                # run regardless of what is about to be written.
+                changed = sorted(k for k in settings if current.get(k) != settings.get(k))
                 current.update(settings)
+
+                # GLD-SON-20 - THE GATE. This PUT rewrites Sonarr's media-management
+                # configuration for every instance. `self.dry_run` was set in
+                # __init__ and read by NOTHING here, so a disarmed run wrote anyway.
+                # A class that LOOKS disarmable and is not is worse than one that
+                # never claimed to be: every caller reasonably assumes a dry run is
+                # safe, which is precisely why this one was never audited.
+                #
+                # The preview logs the KEYS that differ, not the payload: `current`
+                # is Sonarr's entire config and dumping it would bury the handful of
+                # fields that actually change.
+                if getattr(self, "dry_run", False):
+                    self.logger.log_info(
+                        f"[dry_run] would PUT config/mediamanagement on '{instance}' - "
+                        f"{len(changed)} field(s) differ: {', '.join(changed) or 'none'}.")
+                    continue
+                if not changed:
+                    # "Already correct" and "synced" are different facts, and a bare
+                    # success line cannot tell them apart.
+                    self.logger.log_info(
+                        f"✅ Media management already in sync for {instance} - no write.")
+                    continue
+
                 result = self.sonarr_api._make_request(instance, "config/mediamanagement", method="PUT", payload=current)
 
                 if result:
-                    self.logger.log_info(f"✅ Media management settings synced for {instance}.")
+                    self.logger.log_info(f"✅ Media management settings synced for {instance} "
+                                         f"({len(changed)} field(s): {', '.join(changed)}).")
                 else:
                     self.logger.log_warning(f"⚠️ Sync failed or returned no result for {instance}.")
 
@@ -92,6 +121,23 @@ class SonarrSyncMediaManager(BaseManager, ComponentManagerMixin):
     def sync_quality_across_instances(self):
         """
         Synchronize quality profiles and custom formats across all Sonarr instance.
+
+        THIS IS THE "CLOBBERING BLIND-POST" (GLD-SON-20). It takes the FIRST
+        instance in the registry as the reference and POSTs its every quality
+        profile and custom format onto every other instance, unconditionally:
+        no diff, no merge, no check for whether the target already has a
+        differently-tuned profile of the same name.
+
+        Radarr's sync manager names this call specifically and refuses to drive
+        it. Two reasons it earns that:
+
+          * the REFERENCE is `next(iter(instances))` - dictionary order, not a
+            configured choice. Which instance wins is an implementation detail.
+          * a POST per profile per instance is not idempotent in any way this
+            code verifies, so re-running it is not obviously safe.
+
+        It is now dry-run gated so a disarmed pass can at least SHOW the blast
+        radius. The gate does not make the design safe - it makes it visible.
         """
         self.logger.log_info("🔁 Syncing quality profiles across Sonarr instance...")
 
@@ -104,6 +150,16 @@ class SonarrSyncMediaManager(BaseManager, ComponentManagerMixin):
         reference_api = instances[reference_instance]
         reference_profiles = reference_api._make_request(reference_instance, "qualityProfile") or []
         reference_formats = reference_api._make_request(reference_instance, "customFormat") or []
+
+        targets = [i for i in instances if i != reference_instance]
+        if getattr(self, "dry_run", False):
+            self.logger.log_info(
+                f"[dry_run] would POST {len(reference_profiles)} quality profile(s) and "
+                f"{len(reference_formats)} custom format(s) from reference "
+                f"'{reference_instance}' onto {len(targets)} instance(s): "
+                f"{', '.join(targets) or 'none'}. No diff is taken - existing "
+                f"same-named profiles on the target would be overwritten.")
+            return
 
         for instance, api in instances.items():
             if instance == reference_instance:

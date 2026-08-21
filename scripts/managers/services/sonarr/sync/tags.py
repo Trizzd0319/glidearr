@@ -179,15 +179,44 @@ class SonarrSyncTagsManager(BaseManager, ComponentManagerMixin):
         return [sid for sid, tags in self.global_tag_map.items() if tag in tags]
 
     def sync_tags_across_instances(self):
+        """Union `master_tag_set` onto EVERY series on EVERY instance.
+
+        GLD-SON-20 - THE GATE. `self.dry_run` was set in __init__ and read by
+        nothing, so a disarmed run issued one `update_series_tags` call per series
+        per instance. At ~300 owned series across two instances that is ~600
+        writes a dry run was silently making.
+
+        Note this is the same surface as `GLD-ACQ-31`, where the 'keep' LABEL was
+        sent into an ids array and 400-ed every series PUT. Series tag writes have
+        already gone wrong here once; a preview is the minimum this deserves.
+        """
         self.logger.log_info("🌐 Synchronizing tags across all Sonarr instance...")
         all_instances = self.instance_manager.get_all_sonarr_apis()
+        dry = bool(getattr(self, "dry_run", False))
         for instance_name, api in all_instances.items():
             series_list = api.get_all_series()
+            changed = 0
             for series in series_list:
                 current_tags = set(self._normalize_tags(series.get('tags', [])))
                 updated_tags = list(current_tags.union(self.master_tag_set))
+                if set(updated_tags) == current_tags:
+                    # Already carries every master tag. Writing anyway would be a
+                    # no-op PUT per series - the churn that makes a real change
+                    # impossible to spot in the log.
+                    continue
+                changed += 1
+                if dry:
+                    continue
                 api.update_series_tags(series['id'], updated_tags)
                 self.logger.log_info(f"✅ Synced tags for series {series['id']} on {instance_name}")
+            if dry:
+                self.logger.log_info(
+                    f"[dry_run] would update tags on {changed} of {len(series_list)} "
+                    f"series on '{instance_name}' (union with {len(self.master_tag_set)} "
+                    f"master tag(s)).")
+            elif not changed:
+                self.logger.log_info(
+                    f"✅ Tags already in sync on '{instance_name}' - no writes.")
 
     def run_tag_data_pull(self, instance):
         all_instances = list(self.sonarr_api.get_all_sonarr_apis().items())

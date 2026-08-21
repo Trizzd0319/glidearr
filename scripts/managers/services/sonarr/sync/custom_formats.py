@@ -109,8 +109,23 @@ class SonarrSyncCustomFormatsManager(BaseManager, ComponentManagerMixin):
                     all_unique_cfs.append(cf)
 
         for instance, existing_cfs in instance_cf_map.items():
-            for cf in all_unique_cfs:
-                if not self.custom_format_exists(cf, existing_cfs):
-                    result = self.sonarr_api.add_custom_format(instance, cf)
-                    status = "✅" if result else "❌"
-                    self.logger.log_info(f"{status} Synced '{cf['name']}' to {instance}")
+            missing = [cf for cf in all_unique_cfs
+                       if not self.custom_format_exists(cf, existing_cfs)]
+            # GLD-SON-20 - THE GATE. `self.dry_run` was set in __init__ and read by
+            # nothing, so a disarmed run added custom formats to every instance.
+            # This one is ADDITIVE - it only adds definitions the target lacks, and
+            # `custom_format_exists` similarity-matches first - which makes it the
+            # least dangerous of the three ungated writers. But "least dangerous" is
+            # not "previewable", and a dry run that silently writes is the failure
+            # regardless of how gentle the write is.
+            if getattr(self, "dry_run", False):
+                self.logger.log_info(
+                    f"[dry_run] would add {len(missing)} custom format(s) to {instance}"
+                    + (f": {', '.join(cf['name'] for cf in missing[:6])}"
+                       + (f" (+{len(missing) - 6} more)" if len(missing) > 6 else "")
+                       if missing else " - already in sync."))
+                continue
+            for cf in missing:
+                result = self.sonarr_api.add_custom_format(instance, cf)
+                status = "✅" if result else "❌"
+                self.logger.log_info(f"{status} Synced '{cf['name']}' to {instance}")

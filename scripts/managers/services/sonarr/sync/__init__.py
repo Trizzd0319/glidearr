@@ -92,3 +92,62 @@ class SonarrSyncManager(BaseManager, ComponentManagerMixin):
             noncritical_components=noncritical_components.keys(),
             all_critical_loaded=all_critical_loaded
         )
+
+    # ── run ───────────────────────────────────────────────────────────────────
+    #
+    # GLD-SON-01. This class had NO run() and no prepare(), so the five sync
+    # sub-managers were constructed and never driven.
+    #
+    # WHAT RADARR ACTUALLY DOES, which is not what "match Radarr" first suggested.
+    # `RadarrSyncManager.run` drives ONLY the custom-format / profile-score path
+    # and says so explicitly: "The other sync leaves (tags / folders / naming /
+    # media_management) stay caller-driven and are NOT run here - in particular
+    # media_management.sync_quality_across_instances (a clobbering blind-POST) is
+    # never invoked."
+    #
+    # So the asymmetry was narrower than it looked. Radarr does not sweep all five
+    # either; it runs one gated path and leaves the rest to explicit callers.
+    # Sonarr now does the same.
+    #
+    # THE THREE THIS DELIBERATELY DOES NOT CALL, and why:
+    #
+    #   media_management.sync_quality_across_instances
+    #       `sync_media_management_settings` issues an unconditional
+    #       `PUT config/mediamanagement` with NO dry_run check. Radarr names it a
+    #       clobbering blind-POST and refuses it; there is no reason Sonarr should
+    #       be braver about the same call.
+    #   tags.sync_tags_across_instances
+    #       stores `self.dry_run` and never reads it.
+    #   custom_formats.sync_all_custom_formats
+    #       stores `self.dry_run` and never reads it.
+    #
+    # naming and folders DO honour dry_run, but both need arguments
+    # (`sync_naming_settings(naming_config)`, `initialize_root_folders(instance,
+    # dry_run)`) that only a caller with the config and the instance can supply -
+    # which is precisely what "caller-driven" means. Driving them from here would
+    # require inventing a naming_config, and a wrong one rewrites every file name
+    # in the library.
+    #
+    # The remaining honest gap is that Sonarr has no equivalent of Radarr's
+    # `profile_scores` leaf, so there is currently nothing safe to sweep. Filed as
+    # GLD-SON-20 with the dry_run gaps.
+
+    @timeit("run")
+    def run(self) -> dict:
+        """Report what this manager holds. Drives nothing yet - see the block above.
+
+        Deliberately not a no-op METHOD: before this existed the manager was
+        indistinguishable from absent, which is how it stayed inert unnoticed. A
+        run() that reports its own inertness is the detector for its own gap.
+        """
+        leaves = [n for n in ("custom_formats", "folders", "media_management",
+                              "naming", "tags") if getattr(self, n, None) is not None]
+        ungated = [n for n in ("custom_formats", "media_management", "tags")
+                   if getattr(self, n, None) is not None]
+        self.logger.log_info(
+            f"[SonarrSync] {len(leaves)} sync leaf/leaves loaded ({', '.join(leaves)}) - "
+            f"none driven automatically. {len(ungated)} of them ignore dry_run and must "
+            f"stay caller-driven until they honour it (GLD-SON-20); Radarr excludes the "
+            f"same three.")
+        return {"loaded": len(leaves), "driven": 0, "ungated": len(ungated)}
+
