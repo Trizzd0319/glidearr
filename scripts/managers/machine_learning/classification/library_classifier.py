@@ -119,6 +119,15 @@ DEFAULT_KIDS_CERTS = frozenset({"tv-y", "tv-y7", "tv-g", "g", "pg"})
 KID_SAFE_FAMILY_CERTS = frozenset({"tv-y", "tv-y7", "tv-g", "tv-pg", "g", "pg"})
 DEFAULT_REALITY_GENRES = frozenset({"reality", "reality-tv", "reality tv", "game show", "talk show"})
 DEFAULT_DOCUMENTARY_GENRES = frozenset({"documentary", "biography", "nature"})
+# NEWS beats reality and routes to the DOCUMENTARY bucket (operator rule). Kept as its
+# own set rather than folded into DEFAULT_DOCUMENTARY_GENRES because the two do
+# different jobs: the documentary genres COMPETE (checked after reality), while news
+# WINS (checked before it). A news programme tagged "Talk Show" is still news -- the
+# tag describes the format, the genre describes the subject.
+#
+# Deliberately NOT its own library: a household with a handful of news titles is worse
+# served by a four-item folder than by none, so news lands with the documentaries.
+DEFAULT_NEWS_GENRES = frozenset({"news"})
 # Preschool / toddler content beats anime → Kids, but ONLY via the 'Preschool'
 # GENRE — NOT a cert. Certs proved unreliable for this: TV-Y/TV-Y7 is the rating
 # for most mainstream shōnen anime (One Piece, Pokémon, Yu-Gi-Oh, Digimon), so a
@@ -456,6 +465,7 @@ def classify_show_explained(
     kids_networks=None,
     reality_genres=None,
     documentary_genres=None,
+    news_genres=None,
     preschool_genres=None,
     non_kids_genres=None,
 ) -> tuple[str, str]:
@@ -463,7 +473,7 @@ def classify_show_explained(
     Return ``(category, reason)``. ``category`` is one of :data:`CATEGORY_ORDER`;
     the first matching rule wins, so the order of the checks encodes precedence:
 
-        preschool → anime → kids(genre) → kids(network) → reality → documentary → kids(cert) → series
+        preschool → anime → kids(genre) → kids(network) → news → reality → documentary → kids(cert) → series
 
     ``reason`` is a short tag (e.g. ``"japanese-animation"``, ``"network:nickelodeon"``)
     explaining the match. All genre/cert/network arguments are optional; when omitted (or
@@ -509,6 +519,7 @@ def classify_show_explained(
     kids_nets = _as_set(kids_networks, DEFAULT_KIDS_NETWORKS)
     reality_g = _as_set(reality_genres, DEFAULT_REALITY_GENRES)
     doc_g = _as_set(documentary_genres, DEFAULT_DOCUMENTARY_GENRES)
+    news_g = _as_set(news_genres, DEFAULT_NEWS_GENRES)
     pre_g = _as_set(preschool_genres, DEFAULT_PRESCHOOL_GENRES)
     nonkids_g = _as_set(non_kids_genres, DEFAULT_NON_KIDS_GENRES)
 
@@ -540,29 +551,60 @@ def classify_show_explained(
     if kids_ok and not csm_blocks_kids:
         return "kids", kids_reason
 
-    # ── 4. Kids by NETWORK — a genuine kids network is strong made-for-children evidence,
-    #    rescuing kids shows with sparse genre/cert metadata (Star Trek: Prodigy on
-    #    Nickelodeon → Kids). Gated like the cert route: skipped when lifestyle/reality-
-    #    vetoed, when CSM rates it over the cutoff, or when the cert is adult. ──────────────
-    if (netw and not vetoed and not csm_blocks_kids and cert not in _ADULT_TV_CERTS
+    # ── 4. Kids by NETWORK — a genuine kids network OUTRANKS a format tag. ───────────
+    #    A children's channel does not broadcast adult content, so "it aired on
+    #    Nickelodeon" is a stronger statement about the audience than "it is tagged
+    #    Game Show" is about the subject. The lifestyle/reality veto therefore does NOT
+    #    apply here, unlike the softer Family-genre and certificate routes.
+    #
+    #    IT USED TO. `non_kids_genres` contains reality/game show/talk show, so a kids
+    #    network show carrying any of those was vetoed out of this route and fell
+    #    through to Reality -- observed on a real plan: `Take Two with Phineas and Ferb`
+    #    (Disney Channel, tagged Talk Show) and `Crashbox` both routed to the reality
+    #    folder. That is the veto doing the opposite of its job: it exists to stop a
+    #    GENERAL network's cooking/talk output being called kids, and a kids network is
+    #    the one case where the format tag carries no such risk. A kids cooking show on
+    #    Nickelodeon is a kids show.
+    #
+    #    The CSM ceiling and the adult-certificate guard still apply — those speak to
+    #    the audience, which is the question this route answers. Only the format veto is
+    #    lifted.
+    if (netw and not csm_blocks_kids and cert not in _ADULT_TV_CERTS
             and any(tok in netw for tok in kids_nets)):
         return "kids", f"network:{netw}"
 
-    # ── 5. Reality ────────────────────────────────────────────────────────────
+    # ── 5. NEWS beats reality (operator rule) ─────────────────────────────────
+    # A news programme tagged "Talk Show" is still news. TVDB/TMDB label news
+    # magazines and satire (20/20, Axios, Last Week Tonight, You Can't Ask That)
+    # with the same talk-show genre it gives Maury and Steve Wilkos, so widening
+    # ``reality_genres`` to catch genuine talk/game shows swept the news formats in
+    # with them -- reality is checked BEFORE documentary, so anything tagged both
+    # landed in reality.
+    #
+    # News routes to DOCUMENTARY rather than its own bucket: this household does not
+    # own enough news to warrant a library, and a folder with four titles in it is
+    # worse than none. The check sits ahead of reality so the genre WINS rather than
+    # merely competing -- "contains news" is a stronger statement about a programme
+    # than "contains talk show", which is a format, not a subject.
+    news_hit = g & news_g
+    if news_hit:
+        return "documentary", f"news:{sorted(news_hit)[0]}"
+
+    # ── 6. Reality ────────────────────────────────────────────────────────────
     real_hit = g & reality_g
     if real_hit:
         return "reality", f"genre:{sorted(real_hit)[0]}"
 
-    # ── 6. Documentary ────────────────────────────────────────────────────────
+    # ── 7. Documentary ────────────────────────────────────────────────────────
     doc_hit = g & doc_g
     if doc_hit:
         return "documentary", f"genre:{sorted(doc_hit)[0]}"
 
-    # ── 7. Kids by CERTIFICATE (TV-G/G/PG) — last; skipped if vetoed or CSM>cutoff ─
+    # ── 8. Kids by CERTIFICATE (TV-G/G/PG) — last; skipped if vetoed or CSM>cutoff ─
     if not vetoed and not csm_blocks_kids and cert and cert in kids_c:
         return "kids", f"cert:{cert}"
 
-    # ── 8. Default catch-all ──────────────────────────────────────────────────
+    # ── 9. Default catch-all ──────────────────────────────────────────────────
     return "series", "default"
 
 
@@ -594,6 +636,7 @@ def classify_from_config(show: dict, config_get, *, is_anime_hint: bool = False,
         kids_networks=config_get("kidsNetworks", None),
         reality_genres=config_get("realityGenres", None),
         documentary_genres=config_get("documentaryGenres", None),
+        news_genres=config_get("newsGenres", None),
         preschool_genres=config_get("preschoolGenres", None),
         non_kids_genres=config_get("nonKidsGenres", None),
     )

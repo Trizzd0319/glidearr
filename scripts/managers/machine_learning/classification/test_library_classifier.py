@@ -247,11 +247,41 @@ def test_show_kids_network_routes_to_kids():
 
 
 def test_show_kids_network_is_gated():
-    # The network route respects the same gates as the cert route.
-    assert _show(["Reality"], network="Nickelodeon") == "reality"                     # lifestyle veto wins
+    # The network route respects the gates that speak to AUDIENCE — but NOT the
+    # lifestyle/format veto. See test_show_kids_network_beats_format_tags below.
     assert _show(["Drama"], network="Cartoon Network", recommended_age=16) == "series"  # CSM over cutoff
     assert _show(["Drama"], "TV-MA", network="Cartoon Network") == "series"           # adult cert (Adult Swim-style)
     assert _show(["Drama"], network="HBO") == "series"                               # not a kids network
+
+
+def test_show_kids_network_beats_format_tags():
+    """A genuine kids network OUTRANKS a reality/game-show/talk-show tag.
+
+    POLICY REVERSAL, deliberate (operator, 2026-08-21). This previously asserted
+    ``_show(["Reality"], network="Nickelodeon") == "reality"`` — "lifestyle veto
+    wins" — and a real routing plan showed what that costs: `Take Two with Phineas
+    and Ferb` (Disney Channel, tagged Talk Show) and `Crashbox` (HBO Family, tagged
+    Game Show) both routed to the REALITY folder, away from the children they are
+    made for.
+
+    The veto exists to stop a GENERAL network's cooking/talk output being called
+    kids. A kids network is the one case where a format tag carries no such risk: a
+    children's channel does not broadcast adult content, so "it aired on Nickelodeon"
+    is a stronger statement about the audience than "it is tagged Game Show" is about
+    the subject. Nickelodeon's own reality output (Double Dare, Figure It Out) is
+    exactly the content this must keep in Kids.
+
+    The guards that speak to AUDIENCE rather than format are untouched — an adult
+    certificate and a CSM age over the ceiling both still refuse (above).
+    """
+    assert _show(["Reality"], network="Nickelodeon") == "kids"
+    assert _show(["Talk Show"], network="Disney Channel") == "kids"
+    assert _show(["Game Show"], network="HBO Family",
+                 kids_networks=["hbo family", "nickelodeon", "disney channel"]) == "kids"
+    assert _show(["Food", "Reality"], network="Nickelodeon") == "kids"
+    # ...while the SAME tags on a general network still take the veto:
+    assert _show(["Reality"], network="CBS") == "reality"
+    assert _show(["Talk Show"], network="CBS") == "reality"
 
 
 def test_show_csm_over_cutoff_blocks_soft_family():

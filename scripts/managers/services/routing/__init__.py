@@ -56,6 +56,7 @@ class RoutingManager:
         self._kids_networks = [str(n) for n in (self.config.get("kidsNetworks", []) or []) if n]
         self._reality_genres = [str(g) for g in (self.config.get("realityGenres", []) or []) if g]
         self._doc_genres = [str(g) for g in (self.config.get("documentaryGenres", []) or []) if g]
+        self._news_genres = [str(g) for g in (self.config.get("newsGenres", []) or []) if g]
         self._preschool_genres = [str(g) for g in (self.config.get("preschoolGenres", []) or []) if g]
         self._non_kids_genres = [str(g) for g in (self.config.get("nonKidsGenres", []) or []) if g]
         # CSM AGE GATE (GLD-ROU-11). The oldest Common Sense Media recommended age that
@@ -315,7 +316,8 @@ class RoutingManager:
                     anime_genres=self._anime_genres, kids_genres=self._kids_genres,
                     kids_certs=self._kids_certs, kids_networks=self._kids_networks,
                     reality_genres=self._reality_genres,
-                    documentary_genres=self._doc_genres, preschool_genres=self._preschool_genres,
+                    documentary_genres=self._doc_genres, news_genres=self._news_genres,
+                    preschool_genres=self._preschool_genres,
                     non_kids_genres=self._non_kids_genres)
             return classify
 
