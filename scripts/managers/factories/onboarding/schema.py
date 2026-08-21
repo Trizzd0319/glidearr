@@ -602,6 +602,9 @@ def empty_config() -> dict:
                  #     0-100 alias for affinity_weight = tilt/100).
                  #   exclude_users: profile titles / safe_users to skip entirely.
                  #   profile_ages: operator override of a profile's age tier (parental gate).
+                 #   kids_age_max: the CSM age ceiling for the kids LIBRARY (see below) -
+                 #     the companion to profile_ages: one gates what a profile may see,
+                 #     the other gates what lands in the kids folder at all.
                  #   recency_boost: lift a group you're caught up on the instant its freshest
                  #     member landed within window_days (a finished show whose new episode just
                  #     aired) — applied to the per-user Up Next ordering (TV, movie, and combined),
@@ -639,6 +642,30 @@ def empty_config() -> dict:
                      "personal_tilt": 90,
                      "exclude_users": [],
                      "profile_ages": {},
+                     # kids_age_max: THE AGE GATE FOR THE KIDS LIBRARY (GLD-ROU-11).
+                     #   The oldest Common Sense Media recommended age that still counts
+                     #   as "kids". A title CSM rates ABOVE this is routed OUT of the kids
+                     #   folder; a low or absent CSM age never routes one IN on its own
+                     #   ("never trust Common Sense alone" - Star Trek: DS9 is CSM ~10 and
+                     #   is an adult drama, so a borderline age must be corroborated by a
+                     #   real child-oriented signal: a kids GENRE, a kids NETWORK, or a
+                     #   kid-safe CERTIFICATE).
+                     #
+                     #   Asked HERE, beside profile_ages, because both are the same
+                     #   question - what is age-appropriate in this house - and a parent
+                     #   setting up their children's profiles is the person who knows.
+                     #   It sat at a hard-coded 11 that the router never even passed, so
+                     #   the single most consequential number in kids routing was
+                     #   invisible and unchangeable without editing the classifier.
+                     #
+                     #   11 = the oldest genuine Pixar/Disney animation. Lower it for
+                     #   younger children (8 keeps tween content out); raise it for older
+                     #   ones. Accepted range 2-17; anything outside, or unreadable, falls
+                     #   back to 11 with a WARNING rather than being clamped - a typo that
+                     #   widened the gate would put age-inappropriate titles in front of a
+                     #   child, and silently coercing a bad value into a usable one is the
+                     #   wrong failure direction on a parental control.
+                     "kids_age_max": 11,
                      "recency_boost": {"enabled": False, "window_days": 30},
                      "fresh_arrivals": {"enabled": False, "acquired_window_days": 45},
                      "universe_timeline": {"enabled": False, "ttl_days": 7},

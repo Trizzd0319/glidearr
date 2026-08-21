@@ -58,8 +58,65 @@ class RoutingManager:
         self._doc_genres = [str(g) for g in (self.config.get("documentaryGenres", []) or []) if g]
         self._preschool_genres = [str(g) for g in (self.config.get("preschoolGenres", []) or []) if g]
         self._non_kids_genres = [str(g) for g in (self.config.get("nonKidsGenres", []) or []) if g]
+        # CSM AGE GATE (GLD-ROU-11). The oldest Common Sense Media recommended age that
+        # still counts as "kids". A title rated OVER this is demoted OUT of the kids
+        # bucket; a low or absent age never promotes one INTO it ("never trust Common
+        # Sense alone" -- Star Trek: DS9 is CSM ~10 and is an adult drama).
+        #
+        # This was hard-pinned at the classifier's default of 11 because the router
+        # never passed it, so the single most consequential number in kids routing was
+        # invisible to the operator and unchangeable without editing library_classifier.
+        # It is a HOUSEHOLD decision -- it depends on the actual children -- so it
+        # belongs in config beside the other kids_* keys.
+        #
+        # Out-of-range or non-numeric falls back to the classifier default rather than
+        # clamping silently: a typo that widened the gate would put age-inappropriate
+        # content in front of a child, so an unusable value must not be quietly coerced
+        # into a usable one.
+        self._kids_age_max = self._read_kids_age_max()
         self._movie_ages = None       # CSM caches, lazy-loaded once
         self._show_ages = None
+
+    #: Bounds for ``kidsAgeMax``. 2 is the youngest CSM rating in practice; 17 is the
+    #: point above which "kids" is meaningless. A value outside this is treated as a
+    #: mistake, not an intention.
+    _KIDS_AGE_MIN, _KIDS_AGE_MAX_CEIL, _KIDS_AGE_DEFAULT = 2, 17, 11
+
+    def _read_kids_age_max(self) -> int:
+        """The CSM age ceiling, read from where ONBOARDING writes it.
+
+        ``plex.playlists.kids_age_max`` is the canonical location: the onboarding
+        schema asks for it there, beside ``profile_ages``, because both answer the
+        same household question and a parent setting up their children's profiles is
+        the person who knows. A top-level ``kidsAgeMax`` is accepted as an alias so a
+        hand-edited config keeps working.
+
+        Reading only one of the two would make the other a value that is written and
+        never consumed (P-A) — and on a parental control that failure is silent and
+        looks exactly like the setting having no effect.
+        """
+        raw = (((self.config.get("plex") or {}).get("playlists") or {})
+               .get("kids_age_max"))
+        if raw is None:
+            raw = self.config.get("kidsAgeMax")
+        if raw is None:
+            return self._KIDS_AGE_DEFAULT
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            self._log("log_warning",
+                      f"[Routing] kidsAgeMax={raw!r} is not a number — using the default "
+                      f"{self._KIDS_AGE_DEFAULT}. Kids routing is age-gated, so an unreadable "
+                      f"value is NOT silently accepted.")
+            return self._KIDS_AGE_DEFAULT
+        if not (self._KIDS_AGE_MIN <= val <= self._KIDS_AGE_MAX_CEIL):
+            self._log("log_warning",
+                      f"[Routing] kidsAgeMax={val} is outside {self._KIDS_AGE_MIN}-"
+                      f"{self._KIDS_AGE_MAX_CEIL} — using the default {self._KIDS_AGE_DEFAULT}. "
+                      f"A too-high gate would route age-inappropriate titles into the kids "
+                      f"library, so the value is refused rather than clamped.")
+            return self._KIDS_AGE_DEFAULT
+        return val
 
     @staticmethod
     def _im(mgr):
@@ -254,6 +311,7 @@ class RoutingManager:
                     series_type=it.get("seriesType"), original_language=self._olang(it),
                     network=it.get("network"),
                     recommended_age=self._show_age(it.get("tmdbId")),
+                    kids_age_max=self._kids_age_max,
                     anime_genres=self._anime_genres, kids_genres=self._kids_genres,
                     kids_certs=self._kids_certs, kids_networks=self._kids_networks,
                     reality_genres=self._reality_genres,
@@ -266,6 +324,7 @@ class RoutingManager:
                 genres=it.get("genres"), certification=it.get("certification"),
                 original_language=self._olang(it), studio=it.get("studio"),
                 recommended_age=self._movie_age(it.get("tmdbId")), is_uhd=False,
+                kids_age_max=self._kids_age_max,
                 anime_genres=self._anime_genres, kids_genres=self._kids_genres,
                 kids_certs=self._kids_certs, preschool_genres=self._preschool_genres,
                 non_kids_genres=self._non_kids_genres)
