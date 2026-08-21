@@ -27,7 +27,7 @@ class _Cache:
 
 
 def _mgr(cache, config=None):
-    m = CombinedPlaylistBuilderManager.__new__(CombinedPlaylistBuilderManager)
+    m = object.__new__(CombinedPlaylistBuilderManager)
     m.global_cache = cache
     m.logger = _Log()
     m.config = config if config is not None else {}

@@ -21,7 +21,7 @@ class _Cache:
 
 
 def _mgr(series_rows):
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.sonarr_cache = _Cache(_Series(series_rows))
     return m
 
@@ -59,6 +59,6 @@ def test_none_timestamp_sorts_last_and_title_match_is_case_insensitive():
 
 
 def test_no_series_cache_returns_empty():
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.sonarr_cache = _Cache(None)
     assert m._build_jit_watchers("sonarr", {("X", 1, 1): {"per_user": {"a": "t"}}}) == {}

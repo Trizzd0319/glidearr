@@ -70,7 +70,7 @@ class _FakeApi:
 
 def _mk(api, items, grab_at):
     """grab_at: {sid: pid_that_grabs}; a sid absent → never grabs (forces a full climb + revert)."""
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     ep_to_sid = {int(ep): int(sid) for sid, ep in items}

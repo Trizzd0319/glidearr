@@ -120,7 +120,7 @@ class _Users:
 
 
 def _mgr(cache, api, config=None, dry_run=False):
-    m = PlaylistWritebackManager.__new__(PlaylistWritebackManager)
+    m = object.__new__(PlaylistWritebackManager)
     m.global_cache = cache
     m.logger = _Log()
     m.config = config if config is not None else {"plex": {"playlists": {"writeback": {"enabled": True}}}}

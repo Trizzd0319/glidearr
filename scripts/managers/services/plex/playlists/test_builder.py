@@ -48,7 +48,7 @@ class _Cache:
 
 
 def _mgr(cache=None, logger=None, config=None):
-    m = PlexPlaylistBuilderManager.__new__(PlexPlaylistBuilderManager)
+    m = object.__new__(PlexPlaylistBuilderManager)
     m.global_cache = cache
     m.logger = logger or _Log()
     m.config = config if config is not None else {}

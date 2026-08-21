@@ -20,7 +20,7 @@ class _StubLogger:
 
 
 def _mgr(config, dry_run=False):
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = config
     m.dry_run = dry_run

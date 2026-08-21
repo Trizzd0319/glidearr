@@ -75,7 +75,7 @@ class _Log:
 
 
 def _mgr(api, meta, cache):
-    m = PlexEpisodesManager.__new__(PlexEpisodesManager)
+    m = object.__new__(PlexEpisodesManager)
     m.plex_api = api
     m.global_cache = cache
     m.registry = _Reg(meta)

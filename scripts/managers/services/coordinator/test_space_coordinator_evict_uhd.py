@@ -75,7 +75,7 @@ class _Reg:
 
 
 def _coord(sp, restore, config):
-    c = C.__new__(C)
+    c = object.__new__(C)
     c.config, c.logger, c.dry_run, c.registry = config, _Log(), False, _Reg(sp, restore)
     return c
 

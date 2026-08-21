@@ -146,7 +146,7 @@ class _StubLogger:
 
 
 def _sonarr_mgr() -> M:
-    mgr = M.__new__(M)
+    mgr = object.__new__(M)
     mgr.logger = _StubLogger()
     mgr.dry_run = True
     mgr.global_cache = None   # dry_run: restore-set write is skipped
@@ -257,7 +257,7 @@ def test_candidate_failsafes():
     # multi-ep sibling must never leak into the pool because the guard crashed).
     #
     # NB: M (via BaseManager.__new__) is a process-wide singleton keyed on
-    # (cls, singleton_key), so M.__new__(M) hands back the SAME instance every
+    # (cls, singleton_key), so object.__new__(M) hands back the SAME instance every
     # time. Patching _build_protected_file_ids onto it shadows the class method
     # for the whole process — restore it in finally or the boom stub leaks into
     # sibling test files (e.g. test_episode_files_guards.py).

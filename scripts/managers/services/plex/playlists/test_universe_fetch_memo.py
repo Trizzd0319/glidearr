@@ -86,7 +86,7 @@ _MCU_SOURCE = {"universes": {"mcu": {"timeline": True, "movies": [604, 603], "sh
 def _mgr(cls, gc, api, *, source=None):
     """A builder INSTANCE wired to the shared global_cache + Plex API, with the file-backed
     catalogs neutralised so each test fully controls the universe/franchise inputs."""
-    m = cls.__new__(cls)
+    m = object.__new__(cls)
     m.global_cache = gc
     m.logger = _Log()
     m.config = {"plex": {"playlists": {"universe_timeline": {"enabled": True}}}}

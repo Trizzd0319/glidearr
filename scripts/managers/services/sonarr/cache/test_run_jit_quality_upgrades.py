@@ -66,7 +66,7 @@ def test_mixed_target_series_buckets_into_two_tier_groups():
                 return list(_PROFILES)
             return fallback
 
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = {"free_space_limit": 100, "watch_likelihood": _WL,
                 "jit_per_episode_tiers": {"enabled": True}}
@@ -104,7 +104,7 @@ def test_single_target_series_is_one_group():
         def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
             return list(_PROFILES) if endpoint == "qualityprofile" else fallback
 
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = {"free_space_limit": 100, "watch_likelihood": _WL,
                 "jit_per_episode_tiers": {"enabled": True}}
@@ -136,7 +136,7 @@ def test_acquire_missing_episode_grabs_at_jit_tier():
         def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
             return list(_PROFILES) if endpoint == "qualityprofile" else fallback
 
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = {"free_space_limit": 100, "watch_likelihood": _WL,
                 "jit_per_episode_tiers": {"enabled": True}}
@@ -190,7 +190,7 @@ def _jit_manager(df, captured):
     class _Api:
         def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
             return list(_PROFILES) if endpoint == "qualityprofile" else fallback
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = {"free_space_limit": 100, "watch_likelihood": _WL_TIERED,
                 "jit_per_episode_tiers": {"enabled": True}}
@@ -250,7 +250,7 @@ def test_jit_live_stamps_pre_upgrade_quality_into_float64_column():
         def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
             return list(_PROFILES) if endpoint == "qualityprofile" else fallback
 
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = {"free_space_limit": 100, "watch_likelihood": _WL,
                 "jit_per_episode_tiers": {"enabled": True}}
@@ -283,7 +283,7 @@ def test_episodes_in_queue_uses_repeated_episodeids_param():
             captured["endpoint"] = endpoint
             return [{"episodeId": 911794}, {"episodeId": 911795}]
 
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = _Api()
 
@@ -318,7 +318,7 @@ def test_jit_plan_routes_into_run_summary():
         def get(self, *a, **k): return None
 
     rs = RunSummaryManager()
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = {"free_space_limit": 100, "watch_likelihood": _WL,
                 "jit_per_episode_tiers": {"enabled": True}}
@@ -371,7 +371,7 @@ def _pilot_manager(df, captured, *, hold_enabled=True):
     class _Api:
         def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
             return list(_PROFILES) if endpoint == "qualityprofile" else fallback
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = {"free_space_limit": 100, "watch_likelihood": _WL_PILOT,
                 "jit_per_episode_tiers": {"enabled": True},
@@ -451,7 +451,7 @@ def test_jit_grabbed_persisted_in_dry_run():
             return list(_PROFILES) if endpoint == "qualityprofile" else fallback
 
     cache = _Cache()
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = {"free_space_limit": 100, "watch_likelihood": _WL,
                 "jit_per_episode_tiers": {"enabled": True}}
@@ -481,7 +481,7 @@ def test_jit_grabbed_cleared_on_early_return():
     class _Api:
         def _make_request(self, *a, **k): return []
 
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = {"free_space_limit": 100, "watch_likelihood": _WL,
                 "jit_per_episode_tiers": {"enabled": True}}

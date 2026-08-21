@@ -51,10 +51,10 @@ class _StubCache:
 
 
 def _mgr(config=None, cache=None) -> M:
-    # NOTE: BaseManager.__new__ is a SINGLETON registry, so M.__new__(M) hands back
+    # NOTE: BaseManager.__new__ is a SINGLETON registry, so object.__new__(M) hands back
     # the SAME object every time. Anything monkey-patched onto it therefore leaks
     # into every later test — patches below are always undone in a finally.
-    mgr = M.__new__(M)
+    mgr = object.__new__(M)
     mgr.logger = _StubLogger()
     mgr.dry_run = True
     mgr.global_cache = cache if cache is not None else _StubCache()

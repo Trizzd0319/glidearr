@@ -48,7 +48,7 @@ class _Api:
 
 
 def _cache(tmp_path):
-    gc = GlobalCacheManager.__new__(GlobalCacheManager)
+    gc = object.__new__(GlobalCacheManager)
     gc.logger = _Logger()
     gc.config = {}
     GlobalCacheManager.__init__(gc, logger=_Logger(), config={})
@@ -62,7 +62,7 @@ def _cache(tmp_path):
 
 
 def _mgr(cache, api):
-    m = TraktRecommendationsManager.__new__(TraktRecommendationsManager)
+    m = object.__new__(TraktRecommendationsManager)
     m.global_cache = cache
     m.logger = _Logger()
     m.config = {"trakt": {"username": "u"}}

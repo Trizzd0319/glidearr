@@ -20,7 +20,7 @@ def _write_gz(path, data):
 
 
 def test_movie_cache_zero_byte_is_miss(tmp_path):
-    m = TraktMovieCacheManager.__new__(TraktMovieCacheManager)
+    m = object.__new__(TraktMovieCacheManager)
     m.logger, m.ttl, m.base_dir = _Log(), 999_999, tmp_path
     m._dirs = {k: tmp_path for k in ("people", "ratings", "summary", "related")}
 
@@ -35,7 +35,7 @@ def test_movie_cache_zero_byte_is_miss(tmp_path):
 
 
 def test_show_cache_zero_byte_is_miss(tmp_path):
-    s = TraktShowCacheManager.__new__(TraktShowCacheManager)
+    s = object.__new__(TraktShowCacheManager)
     s.logger, s.ttl = _Log(), 999_999
     s._dirs = {k: tmp_path for k in ("people", "ratings", "related", "summary")}
 

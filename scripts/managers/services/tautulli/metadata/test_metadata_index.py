@@ -54,7 +54,7 @@ class _Log:
 
 
 def _mgr(cache, api):
-    m = TautulliMetadataManager.__new__(TautulliMetadataManager)
+    m = object.__new__(TautulliMetadataManager)
     m.global_cache = cache
     m.tautulli_api = api
     m.logger = _Log()

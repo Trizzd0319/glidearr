@@ -85,7 +85,7 @@ class _SonarrCache:
 
 
 def _mgr(tmp_path):
-    m = M.__new__(M)
+    m = object.__new__(M)
     m.logger = type("L", (), {"log_info": lambda *a, **k: None,
                               "log_warning": lambda *a, **k: None})()
     ep = _FakeEpisodeFiles()

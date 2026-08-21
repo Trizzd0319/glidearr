@@ -70,7 +70,7 @@ class _FakeApi:
 
 
 def _mk(api, gc=None):
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.global_cache = gc

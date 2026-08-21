@@ -44,7 +44,7 @@ class _StubLogger:
 
 def _mgr() -> M:
     """Build a manager instance without running __init__ (no deps needed)."""
-    mgr = M.__new__(M)
+    mgr = object.__new__(M)
     mgr.logger = _StubLogger()
     mgr.dry_run = True
     # Arm the deletion hard gate (deletions_enabled = explicit consent AND floor):

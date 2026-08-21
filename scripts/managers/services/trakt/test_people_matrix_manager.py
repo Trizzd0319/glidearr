@@ -31,7 +31,7 @@ class _GC:
 
 
 def _mgr(tmp_path, cache_base=None):
-    m = TraktPeopleMatrixManager.__new__(TraktPeopleMatrixManager)
+    m = object.__new__(TraktPeopleMatrixManager)
     m.logger, m.global_cache, m.dry_run, m.ttl = _Log(), _GC(cache_base), False, 999_999
     m.config = None
     m.matrix_path = tmp_path / "people_matrix.json.gz"

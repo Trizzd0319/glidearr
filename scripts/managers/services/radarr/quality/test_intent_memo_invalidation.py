@@ -71,7 +71,7 @@ def _union(members=("trizzd",)):
 
 
 def _mgr(cache):
-    m = RadarrSpacePressureManager.__new__(RadarrSpacePressureManager)
+    m = object.__new__(RadarrSpacePressureManager)
     m.global_cache = cache
     m.logger = _Logger()
     m.config = {"scoring": {"show_score_memo_audit_pct": 0.0}}

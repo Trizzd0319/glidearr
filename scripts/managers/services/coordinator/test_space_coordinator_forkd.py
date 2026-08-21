@@ -107,7 +107,7 @@ class _Reg:
 
 
 def _coord(dfs, *, free=5400.0, dry_run=False, flag=True, acq_action="added", cache=None):
-    c = C.__new__(C)
+    c = object.__new__(C)
     c.config = {
         "space_coordinator_enabled": True, "deletions_consent": True, "free_space_limit": 5500,
         "radarr_instances": {"standard": {}, "uhd": {}, "default_instance": "standard"},

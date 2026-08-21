@@ -43,7 +43,7 @@ def _gc(tmp_path) -> GlobalCacheManager:
 
 
 def _mgr(tmp_path, profiles, cfs):
-    m = RadarrQualityCacheManager.__new__(RadarrQualityCacheManager)
+    m = object.__new__(RadarrQualityCacheManager)
     m.radarr_api = _Api(profiles, cfs)
     m.global_cache = _gc(tmp_path)
     m.logger = _Logger()

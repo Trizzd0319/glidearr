@@ -31,7 +31,7 @@ class _Logger:
 
 
 def _mgr():
-    m = RadarrSpacePressureManager.__new__(RadarrSpacePressureManager)
+    m = object.__new__(RadarrSpacePressureManager)
     m.logger = _Logger()
     m.config = {"space_pressure_score_ceiling": 17, "space_exhaustive_downgrade": False}
     m.global_cache = None

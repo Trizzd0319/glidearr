@@ -55,6 +55,9 @@ class _FakeApi:
         self.puts = []
         self.writes = []          # every non-GET call — the dry-run "zero Sonarr writes" ledger
 
+    def disk_free_gb(self, instance):
+        return float("inf")  # matches the real method's "no constraint" value
+
     def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
         if method != "GET":
             self.writes.append((method, endpoint))
@@ -83,7 +86,7 @@ def _stub_df(last_pid=None, score="__omit__"):
 def _run(config, *, free_gb, series_qp=99, last_pid=None, score="__omit__"):
     df = _stub_df(last_pid=last_pid, score=score)
     api = _FakeApi(series_qp=series_qp)
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.sonarr_cache = None
@@ -235,7 +238,7 @@ def test_multiple_pilots_all_search_no_cumulative_throttle():
             return fallback
 
     api = _MultiApi()
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.sonarr_cache = None
@@ -294,7 +297,7 @@ def test_live_reads_snapshot_and_fetches_fresh_only_for_changers():
             return fallback   # "command" POST etc.
 
     api = _CountingApi()
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.sonarr_cache = None          # → snapshot falls back to the ONE bulk /series GET
@@ -335,7 +338,7 @@ def test_bulk_live_loop_resolves_ids_cache_only():
             return fallback
 
     captured_allow_live = []
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = _Api()
     m.sonarr_cache = None
@@ -379,7 +382,7 @@ def test_interactive_default_spawns_interactive_worker():
     flips itself (the worker owns the grab). The worker is stubbed to capture its arguments."""
     df = _stub_df()
     api = _FakeApi(series_qp=99)
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.sonarr_cache = None
@@ -421,7 +424,7 @@ def test_removes_stub_with_committed_grab():
 
     api = _DlApi(series_qp=99)
     saved: dict = {}
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.sonarr_cache = None
@@ -460,7 +463,7 @@ def test_dry_run_does_not_remove_committed_grab():
 
     saved: list = []
     api = _DlApi(series_qp=99)
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.sonarr_cache = None
@@ -492,7 +495,7 @@ def test_climb_default_collects_items_and_spawns_worker():
     itself (the worker owns those). The worker is stubbed to capture its arguments."""
     df = _stub_df()
     api = _FakeApi(series_qp=99)
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.sonarr_cache = None
@@ -541,7 +544,7 @@ def test_climb_unresolved_id_defers_instead_of_series_search():
     api._make_request = _track
 
     spawned: list = []
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.sonarr_cache = None
@@ -571,7 +574,7 @@ def test_climb_dry_run_does_not_spawn_or_write():
     api = _FakeApi(series_qp=99)
     saved: list = []
     spawned: list = []
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.sonarr_cache = None
@@ -635,7 +638,7 @@ def test_dry_run_never_influences_next_live_run():
         api = _FakeApi(series_qp=99)
         saved: list = []
         spawned: list = []
-        m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+        m = object.__new__(SonarrCacheEpisodeFilesManager)
         m.logger = _StubLogger()
         m.sonarr_api = api
         m.sonarr_cache = None

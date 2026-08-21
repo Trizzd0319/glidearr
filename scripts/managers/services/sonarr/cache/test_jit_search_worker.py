@@ -52,7 +52,7 @@ class _FakeApi:
 
 
 def _mgr(api, *, grab=True):
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.global_cache = None
@@ -254,7 +254,7 @@ def test_multiple_series_run_concurrently_and_each_reverts_independently():
         (3, [(2160, [(400, 1, 1)], [13])]),
     ]
     api = _MultiFakeApi(originals)
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = api
     m.global_cache = cache = _StubCache()

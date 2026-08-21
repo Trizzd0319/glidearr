@@ -18,7 +18,7 @@ class _RadarrSP:
 
 
 def _coord(profiles, *, floor="HD-720p"):
-    c = C.__new__(C)
+    c = object.__new__(C)
     c.config = {"routing": {"movies": {"rehome_floor_profile": floor}}}
     return c, _RadarrSP(profiles)
 

@@ -38,7 +38,7 @@ def _movie(tmdb, size, resolution, *, has_file=True):
 
 
 def _mgr(libraries, *, instances=None, cats=CATS):
-    m = RadarrCacheMovieFilesManager.__new__(RadarrCacheMovieFilesManager)
+    m = object.__new__(RadarrCacheMovieFilesManager)
     m.logger = _Log()
     m.config = {"radarr_instances_categorized": cats,
                 "radarr_instances": {i: {} for i in (instances or libraries)}}

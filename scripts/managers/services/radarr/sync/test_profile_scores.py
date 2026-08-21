@@ -91,10 +91,10 @@ def _build(cfg, cfs=None, profiles=None, dry_run=False):
     if cfs is None or profiles is None:
         cfs, profiles = _data()
     api, cache = _Api(cfs, profiles), _Cache()
-    cf = RadarrSyncCustomFormatsManager.__new__(RadarrSyncCustomFormatsManager)
+    cf = object.__new__(RadarrSyncCustomFormatsManager)
     cf.radarr_api, cf.global_cache, cf.instance_manager = api, cache, None
     cf.dry_run, cf.logger = dry_run, _Logger()
-    ps = RadarrSyncProfileScoresManager.__new__(RadarrSyncProfileScoresManager)
+    ps = object.__new__(RadarrSyncProfileScoresManager)
     ps.config, ps.radarr_api, ps.global_cache, ps.instance_manager = cfg, api, cache, None
     ps.dry_run, ps.logger = dry_run, _Logger()
     ps._parent = type("_P", (), {"custom_formats": cf})()
@@ -519,12 +519,12 @@ def test_sync_manager_run_gating_and_order():
 
     _two = {"radarr_instances": {"default_instance": {"name": "standard"}, "standard": {}, "ultra": {}}}
 
-    off = RadarrSyncManager.__new__(RadarrSyncManager)
+    off = object.__new__(RadarrSyncManager)
     off.logger, off.profile_scores, off.config = _Logger(), _PS(False), _two
     off.run()
     assert off.profile_scores.calls == []                 # disabled -> complete no-op
 
-    on = RadarrSyncManager.__new__(RadarrSyncManager)
+    on = object.__new__(RadarrSyncManager)
     on.logger, on.profile_scores, on.config = _Logger(), _PS(True), _two
     on.run()
     assert on.profile_scores.calls == ["cap", "def", "uhd", "score"]   # cap -> defs -> uhd -> scores

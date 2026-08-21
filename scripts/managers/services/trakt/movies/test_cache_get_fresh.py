@@ -24,7 +24,7 @@ class _Logger:
 
 def _cache(tmp_path, ttl=1000):
     # Bypass the heavy BaseManager __init__; get_fresh only needs base_dir/ttl/logger.
-    c = TraktMovieCacheManager.__new__(TraktMovieCacheManager)
+    c = object.__new__(TraktMovieCacheManager)
     c.base_dir = Path(tmp_path)
     c.ttl = ttl
     c.logger = _Logger()

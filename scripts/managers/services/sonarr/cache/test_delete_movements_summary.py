@@ -35,7 +35,7 @@ def test_sonarr_deletes_route_into_movements_table():
              size_bytes=1_000_000_000, series_title="My Show"),
     ])
     rs = RunSummaryManager()
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _L()
     m.config = {"free_space_limit": 100, "deletions_consent": True}   # deletions enabled (consent + floor)
     m.dry_run = True                          # dry-run -> no API, "would delete"

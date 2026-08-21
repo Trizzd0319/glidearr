@@ -67,7 +67,7 @@ class _FakePlexAPI:
 
 
 def _mgr(cache, plex_api, meta=None):
-    m = PlexCollectionsManager.__new__(PlexCollectionsManager)
+    m = object.__new__(PlexCollectionsManager)
     m.global_cache = cache
     m.logger = _Log()
     m.config = {}

@@ -27,7 +27,7 @@ class _StubLogger:
 
 
 def _mgr(config, dry_run=False):
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.config = config
     m.dry_run = dry_run
@@ -149,7 +149,7 @@ def _run_pilot(config, monkeypatch):
              "pilot_search_attempts": None, "pilot_last_searched_at": None, "pilot_last_profile_id": None}
             for i in range(1, 13)]                       # 12 stubs > threshold
     df = pd.DataFrame(rows)
-    m = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    m = object.__new__(SonarrCacheEpisodeFilesManager)
     m.logger = _StubLogger()
     m.sonarr_api = _Api()
     m.sonarr_cache = None

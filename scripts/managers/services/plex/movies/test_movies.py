@@ -47,7 +47,7 @@ class _Api:
 
 
 def _mgr(cache, meta, api=None):
-    m = PlexMoviesManager.__new__(PlexMoviesManager)
+    m = object.__new__(PlexMoviesManager)
     m.logger = _Log()
     m.config = {}
     m.global_cache = cache

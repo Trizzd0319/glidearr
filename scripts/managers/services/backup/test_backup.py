@@ -182,7 +182,7 @@ def _stamp(hours_ago):
 
 def _one(*, listings, wait_ok=True, config=None, dry_run=False):
     """A manager wired to a scripted sequence of ``_list_backups`` results."""
-    m = ServiceBackupManager.__new__(ServiceBackupManager)
+    m = object.__new__(ServiceBackupManager)
     m.logger, m.config, m.global_cache, m.dry_run = _Log(), (config or {}), _GC(), dry_run
     m.POLL_INTERVAL_S = 0.01                       # keep the test instant
     m.LISTING_SETTLE_S = getattr(m, "LISTING_SETTLE_S", 90.0)

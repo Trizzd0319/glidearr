@@ -70,7 +70,7 @@ def _play(pct, *, days_ago=1.0, user="Trizzd", watched_status=None, media="episo
 # ── 1. the SONARR producer ────────────────────────────────────────────────────
 def _sonarr_history(entries, config=None):
     """Drive the real ``_collect_tautulli_episode_history`` over a stubbed API."""
-    mgr = SM.__new__(SM)
+    mgr = object.__new__(SM)
     mgr.logger = _StubLogger()
     mgr.dry_run = True
     mgr.global_cache = None
@@ -145,7 +145,7 @@ def test_sonarr_producer_household_view_is_watched_only():
 
 # ── 2. the RADARR producer — the SAME definition ──────────────────────────────
 def _radarr_watch_map(entries, config=None):
-    mgr = RM.__new__(RM)
+    mgr = object.__new__(RM)
     mgr.logger = _StubLogger()
     mgr.dry_run = True
     mgr.global_cache = None
@@ -203,7 +203,7 @@ def _ep_row(**over):
 
 
 def _mgr_for_grace():
-    mgr = SM.__new__(SM)
+    mgr = object.__new__(SM)
     mgr.logger = _StubLogger()
     mgr.dry_run = True
     mgr.global_cache = None

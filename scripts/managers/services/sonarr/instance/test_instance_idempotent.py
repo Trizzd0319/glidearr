@@ -12,7 +12,7 @@ class _Log:
 
 
 def _bare():
-    m = SonarrInstanceManager.__new__(SonarrInstanceManager)
+    m = object.__new__(SonarrInstanceManager)
     m.logger = _Log()
     m.all_components_loaded = None
     return m

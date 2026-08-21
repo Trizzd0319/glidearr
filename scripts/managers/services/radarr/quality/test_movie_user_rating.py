@@ -72,7 +72,7 @@ def _rating_row(tmdb, rating):
 
 
 def _mgr(cache, config=None):
-    m = RadarrSpacePressureManager.__new__(RadarrSpacePressureManager)
+    m = object.__new__(RadarrSpacePressureManager)
     m.global_cache = cache
     m.logger = _Logger()
     m.config = config if config is not None else {"scoring": {"show_score_memo_audit_pct": 0.0}}
@@ -137,7 +137,7 @@ def test_an_absent_ratings_cache_yields_an_empty_map_not_an_error():
 def test_the_movie_map_and_the_show_map_agree_field_for_field():
     """Same shape, same precedence — the twin implementations must not drift."""
     from scripts.managers.services.sonarr.cache.episode_files import SonarrCacheEpisodeFilesManager
-    show = SonarrCacheEpisodeFilesManager.__new__(SonarrCacheEpisodeFilesManager)
+    show = object.__new__(SonarrCacheEpisodeFilesManager)
     show.global_cache = _Cache({"trakt/default/ratings/shows": [
         {"rating": 7, "show": {"ids": {"tvdb": 247808}}}]})
     show.config = {}

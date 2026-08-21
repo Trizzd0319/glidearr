@@ -80,7 +80,7 @@ class _Reg:
 
 
 def _coord(sp, restore):
-    c = C.__new__(C)
+    c = object.__new__(C)
     c.config = {
         "space_coordinator_enabled": True, "deletions_consent": True, "free_space_limit": 100.0,
         "radarr_instances": {"standard": {}, "ultra": {}, "test": {}, "default_instance": "standard"},

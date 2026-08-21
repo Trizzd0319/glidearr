@@ -83,7 +83,7 @@ def test_empty_or_absent_instances_return_empty_dict():
 def test_config_manager_get_default_sonarr_instance_delegates():
     # Build a bare ConfigManager and attach a resolver directly, avoiding the
     # heavy load()/SecretBootstrap path — we only assert the delegation contract.
-    cm = ConfigManager.__new__(ConfigManager)
+    cm = object.__new__(ConfigManager)
     cm.resolver = _resolver(
         {"sonarr_instances": {"default_instance": {"name": "sonarr"}, "sonarr": {"url": "http://sonarr"}}}
     )
