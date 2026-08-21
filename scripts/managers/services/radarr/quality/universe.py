@@ -318,6 +318,7 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
             "movies_in_parquet":           0,
             "movies_only_in_radarr":       [],  # tagged in Radarr but not in Parquet
             "movies_only_in_parquet":      [],  # in Parquet but tag missing in Radarr
+            "parquet_policies":            {},  # {policy_label: count} — named universes included
             "tag_label_matches":           {},
         }
 
@@ -390,8 +391,25 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
         if mfm:
             df = mfm.load(instance)
             if not df.empty and "keep_policy" in df.columns:
-                parquet_uni = df[df["keep_policy"] == "universe"]
+                # Count EVERY universe-policy row, not just the bare-"universe" label.
+                # The Radarr side of this audit matches three tag shapes (`keep-universe`,
+                # `keep-universe-*`, `universe`), and a named tag like `keep-universe-mcu`
+                # is stamped into the Parquet under its OWN label ("mcu", "xmen", ...).
+                # Comparing that broad set against `keep_policy == "universe"` exactly meant
+                # a library whose universes are all NAMED reported "6 tagged vs 0 in Parquet"
+                # forever, and advised a refresh that could never change the number
+                # (2026-08-20). Broad vs broad is the only comparison that can be true.
+                #
+                # fillna FIRST: a None/NaN policy survives `.astype(str)` as a FLOAT nan
+                # (the `.str` accessor propagates it rather than operating on it), and
+                # `nan != "nan"` is True -- so a naive string filter lets every unpolicied
+                # row through. Caught in test at 46-of-51 instead of 6.
+                _kp = (df["keep_policy"].fillna("").astype(str)
+                       .str.strip().str.lower())
+                _uni = ~_kp.isin(("", "nan", "none"))
+                parquet_uni = df[_uni]
                 report["movies_in_parquet"] = len(parquet_uni)
+                report["parquet_policies"] = _kp[_uni].value_counts().to_dict()
                 if "quality_action" in df.columns and "movie_id" in df.columns:
                     for _, row in df[df["quality_action"].notna()].iterrows():
                         _mid = row.get("movie_id")
@@ -508,8 +526,12 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
             if _mode == MODE_TAGS:
                 self.logger.log_warning(
                     f"[Universe] Mismatch: {report['movies_tagged_in_radarr']} tagged in Radarr "
-                    f"vs {report['movies_in_parquet']} in Parquet. "
-                    f"Run movie_files.refresh() to sync the Parquet."
+                    f"vs {report['movies_in_parquet']} in Parquet"
+                    + (f" (Parquet policies: "
+                       + ", ".join(f"{k}={v}" for k, v in
+                                   sorted(report.get("parquet_policies", {}).items()))
+                       + ")" if report.get("parquet_policies") else "")
+                    + ". Run movie_files.refresh() to sync the Parquet."
                 )
             else:
                 self.logger.log_info(
@@ -1003,11 +1025,21 @@ class RadarrQualityUniverseManager(BaseManager, ComponentManagerMixin):
                     _target_res = _pmr(target_profile)
                 except Exception:
                     _target_res = None
+                # GLD-RAD-33 — refuse releases on protocols no enabled client serves.
+                # This is the pass that deleted 70 files into failed grabs on 2026-08-15:
+                # the pick preceded the delete, but nothing told the pick that 'standard'
+                # had no torrent client. One probe per pass, memoised per instance.
+                if not hasattr(self, "_grabbable_protocols_memo"):
+                    self._grabbable_protocols_memo = {}
+                if instance not in self._grabbable_protocols_memo:
+                    self._grabbable_protocols_memo[instance] = (
+                        RadarrSpacePressureManager._enabled_protocols(self.radarr_api, instance))
                 pick = _pick_stepdown_release(
                     releases,
                     current_res=df.at[idx, "resolution"] if "resolution" in df.columns else None,
                     allow_below_floor=exhaustive_downgrade(self.config),
                     target_res=_target_res,
+                    allowed_protocols=self._grabbable_protocols_memo[instance],
                     # GLD-RAD-30: identity + language gates. The payload fetched above
                     # carries the authoritative title/year/alternateTitles — anime saga
                     # members especially need the alternates (romaji release names).
