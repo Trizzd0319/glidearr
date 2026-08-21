@@ -29,8 +29,10 @@ class _API:
 
 
 class _GC:
-    def __init__(self, gate=None): self.d = {GATE_KEY: gate} if gate is not None else {}
+    def __init__(self, gate=None):
+        self.d = {GATE_KEY: gate} if gate is not None else {}
     def get(self, k, default=None): return self.d.get(k, default)
+    def set(self, k, v): self.d[k] = v; return True
 
 
 # series_id -> episodes (id/coord/monitored as Sonarr's /episode returns them)
@@ -45,11 +47,11 @@ _ROWS = [
      "season_number": 1, "episode_number": 1},
     {"action": "regrab", "series_id": 2, "episode_file_id": 20, "series_title": "Bloated",
      "season_number": 1, "episode_number": 2, "size_gb": 30.0, "quality_name": "Bluray-1080p",
-     "reclaim_gb": 25.0},
+     "size_bytes": 32_212_254_720, "reclaim_gb": 25.0},
     {"action": "regrab", "series_id": 3, "episode_file_id": 30, "series_title": "Unmonitored",
-     "season_number": 2, "episode_number": 5},
+     "season_number": 2, "episode_number": 5, "size_bytes": 9_000_000_000},
     {"action": "regrab", "series_id": 4, "episode_file_id": 40, "series_title": "Guarded",
-     "season_number": 1, "episode_number": 1},
+     "season_number": 1, "episode_number": 1, "size_bytes": 8_000_000_000},
 ]
 
 
@@ -75,17 +77,58 @@ def _writes(api):
     return [c for c in api.calls if c[1] in ("POST", "DELETE")]
 
 
-def test_real_armed_run_rescans_and_regrabs_monitored_unguarded_only():
-    m = _mgr(remediate=True, dry_run=False)                       # gate unset → armed
+def test_real_armed_run_rescans_and_searches_unguarded_only():
+    """GLD-SON-18: the bloat path is SEARCH-ONLY - the file is kept until a replacement
+    imports, so there is no window with no file and no orphan hazard. An UNMONITORED episode
+    is still searched (the search is inert, not destructive) but counted separately."""
+    m = _mgr(remediate=True, dry_run=False)                       # gate unset -> armed
     stats = m.remediate_size_anomalies("standard", _ROWS)
-    assert stats == {"rescanned": 1, "regrabbed": 1, "skipped_unmonitored": 1,
-                     "skipped_guard": 1, "failed": 0}
+    assert stats["rescanned"] == 1
+    assert stats["regrabbed"] == 2                                # monitored + unmonitored
+    assert stats["searched_unmonitored"] == 1
+    assert stats["skipped_guard"] == 1
+    assert stats["failed"] == 0
     calls = m.sonarr_api.calls
     assert ("command", "POST", {"name": "RefreshSeries", "seriesId": 1}) in calls     # rescan
-    assert ("episodefile/20", "DELETE", None) in calls                                # delete bloated
-    assert ("command", "POST", {"name": "EpisodeSearch", "episodeIds": [200]}) in calls  # re-search
-    assert all("episodefile/30" not in c[0] for c in calls)      # unmonitored never deleted
-    assert all("episodefile/40" not in c[0] for c in calls)      # guarded never deleted
+    assert ("command", "POST", {"name": "EpisodeSearch", "episodeIds": [200]}) in calls
+    assert all(c[1] != "DELETE" for c in calls)                   # nothing is ever deleted
+    assert all("episodefile/40" not in c[0] for c in calls)       # guarded never touched
+
+
+def test_armed_run_records_the_attempt_ledger():
+    m = _mgr(remediate=True, dry_run=False)
+    m.remediate_size_anomalies("standard", _ROWS)
+    from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
+    ledger = m.global_cache.get(size_anomaly.attempts_key("standard"))
+    assert ledger["20"]["attempts"] == 1
+    assert ledger["20"]["size_bytes"] == 32_212_254_720
+    assert "40" not in ledger                                     # guarded was never searched
+
+
+def test_spent_budget_stops_the_search():
+    """The measured failure was the same episodes searched every run forever because a smaller
+    replacement is never an 'upgrade' Sonarr will grab. After max_regrab_attempts with the size
+    unchanged the file is abandoned rather than re-searched."""
+    from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
+    m = _mgr(remediate=True, dry_run=False)
+    m.global_cache.d[size_anomaly.attempts_key("standard")] = {
+        "20": {"attempts": 3, "last_at": 0, "size_bytes": 32_212_254_720},
+    }
+    stats = m.remediate_size_anomalies("standard", _ROWS)
+    assert stats.get("abandoned") == 1
+    assert all(c[2] != {"name": "EpisodeSearch", "episodeIds": [200]}
+               for c in m.sonarr_api.calls)
+
+
+def test_a_changed_size_reopens_the_budget():
+    from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
+    m = _mgr(remediate=True, dry_run=False)
+    m.global_cache.d[size_anomaly.attempts_key("standard")] = {
+        "20": {"attempts": 3, "last_at": 0, "size_bytes": 999},   # different size => replaced
+    }
+    stats = m.remediate_size_anomalies("standard", _ROWS)
+    assert stats.get("abandoned") is None
+    assert ("command", "POST", {"name": "EpisodeSearch", "episodeIds": [200]}) in m.sonarr_api.calls
 
 
 def test_dry_run_makes_no_writes():
@@ -93,6 +136,8 @@ def test_dry_run_makes_no_writes():
     stats = m.remediate_size_anomalies("standard", _ROWS)
     assert stats["rescanned"] == 0 and stats["regrabbed"] == 0
     assert _writes(m.sonarr_api) == []                           # only the episode GET, no POST/DELETE
+    from scripts.managers.machine_learning.sizing import anomaly as size_anomaly
+    assert m.global_cache.get(size_anomaly.attempts_key("standard")) is None   # ledger untouched
 
 
 def test_disarmed_backup_gate_degrades_to_dry_run():
@@ -109,7 +154,7 @@ def test_guard_build_failure_skips_all_regrabs():
     m._build_protected_file_ids = _boom
     stats = m.remediate_size_anomalies("standard", _ROWS)
     assert stats["regrabbed"] == 0 and stats["skipped_guard"] == 3   # all 3 regrab rows skipped
-    assert all("episodefile/" not in c[0] for c in m.sonarr_api.calls)  # nothing deleted
+    assert all(c[1] != "DELETE" for c in m.sonarr_api.calls)         # nothing destructive
 
 
 def test_remediate_flag_off_is_noop():
