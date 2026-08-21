@@ -92,6 +92,7 @@ from scripts.support.utilities.watch_likelihood import (
     affinity_boost as _affinity_boost,
 )
 from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
+from scripts.support.utilities import stepdown_cooldown
 from scripts.support.utilities.space_targets import (
     coordinator_owns_deletion, deletions_disabled_reason, deletions_enabled,
     downgrade_regrab_cap, exhaustive_downgrade, space_targets,
@@ -1125,6 +1126,42 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # loop below is what stops at U, using a free-space figure NET of the re-grabs it
         # queued this run, and is bounded by space_downgrade_max_regrabs_per_run.
         _exhaustive = exhaustive_downgrade(self.config)
+        # PASS-LEVEL RATE LIMIT. Exhaustive mode plans EVERY title above the floor,
+        # so an unthrottled pass can re-admit the very files the previous one just
+        # created. Radarr's deletion history for 2026-08-08 shows exactly that:
+        # Edge of Tomorrow deleted six times in one day, and the 720p step-down
+        # REPLACEMENTS deleted the following day. ~5.6 TiB went to the recycle bin
+        # to satisfy a 1546 GB deficit that resolved itself when the bin cleared.
+        #
+        # Only exhaustive mode is throttled. The targeted path stops at need_gb and
+        # cannot run away; exhaustive has no such bound by design.
+        _pass_ledger = {}
+        # Every other global_cache read in this file is guarded (see _affinity_inputs
+        # and the device/transcode block); this one must be too. The throttle needs a
+        # PERSISTED last-run stamp, so with no usable cache there is no record to read
+        # - which pass_allowed() already treats as "first run, allow". Warn rather than
+        # skip silently: a cacheless run is exactly when an unthrottled exhaustive pass
+        # would go unnoticed.
+        _gc = self.global_cache if hasattr(self.global_cache, "get") else None
+        if _exhaustive:
+            if _gc is None:
+                self.logger.log_warning(
+                    "  [SpacePressure] no usable global_cache, so the exhaustive "
+                    "step-down rate limit cannot be enforced this run.")
+            _pass_ledger = (_gc.get(
+                stepdown_cooldown.ledger_key("radarr", instance)) if _gc else None) or {}
+            _verdict = stepdown_cooldown.pass_allowed(
+                _pass_ledger, free_gb=free_space_gb, config=self.config)
+            if not _verdict["allowed"]:
+                self.logger.log_info(
+                    f"  [SpacePressure] exhaustive step-down SKIPPED on '{instance}': "
+                    f"{_verdict['reason']}. Falling back to targeted downgrades "
+                    f"(need {need_gb:.0f} GB).")
+                _exhaustive = False
+                stats["exhaustive_rate_limited"] = 1
+            elif _verdict.get("extreme"):
+                self.logger.log_warning(
+                    f"  [SpacePressure] {_verdict['reason']} on '{instance}'.")
         protect = self._downgrade_protect_threshold()
         candidates, _pstats = plan_movie_downgrades(
             df, score_map, ranked_profiles,
@@ -1136,6 +1173,15 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             exhaustive=_exhaustive,
         )
         stats.update(_pstats)
+        if _exhaustive and candidates:
+            # Stamped on RUN, not on success: a pass that admitted titles and then
+            # failed still churned the library, and spacing THAT out is the point.
+            # Only stamped when it actually admitted something, so a no-op pass does
+            # not burn the next 12 hours.
+            if _gc is not None and hasattr(_gc, "set"):
+                _gc.set(
+                    stepdown_cooldown.ledger_key("radarr", instance),
+                    stepdown_cooldown.stamp_pass(_pass_ledger, admitted=len(candidates)))
         # Publish this pass's projected reclaim so LATER passes (the other Radarr instance,
         # Sonarr TV, the universe pass, the coordinator) plan against the remaining deficit
         # rather than the same one. Projected, not realized: the whole point is that the
@@ -1266,6 +1312,14 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     self.logger.log_debug(
                         f"  ⏭️ '{title}': step-down on cooldown, {_cd:.0f}d left — skipped.")
                     continue
+                # GLD-RAD-33 — one downloadclient probe per pass, lazily memoised, so
+                # the picker can refuse releases on protocols nothing can download.
+                if not hasattr(self, "_grabbable_protocols_memo"):
+                    self._grabbable_protocols_memo = {}
+                if instance not in self._grabbable_protocols_memo:
+                    self._grabbable_protocols_memo[instance] = self._enabled_protocols(
+                        self.radarr_api, instance)
+                _grabbable = self._grabbable_protocols_memo[instance]
                 releases = self.radarr_api._make_request(
                     instance, f"release?movieId={int(movie_id)}", fallback=None) or []
                 pick = self._pick_stepdown_release(
@@ -1274,6 +1328,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     allow_below_floor=_exhaustive,
                     movie_title=title,
                     movie_year=(df.at[idx, "year"] if "year" in df.columns else None),
+                    allowed_protocols=_grabbable,
                 )
                 if not pick:
                     # Back this title off instead of re-probing it every run. 31 titles on
@@ -2548,7 +2603,29 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         instance = self._resolve_instance(instance)
         eff_dry = effective_dry_run(self.dry_run, self.global_cache)
         stats = {"rescanned": 0, "regrabbed": 0, "skipped_unmonitored": 0,
-                 "skipped_no_release": 0, "failed": 0}
+                 "skipped_no_release": 0, "failed": 0,
+                 # ACCOUNTING, not a bug fix. VERDICT and ACTION are different
+                 # populations and conflating them misreads a correct log as a
+                 # defect - which happened on 2026-08-10 while auditing this very
+                 # method:
+                 #
+                 #   report:  82 anomalies = 12 oversized + 70 undersized
+                 #   summary: 80 rescanned, 0 re-grabbed, 2 skipped (unmonitored)
+                 #
+                 # "12 oversized but only 2 in the regrab counters" LOOKS like ten
+                 # rows vanishing. They did not. `recommend_action` sends an
+                 # oversized file at a JUNK/SD grade to `rescan`, because a 30 GB
+                 # file graded SDTV is MIS-GRADED, not bloated - rescanning fixes
+                 # the grade non-destructively. So 10 of the 12 were rescan rows:
+                 # 70 undersized + 10 junk-graded = 80 rescanned, leaving exactly
+                 # 2 genuine regrab rows, both unmonitored. 80 + 2 = 82. Exact.
+                 #
+                 # These three counters make that split visible so the arithmetic
+                 # can be checked from the log instead of re-derived from source.
+                 # `missing_ids` additionally catches a real fault if one ever
+                 # occurs: a regrab-CLASSIFIED row arriving with no ids is a
+                 # detector/remediator mismatch, not a policy skip.
+                 "not_regrab_action": 0, "missing_ids": 0, "dry_deferred": 0}
 
         # ── rescan mis-graded (non-destructive) ──────────────────────────────────
         mids = [int(r["movie_id"]) for r in rows
@@ -2579,13 +2656,26 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         _dry_deferred = 0
         for r in rows:
             if r.get("action") != "regrab":
+                # RESCAN rows (every undersized file, plus oversized-at-a-junk-grade)
+                # and anything the classifier declined. Counted so the summary can show
+                # that verdict-oversized and action-regrab are different populations.
+                stats["not_regrab_action"] += 1
                 continue
             mid, fid = r.get("movie_id"), r.get("movie_file_id")
             if mid is None or fid is None:
+                # A regrab-classified row with no ids cannot be acted on. This IS a
+                # real fault if it ever fires - the detector produced a row the
+                # remediator cannot use - so it logs per item rather than only
+                # incrementing a counter. Not observed to date.
+                stats["missing_ids"] += 1
+                self.logger.log_info(
+                    f"[SizeAnomaly] cannot re-grab '{r.get('title') or '?'}' - row carries "
+                    f"no movie_id/movie_file_id (detector/remediator mismatch).")
                 continue
             if eff_dry:
                 if _dry_searched >= _dry_search_budget:
                     _dry_deferred += 1
+                    stats["dry_deferred"] += 1
                     continue
                 _dry_searched += 1
             # Only re-grab MONITORED movies — replacing an unmonitored movie's file overrides a
@@ -2655,12 +2745,26 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 f"for re-grab — release checks deferred (candidates are in the size-anomaly "
                 f"grid; set size_anomaly.dry_run_search_budget>0 to sample releases inline).")
         acted = stats["rescanned"] + stats["regrabbed"]
-        if acted or stats["skipped_unmonitored"] or stats["skipped_no_release"]:
+        if acted or stats["skipped_unmonitored"] or stats["skipped_no_release"] \
+                or stats["missing_ids"] or stats["dry_deferred"]:
+            # The regrab lane reports against the rows it was actually HANDED, not
+            # against the oversized count - see the note at `stats`. `_cands` is the
+            # regrab population; `not_regrab_action` is the rescan one, and the two
+            # together are every row.
+            _cands = (stats["regrabbed"] + stats["skipped_unmonitored"]
+                      + stats["skipped_no_release"] + stats["missing_ids"]
+                      + stats["dry_deferred"] + stats["failed"])
             self.logger.log_info(
                 f"[SizeAnomaly] '{instance}' remediation: {stats['rescanned']} rescanned, "
                 f"{stats['regrabbed']} re-grabbed, {stats['skipped_unmonitored']} skipped "
                 f"(unmonitored), {stats['skipped_no_release']} kept (no right-sized release), "
-                f"{stats['failed']} failed."
+                + (f"{stats['dry_deferred']} deferred (dry-run search budget), "
+                   if stats["dry_deferred"] else "")
+                + (f"{stats['missing_ids']} unusable (no ids), "
+                   if stats["missing_ids"] else "")
+                + f"{stats['failed']} failed — {_cands} regrab candidate(s) of "
+                f"{_cands + stats['not_regrab_action']} anomaly row(s) "
+                f"({stats['not_regrab_action']} were rescan-action)."
             )
         return stats
 
@@ -2795,11 +2899,46 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         return True
 
     @staticmethod
+    def _enabled_protocols(radarr_api, instance) -> "frozenset | None":
+        """Protocols at least one ENABLED download client serves, or None when the
+        answer is unavailable.
+
+        WHY — GLD-RAD-33. 2026-08-15 live apply: Radarr 'standard' had NO torrent
+        client, the picker chose torrent releases on seeders alone, and the realize
+        flow is delete-THEN-grab — so 70 movies (~150 GB) were deleted and every grab
+        500'd ("Torrent Download client isn't configured yet"), leaving blind-search
+        fallbacks as the only thing between the library and the recycle bin's cleanup
+        clock. A release nothing can download must never win the pick; with the pick
+        empty the caller keeps the file and never reaches its delete.
+
+        FAILURE SEMANTICS — the three-way distinction matters (P-C):
+          list of clients  -> the frozenset of enabled protocols (may be EMPTY: no
+                              enabled clients means nothing is grabbable, and an
+                              empty set correctly rejects every candidate BEFORE any
+                              delete can be reached).
+          unreachable/odd  -> None = "unknown" — fail OPEN to the pre-guard
+                              behaviour. Blocking every downgrade because one status
+                              call blipped would be worse than the disease; the
+                              delete-side contract (no pick ⇒ no delete) still holds.
+        """
+        try:
+            clients = radarr_api._make_request(instance, "downloadclient", fallback=None)
+            if not isinstance(clients, list):
+                return None
+            return frozenset(
+                p for p in (str(c.get("protocol") or "").lower()
+                            for c in clients if isinstance(c, dict) and c.get("enable"))
+                if p)
+        except Exception:
+            return None
+
+    @staticmethod
     def _pick_stepdown_release(releases: list, current_res=None,
                                min_size_bytes: int = 300 * 1024 * 1024,
                                allow_below_floor: bool = False,
                                target_res=None, movie_title=None, movie_year=None,
-                               alt_titles=(), allowed_langs=("english",)) -> "dict | None":
+                               alt_titles=(), allowed_langs=("english",),
+                               allowed_protocols=None) -> "dict | None":
         """Pick the release a step-down should grab: walk the resolution ladder
         UP from the floor (720 → 1080) and take the first non-empty rung strictly
         below the current file's resolution — 'no 720 found, take the next tier
@@ -2833,6 +2972,15 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         for r in releases or []:
             if not isinstance(r, dict) or not r.get("guid"):
                 continue
+            # GLD-RAD-33 — a release on a protocol NO enabled client serves is not a
+            # candidate, however good it looks: the grab is a guaranteed 500 and the
+            # caller's delete has already happened by then. None = unknown = allow
+            # (fail-open); an ABSENT protocol field on the release is likewise not
+            # treated as unserveable — absent is not "torrent" (P-C).
+            if allowed_protocols is not None:
+                _proto = str(r.get("protocol") or "").lower()
+                if _proto and _proto not in allowed_protocols:
+                    continue
             res = (((r.get("quality") or {}).get("quality") or {}).get("resolution"))
             try:
                 res = int(res)

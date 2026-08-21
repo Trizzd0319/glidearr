@@ -29,6 +29,48 @@ from datetime import datetime, timezone
 _BASE_DAYS = 7        # config: space_downgrade_retry_days
 _MAX_DAYS = 90        # ceiling, so nothing is written off permanently
 
+# ── pass-level rate limit ──────────────────────────────────────────────
+#
+# DIFFERENT MECHANISM FROM THE PER-ITEM BACKOFF ABOVE, and the distinction is the
+# whole reason this exists.
+#
+#   entry_key(id, res)   "we searched THIS title at THIS resolution and found
+#                        nothing smaller" - a FAILURE backoff, deliberately keyed
+#                        so any change to the file retries immediately.
+#   pass_key(...)        "the exhaustive step-down PASS ran" - a RATE LIMIT on
+#                        the pass itself, regardless of which titles it touched.
+#
+# The per-item key cannot rate-limit a pass, and not because it is wrong: a title
+# walking 2160 -> 1080 -> 720 legitimately uses three different keys, since the
+# release landscape genuinely differs at each tier.
+#
+# WHAT THIS WAS BUILT FROM (2026-08-08). The pressure pass read 1546 GB free
+# against a 3500 GB floor, declared CRITICAL, and admitted 523 titles to an
+# exhaustive step-down. Radarr's deletion history then shows Edge of Tomorrow
+# deleted SIX times in one day (4x 2160p, 2x 1080p), and 720p files - Iron Man,
+# Spider-Man: Far From Home - being deleted the following day, i.e. the step-down
+# REPLACEMENTS were themselves replaced. Roughly 5.6 TiB went to the recycle bin.
+#
+# And the deficit was never real in the way it looked: when the bin's retention
+# dropped to a day and it cleared, free space went to 8.25 TB. The library was
+# downgraded to satisfy pressure that would have resolved itself.
+#
+# A single pass is defensible. A pass that can re-run every cycle, each time
+# admitting whatever the previous one just created, is a loop.
+
+#: Hours between exhaustive step-down passes. Config: `space_stepdown_min_hours`.
+#: Twelve, so a pass can still run twice a day if pressure is sustained, but the
+#: output of one pass cannot become the input of the next within the same evening.
+_PASS_MIN_HOURS = 12.0
+
+#: Free GB below which the rate limit is IGNORED. Config: `space_stepdown_extreme_gb`.
+#: Deliberately far under the ordinary floor (3500 GB at time of writing): this is
+#: for "the array is about to stop accepting writes", not for "we are in the
+#: pressure band". The 2026-08-08 incident sat at 1546 GB and would NOT have
+#: qualified - which is the intended behaviour, because that deficit resolved on
+#: its own.
+_PASS_EXTREME_GB = 500.0
+
 
 def ledger_key(service: str, instance: str) -> str:
     """Cache key for one service/instance ledger, e.g. ``radarr/ultra/stepdown_cooldown``."""
@@ -57,6 +99,107 @@ def entry_key(item_id, resolution=None) -> str:
     except (TypeError, ValueError):
         r = None
     return f"{item_id}:{r}" if r else f"{item_id}"
+
+
+def pass_key(name: str = "exhaustive_stepdown") -> str:
+    """Ledger key for a PASS-level record.
+
+    Double-underscored so it cannot collide with an item key: those are ``<id>``
+    or ``<id>:<res>`` and always start with a digit.
+    """
+    return f"__pass__:{name}"
+
+
+def _pass_hours(config) -> float:
+    try:
+        v = float((config or {}).get("space_stepdown_min_hours") or _PASS_MIN_HOURS)
+        return v if v > 0 else _PASS_MIN_HOURS
+    except (TypeError, ValueError):
+        return _PASS_MIN_HOURS
+
+
+def _pass_extreme_gb(config) -> float:
+    try:
+        v = float((config or {}).get("space_stepdown_extreme_gb") or _PASS_EXTREME_GB)
+        return v if v > 0 else _PASS_EXTREME_GB
+    except (TypeError, ValueError):
+        return _PASS_EXTREME_GB
+
+
+def pass_allowed(ledger, *, free_gb=None, config=None, now=None,
+                 name: str = "exhaustive_stepdown") -> dict:
+    """May the exhaustive step-down pass run? ``{allowed, reason, hours_left, ...}``.
+
+    Two ways to be allowed: the interval has elapsed, or free space is under the
+    EXTREME threshold. Nothing else overrides it.
+
+    UNKNOWN FREE SPACE DOES NOT UNLOCK THE OVERRIDE. ``free_gb=None`` means the
+    caller could not establish how much room there is, and "we cannot tell" must
+    not be read as "it is an emergency" - that would turn every failed space read
+    into an unthrottled step-down pass, which is the loop this prevents (P-C).
+
+    A ledger with NO record allows the pass: a first run must not be blocked by
+    the absence of a prior one.
+    """
+    hours = _pass_hours(config)
+    extreme = _pass_extreme_gb(config)
+
+    try:
+        free = float(free_gb) if free_gb is not None else None
+        if free is not None and free != free:      # NaN
+            free = None
+    except (TypeError, ValueError):
+        free = None
+
+    entry = (ledger or {}).get(pass_key(name)) or {}
+    last = entry.get("at")
+    if not last:
+        return {"allowed": True, "reason": "no prior pass recorded",
+                "hours_left": 0.0, "hours_since": None, "extreme": False}
+
+    try:
+        then = datetime.fromisoformat(str(last))
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        # An unparseable stamp is not evidence the interval elapsed, but blocking
+        # forever on a corrupt record is worse than one extra pass. Allow, and say so.
+        return {"allowed": True, "reason": f"unparseable last-run stamp {last!r}",
+                "hours_left": 0.0, "hours_since": None, "extreme": False}
+
+    now = now or datetime.now(timezone.utc)
+    since = (now - then).total_seconds() / 3600.0
+    left = max(0.0, hours - since)
+
+    if since >= hours:
+        return {"allowed": True, "reason": f"{since:.1f}h since last pass (>= {hours:.0f}h)",
+                "hours_left": 0.0, "hours_since": since, "extreme": False}
+
+    if free is not None and free < extreme:
+        return {"allowed": True, "extreme": True, "hours_since": since, "hours_left": left,
+                "reason": (f"EXTREME pressure override: {free:,.0f} GB free is below "
+                           f"{extreme:,.0f} GB - running {left:.1f}h early")}
+
+    return {"allowed": False, "extreme": False, "hours_since": since, "hours_left": left,
+            "reason": (f"last exhaustive step-down was {since:.1f}h ago; "
+                       f"{left:.1f}h left of the {hours:.0f}h interval"
+                       + (f" ({free:,.0f} GB free, above the {extreme:,.0f} GB "
+                          f"extreme threshold)" if free is not None else ""))}
+
+
+def stamp_pass(ledger, *, now=None, name: str = "exhaustive_stepdown",
+               admitted: int = 0) -> dict:
+    """Record that the pass RAN. Caller persists the ledger.
+
+    Stamped on RUN, not on success: a pass that admitted titles and then failed
+    still churned the library, and is exactly what the interval exists to space out.
+    """
+    ledger = ledger if isinstance(ledger, dict) else {}
+    ledger[pass_key(name)] = {
+        "at": (now or datetime.now(timezone.utc)).isoformat(),
+        "admitted": int(admitted or 0),
+    }
+    return ledger
 
 
 def _base_days(config) -> float:
