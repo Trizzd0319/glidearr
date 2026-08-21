@@ -112,17 +112,29 @@ def test_fallback_is_25pct_of_total_when_limit_unset():
     assert s2["downgrade_marked"] == 2, s2
 
 
-def test_last_resort_constant_when_total_unknown():
-    """No free_space_limit AND total unknown (inf) -> last-resort 25 GB constant
-    (PRESSURE_FALLBACK_GB), never the old 50 GB."""
+def test_no_last_resort_floor_when_total_unknown():
+    """No free_space_limit AND total unknown (inf) -> NO floor at all.
+
+    There is no last-resort GB constant any more. Four callers each declared one and
+    they disagreed - 25.0 here (under the DIFFERENT NAME PRESSURE_THRESHOLD_GB, so a
+    grep for the common name missed it), 25.0 in sonarr/series, 1000.0 in the
+    coordinator - none of them chosen by the operator. The floor now comes from
+    free_space_limit, else 25% of the total drive, else nothing.
+
+    0.0 is the right last resort because the two errors are not symmetric: a
+    wrongly-LOW floor does nothing (no pressure, no reclamation), while a wrongly-HIGH
+    one declares pressure on a healthy disk and starts deleting. With neither the
+    operator config nor the drive size available there is no basis for claiming the
+    disk is full, so the pass declines to claim it."""
     mgr = _mk_mgr({}, _universe_df(2), total_gb=float("inf"))
     assert mgr.evaluate_quality_actions("standard", free_space_gb=100.0)["upgrade_marked"] == 2
     mgr2 = _mk_mgr({}, _universe_df(2), total_gb=float("inf"))
-    # 30 GB is below the old 50 GB gate but ABOVE the 25 GB last-resort -> still upgrades,
-    # proving 50 no longer floors anything.
     assert mgr2.evaluate_quality_actions("standard", free_space_gb=30.0)["upgrade_marked"] == 2
+    # Even at 10 GB free: unknown total + unset limit = no floor, so free < T is never
+    # true. deletions_enabled independently requires free_space_limit > 0, so this only
+    # ever governed downgrades and the non-delete gates.
     mgr3 = _mk_mgr({}, _universe_df(2), total_gb=float("inf"))
-    assert mgr3.evaluate_quality_actions("standard", free_space_gb=10.0)["upgrade_marked"] == 0
+    assert mgr3.evaluate_quality_actions("standard", free_space_gb=10.0)["upgrade_marked"] == 2
 
 
 def test_universe_downgrade_steps_one_rank_not_to_floor():

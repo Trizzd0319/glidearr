@@ -94,8 +94,15 @@ def test_persist_roster_is_pii_minimized():
                     "rating_groups": ["household"], "matched_via": "plex_id"}}
     m._persist(roster, idmap)
     stored = m.global_cache.get("plex/users")
+    # EXACT match on purpose: this allowlist is the guard, so any newly persisted field
+    # has to be looked at rather than absorbed. restriction_profile is the Plex parental-
+    # controls age tier (little_kid / older_kid / teen) - a coarse enum, no email and no
+    # token, the same bar as is_managed. It is persisted because this manager runs AFTER
+    # the Radarr scoring phase, so a consumer needing the kid/adult split cannot read
+    # tracked_users in memory: it is still empty on that pass.
     assert stored == [{"uuid": "ua", "title": "Rob", "is_admin": True,
-                       "is_managed": False, "protected": False, "token_scope_ok": True}]
+                       "is_managed": False, "protected": False,
+                       "restriction_profile": None, "token_scope_ok": True}]
     # no email, no token anywhere in the persisted blobs
     blob = repr(m.global_cache.d)
     assert "rob@x.io" not in blob and "tok-secret" not in blob

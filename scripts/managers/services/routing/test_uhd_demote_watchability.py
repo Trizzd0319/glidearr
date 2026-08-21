@@ -49,7 +49,10 @@ class _Im:
         if method == "PUT" and endpoint == "movie/editor":
             self.puts.append((name, payload)); return {"ok": True}
         if method == "DELETE":
-            self.deletes.append((name, endpoint)); return {}
+            # BASE CONTRACT: a successful DELETE returns True. Returning {} is what a
+            # SWALLOWED failure looks like, and the demote path checks the result before
+            # ledgering - so the shell went un-ledgered and the entry never appeared.
+            self.deletes.append((name, endpoint)); return True
         self.gets.append((name, endpoint))
         table = {"movie": self._lib, "tag": self._tags,
                  "qualityprofile": self._profiles, "rootfolder": self._roots}

@@ -155,12 +155,20 @@ def test_decision_table_attributes_saga_and_profile(monkeypatch):
     m.global_cache = _DictCache({"plex/playlists/universe_source": src})
     m.run()
 
-    headers, rows = m.logger.tables[-1]
+    # Select the DECISION table by its shape, not by position. A signal-coverage table is
+    # emitted after it now, so tables[-1] silently picked a different table and the
+    # failure read as "the saga column is gone" rather than "the index moved".
+    headers, rows = next((h, r) for h, r in m.logger.tables if "saga" in h)
     assert "saga" in headers
     assert rows[0][headers.index("saga")] == "Marvel Cinematic Universe"   # full name in the table
-    text = "\n".join(m.logger.infos)
-    assert "saga: part of Marvel Cinematic Universe" in text       # friendly name in the breakdown
-    assert "profile: UHD-std  (score 87 picks up to the 2160p tier) -> standard" in text
+    # The free-form stanzas these used to match are gone by design: they repeated two
+    # RUN-CONSTANT facts on every row, so the breakdown now emits them ONCE as a legend
+    # table joined by a (n) ref. Same information, asserted where it actually lives.
+    lh, lrows = next((h, r) for h, r in m.logger.tables if "Why this profile" in h)
+    assert lrows[0][lh.index("Profile")] == "UHD-std"
+    assert lrows[0][lh.index("Why this profile")] == "score 87 picks up to the 2160p tier"
+    eh, erows = next((h, r) for h, r in m.logger.tables if "Saga" in h)
+    assert erows[0][eh.index("Saga")] == "Marvel Cinematic Universe"   # friendly name
 
 
 def test_both_emits_baseline_then_4k(monkeypatch):

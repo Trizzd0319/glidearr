@@ -87,11 +87,21 @@ def _writes(api):
 def test_real_armed_run_rescans_and_regrabs_by_acquiring_right_sized_release():
     m = _mgr(remediate=True, dry_run=False)                       # gate unset → armed
     stats = m.remediate_size_anomalies("standard", _ROWS)
+    # The three extra counters are ACCOUNTING, not new behaviour: VERDICT and ACTION are
+    # different populations, and conflating them read a correct log as a defect ("12
+    # oversized but only 2 in the regrab counters" - the other 10 were junk-graded and
+    # went to rescan). not_regrab_action is the rescan population; missing_ids catches a
+    # regrab-classified row arriving with no ids, which would be a real detector/
+    # remediator mismatch rather than a policy skip.
     assert stats == {"rescanned": 1, "regrabbed": 1, "skipped_unmonitored": 1,
-                     "skipped_no_release": 0, "failed": 0}
+                     "skipped_no_release": 0, "failed": 0,
+                     "not_regrab_action": 1, "missing_ids": 0, "dry_deferred": 0}
     calls = m.radarr_api.calls
     assert ("command", "POST", {"name": "RefreshMovie", "movieIds": [1]}) in calls   # rescan
-    assert ("release", "POST", {"guid": "right", "indexerId": 1}) in calls           # acquire the 14 GB one
+    # movieId rides along: without it Radarr re-parses the release title to identify the
+    # movie, which fails on foreign-language and fansub names.
+    assert ("release", "POST",
+            {"guid": "right", "indexerId": 1, "movieId": 2}) in calls   # acquire the 14 GB one
     assert all(c[0] != "moviefile/20" for c in calls)            # NEVER delete-first
     assert all(c[1] != "DELETE" for c in calls)                  # nothing deleted by us
     assert all(p != {"name": "MoviesSearch", "movieIds": [2]}    # no blind re-acquire

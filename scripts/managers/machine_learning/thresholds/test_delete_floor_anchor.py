@@ -217,7 +217,13 @@ def test_only_the_radarr_leg_reads_the_radarr_restore_key():
         if path.name.startswith("test_"):
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
-        if re.search(r'get\(\s*["\']owned_restore_score_threshold["\']', text):
+        # Match ANY accessor call taking the key, not just `.get(`. The read moved behind
+        # a `_cfg_int(...)` helper and this grep-based invariant went quiet - reporting
+        # ZERO readers for a key that still has exactly one, which reads as "the feature
+        # is dead" rather than "the detector is stale". The `\w+\(` prefix keeps
+        # DECLARATIONS out: schema's dict key and env_map's tuple entry have no identifier
+        # before the paren, and registry.py's mentions are prose inside strings.
+        if re.search(r'\w+\(\s*["\']owned_restore_score_threshold["\']', text):
             readers.append(path.relative_to(root).as_posix())
     assert readers == ["services/radarr/repair/anomaly.py"], readers
 

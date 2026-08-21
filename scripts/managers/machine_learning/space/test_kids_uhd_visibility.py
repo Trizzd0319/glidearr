@@ -93,5 +93,8 @@ def test_uhd_root_folders_ignores_a_non_dict():
 
 def test_kids_uhd_allowed_tracks_visibility():
     cfg = _cfg("/data/media/movies/4k/kids")
-    assert rt.kids_uhd_allowed(cfg, ["/data/media/movies/4k"]) is True
-    assert rt.kids_uhd_allowed(cfg, ["/data/media/movies/kids"]) is False
+    # Returns (allowed, reason) now - the reason is what makes a refusal legible in the
+    # log; a bare bool could only say no, never why.
+    assert rt.kids_uhd_allowed(cfg, ["/data/media/movies/4k"]) == (True, "visible")
+    allowed, why = rt.kids_uhd_allowed(cfg, ["/data/media/movies/kids"])
+    assert allowed is False and why == "not-in-library"   # the reason a child's copy vanished

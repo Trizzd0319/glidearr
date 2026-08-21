@@ -121,7 +121,11 @@ def test_taste_profile_names_household_cast_and_crew():
 
 
 def test_taste_profile_empty_without_affinity():
-    assert S(_GC({}), None).taste_profile() == {"genres": [], "directors": [], "actors": []}
+    # aggregate_affinity tallies all the roles the metadata source supplies, so the empty
+    # profile carries a key per role - each an empty list that prints nothing.
+    assert S(_GC({}), None).taste_profile() == {
+        "genres": [], "directors": [], "actors": [],
+        "composers": [], "producers": [], "writers": []}
 
 
 # ── per-instance weight overrides (the anniversary shelf re-weights popularity) ────────
