@@ -4448,7 +4448,14 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                                 df.at[i, "marked_for_deletion"] = True
                                 stats["marked"] += 1
                         except Exception:
-                            pass
+                            # A CORRUPT available_until leaves the row unmarked, which is
+                            # the SAFE direction (the file is kept). But silently: the row
+                            # can never become deletable, on any future run, and nothing
+                            # says so -- space that will never be reclaimed for a reason
+                            # nobody can see. Count it so the grace summary can name it.
+                            # (P-D: failure with no detector -- the shape that hid
+                            # GLD-SON-25's 69 dead pointers for weeks.)
+                            stats["bad_available_until"] = stats.get("bad_available_until", 0) + 1
                     else:
                         # WINDOW RESTART: cold again after a score-recovery release
                         # (available_until was cleared) — stamp a FRESH visibility
@@ -4567,6 +4574,17 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"released (score recovered), {stats['rewindowed']} re-windowed "
                 f"(cooled again after release). Window {grace_days}d; cap {cap} series/run; "
                 f"deletion still decided by the coordinator's ranked pool.")
+        # Surfaced SEPARATELY and as a WARNING, not folded into the line above: these
+        # rows are stuck. An unparseable available_until means the row can never reach
+        # its window end, on this run or any future one, so the space it holds is
+        # unreclaimable until someone looks. Folding it into the info line would make a
+        # permanent condition read like a per-run statistic.
+        if stats.get("bad_available_until"):
+            self.logger.log_warning(
+                f"❄️ [ColdTV] '{instance}': {stats['bad_available_until']} row(s) have an "
+                f"unparseable available_until — they were left UNMARKED (the safe direction, "
+                f"the file is kept) but they can never expire, so their space is "
+                f"unreclaimable until the value is repaired or cleared.")
         return df
 
     # ---- GLD-INV-01: inventory is not the same question as reclaim -------------

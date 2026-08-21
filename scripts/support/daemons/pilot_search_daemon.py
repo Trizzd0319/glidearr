@@ -543,8 +543,32 @@ def _process_legacy_regrab_job(cfg: dict, job: dict, ledger, dry_run: bool) -> d
     result = run_legacy_regrab(make_request=client._make_request, logger=_LOG, global_cache=ledger,
                                instance=instance, items=items, max_workers=workers, dry_run=False)
     log.info(f"Legacy re-grab done for '{instance}': {result.get('grabbed', 0)} grabbed, "
-             f"{result.get('no_release', 0)} no modern release, {result.get('failed', 0)} failed "
-             f"(of {result.get('checked', 0)} checked).")
+             f"{result.get('no_release', 0)} no modern release, "
+             # SAME OMISSION THE RUN'S OWN SUMMARY HAD (GLD-SON-24), in a second place.
+             # `checked` counts LOOP ITERATIONS, not searches, and the outcome buckets
+             # below it are the only thing that says what actually happened. Print every
+             # non-zero one, or a batch where nothing could be searched reports three
+             # zeros and reads as "nothing to do" -- which is exactly how GLD-SON-25's 69
+             # dead pointers stayed invisible for weeks.
+             + "".join(
+                 f"{result.get(_k, 0)} {_label}, "
+                 for _k, _label in (
+                     ("empty_search", "empty search (indexer returned nothing)"),
+                     ("superseded", "superseded (file already replaced)"),
+                     ("episode_no_file", "episode has no file"),
+                     ("unresolved", "unresolved (stale pointer or fetch failure)"),
+                 ) if result.get(_k))
+             + f"{result.get('failed', 0)} failed "
+             f"(of {result.get('checked', 0)} checked — iterations, not searches).")
+    _empty = int(result.get("empty_search") or 0)
+    if _empty and _empty == int(result.get("checked") or 0):
+        # Whole-batch zero is an INDEXER signal, not a library one: a disabled,
+        # unconfigured or rate-limited provider is indistinguishable from "no release
+        # exists", and concluding the latter is how a backlog gets written off.
+        log.warning(
+            f"Legacy re-grab '{instance}': ALL {_empty} search(es) returned zero releases — "
+            f"that points at indexer health, not the library. Check Prowlarr before "
+            f"treating these as having no modern release.")
     return result
 
 

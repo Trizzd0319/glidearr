@@ -76,6 +76,35 @@ class RoutingManager:
     # ── entry ─────────────────────────────────────────────────────────────────
     def run(self):
         if not self._routing.get("configured"):
+            # SILENT NO-OP WAS THE DEFECT (GLD-ROU-10). A never-onboarded install
+            # must do nothing -- that part is right. But an operator who has SET an
+            # actuating reorg_mode, granted relocation consent AND disabled dry_run
+            # has stated an intention, and returning here without a word means the
+            # config contradicts itself in silence. Measured: `reorg_mode` sat at
+            # `all` with every consent true for hours across two full runs, and the
+            # router never ran once -- no routing output at all, and relocation.log
+            # untouched for two days. The 121 same-instance misplacements were not
+            # merely unactuated, they were never even classified.
+            #
+            # Every OTHER refusal on this path announces itself (log_only logs the
+            # plan; a consent miss logs the plan and names the missing consent), so
+            # this was the one exit that told the operator nothing. Warn ONCE, and
+            # only when the config is self-contradictory -- a genuinely un-onboarded
+            # install with no consents set stays silent, exactly as before.
+            try:
+                # `relocation_enabled` is the single source of truth for "this mode
+                # actuates AND consent is granted" (GLD-ROU-07 made it so, precisely
+                # to stop two places disagreeing). Reusing it here means this warning
+                # can never drift from the gate it is describing.
+                if relocation_enabled(self.config):
+                    self._log("log_warning",
+                              f"[Routing] SKIPPED entirely: reorg_mode is "
+                              f"'{reorg_mode(self.config)}' and relocation consent is granted, "
+                              f"but routing.configured is not set — the routing onboarding step "
+                              f"has never run, so nothing is classified or moved. Set "
+                              f"routing.configured=true to act on it.")
+            except Exception:
+                pass                            # a diagnostic must never cost the run
             return                              # never-onboarded → today's behaviour (nothing)
         mode = reorg_mode(self.config)
         if mode == "off":
