@@ -70,6 +70,7 @@ from scripts.managers.services.sonarr.cache.pilot_interactive import (          
     checkpoint_key,
     interactive_pilot_search,
 )
+from scripts.managers.machine_learning.space import jit_backoff                     # noqa: E402
 from scripts.managers.services.sonarr.cache.jit_search import (                     # noqa: E402
     episodes_in_queue,
     jit_step_down_search,
@@ -466,10 +467,52 @@ def _process_jit_job(cfg: dict, job: dict, ledger, dry_run: bool) -> dict:
         global_cache=ledger,
         instance=instance, items=items,
         max_workers=PILOT_SEARCH_WORKERS,
+        max_consecutive_misses=jit_backoff.MAX_CONSECUTIVE_MISSES,
     )
+    # GLD-SON-26: record the demotion HERE as well as in the in-process worker.
+    # On this deployment the batch almost always exceeds the offload threshold, so
+    # the in-process path rarely runs -- without this the ledger would never receive
+    # its first entry and the queue could never order anything.
+    _record_jit_backoff(ledger, instance, result)
     log.info(f"JIT job done for '{instance}': {len(result.get('failed', []))} ep(s) not grabbed "
-             f"(re-enabled for retry next run).")
+             f"(re-enabled for retry next run)"
+             + (f"; {len(result.get('exhausted_sids') or [])} series demoted to the back of the "
+                f"queue, {len(result.get('grabbed_sids') or [])} cleared"
+                if (result.get("exhausted_sids") or result.get("grabbed_sids")) else "")
+             + ".")
     return result
+
+
+def _record_jit_backoff(ledger, instance: str, result: dict) -> None:
+    """Fold one daemon pass's outcome into the demotion ledger (``GLD-SON-26``).
+
+    Mirrors ``SonarrCacheEpisodeFilesManager._record_jit_backoff`` deliberately: the
+    daemon and the in-process worker share ``jit_step_down_search``, so they must
+    also share what they RECORD, or a series demoted by one path would be invisible
+    to the other and the ordering would depend on which route the batch happened to
+    take.
+
+    Writes ``jit/backoff`` only. ``jit/failed_upgrades`` is a SEPARATE key with a
+    separate meaning -- "is this EPISODE still owed a grab?" versus "how often has
+    this SERIES come up empty?" -- and the run's ``_reconcile_failed_jit`` clears
+    that one every pass. Clearing this one alongside it would wipe the counters and
+    restore the loop the demotion exists to break.
+    """
+    if ledger is None or not isinstance(result, dict):
+        return
+    try:
+        key = jit_backoff.ledger_key(instance)
+        led = ledger.get(key) or {}
+        seq = int(ledger.get(jit_backoff.run_seq_key(instance)) or 0)
+        for sid in (result.get("grabbed_sids") or []):
+            led = jit_backoff.record_success(led, sid)
+        for sid in (result.get("exhausted_sids") or []):
+            led = jit_backoff.record_exhaustion(led, sid, run_seq=seq)
+        ledger.set(key, led)
+    except Exception as e:
+        # Never cost the job: worst case a series keeps its current queue position,
+        # which is the pre-GLD-SON-26 behaviour.
+        log.debug(f"JIT backoff ledger not updated for '{instance}': {e}")
 
 
 def _process_legacy_regrab_job(cfg: dict, job: dict, ledger, dry_run: bool) -> dict:

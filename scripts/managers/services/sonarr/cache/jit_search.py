@@ -86,15 +86,23 @@ def jit_step_down_search(
     max_workers: int,
     poll_interval_s: float = 3.0,
     cmd_timeout_s: float = 180.0,
+    max_consecutive_misses: int = 0,   # 0 = walk the whole ladder (legacy behaviour)
 ) -> dict:
-    """Run the step-down ladder for every series CONCURRENTLY (each owns its own profile + episodeIds,
-    so they're independent); the ladder WITHIN a series is strictly sequential (the shared series
-    profile means a lower-target episode is never searched while flipped to a higher tier — the
-    group-by-tier invariant that prevents over-grab). Returns ``{"failed": [...]}``."""
+    """Run the step-down ladder for every series CONCURRENTLY (each owns its own profile +
+    episodeIds, so they're independent); the ladder WITHIN a series is strictly sequential (the
+    shared series profile means a lower-target episode is never searched while flipped to a higher
+    tier — the group-by-tier invariant that prevents over-grab).
+
+    Returns ``{"failed": [...], "exhausted_sids": [...], "grabbed_sids": [...]}``. The two sid
+    lists feed ``space/jit_backoff``: a series that exhausted its ladder is DEMOTED (attempted
+    last next run, never excluded — see that module for why ordering rather than a cooldown), and
+    any grab CLEARS the demotion, so the queue heals itself when supply returns."""
     lock = threading.Lock()   # guards the inflight-QP read-modify-write
+    grabbed_sids: set = set()
+    exhausted_sids: set = set()
     items = [(int(s), g) for s, g in items if g]
     if not items:
-        return {"failed": []}
+        return {"failed": [], "exhausted_sids": [], "grabbed_sids": []}
 
     def _label(sid, info=None):
         if isinstance(info, dict):
@@ -165,8 +173,22 @@ def jit_step_down_search(
             for tier_res, eps, step_pids in groups:
                 ep_meta   = {int(e[0]): (int(e[1]), int(e[2])) for e in eps if e and e[0]}
                 remaining = set(ep_meta.keys())
+                _misses = 0
                 for pid in step_pids:
                     if not remaining:
+                        break
+                    # STEP BUDGET (GLD-SON-26). Measured 2026-08-21: one series walked
+                    # 37 profiles at ~112s each and grabbed nothing, and five such series
+                    # consumed 116 of the window's 146 step-downs. The TAIL of a ladder is
+                    # where releases are rarest, so the marginal profile is both the least
+                    # likely to grab and exactly as expensive as the first. Stop after N
+                    # CONSECUTIVE misses; any grab resets the count, so a productive ladder
+                    # is never cut short.
+                    if max_consecutive_misses and _misses >= int(max_consecutive_misses):
+                        logger.log_info(
+                            f"  ⏸ JIT step budget: {label} stopped after {_misses} consecutive "
+                            f"miss(es) in the ≤{tier_res}p tier ({len(step_pids)} profile(s) "
+                            f"available); {len(remaining)} ep(s) deferred, not abandoned.")
                         break
                     s = make_request(instance, f"series/{sid}", fallback=None)
                     if not (s and isinstance(s, dict)):
@@ -182,12 +204,16 @@ def jit_step_down_search(
                     grabbed_now = in_queue(instance, list(remaining))
                     if grabbed_now:
                         remaining -= set(grabbed_now)
+                        _misses = 0
+                        grabbed_sids.add(sid)
                         logger.log_info(
                             f"  ✅ JIT grab: {label} grabbed {len(grabbed_now)} ep(s) at profile "
                             f"{pid} (≤{tier_res}p tier, {len(remaining)} still searching)")
                     else:
+                        _misses += 1
                         logger.log_info(f"  ⏬ JIT step-down: {label} found nothing at profile {pid}")
                 if remaining:
+                    exhausted_sids.add(sid)
                     logger.log_info(
                         f"  ∅ JIT: {label} — {len(remaining)} ep(s) in the ≤{tier_res}p tier found no "
                         f"release across {len(step_pids)} profile(s); queued for retry next run")
@@ -231,7 +257,11 @@ def jit_step_down_search(
             global_cache.set(key, list(existing) + failed_all)
         except Exception as e:
             logger.log_warning(f"[JIT] Could not persist failed upgrades for retry: {e}")
-    return {"failed": failed_all}
+    # A series that GRABBED anything is never demoted, even if another tier group of
+    # the same series came up empty — supply demonstrably exists for it.
+    return {"failed": failed_all,
+            "exhausted_sids": sorted(exhausted_sids - grabbed_sids),
+            "grabbed_sids": sorted(grabbed_sids)}
 
 
 def revert_inflight_qp(*, make_request, logger, global_cache, instance: str) -> int:

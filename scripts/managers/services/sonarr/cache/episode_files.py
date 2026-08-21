@@ -26,23 +26,14 @@ Storage
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-import time
 
 import pandas as pd
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
-from scripts.support.utilities.decorators.timing import timeit
-from scripts.support.utilities.logger.logger import LoggerManager
-from scripts.managers.machine_learning.sizing.size_model import (
-    CALIBRATED_MB_PER_MIN,
-    estimate_gb,
-    estimate_gb_for_profile,
-    measured_mb_per_min,
-    profile_max_quality,
-)
 from scripts.managers.machine_learning.acquisition.next_episode_planner import (
     DEFAULT_BUDGET_RAMP,
     DEFAULT_GRADUATED_CAP,
@@ -57,11 +48,7 @@ from scripts.managers.machine_learning.acquisition.next_episode_planner import (
     order_series_by_recency,
     series_budget_multiplier,
 )
-from scripts.managers.machine_learning.likelihood.watch_likelihood import series_universe_credits
-from scripts.managers.machine_learning.thresholds.registry import get_threshold
-from scripts.managers.services.plex.playlists.universe_order import tv_group_maps_from_series
 from scripts.managers.machine_learning.acquisition.pilot_stepping import (
-    choose_lowest_available_tier,
     choose_pilot_profile,
     indexer_fingerprint,
     next_pilot_profile,
@@ -73,7 +60,6 @@ from scripts.managers.machine_learning.acquisition.pilot_stepping import (
     profile_max_resolution,
     rank_pilot_profiles,
 )
-from scripts.support.utilities.backup_gate import effective_dry_run
 from scripts.managers.machine_learning.lifecycle.grace_policy import (
     episode_grace_decision,
     grace_mark,
@@ -81,14 +67,6 @@ from scripts.managers.machine_learning.lifecycle.grace_policy import (
 )
 from scripts.managers.machine_learning.lifecycle.household_watch import (
     resolve_household_watch,
-)
-from scripts.managers.machine_learning.lifecycle.viewer_retention import (
-    account_facts,
-    episode_ordinal,
-    merge_state,
-    resolve_retention_config,
-    series_protected_from_states,
-    watched_by_tautulli,
 )
 from scripts.managers.machine_learning.lifecycle.restore_policy import (
     RELEASE_FIELDS,
@@ -103,6 +81,28 @@ from scripts.managers.machine_learning.lifecycle.restore_policy import (
 from scripts.managers.machine_learning.lifecycle.stale_prune_policy import (
     restore_cooldown_active,
 )
+from scripts.managers.machine_learning.lifecycle.viewer_retention import (
+    account_facts,
+    episode_ordinal,
+    merge_state,
+    resolve_retention_config,
+    series_protected_from_states,
+    watched_by_tautulli,
+)
+from scripts.managers.machine_learning.likelihood.watch_likelihood import (
+    series_universe_credits,
+)
+from scripts.managers.machine_learning.sizing.size_model import (
+    CALIBRATED_MB_PER_MIN,
+    estimate_gb,
+    estimate_gb_for_profile,
+    measured_mb_per_min,
+    profile_max_quality,
+)
+from scripts.managers.machine_learning.space import jit_backoff
+from scripts.managers.machine_learning.space.downgrade_planner import (
+    DEFAULT_FLOOR_RESOLUTION as DOWNGRADE_FLOOR_RESOLUTION,
+)
 from scripts.managers.machine_learning.space.jit_planner import (
     choose_jit_profile,
     jit_reserve_gb,
@@ -112,17 +112,24 @@ from scripts.managers.machine_learning.space.jit_planner import (
     pilot_floor_hold,
     target_tier_key,
 )
+from scripts.managers.machine_learning.thresholds.registry import get_threshold
+from scripts.managers.services.plex.playlists.universe_order import (
+    tv_group_maps_from_series,
+)
+from scripts.support.utilities.backup_gate import effective_dry_run
+from scripts.support.utilities.decorators.timing import timeit
+from scripts.support.utilities.logger.logger import LoggerManager
+from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
+from scripts.support.utilities.space_targets import (
+    coordinator_owns_deletion,
+    deletions_disabled_reason,
+    deletions_enabled,
+    exhaustive_downgrade,
+    space_targets,
+)
 from scripts.support.utilities.watch_likelihood import (
     resolution_cap_for_likelihood,
     watch_likelihood,
-)
-from scripts.managers.machine_learning.space.downgrade_planner import (
-    DEFAULT_FLOOR_RESOLUTION as DOWNGRADE_FLOOR_RESOLUTION,
-)
-from scripts.support.utilities.space_floor_alert import alert_unconfigured_floor
-from scripts.support.utilities.space_targets import (
-    coordinator_owns_deletion, deletions_disabled_reason, deletions_enabled,
-    exhaustive_downgrade, space_targets,
 )
 
 
@@ -486,7 +493,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     @staticmethod
     @timeit("_safe_concat")
-    def _safe_concat(df: "pd.DataFrame", df_new: "pd.DataFrame") -> "pd.DataFrame":
+    def _safe_concat(df: pd.DataFrame, df_new: pd.DataFrame) -> pd.DataFrame:
         """
         Concatenate two schema-conformant DataFrames without triggering the
         FutureWarning about all-NA column dtype inference.
@@ -538,7 +545,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     @staticmethod
     @timeit("_build_pilot_file_ids")
-    def _build_pilot_file_ids(df: "pd.DataFrame") -> "frozenset":
+    def _build_pilot_file_ids(df: pd.DataFrame) -> frozenset:
         """
         Return the frozenset of ``episode_file_id`` values that must **never** be
         deleted.
@@ -574,10 +581,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     @timeit("_build_protected_file_ids")
     def _build_protected_file_ids(
         self,
-        df: "pd.DataFrame",
-        now: "datetime",
-        pilot_file_ids: "frozenset | None" = None,
-    ) -> "frozenset":
+        df: pd.DataFrame,
+        now: datetime,
+        pilot_file_ids: frozenset | None = None,
+    ) -> frozenset:
         """
         Return the frozenset of ``episode_file_id`` values that must **never** be
         deleted because **any** episode row backed by that file hits a
@@ -631,10 +638,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     def _build_protected_file_reasons(
         self,
-        df: "pd.DataFrame",
-        now: "datetime",
-        pilot_file_ids: "frozenset | None" = None,
-    ) -> "dict[str, frozenset]":
+        df: pd.DataFrame,
+        now: datetime,
+        pilot_file_ids: frozenset | None = None,
+    ) -> dict[str, frozenset]:
         """GLD-ACQ-22 — per-guard breakdown of :meth:`_build_protected_file_ids`:
         ``{guard: fids}`` from the SAME mask source, so attribution can never disagree
         with the guard. The union of the values equals the flat protected set."""
@@ -650,7 +657,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     # ── Formatting helpers ───────────────────────────────────────────────────────
 
     @staticmethod
-    def _fmt_bytes(n: "int | float | None") -> str:
+    def _fmt_bytes(n: float | None) -> str:
         """Format a raw byte count into a compact, human-readable string.
 
         Examples: 0 B, 512.0 MB, 4.2 GB, 1.1 TB
@@ -1019,8 +1026,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 gather_saga_engagement,
                 household_member_count,
             )
-            from scripts.managers.machine_learning.likelihood.watch_likelihood import saga_credit
-            from scripts.managers.services.plex.playlists.universe_order import saga_display_name
+            from scripts.managers.machine_learning.likelihood.watch_likelihood import (
+                saga_credit,
+            )
+            from scripts.managers.services.plex.playlists.universe_order import (
+                saga_display_name,
+            )
             eng = gather_saga_engagement(self.global_cache, self.config)
             if not eng or "date_added" not in df.columns:
                 return out
@@ -1128,7 +1139,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return title
 
     @timeit("remediate_size_anomalies")
-    def remediate_size_anomalies(self, instance: str, rows: "list | None") -> dict:
+    def remediate_size_anomalies(self, instance: str, rows: list | None) -> dict:
         """ACT on the size anomalies (opt-in: ``size_anomaly.remediate=true``) — the TV twin of
         Radarr's remediation.
 
@@ -1414,11 +1425,14 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if series_df is None or getattr(series_df, "empty", True):
             return []
         from scripts.managers.machine_learning.quality_analytics.codec_report import (
-            build_per_title_watchers, codec_report_rows, normalize_title,
+            build_per_title_watchers,
+            codec_report_rows,
+            normalize_title,
             per_user_platform_usage_from_history,
         )
         from scripts.managers.machine_learning.quality_analytics.transcode_fingerprint import (
-            per_user_source_fingerprint_matrix, per_user_transcode_fingerprint_matrix,
+            per_user_source_fingerprint_matrix,
+            per_user_transcode_fingerprint_matrix,
         )
         # Source-codec matrix (keyed by the FILE's codec via the metadata index, NOT Plex's streamed /
         # transcode-target codec) so the prediction is codec-aware; falls back to the streamed matrix
@@ -1574,9 +1588,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if df is None or getattr(df, "empty", True):
             return {}
         from scripts.managers.machine_learning.quality_analytics.legacy_codec import (
-            interleave_by_series, legacy_files_from_df,
+            interleave_by_series,
+            legacy_files_from_df,
         )
-        from scripts.managers.services.sonarr.cache.legacy_regrab import ledger_key, run_legacy_regrab
+        from scripts.managers.services.sonarr.cache.legacy_regrab import (
+            ledger_key,
+            run_legacy_regrab,
+        )
         legacy = legacy_files_from_df(df)
         if not legacy:
             return {}
@@ -1757,7 +1775,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return False
         try:
             import os
-            from scripts.managers.factories.daemons.daemon_paths import PILOT_SPILL_THRESHOLD
+
+            from scripts.managers.factories.daemons.daemon_paths import (
+                PILOT_SPILL_THRESHOLD,
+            )
             dcfg = ((self.config or {}).get("daemons", {}) or {}).get("pilot_search", {}) or {}
             if not dcfg.get("enabled", True):
                 return False
@@ -1768,7 +1789,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             if len(items) <= max(0, threshold):
                 return False
             from scripts.managers.factories.daemons import pilot_jobs
-            from scripts.managers.factories.daemons.supervisor import PilotSearchDaemonSupervisor
+            from scripts.managers.factories.daemons.supervisor import (
+                PilotSearchDaemonSupervisor,
+            )
             cp = (((self.config or {}).get("scoring") or {}).get("codec_profiles") or {})
             job = {
                 "version":       1,
@@ -1817,7 +1840,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         (read via TraktShowCacheManager). Best-effort: a series the daemon hasn't enriched
         yet gets None columns this run and fills in later. Persisted even in dry_run (a
         non-destructive annotation, like the watchability score)."""
-        from scripts.managers.factories.daemons.bucket_merge import show_enrichment_columns
+        from scripts.managers.factories.daemons.bucket_merge import (
+            show_enrichment_columns,
+        )
 
         instance = self._resolve_instance(instance)
         df = self.load(instance)
@@ -1873,7 +1898,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         return len(cols_by_series)
 
     @timeit("_build_show_score_map")
-    def _build_show_score_map(self, df: "pd.DataFrame", instance: str,
+    def _build_show_score_map(self, df: pd.DataFrame, instance: str,
                               with_breakdown: bool = False) -> dict:
         """Return ``{series_id: watchability_score}`` for every series in *df*.
 
@@ -1887,8 +1912,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         dict is added (the persistence path uses this; decision paths don't).
         """
         from scripts.managers.machine_learning.features.show_features import (
-            build_show_feature_row, score_show_features,
+            build_show_feature_row,
+            score_show_features,
         )
+
         # Group-D device matrix: the shipped cold-start prior plus whatever the operator
         # added under scoring.device_capabilities. Resolved ONCE for the whole pass.
         from scripts.managers.machine_learning.scoring._shared import (
@@ -1948,7 +1975,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # GROUP C4 — cast/crew taste overlap (config.scoring.person_affinity), the TV twin
         # of the movie path. Same shared resolver, so cap=0.0 (byte-identical) whenever the
         # term is disabled or the people-matrix affinity is empty. Loaded once per pass.
-        from scripts.managers.machine_learning.scoring._shared import resolve_person_affinity_inputs
+        from scripts.managers.machine_learning.scoring._shared import (
+            resolve_person_affinity_inputs,
+        )
         _aff_raw = self.global_cache.get("people_matrix/affinity") if self.global_cache else None
         person_weights, person_affinity_cap = resolve_person_affinity_inputs(self.config, _aff_raw)
 
@@ -1957,9 +1986,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # disagree about what the household asked for. Shows are where the DATED half bites:
         # Plex's union is undated, but Trakt's show watchlist carries a real ``listed_at``.
         # cap forced to 0.0 (byte-identical) when disabled or nothing is watchlisted.
-        from scripts.managers.machine_learning.scoring._shared import resolve_intent_inputs
+        from scripts.managers.machine_learning.scoring._shared import (
+            resolve_intent_inputs,
+        )
         from scripts.managers.services._intent_index import (
-            gather_intent_index, intent_memo_fingerprint,
+            gather_intent_index,
+            intent_memo_fingerprint,
         )
         _intent_all = gather_intent_index(self.global_cache, self.config,
                                           logger=getattr(self, "logger", None))
@@ -1979,7 +2011,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if related_enabled and "is_watched" in df.columns:
             for _wsid, _wrows in df.groupby("series_id", sort=False):
                 try:
-                    if int((_wrows["is_watched"] == True).sum()) <= 0:   # noqa: E712
+                    if int((_wrows["is_watched"] == True).sum()) <= 0:
                         continue
                     _wso = series_by_id.get(str(int(_wsid))) or {}
                     _wtv = _wso.get("tvdbId")
@@ -2281,11 +2313,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         the movie and show paths cannot disagree about what this household transcodes
         for. Any failure, or a household with no evidence at all, returns None."""
         try:
-            from scripts.managers.machine_learning.scoring.device_fit import (
-                build_transcode_profile, resolve_device_fit,
-            )
             from scripts.managers.machine_learning.scoring._shared import (
                 resolve_device_capabilities,
+            )
+            from scripts.managers.machine_learning.scoring.device_fit import (
+                build_transcode_profile,
+                resolve_device_fit,
             )
             settings = resolve_device_fit(self.config)
             if not settings.enabled:
@@ -2314,7 +2347,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         file-owning subset — the population the ladder and the delete floor are anchored
         on — is reported separately and is the one the guard fires on."""
         try:
-            from scripts.managers.machine_learning.scoring.device_fit import summarise_group_d
+            from scripts.managers.machine_learning.scoring.device_fit import (
+                summarise_group_d,
+            )
             vals = []
             for bd in breakdowns:
                 if not isinstance(bd, dict):
@@ -2406,7 +2441,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         cached = getattr(self, "_show_cache", None)
         if cached is None:
             try:
-                from scripts.managers.services.trakt.shows.cache import TraktShowCacheManager
+                from scripts.managers.services.trakt.shows.cache import (
+                    TraktShowCacheManager,
+                )
                 cached = TraktShowCacheManager(
                     logger=self.logger, config=self.config,
                     global_cache=self.global_cache, registry=self.registry,
@@ -2459,7 +2496,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             df = self.load(instance)
         if df is None or df.empty or "episode_file_id" not in df.columns or "marked_for_deletion" not in df.columns:
             return out
-        marked = (df["marked_for_deletion"] == True)  # noqa: E712 (null-safe)
+        marked = (df["marked_for_deletion"] == True)
         if not marked.any():
             return out
         # Refuse to contribute candidates when scores never populated (column absent
@@ -4328,10 +4365,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     @timeit("_ingest_cold_inventory")
     def _ingest_cold_inventory(
-        self, df: "pd.DataFrame", instance: str,
+        self, df: pd.DataFrame, instance: str,
         *, season_ep_cache: dict | None = None,
         files_session_cache: dict | None = None,
-    ) -> "pd.DataFrame":
+    ) -> pd.DataFrame:
         """GLD-ACQ-24 — make cold unwatched TV reachable by the delete flow.
 
         Unwatched non-pilot episodes have NO parquet rows (rows come from the watch
@@ -4788,7 +4825,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     @timeit("_resolve_keep_policy_map")
     def _resolve_keep_policy_map(
         self, instance: str, df: pd.DataFrame
-    ) -> "dict[int, str | None]":
+    ) -> dict[int, str | None]:
         """
         Build a ``{series_id: keep_policy}`` map from Sonarr tag assignments.
 
@@ -5271,7 +5308,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         to protect.
         """
         from scripts.managers.machine_learning.acquisition.recycle_planner import (
-            DEFAULT_REWATCH_BUFFER, DEFAULT_SIZE_TOLERANCE, plan_recycle,
+            DEFAULT_REWATCH_BUFFER,
+            DEFAULT_SIZE_TOLERANCE,
+            plan_recycle,
         )
 
         cfg = self._recycle_cfg()
@@ -6133,7 +6172,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             }
         """
         # Import the working low-level API — NOT TautulliManager (broken imports)
-        from scripts.managers.services.tautulli.instances.api import TautulliAPI as TautulliInstanceAPI
+        from scripts.managers.services.tautulli.instances.api import (
+            TautulliAPI as TautulliInstanceAPI,
+        )
 
         tautulli_config = (self.config or {}).get("tautulli", {})
         if not tautulli_config:
@@ -6379,7 +6420,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     @staticmethod
     def _resolve_household_watch_state(
-        per_user: dict, household_members: list[str], *, quorum: "int | None" = None
+        per_user: dict, household_members: list[str], *, quorum: int | None = None
     ) -> tuple[bool, str | None]:
         """
         Determine whether the household has watched an episode — delegates to the brain
@@ -6427,8 +6468,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     @timeit("_apply_viewer_retention")
     def _apply_viewer_retention(
-        self, df: "pd.DataFrame", history: dict, instance: str
-    ) -> "tuple[pd.DataFrame, dict]":
+        self, df: pd.DataFrame, history: dict, instance: str
+    ) -> tuple[pd.DataFrame, dict]:
         """Stamp the per-viewer retention verdict onto ``retention_hold`` /
         ``retention_hold_by`` and persist each account's resume state.
 
@@ -7029,7 +7070,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         Load {series_id: sonarr_episode_id} from the pilots Parquet.
         Avoids per-series cache files and live API calls for S01E01 IDs.
         """
-        import pandas as pd, pathlib
+        import pathlib
+
+        import pandas as pd
         key = self._pilot_cache_key(instance)
         raw = self.global_cache.get(key) if self.global_cache else None
         if isinstance(raw, dict):
@@ -7053,7 +7096,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     def _save_pilot_episode_cache(self, instance: str, mapping: dict):
         """Persist {series_id: sonarr_episode_id} to pilots.parquet."""
-        import pandas as pd, pathlib
+        import pathlib
+
+        import pandas as pd
         if not mapping:
             return
         key = self._pilot_cache_key(instance)
@@ -7152,8 +7197,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # keeps re-grading it every run and it returns the moment its affinity climbs back over the
         # floor (no dead-zone). Inert when the column is absent (first post-reset run) or the floor is 0.
         try:
-            _pilot_floor = float((((self.config or {}).get("pilot_interactive", {}) or {})
-                                  .get("min_watchability", self.PILOT_MIN_WATCHABILITY)))
+            _pilot_floor = float(((self.config or {}).get("pilot_interactive", {}) or {})
+                                  .get("min_watchability", self.PILOT_MIN_WATCHABILITY))
         except (TypeError, ValueError):
             _pilot_floor = self.PILOT_MIN_WATCHABILITY
         _pilot_floor = get_threshold("pilot_min_watchability", self.config,
@@ -8174,7 +8219,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         worker / daemon writes it; run_pilot_search reads it to gate re-searches). Delegates to
         the shared single source of truth so the in-process worker, the daemon, and the reader
         can never disagree about the key."""
-        from scripts.managers.services.sonarr.cache.pilot_interactive import unacquirable_key
+        from scripts.managers.services.sonarr.cache.pilot_interactive import (
+            unacquirable_key,
+        )
         return unacquirable_key(instance)
 
     def _spawn_pilot_interactive_worker(self, instance: str, items: list, ladder: list,
@@ -8219,7 +8266,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return False
         try:
             import os
-            from scripts.managers.factories.daemons.daemon_paths import PILOT_SPILL_THRESHOLD
+
+            from scripts.managers.factories.daemons.daemon_paths import (
+                PILOT_SPILL_THRESHOLD,
+            )
             cfg = ((self.config or {}).get("daemons", {}) or {}).get("pilot_search", {}) or {}
             if not cfg.get("enabled", True):
                 return False
@@ -8231,7 +8281,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 return False
 
             from scripts.managers.factories.daemons import pilot_jobs
-            from scripts.managers.factories.daemons.supervisor import PilotSearchDaemonSupervisor
+            from scripts.managers.factories.daemons.supervisor import (
+                PilotSearchDaemonSupervisor,
+            )
 
             try:
                 recheck_days = float(recheck_cooldown.total_seconds()) / 86_400.0
@@ -8579,6 +8631,50 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # JIT tier, not the raw series profile (_do_acquire_next_episodes already MONITORED it, so
         # the shared step-down worker can search it).
         candidates = next_up_grab_candidates(df, upgrade_cap=self.JIT_MAX_EPISODES)
+        # QUEUE ORDER (GLD-SON-26). Series that came up empty on a previous run sort
+        # to the BACK, so a run's finite search budget goes to candidates that can
+        # actually grab. Measured 2026-08-21: five series that grabbed NOTHING consumed
+        # 116 of 146 step-downs at ~112s each, then had their flags reset and were fully
+        # re-eligible the next run — the same three hours, every night.
+        #
+        # ORDERING, NOT EXCLUSION, and the distinction is load-bearing. `legacy_regrab`
+        # benches a file for 14 days; GLD-SON-02 records that going wrong at 814-of-881
+        # scale, because a disabled or rate-limited indexer is indistinguishable from
+        # "no release exists". Those five titles are old/obscure/anime — exactly what
+        # lives on the torrent indexers currently disabled here. A bench would survive
+        # re-enabling them; a demotion does not: the first grab calls record_success and
+        # the series returns to full priority with no operator action.
+        # Baked in, not configurable: see jit_backoff's policy-constants block. A knob
+        # here would be a knob to re-enable the defect.
+        _bo_led = {}
+        _bo_deferred: list = []
+        if self.global_cache:
+            try:
+                _bo_led = self.global_cache.get(jit_backoff.ledger_key(instance)) or {}
+                _seq = int(self.global_cache.get(jit_backoff.run_seq_key(instance)) or 0) + 1
+                self.global_cache.set(jit_backoff.run_seq_key(instance), _seq)
+                _sids = list(dict.fromkeys(
+                    int(s) for s in candidates.get("series_id", []) if pd.notna(s)))
+                _now, _bo_deferred = jit_backoff.order_series(_sids, _bo_led, run_seq=_seq)
+                if _bo_deferred or _now != _sids:
+                    _rank = {s: i for i, s in enumerate(_now)}
+                    _keep = candidates["series_id"].isin(_rank)
+                    candidates = (candidates[_keep]
+                                  .assign(_bo=candidates.loc[_keep, "series_id"].map(_rank))
+                                  .sort_values("_bo", kind="stable")
+                                  .drop(columns=["_bo"]))
+                _sum = jit_backoff.summarise(_bo_led)
+                if _sum["demoted"]:
+                    self.logger.log_info(
+                        f"[JIT] queue order: {_sum['demoted']} series demoted after coming up "
+                        f"empty (worst: {_sum['worst_n']}x)"
+                        + (f"; {len(_bo_deferred)} skipped this run (soft cooldown, never "
+                           f"benched)" if _bo_deferred else "")
+                        + " — fresh candidates searched first.")
+            except Exception as e:
+                # Ordering is an optimisation: on any failure fall back to the caller's
+                # order, which is exactly the pre-GLD-SON-26 behaviour.
+                self.logger.log_debug(f"[JIT] backoff ordering skipped: {e}")
         if candidates.empty:
             if reconcile_changed and not self.dry_run:
                 self.save(instance, df)  # persist the flag resets from reconcile
@@ -8989,6 +9085,13 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         Re-enable episodes that a prior run's background step-down search failed
         to grab: reset their JIT flags so this run's pass re-attempts them.
         Consumes (deletes) the side cache. Returns True if any row changed.
+
+        NOTE (``GLD-SON-26``): this clears ``jit/failed_upgrades`` ONLY. The per-series
+        demotion ledger (``jit/backoff``) is a SEPARATE key and must survive — the
+        episodes going back into the candidate pool is exactly the intent, and the
+        backoff counter is what decides they are attempted LAST rather than first.
+        Clearing both here would wipe the demotion every run and re-create the loop
+        it exists to break. See ``_record_jit_backoff``.
         """
         if not self.global_cache:
             return False
@@ -9091,7 +9194,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return False
         try:
             import os
-            from scripts.managers.factories.daemons.daemon_paths import PILOT_SPILL_THRESHOLD
+
+            from scripts.managers.factories.daemons.daemon_paths import (
+                PILOT_SPILL_THRESHOLD,
+            )
             cfg = ((self.config or {}).get("daemons", {}) or {}).get("pilot_search", {}) or {}
             if not cfg.get("enabled", True):
                 return False
@@ -9116,7 +9222,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 return False
 
             from scripts.managers.factories.daemons import pilot_jobs
-            from scripts.managers.factories.daemons.supervisor import PilotSearchDaemonSupervisor
+            from scripts.managers.factories.daemons.supervisor import (
+                PilotSearchDaemonSupervisor,
+            )
 
             job = {"version": 1, "mode": "jit", "instance": instance,
                    "items": items, "run_pid": os.getpid()}
@@ -9159,15 +9267,53 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # pilot-search daemon's "jit" mode call, so the two can never drift). ``_episodes_in_queue``
         # is injected as the grabbed-episode probe; the core records each series' pre-flip profile in
         # a durable inflight store and reverts it, so a detached crash never strands a bumped tier.
-        from scripts.managers.services.sonarr.cache.jit_search import jit_step_down_search
-        jit_step_down_search(
+        from scripts.managers.services.sonarr.cache.jit_search import (
+            jit_step_down_search,
+        )
+        res = jit_step_down_search(
             make_request=self.sonarr_api._make_request,
             in_queue=self._episodes_in_queue,
             logger=self.logger,
             global_cache=self.global_cache,
             instance=instance, items=items,
             max_workers=self.JIT_SEARCH_MAX_WORKERS,
+            max_consecutive_misses=jit_backoff.MAX_CONSECUTIVE_MISSES,
         )
+        self._record_jit_backoff(instance, res)
+
+    def _record_jit_backoff(self, instance: str, res: dict) -> None:
+        """Fold one search pass's outcome into the demotion ledger (``GLD-SON-26``).
+
+        DELIBERATELY SEPARATE FROM ``_reconcile_failed_jit``. That method reads
+        ``jit/failed_upgrades``, resets the EPISODE flags so the rows are candidates
+        again, and deletes its key — which is correct and stays. This writes
+        ``jit/backoff``, a per-SERIES counter, and must NOT be cleared with it: the
+        two answer different questions.
+
+            failed_upgrades  — "is this EPISODE still owed a grab?"      (yes, retry)
+            backoff          — "how often has this SERIES come up empty?" (sort it last)
+
+        Together they produce the intended behaviour: the episodes stay fully
+        eligible, and their series simply goes to the BACK of the queue. Merging the
+        two — or clearing this key in the reconcile — would wipe the counters every
+        run and restore the loop this exists to break: five series consuming 116 of
+        146 step-downs, every night, forever.
+        """
+        if not self.global_cache or not isinstance(res, dict):
+            return
+        try:
+            key = jit_backoff.ledger_key(instance)
+            led = self.global_cache.get(key) or {}
+            seq = int(self.global_cache.get(jit_backoff.run_seq_key(instance)) or 0)
+            for sid in (res.get("grabbed_sids") or []):
+                led = jit_backoff.record_success(led, sid)      # supply exists → full priority
+            for sid in (res.get("exhausted_sids") or []):
+                led = jit_backoff.record_exhaustion(led, sid, run_seq=seq)
+            self.global_cache.set(key, led)
+        except Exception as e:
+            # A ledger write must never cost the run: worst case the series keeps its
+            # current position, which is the pre-GLD-SON-26 behaviour.
+            self.logger.log_debug(f"[JIT] backoff ledger not updated: {e}")
 
     def _episodes_in_queue(self, instance: str, ep_ids: list,
                            attempts: int = 3, delay_s: float = 2.0) -> set:
@@ -9491,7 +9637,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # members have watched it, rather than requiring every single member. Default-off
         # (household_watch_quorum unset / fraction>=1.0) → quorum None → require all,
         # byte-identical. fraction is clamped to [0,1] and rounded UP to a member count.
-        _hh_quorum: "int | None" = None
+        _hh_quorum: int | None = None
         _hq_cfg = ((self.config or {}).get("household_watch_quorum") or {})
         if _hq_cfg.get("enabled") and household_members:
             try:
