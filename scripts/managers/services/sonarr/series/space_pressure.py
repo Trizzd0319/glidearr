@@ -891,7 +891,7 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             self._archive_stepdown_release(
                 instance, sid, sn, en, df.loc[idx], eid,
                 from_res=res, to_res=int(target_res) if target_res else None)
-            # CHECK THE RETURN VALUE, do not rely on an exception. ``_make_request``
+            # GLD-SON-23 - CHECK THE RETURN VALUE, do not rely on an exception. ``_make_request``
             # SWALLOWS a failed call - it logs a warning and returns the fallback - so
             # the ``except`` below never fires for an HTTP failure and this block used
             # to count a FAILED delete as realized: its bytes were added to

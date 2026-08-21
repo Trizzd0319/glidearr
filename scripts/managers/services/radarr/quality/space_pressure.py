@@ -1136,7 +1136,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # Only exhaustive mode is throttled. The targeted path stops at need_gb and
         # cannot run away; exhaustive has no such bound by design.
         _pass_ledger = {}
-        # Every other global_cache read in this file is guarded (see _affinity_inputs
+        # GLD-RAD-36 - every other global_cache read in this file is guarded (see _affinity_inputs
         # and the device/transcode block); this one must be too. The throttle needs a
         # PERSISTED last-run stamp, so with no usable cache there is no record to read
         # - which pass_allowed() already treats as "first run, allow". Warn rather than
