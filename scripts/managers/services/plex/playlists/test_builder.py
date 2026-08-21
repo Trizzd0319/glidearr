@@ -30,6 +30,7 @@ class _Log:
     def log_info(self, m): self.infos.append(m)
     def log_warning(self, m): self.warns.append(m)
     def log_error(self, m): pass
+    def log_debug(self, *a, **k): pass          # SagaProgress logs at debug
 
     def log_grid(self, headers, rows, title="", cap=16, caption=""):
         self.grids.append((title, headers, rows))
@@ -87,7 +88,11 @@ def test_builds_and_caches_per_user_plans():
     assert _items(cache, "kid") == ["a", "b"]                  # nothing watched
     assert len(log.grids) == 1                                 # ONE summary table, not a grid per user
     assert [r[1] for r in log.grids[0][2]] == ["R - adult 1", "K - adult 2"]   # a row per profile
-    assert log.warns == []                                     # full coverage, scored
+    # SagaProgress reads library shards off disk and this fixture has none, so it
+    # degrades - by design ("degrades, never blocks"). That is a different subsystem
+    # from the claim under test, which is that every profile was covered and scored.
+    assert [w for w in log.warns
+            if not w.startswith("[SagaProgress]")] == []       # full coverage, scored
 
 
 def test_serialized_plan_shape():

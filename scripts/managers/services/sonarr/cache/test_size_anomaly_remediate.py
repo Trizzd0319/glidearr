@@ -176,9 +176,14 @@ def _omnibus_mgr(eps, df):
     return m
 
 
-def test_multi_episode_file_with_unmonitored_sibling_is_not_deleted():
+def test_multi_episode_file_with_unmonitored_sibling_is_searched_never_deleted():
     # One physical file (fid 50) backs S01E02 (monitored, the anomaly row) AND S01E03 (UNMONITORED).
-    # Deleting it would orphan E03 with nothing to re-grab it → the whole file must be SKIPPED.
+    # GLD-SON-18 removed the orphan risk at its source: the old DELETE-then-search left the file
+    # gone and the search inert (Sonarr will not search an unmonitored episode), so an unmonitored
+    # sibling had to veto the whole file. Search-only cannot orphan anything - at worst the search
+    # finds nothing and the household keeps exactly what it had - so the veto became a COUNTER:
+    # searched_unmonitored tells the operator this file needs `monitored: true` before the bloat
+    # can actually be corrected. The safety property is unchanged and now structural.
     eps = {5: [{"id": 502, "seasonNumber": 1, "episodeNumber": 2, "monitored": True},
                {"id": 503, "seasonNumber": 1, "episodeNumber": 3, "monitored": False}]}
     df = pd.DataFrame([{"episode_file_id": 50, "season_number": 1, "episode_number": 2},
@@ -187,13 +192,17 @@ def test_multi_episode_file_with_unmonitored_sibling_is_not_deleted():
     rows = [{"action": "regrab", "series_id": 5, "episode_file_id": 50, "series_title": "Omnibus",
              "season_number": 1, "episode_number": 2, "size_gb": 30.0, "quality_name": "Bluray-1080p"}]
     stats = m.remediate_size_anomalies("standard", rows)
-    assert stats["regrabbed"] == 0 and stats["skipped_unmonitored"] == 1
+    assert stats["regrabbed"] == 1 and stats.get("searched_unmonitored") == 1
+    assert stats["skipped_unmonitored"] == 0                               # no longer a veto
+    assert all(c[1] != "DELETE" for c in m.sonarr_api.calls)               # nothing is ever deleted
     assert all("episodefile/50" not in c[0] for c in m.sonarr_api.calls)   # file preserved, no orphaning
 
 
 def test_multi_episode_file_all_monitored_searches_every_episode_once():
-    # Same omnibus but BOTH episodes monitored → safe to replace; deleted ONCE (deduped), EpisodeSearch
-    # covers BOTH episode ids so the whole multi-ep file is re-acquired.
+    # Same omnibus but BOTH episodes monitored. ONE decision per unique file id (deduped), and the
+    # EpisodeSearch covers BOTH episode ids so the whole multi-ep file is re-acquired. Under
+    # GLD-SON-18 the file is left in place: Sonarr replaces it on import rather than being handed
+    # a hole to fill.
     eps = {6: [{"id": 602, "seasonNumber": 1, "episodeNumber": 2, "monitored": True},
                {"id": 603, "seasonNumber": 1, "episodeNumber": 3, "monitored": True}]}
     df = pd.DataFrame([{"episode_file_id": 60, "season_number": 1, "episode_number": 2},
@@ -203,8 +212,8 @@ def test_multi_episode_file_all_monitored_searches_every_episode_once():
              "season_number": 1, "episode_number": n, "size_gb": 30.0, "quality_name": "Bluray-1080p"}
             for n in (2, 3)]                                  # two anomaly rows sharing fid 60
     stats = m.remediate_size_anomalies("standard", rows)
-    assert stats["regrabbed"] == 1                            # ONE file, deleted once (deduped)
-    assert ("episodefile/60", "DELETE", None) in m.sonarr_api.calls
+    assert stats["regrabbed"] == 1                            # ONE file, one decision (deduped)
+    assert all(c[1] != "DELETE" for c in m.sonarr_api.calls)  # search-only: never deleted
     searches = [c for c in m.sonarr_api.calls
                 if isinstance(c[2], dict) and c[2].get("name") == "EpisodeSearch"]
     assert len(searches) == 1 and sorted(searches[0][2]["episodeIds"]) == [602, 603]

@@ -31,6 +31,12 @@ class _Api:
         self.eps = ep_by_series
         self.grabs = []
 
+    def disk_free_gb(self, instance):
+        # GLD-ACQ-30 holds work when free space is under the acquire floor. These
+        # tests are not about that gate, and inf is the real method's own "no
+        # constraint" value, so the floor never fires here.
+        return float("inf")
+
     def _make_request(self, instance, ep, method="GET", payload=None, fallback=None):
         if ep == "release" and method == "POST":
             self.grabs.append(payload)

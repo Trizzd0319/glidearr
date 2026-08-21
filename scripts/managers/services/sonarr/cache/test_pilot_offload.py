@@ -127,6 +127,12 @@ _PROFILES = [_prof(13, 2160), _prof(12, 1080), _prof(11, 720)]
 
 class _Api:
     def __init__(self): self.puts = []
+    def disk_free_gb(self, instance):
+        # GLD-ACQ-30 holds work when free space is under the acquire floor. These
+        # tests are not about that gate, and inf is the real method's own "no
+        # constraint" value, so the floor never fires here.
+        return float("inf")
+
     def _make_request(self, instance, endpoint, method="GET", payload=None, fallback=None):
         if endpoint == "qualityprofile":
             return list(_PROFILES)

@@ -88,6 +88,15 @@ class _CapLogger:
 class _GC:
     def __init__(self, run_summary): self.run_summary = run_summary
 
+    def get(self, key, default=None):
+        # The realize path reads the step-down cooldown ledger through the cache.
+        # _stepdown_ledger guards with `if not self.global_cache`, which a stub that is
+        # truthy-but-has-no-`get` sails straight past - so the stub has to answer.
+        return default
+
+    def set(self, key, value):
+        pass
+
 
 def _mk_apply_mgr(df, ranked, target, sink, *, hold_qp, run_summary=None):
     m = object.__new__(U)                       # skip __init__/registry/base
