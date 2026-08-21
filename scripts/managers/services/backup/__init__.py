@@ -34,8 +34,10 @@ _CONFIG_SUFFIX = "config.xml"
 class ServiceBackupManager:
     POLL_INTERVAL_S = 3.0
     BACKUP_TIMEOUT_S = 300.0          # native backups of a big DB can take a minute+
+    LISTING_SETTLE_S = 90.0           # the *arr lists a backup AFTER the command completes
     MIN_BACKUP_BYTES = 64 * 1024      # below this a "backup" is empty/garbage, not a real DB dump
     DEFAULT_MAX_AGE_HOURS = 24.0      # reuse a backup younger than this instead of making a new one
+    DEFAULT_FALLBACK_AGE_HOURS = 72.0 # accept an OLDER valid backup rather than disarm the gate
     _DONE = ("completed", "failed", "aborted", "cancelled")
 
     def __init__(self, logger, config, global_cache=None, *, dry_run: bool = False):
@@ -70,15 +72,27 @@ class ServiceBackupManager:
         self._set_gate(all_ok, reason="ok" if all_ok else "backup_failed", results=results)
         if all_ok:
             names = ", ".join(
-                f"{k} ({v.get('size_mb', 0):.0f} MB{', reused' if v.get('reused') else ''})"
+                f"{k} ({v.get('size_mb', 0):.0f} MB"
+                + (f", {v['age_hours']}h old FALLBACK" if v.get("stale_fallback")
+                   else ", reused" if v.get("reused") else "")
+                + ")"
                 for k, v in results.items())
             self.logger.log_success(
                 f"[Backup] validated loadable pre-destructive backups: {names}."
             )
         else:
-            bad = ", ".join(k for k, v in results.items() if not v.get("ok")) or "(none created)"
+            # Name the CAUSE, not just the instance. `_backup_one` computes a precise
+            # `detail` on every failure path -- "Backup command did not complete within
+            # 300s", "no backup file appeared", "no base_url / api key in config", or the
+            # exception -- and this warning used to build itself from the keys alone,
+            # discarding all of it (P-A). The operator was told the run degraded and given
+            # no way to find out why: a gate that blocks every live run while withholding
+            # the reason it computed is worse than one that fails loudly.
+            bad = ", ".join(
+                f"{k} ({v.get('detail') or 'created but did not validate'})"
+                for k, v in results.items() if not v.get("ok")) or "(none created)"
             self.logger.log_warning(
-                f"[Backup] backup FAILED or not loadable for: {bad}. DEGRADING this run to "
+                f"[Backup] backup unusable for: {bad}. DEGRADING this run to "
                 f"dry-run — NO destructive changes will be made (every delete/re-grab logs "
                 f"'would …' instead). Fix the backup target and re-run for live changes."
             )
@@ -106,14 +120,106 @@ class ServiceBackupManager:
             cmd = self._api_post(base, key, "command", {"name": "Backup"})
             cid = (cmd or {}).get("id")
             if not self._wait_command(base, key, cid):
-                return {"ok": False, "detail": "Backup command did not complete"}
-            backups = self._list_backups(base, key) or []
-            fresh = self._pick_newest(backups, exclude_paths=before) or self._pick_newest(backups)
+                return (self._stale_fallback(service, inst, base, key, existing)
+                        or {"ok": False, "detail": "Backup command did not complete "
+                                                   f"within {self.BACKUP_TIMEOUT_S:.0f}s"})
+            fresh = self._await_new_backup(base, key, before)
             if not fresh:
-                return {"ok": False, "detail": "no backup file appeared"}
-            return self._finalize(service, inst, base, key, fresh, reused=False)
+                return (self._stale_fallback(service, inst, base, key,
+                                             self._list_backups(base, key) or existing)
+                        or {"ok": False, "detail": "no backup file appeared within "
+                                                   f"{self.LISTING_SETTLE_S:.0f}s of the Backup "
+                                                   "command completing"})
+            res = self._finalize(service, inst, base, key, fresh, reused=False)
+            if res.get("ok"):
+                return res
+            return (self._stale_fallback(service, inst, base, key,
+                                         self._list_backups(base, key) or [])
+                    or res)
         except Exception as e:
             return {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+
+    def _await_new_backup(self, base: str, key: str, before: set) -> "dict | None":
+        """Poll the backup listing until a NEW file appears, or the settle window expires.
+
+        The *arr marks the Backup command ``completed`` BEFORE the zip is flushed and
+        listed, so a single immediate ``_list_backups`` is a race the caller loses in
+        proportion to database size. Measured on this deployment 2026-08-20: radarr/ultra
+        (0.4 MB) listed instantly and passed, while radarr/standard (218.8 MB, ~27.5k
+        movies) was checked ~10s too early, reported "no backup file appeared", and
+        DEGRADED the whole live run -- the file it wanted appeared moments later and was
+        happily reused by the next run.
+
+        Polling here rather than raising BACKUP_TIMEOUT_S: the command really had
+        completed, so waiting longer for the COMMAND would not have helped. It is the
+        LISTING that lags.
+
+        Falls back to the newest backup of any age only if no new path shows up -- the
+        caller then validates it and, failing that, tries the stale-fallback window.
+        """
+        deadline = time.time() + self.LISTING_SETTLE_S
+        while True:
+            backups = self._list_backups(base, key) or []
+            fresh = self._pick_newest(backups, exclude_paths=before)
+            if fresh:
+                return fresh
+            if time.time() >= deadline:
+                # No NEW path within the window. A pre-existing one may still be valid
+                # (the *arr can reuse a filename); let the caller validate it.
+                return self._pick_newest(backups)
+            time.sleep(self.POLL_INTERVAL_S)
+
+    def _fallback_age_hours(self) -> float:
+        try:
+            return float(self._cfg("backup_fallback_max_age_hours",
+                                   self.DEFAULT_FALLBACK_AGE_HOURS))
+        except (TypeError, ValueError):
+            return self.DEFAULT_FALLBACK_AGE_HOURS
+
+    def _stale_fallback(self, service: str, inst: str, base: str, key: str,
+                        candidates: list) -> "dict | None":
+        """Accept an OLDER but still-valid backup rather than disarm the gate.
+
+        The gate exists to guarantee a restorable rollback point before anything
+        destructive runs -- NOT to guarantee a brand-new one. When the *arr's Backup
+        command times out or produces nothing, a valid backup from a few hours ago is
+        still a rollback point, and disarming over it costs the operator an entire
+        live run for no gain in safety.
+
+        Two things this deliberately does NOT relax:
+
+        * The candidate is validated exactly as a fresh one is (``_finalize``: the
+          MIN_BACKUP_BYTES size check, plus deep zip validation when enabled). A
+          0-byte file inside the window is not a rollback point, and accepting one
+          because it is recent would defeat the gate entirely.
+        * The window is bounded by ``backup_fallback_max_age_hours`` (72h default).
+          Beyond it the gate still disarms, because restoring loses everything since
+          the snapshot -- and that cost grows with age.
+
+        Logged as a WARNING, never info: arming destructive writes against an N-hour-old
+        rollback point is a real trade the operator has to be able to see.
+        """
+        window = self._fallback_age_hours()
+        if window <= 0:
+            return None
+        usable = sorted(
+            (b for b in (candidates or [])
+             if int((b or {}).get("size") or 0) >= self.MIN_BACKUP_BYTES
+             and self._age_hours(b) <= window),
+            key=self._age_hours)
+        for cand in usable:
+            res = self._finalize(service, inst, base, key, cand, reused=True)
+            if res.get("ok"):
+                age = self._age_hours(cand)
+                self.logger.log_warning(
+                    f"[Backup] {service}/{inst}: could not create a FRESH backup, falling "
+                    f"back to '{cand.get('name')}' from {age:.1f}h ago "
+                    f"(within the {window:.0f}h fallback window). The gate stays ARMED, but "
+                    f"a restore would lose the last {age:.1f}h of changes.")
+                res["stale_fallback"] = True
+                res["age_hours"] = round(age, 1)
+                return res
+        return None
 
     def _finalize(self, service: str, inst: str, base: str, key: str, newest: dict, *, reused: bool) -> dict:
         """Validate a listed backup and log it — shared by the REUSE and the just-CREATED paths.

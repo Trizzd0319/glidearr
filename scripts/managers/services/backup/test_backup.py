@@ -166,3 +166,105 @@ def test_effective_dry_run_semantics():
     # armed again → real writes allowed
     gc.set(GATE_KEY, {"armed": True})
     assert effective_dry_run(False, gc) is False
+
+
+# ── the listing race, the stale fallback, and naming the cause ─────────────────
+# All three come from one live incident (2026-08-20 20:33): a real run DEGRADED to
+# dry-run because radarr:standard "failed", with no reason given. It had not failed -
+# the 218.8 MB backup was written moments after the manager looked for it.
+
+_BIG = ServiceBackupManager.MIN_BACKUP_BYTES * 4
+
+
+def _stamp(hours_ago):
+    return (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+
+
+def _one(*, listings, wait_ok=True, config=None, dry_run=False):
+    """A manager wired to a scripted sequence of ``_list_backups`` results."""
+    m = ServiceBackupManager.__new__(ServiceBackupManager)
+    m.logger, m.config, m.global_cache, m.dry_run = _Log(), (config or {}), _GC(), dry_run
+    m.POLL_INTERVAL_S = 0.01                       # keep the test instant
+    m.LISTING_SETTLE_S = getattr(m, "LISTING_SETTLE_S", 90.0)
+    seq = list(listings)
+    m._conn = lambda s, i: ("http://x", "k")
+    m._list_backups = lambda b, k: (seq.pop(0) if len(seq) > 1 else seq[0])
+    m._api_post = lambda b, k, p, pl: {"id": 1}
+    m._wait_command = lambda b, k, c: wait_ok
+    m._download = lambda b, p, k: None
+    return m
+
+
+def test_survives_the_listing_race_that_degraded_a_live_run():
+    """The *arr marks the Backup command completed BEFORE the zip is listed, so the
+    first look finds nothing. Polling must find it rather than declare failure."""
+    new = [{"name": "new.zip", "path": "/b/new", "size": _BIG, "time": _stamp(0)}]
+    m = _one(listings=[[], [], new])
+    m.LISTING_SETTLE_S = 5.0
+    res = m._backup_one("radarr", "standard")
+    assert res["ok"] is True and res["name"] == "new.zip"
+
+
+def test_settle_window_expiry_names_the_cause():
+    """`ensure_backups` used to report only WHICH instance failed, discarding the
+    `detail` `_backup_one` had already computed (P-A). The operator was told the run
+    degraded and given no way to find out why."""
+    m = _one(listings=[[]])
+    m.LISTING_SETTLE_S = 0.02
+    res = m._backup_one("radarr", "standard")
+    assert res["ok"] is False
+    assert "no backup file appeared within" in res["detail"]
+
+
+def test_command_timeout_names_the_cause():
+    m = _one(listings=[[]], wait_ok=False)
+    res = m._backup_one("radarr", "standard")
+    assert res["ok"] is False and "did not complete within" in res["detail"]
+
+
+def test_ensure_backups_surfaces_the_detail():
+    m = _one(listings=[[]])
+    m._instances = lambda s: ["standard"] if s == "radarr" else []
+    m._backup_one = lambda s, i: {"ok": False, "detail": "Backup command did not complete within 300s"}
+    m.ensure_backups()
+    warn = " ".join(str(w) for w in m.logger.warns)
+    assert "did not complete within 300s" in warn
+    assert "FAILED or not loadable" not in warn          # the old ambiguous either/or
+
+
+def test_stale_fallback_arms_on_a_valid_recent_backup_but_warns():
+    """The gate guarantees a restorable ROLLBACK POINT, not a brand-new one. A valid
+    40h-old backup still is one; disarming over it costs a live run for no safety."""
+    old = [{"name": "b40.zip", "path": "/b/40", "size": _BIG, "time": _stamp(40)}]
+    m = _one(listings=[old], wait_ok=False)
+    res = m._backup_one("radarr", "standard")
+    assert res["ok"] is True and res["stale_fallback"] is True
+    assert any("falling back" in str(w) for w in m.logger.warns)
+
+
+def test_stale_fallback_refuses_an_invalid_backup_however_recent():
+    """Accepting a 0-byte file because it is recent would defeat the gate entirely."""
+    tiny = [{"name": "empty.zip", "path": "/b/e", "size": 10, "time": _stamp(1)}]
+    m = _one(listings=[tiny], wait_ok=False)
+    assert m._backup_one("radarr", "standard")["ok"] is False
+
+
+def test_stale_fallback_refuses_beyond_the_window():
+    ancient = [{"name": "old.zip", "path": "/b/o", "size": _BIG, "time": _stamp(200)}]
+    m = _one(listings=[ancient], wait_ok=False)
+    assert m._backup_one("radarr", "standard")["ok"] is False
+
+
+def test_fallback_window_can_be_disabled():
+    old = [{"name": "b40.zip", "path": "/b/40", "size": _BIG, "time": _stamp(40)}]
+    m = _one(listings=[old], wait_ok=False, config={"backup_fallback_max_age_hours": 0})
+    assert m._backup_one("radarr", "standard")["ok"] is False
+
+
+def test_fresh_reuse_still_takes_precedence_over_the_fallback():
+    """Under the 24h freshness window nothing is created and no fallback is involved."""
+    fresh = [{"name": "b6.zip", "path": "/b/6", "size": _BIG, "time": _stamp(6)}]
+    m = _one(listings=[fresh])
+    res = m._backup_one("radarr", "standard")
+    assert res["ok"] is True and res.get("reused") is True
+    assert res.get("stale_fallback") is not True
