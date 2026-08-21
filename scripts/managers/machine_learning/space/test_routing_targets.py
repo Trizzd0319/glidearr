@@ -377,3 +377,57 @@ def test_cross_instance_move_does_not_arm_same_instance_relocation():
     # un-conflation: arming the cross-instance move must NOT enable same-instance folder moves.
     cfg = _move_cfg()
     assert relocation_enabled(cfg) is False
+
+
+# ── the "all" mode ────────────────────────────────────────────────────
+# The two actuating modes are peers on INDEPENDENT axes (content bucket within one
+# instance vs resolution tier across two), so forcing a choice left an operator with
+# BOTH consents armed still running one axis log-only. "all" removes an artificial
+# exclusivity, NOT a safety check.
+
+def _all_cfg(*, relocation=True, move=True, dedup=True):
+    return {
+        "routing": {"reorg_mode": "all"},
+        "relocation_consent": relocation,
+        "cross_instance_move_consent": move,
+        "cross_instance_dedup_consent": dedup,
+    }
+
+
+def test_all_mode_arms_both_axes_when_both_consents_given():
+    cfg = _all_cfg()
+    assert relocation_enabled(cfg) is True
+    assert cross_instance_move_enabled(cfg) is True
+    assert cross_instance_dedup_enabled(cfg) is True
+
+
+def test_all_mode_never_bypasses_a_consent():
+    """The whole justification for `all` is that it loosens no gate. Each axis must
+    still refuse without ITS OWN opt-in."""
+    assert relocation_enabled(_all_cfg(relocation=False)) is False
+    assert cross_instance_move_enabled(_all_cfg(move=False)) is False
+    assert cross_instance_dedup_enabled(_all_cfg(dedup=False)) is False
+
+
+def test_peer_modes_still_arm_only_their_own_axis():
+    same = {"routing": {"reorg_mode": "same_instance"}, "relocation_consent": True,
+            "cross_instance_move_consent": True, "cross_instance_dedup_consent": True}
+    cross = dict(same, routing={"reorg_mode": "cross_instance"})
+    assert (relocation_enabled(same), cross_instance_move_enabled(same)) == (True, False)
+    assert (relocation_enabled(cross), cross_instance_move_enabled(cross)) == (False, True)
+
+
+def test_log_only_and_off_arm_nothing_even_with_every_consent():
+    for mode in ("log_only", "off"):
+        cfg = dict(_all_cfg(), routing={"reorg_mode": mode})
+        assert relocation_enabled(cfg) is False
+        assert cross_instance_move_enabled(cfg) is False
+        assert cross_instance_dedup_enabled(cfg) is False
+
+
+def test_unknown_mode_still_falls_back_to_log_only():
+    """A typo must never actuate. Adding a member to the enum must not widen this."""
+    cfg = dict(_all_cfg(), routing={"reorg_mode": "everything"})
+    assert reorg_mode(cfg) == "log_only"
+    assert relocation_enabled(cfg) is False
+    assert cross_instance_move_enabled(cfg) is False

@@ -170,37 +170,48 @@ separate, deferred path"* — which is `uhd_reconcile.py`'s job.
 
 ---
 
-## 4. 🟡 The `allowed_roots` guard fails toward **action**
+## 4. ✅ The `allowed_roots` guard now fails toward **inaction**
 
 ```python
-# The configured folder maps are GLOBAL, but this instance owns only some roots.
-# Fetch its real ones so plan_moves can refuse a cross-library target (the 4K
-# instance being told to move a kids-classified film into the 1080p kids root).
-# Failure leaves the set empty, which DISABLES THE GUARD rather than the pass.
+# FAILS TOWARD INACTION. A failed rootfolder fetch used to leave the set empty,
+# which DISABLED THE GUARD rather than the pass.
 allowed_roots = set()
 try:
     allowed_roots = {library_router._norm(r.get("path")) for r in
                      (im._make_request(name, "rootfolder", fallback=[]) or []) …}
 except Exception as e:
     …
+if apply and not allowed_roots:
+    self._log("log_warning", "… PLANNING ONLY this run rather than moving files unguarded …")
+    apply_here = False
+else:
+    apply_here = apply
 ```
 
 The hazard is real and well identified: global folder maps against per-instance
 roots, so a 4K instance could be told to move a kids-classified film into the
 1080p kids root.
 
-But the failure direction is stated and **wrong by the repo's own rule**. If the
-`rootfolder` fetch fails, `allowed_roots` is empty, the cross-library guard is
-disabled, and **the moves proceed unguarded**.
+The failure direction used to be stated and **wrong by the repo's own rule** — an
+empty `allowed_roots` disabled the cross-library guard and let the moves proceed
+unguarded. [`discovery/DESIGN.md`](../../machine_learning/discovery/DESIGN.md)
+§3.3's rule — *on unknown input, fail toward the outcome that changes nothing* —
+says the pass should be skipped, not the guard.
 
-[`discovery/DESIGN.md`](../../machine_learning/discovery/DESIGN.md) §3.3's rule —
-*on unknown input, fail toward the outcome that changes nothing* — says the pass
-should be skipped, not the guard.
+It now skips the pass. An unreadable root list downgrades that instance to
+`apply_here = False` for the run: the plan is still classified, still written to
+`support/logs/routing.log`, and the next run with a readable list applies it. The
+two outcomes are not symmetric — skipping costs one run of re-organisation, while
+moving unguarded can put a kids film where its audience cannot reach it and only a
+manual move gets it back. `GLD-RT-01` ✅ **resolved** — see `ENHANCEMENTS.md`
+§0.1 #72.
 
-Three things bound the damage: `apply` requires all four gates (§3), the moves are
-same-instance folder relocations rather than deletions, and the comment is honest
-about the trade. But it is the second documented fail-toward-action in the sweep,
-after `build_franchise_file_ids` — and that one caused an outage. `GLD-RT-01`.
+⚠️ **The guard's first live effect was to look like a broken consent gate.**
+`test_routing_manager`'s fake instance-manager keyed its GET responses on the
+instance NAME alone, so the new `rootfolder` fetch was answered with the ITEM
+list; those dicts carry no `path`, the allowed set came out empty, and two
+consented live-run tests failed `0 == 1` on the PUT count. That reads as a consent
+regression, which is the one thing it was not. `GLD-ROU-09`.
 
 ---
 
@@ -412,7 +423,7 @@ That splits `GLD-SP-03` into two genuinely different things:
 |---|---|---|---|---|
 | `GLD-RT-07` | 🔴 **`uhd_reconcile.py` uses THREE shims plus direct brain imports** in one block — the worst `GLD-CACHE-S01` instance, and it adds `size_model` as a **fourth** shim. Tally: **10 callers across 4 shims** | S | `GLD-CACHE-S01`, `GLD-ML-15` |
 | `GLD-RT-08` | 🎯 **Split `GLD-SP-03` into coordinator→service (structural, fine) and peer→peer (the smell)** — `services/routing/` imports from acquisition, radarr **and** mdblist because it is an orchestration layer, not a peer. `sonarr → radarr`'s **private-method** borrow is the case that actually needs a home in the brain | S | `GLD-SP-03` |
-| `GLD-RT-01` | 🟡 **`allowed_roots` fetch failure disables the guard, not the pass** — so a `rootfolder` error lets same-instance moves proceed **without** the cross-library check. Second documented fail-toward-action after `build_franchise_file_ids`, which caused an outage | S | `GLD-CLS-02`, D36 |
+| `GLD-RT-01` | ✅ **`allowed_roots` fetch failure disabled the guard, not the pass** — a `rootfolder` error let same-instance moves proceed **without** the cross-library check. Now skips the pass for that instance (plan still logged, next readable run applies it) | S | ✅ **Fixed** — `ENHANCEMENTS.md` §0.1 #72 |
 | `GLD-RT-02` | 🟡 **Same file imports `library_router` directly and `library_classifier` through the shim** — two halves of one subsystem, two paths. Second instance of `GLD-CACHE-S01`; brings the tally to **7 callers across 3 shims** | S | `GLD-COORD-02`, `GLD-ML-15` |
 | `GLD-RT-03` | **Put `GLD-CLS-01`'s warning in `target_folder` itself** — there are now **two** call sites (add-time resolver + this re-organiser), and both would silently resolve to `""` | S | `GLD-CLS-01`, `GLD-CFG-03` |
 | `GLD-RT-04` | 🔴 **Document this package** — 130 KB, 62 KB of tests, **zero markdown**. The only service package with none, and it contains `GLD-RAD-01`'s caller | M | — |

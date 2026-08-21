@@ -8,10 +8,20 @@ from scripts.managers.services.routing import RoutingManager
 
 
 class _Im:
-    """Fake instance-manager: serves owned items per instance on GET, records editor PUTs."""
+    """Fake instance-manager: serves owned items per instance on GET, records editor PUTs.
 
-    def __init__(self, items):
+    ENDPOINT-AWARE ON PURPOSE. ``_reorg`` makes TWO different GETs per instance — the
+    item list (``movie``/``series``) and ``rootfolder``, which feeds the cross-root
+    guard. A double that keys only on the instance NAME answers both with the item
+    list, so the guard sees root dicts with no ``path``, computes an EMPTY allowed set,
+    and — by its own fail-toward-inaction rule — downgrades a consented live run to
+    planning-only. That reads at the assertion as ``0 == 1``, i.e. as a broken consent
+    gate, which is the one thing it is not. Serve the roots the instance really owns.
+    """
+
+    def __init__(self, items, roots=()):
         self._items = items            # {instance_name: [arr_obj, ...]}
+        self._roots = list(roots)      # the roots THIS service's instances own
         self.gets, self.puts = [], []
 
     def _get_apis(self):
@@ -22,6 +32,8 @@ class _Im:
             self.puts.append((name, endpoint, payload))
             return {"ok": True}
         self.gets.append((name, endpoint))
+        if endpoint == "rootfolder":
+            return [{"path": p} for p in self._roots]
         return self._items.get(name, fallback if fallback is not None else [])
 
 
@@ -51,7 +63,8 @@ def _cfg(reorg_mode="log_only", configured=True, consent=False):
 
 
 def _mgr(config, *, movies=None, shows=None, dry_run=False, logger=None):
-    rim, sim = _Im(movies or {}), _Im(shows or {})
+    rim = _Im(movies or {}, roots=_MRF.values())
+    sim = _Im(shows or {}, roots=_RF.values())
     m = RoutingManager(config=config, logger=logger, radarr=_Mgr(rim), sonarr=_Mgr(sim), dry_run=dry_run)
     m._movie_ages, m._show_ages = {}, {}        # bypass on-disk CSM cache for determinism
     return m, rim, sim

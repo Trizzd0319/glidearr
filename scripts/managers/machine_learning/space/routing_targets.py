@@ -36,10 +36,10 @@ _DEDUP_CONSENT_ENV_VARS = ("RECOMMENDARR_CROSS_INSTANCE_DEDUP_CONSENT", "GLIDEAR
 _CONSENT_TRUTHY = {"1", "true", "yes", "on", "y"}
 
 # "cross_instance" is a PEER mode to "same_instance" (FORK 1A): it un-conflates moving a file BETWEEN
-# *arr instances from moving a file between root folders on ONE instance. reorg_mode is single-valued,
-# so an install actuates EITHER same-instance folder moves OR the cross-instance reconcile — not both
-# at once (a future "all" mode could lift that if ever needed).
-_REORG_MODES = ("off", "log_only", "same_instance", "cross_instance")
+# *arr instances from moving a file between root folders on ONE instance. The two are INDEPENDENT axes,
+# so "all" actuates both -- each still gated by its OWN consent (relocation_consent for the folder axis,
+# cross_instance_move_consent for the instance axis), which is why enabling both is not a loosening.
+_REORG_MODES = ("off", "log_only", "same_instance", "cross_instance", "all")
 DEFAULT_REORG_MODE = "log_only"
 
 
@@ -94,11 +94,18 @@ def reorg_mode(config) -> str:
 def relocation_enabled(config) -> bool:
     """HARD SAFETY GATE for moving owned files on disk. BOTH are required before the
     re-organizer may relocate any file:
-      1. ``reorg_mode == "same_instance"`` (the operator turned actuation on), AND
+      1. ``reorg_mode`` actuates same-instance moves (``same_instance`` or ``all``), AND
       2. explicit operator consent (``relocation_consented`` — onboarding/env opt-in).
     With either missing, the re-organizer may still classify and LOG misplacements
-    (``log_only``) but must never move a file."""
-    return reorg_mode(config) == "same_instance" and relocation_consented(config)
+    (``log_only``) but must never move a file.
+
+    ``all`` was added because the two actuating modes are peers on INDEPENDENT axes
+    (content bucket within one instance vs resolution tier across two), and forcing a
+    choice between them meant an operator with BOTH consents armed still had one axis
+    silently log-only. It removes an artificial exclusivity, NOT a safety check: each
+    axis still demands its own consent, so ``all`` can never move a file the operator
+    has not separately opted into."""
+    return reorg_mode(config) in ("same_instance", "all") and relocation_consented(config)
 
 
 def cross_instance_move_consented(config) -> bool:
@@ -120,23 +127,25 @@ def cross_instance_dedup_consented(config) -> bool:
 
 def cross_instance_move_enabled(config) -> bool:
     """HARD GATE for actuating a cross-instance FILE MOVE. BOTH required:
-      1. ``reorg_mode == "cross_instance"`` (the operator armed the cross-instance reconcile), AND
+      1. ``reorg_mode`` actuates the instance axis (``cross_instance`` or ``all``), AND
       2. :func:`cross_instance_move_consented` (explicit move opt-in).
     With either missing the reconcile may still classify + LOG move candidates, but moves nothing.
     The backup gate (degrade-to-dry-run) and a shared-storage pre-flight are enforced separately at
     actuation time. Default False — existing installs unchanged."""
-    return reorg_mode(config) == "cross_instance" and cross_instance_move_consented(config)
+    return (reorg_mode(config) in ("cross_instance", "all")
+            and cross_instance_move_consented(config))
 
 
 def cross_instance_dedup_enabled(config) -> bool:
     """HARD GATE for actuating cross-instance DEDUP (reclaim the worse of two copies). BOTH required:
-      1. ``reorg_mode == "cross_instance"`` (the cross-instance reconcile is armed), AND
+      1. ``reorg_mode`` actuates the instance axis (``cross_instance`` or ``all``), AND
       2. :func:`cross_instance_dedup_consented` (explicit dedup/delete opt-in).
     Because dedup deletes a file, the actuator additionally honours the backup gate
     (``effective_dry_run``) — a real run whose backup pre-flight failed reclaims nothing. Same-path
     duplicates (two records, one physical file) are NEVER auto-acted regardless of this gate. Default
     False — existing installs unchanged."""
-    return reorg_mode(config) == "cross_instance" and cross_instance_dedup_consented(config)
+    return (reorg_mode(config) in ("cross_instance", "all")
+            and cross_instance_dedup_consented(config))
 
 
 def proactive_4k_enabled(config) -> bool:

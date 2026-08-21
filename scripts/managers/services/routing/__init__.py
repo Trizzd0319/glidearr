@@ -81,9 +81,24 @@ class RoutingManager:
         if mode == "off":
             return
         # The full per-title plan can be thousands of lines, so it goes to a DEDICATED file
-        # (support/logs/routing.log) instead of flooding the run log/console — the main log gets
+        # (support/logs/routing.log) instead of flooding the run log/console - the main log gets
         # only a per-instance count. Fresh plan each run.
-        self._detail(f"==== routing relocation plan (mode={mode}) ====", reset=True)
+        #
+        # The header states this manager's EFFECTIVE capability, not just the mode string. A
+        # header reading "relocation plan" above hundreds of move-shaped lines, in a mode where
+        # this manager moves nothing, is the kind of log that gets trusted and shouldn't be.
+        _armed = relocation_enabled(self.config) and not self.dry_run
+        if _armed:
+            _cap = "same-instance folder moves ARMED"
+        elif not relocation_enabled(self.config):
+            _cap = ("CLASSIFY-ONLY - nothing below will move. To actuate: "
+                    "routing.reorg_mode = same_instance (or all) AND relocation_consent = true")
+        else:
+            _cap = "CLASSIFY-ONLY - dry run (or backup gate disarmed); nothing below will move"
+        self._detail(f"==== routing plan - SAME-INSTANCE folder moves (mode={mode}) ====", reset=True)
+        self._detail(f"     {_cap}")
+        self._detail("     Cross-INSTANCE moves (standard -> ultra 4K) are a different axis, "
+                     "handled by uhd_reconcile - see support/logs/relocation.log.")
         self._reorg(is_show=False, im=self._radarr_im, get_ep="movie",
                     put_ep="movie/editor", id_key="movieIds", mode=mode)
         self._reorg(is_show=True, im=self._sonarr_im, get_ep="series",
@@ -101,18 +116,12 @@ class RoutingManager:
             return
         classify = self._classifier(is_show)
         anime_media_fn = (lambda it: self._anime_media(it)) if is_show else None
-        # same_instance folder moves require the mode AND consent AND a live (non-dry) run.
-        #
-        # EQUALITY IS DELIBERATE. cross_instance is a PEER mode, not a superset --
-        # routing_targets.py, the single source of truth for these gates, states it:
-        # "reorg_mode is single-valued, so an install actuates EITHER same-instance
-        # folder moves OR the cross-instance reconcile - not both at once (a future
-        # 'all' mode could lift that if ever needed)". relocation_enabled() below
-        # enforces the same thing independently (it returns False unless mode ==
-        # "same_instance"), so widening this test alone changes nothing and widening
-        # BOTH would silently break the stated exclusivity. If you want both
-        # behaviours, add the "all" mode to _REORG_MODES rather than loosening this.
-        apply = (mode == "same_instance") and relocation_enabled(self.config) and not self.dry_run
+        # This axis needs BOTH the mode and relocation_consent, and a live (non-dry) run.
+        # relocation_enabled() is the SINGLE source of truth for the first two -- the old
+        # code re-tested `mode == "same_instance"` alongside it, which meant two places had
+        # to agree about which modes actuate. Widening one and not the other was a live
+        # hazard; there is now one gate, in one place.
+        apply = relocation_enabled(self.config) and not self.dry_run
         for name in list((im._get_apis() or {}).keys()):
             try:
                 items = im._make_request(name, get_ep, fallback=[]) or []

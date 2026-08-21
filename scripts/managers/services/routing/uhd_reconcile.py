@@ -211,10 +211,10 @@ class UhdReconcileManager:
         # MOVE / ACQUIRE owned standard-tier titles toward the 4K instance (reorg-gated).
         if mode != "off":
             self._run_move_acquire(gw, fourk, mode)
-        # DEDUP redundant cross-instance copies (cross_instance mode only). The plan is LOGGED even
+        # DEDUP redundant cross-instance copies (cross_instance / all modes). The plan is LOGGED even
         # when the dedup consent is off; a file is reclaimed only when the gate is armed AND the
         # backup gate is up — and never for a same-path duplicate.
-        if mode == "cross_instance":
+        if mode in ("cross_instance", "all"):
             self._run_dedup(gw, fourk)
         # DOWNGRADE low-watchability 4K-ONLY titles to a 1080p baseline on standard under pressure
         # (evict-gated), so the coordinator can then reclaim their 4K without losing the title.
