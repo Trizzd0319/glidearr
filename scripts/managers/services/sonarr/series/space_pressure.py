@@ -52,9 +52,20 @@ from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.ledger.decision_ledger import stamp
 from scripts.managers.machine_learning.space.downgrade_planner import plan_series_downgrades
+from scripts.managers.machine_learning.lifecycle.restore_policy import (
+    episode_key,
+    merge_ledger_entry,
+    release_record,
+)
 from scripts.managers.machine_learning.space.reclaim_ledger import (
     planned_reclaim_gb,
     record_planned_reclaim,
+)
+from scripts.managers.machine_learning.space.seed_gate import (
+    obligation_shortfall,
+    seed_config,
+    should_defer_stepdown,
+    unbounded_seeding,
 )
 from scripts.managers.machine_learning.thresholds.registry import get_threshold
 from scripts.managers.services.radarr.quality.space_pressure import RadarrSpacePressureManager
@@ -82,13 +93,263 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
     # near-constant +12 bonus with a transcode-risk penalty and translated the score axis
     # (file-owning series median 21 -> 8). See machine_learning/thresholds/registry.py.
     DEFAULT_SCORE_CEILING = 17    # tv_space_pressure_score_ceiling default (0-100 scale)
+    # GLD-INV-01 — row origins the SIZE math must ignore.
+    #
+    # A pilot row is a codec/quality FINGERPRINT: one representative file per series from
+    # _pick_representative_file, with episode_number=None. It was never an inventory of the
+    # series, but this pass read its size_bytes/resolution as though it were — so Marvel's
+    # Daredevil (39 episodes of 4K HDR on disk) presented as one 0.4 GB 480p file, and
+    # library-wide 12,075 pilot rows carried 5,160 GB of single-file sizes standing in for
+    # whole series.
+    #
+    # THIS IS ALSO A CORRECTNESS PRECONDITION FOR _ingest_inventory_tv, not just a tidy-up:
+    # once that pass writes real per-episode rows, the pilot row for the same series still
+    # exists (it is the score/keep anchor other passes read), so counting BOTH would
+    # double-count the representative file on top of the real inventory. Excluding by
+    # origin is what makes the two safe together.
+    #
+    # Precedent: cold_scan rows are already excluded from a consumer for the same
+    # "this row is not what it looks like" reason (episode_files ~4337).
+    NON_INVENTORY_ROWS = ("pilot",)
     DEFAULT_RUNTIME_MIN  = 45.0   # fallback per-episode runtime when unknown
-    KEEP_TAGS = frozenset({"keep_series", "keep_season", "keep_universe", "keep_forever"})
+    # DELETE-scoped keep policies (what the Sonarr tags actually mean — see
+    # cache/episode_files._resolve_keep_policy_map: "No episode from this series will ever
+    # be marked for deletion"). Documentation only on this path; the delete guard lives in
+    # _apply_grace_period and matches these labels inline.
+    #   NOTE 'keep_universe' / 'keep_forever' are RADARR policies. _resolve_keep_policy_map
+    #   only ever emits 'keep_series' | 'keep_season' | None for a TV row, so those two
+    #   entries could never match here — dead branches, kept out of the live set below.
+    KEEP_TAGS = frozenset({"keep_series", "keep_season"})
+    # DOWNGRADE-scoped keep policies — DELIBERATELY EMPTY. GLD-TVQ-01.
+    #
+    # A keep tag answers "may this episode be DELETED?", not "may its quality change?".
+    # Feeding the delete-scoped set into plan_series_downgrades made a keep-tagged series
+    # permanently immune to the step-down ladder as well, which is the opposite of the
+    # operator's intent: a pinned series should hold its EPISODES (playlist order, saga
+    # completeness) while still shrinking toward the floor under space pressure. On a live
+    # run that silently removed 78 series from the downgrade pool.
+    #
+    # The movie twin does gate on keep tags, but for an unrelated reason: keep_universe /
+    # bare universe titles have their quality owned by the universe manager's credit-gated
+    # ladder (see space.downgrade_planner.plan_movie_downgrades). There is NO equivalent
+    # second owner on the TV side, so a skip here is a permanent exemption, not a handoff.
+    #
+    # The planner keeps its ``keep_tags`` parameter (the movie path and the unit tests both
+    # exercise it) — this is a POLICY choice at the service boundary, not a capability removal.
+    DOWNGRADE_KEEP_TAGS = frozenset()
     DEFAULT_REALIZE_CAP  = 15     # tv_downgrade_realize_cap default — episode files searched+replaced
                                   # inline per pass (interactive searches are slow); rest defers
     SEARCH_CHUNK         = 100    # episodeIds per blind EpisodeSearch fallback command (Sonarr accepts a list)
     STEPDOWN_MIN_RELEASE_BYTES = 50 * 1024 * 1024   # episode fake/undersized floor for the shared picker
                                   # (movies use 300 MiB; a legit 720p episode can be far smaller)
+    # ---- GLD-RST-02: the PRE-DOWNGRADE release archive -----------------------
+    # A step-down is the ONLY path in this system that destroys a file without
+    # recording what it was. The delete pass writes sonarr/{inst}/deleted_episodes via
+    # restore_policy.release_record; this pass wrote nothing, so a downgrade was strictly
+    # one-way: once the 1080p file is gone, nothing knows it was a 2.18 GB x265 NTb file,
+    # and nothing can identify it in a recycle bin or an indexer search afterwards.
+    #
+    # DELIBERATELY A SEPARATE KEY from deleted_episodes. That ledger is an INPUT to
+    # restore_recovered_episode_deletions, which re-monitors and re-grabs on score
+    # RECOVERY. Filing step-downs there would make the restore pass fight the space pass:
+    # every series shrunk under pressure would be queued to grow back the moment its score
+    # ticked up -- the upgrade pass's job, and not a decision space pressure asked for.
+    # This key is an ARCHIVE ("here is what we gave up"), never a queue: NOTHING reads it
+    # to take an action. Same entry SHAPE as deleted_episodes, so ledger_releases /
+    # merge_ledger_entry / match_release read it unchanged.
+    STEPDOWN_RELEASES_KEY = "sonarr/{inst}/stepdown_releases"
+    # GLD-RST-06 — when each (episode, resolution) was FIRST held back by the seed
+    # gate, so `max_defer_days` can expire a deferral that is never going to clear.
+    # Separate from stepdown_cooldown: that ledger backs off after a FAILED search
+    # and its retry cadence is tuned for indexer flakiness, whereas this records a
+    # deliberate not-yet on a healthy candidate. Sharing one key would make an
+    # expiring seed deferral look like a failing search and vice versa.
+    SEED_DEFER_KEY = "sonarr/{inst}/seed_defer"
+    # Ceiling on gate examinations per pass. A deferred file does NOT consume the
+    # realize budget (it never gets searched, so it costs no indexer call and should
+    # not burn a slot), but each examination IS one Sonarr history call — so without
+    # a bound, a library where most files are pinned would walk the entire candidate
+    # set every run hitting the API. Expressed as a multiple of the realize budget so
+    # it scales with whatever the operator set rather than being a second magic number.
+    SEED_GATE_EXAMINE_MULT = 4
+    # Query params that carry an indexer SECRET. A grab URL is worth archiving (it is the
+    # release/push descriptor) but it embeds the indexer api key, and this ledger is a
+    # plaintext JSON cache that safe_cache_clear deliberately PRESERVES. The value is
+    # redacted on the way in and the key re-injected at push time from indexer config --
+    # so a leaked cache leaks a URL, not a credential.
+    _SECRET_QS_KEYS = ("apikey", "api_key", "apikey", "passkey", "rss_key", "token", "r", "i")
+
+    # ---- GLD-RST-02 helpers -------------------------------------------------
+    @staticmethod
+    def _redact_grab_url(url, secret_keys) -> "str | None":
+        """*url* with every secret-bearing query param blanked to ``<redacted>``.
+
+        Returns None for anything unparseable rather than storing a half-scrubbed
+        string: a URL we cannot confidently redact is one we must not persist.
+        """
+        if not url:
+            return None
+        try:
+            from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+            p = urlparse(str(url))
+            if not p.scheme or not p.netloc:
+                return None
+            qs = [(k, "<redacted>" if k.lower() in secret_keys else v)
+                  for k, v in parse_qsl(p.query, keep_blank_values=True)]
+            return urlunparse(p._replace(query=urlencode(qs)))
+        except Exception:
+            return None
+
+    def _push_descriptor(self, instance, eid) -> dict:
+        """The ``POST /release/push`` descriptor for the file about to be destroyed.
+
+        Sonarr can re-inject a known release WITHOUT an indexer search via
+        ``release/push`` (the autodl/autobrr path), which needs title + downloadUrl +
+        protocol + publishDate. Those live only in Sonarr's grab HISTORY, and history
+        is finite -- so it is captured HERE, at the moment of destruction, rather than
+        hoped for later.
+
+        Best-effort by construction: a missing descriptor degrades the future restore
+        to an indexer search, which is what happens today. It must never cost a
+        step-down, so every failure path returns {} and the caller proceeds.
+        """
+        try:
+            raw = self.sonarr_api._make_request(
+                instance, f"history?episodeId={int(eid)}&eventType=1&pageSize=50",
+                fallback=None)
+        except Exception:
+            return {}
+        # Sonarr returns a bare list on some routes and a paged {records:[...]} envelope
+        # on others; tolerate both rather than betting on one.
+        rows = raw.get("records") if isinstance(raw, dict) else raw
+        if not isinstance(rows, list) or not rows:
+            return {}
+        newest = max(rows, key=lambda r: str(r.get("date") or "") if isinstance(r, dict) else "")
+        if not isinstance(newest, dict):
+            return {}
+        data = newest.get("data") if isinstance(newest.get("data"), dict) else {}
+        secrets = {k.lower() for k in self._SECRET_QS_KEYS}
+        out = {
+            "title":        newest.get("sourceTitle"),
+            "protocol":     data.get("protocol") or newest.get("protocol"),
+            "publish_date": data.get("publishedDate"),
+            "indexer":      data.get("indexer"),
+            "info_url":     self._redact_grab_url(data.get("nzbInfoUrl"), secrets),
+            "download_url": self._redact_grab_url(data.get("downloadUrl"), secrets),
+            # Torrents only, and the ONE durable identifier in the whole record: an
+            # infohash is content-addressed, so it stays valid for as long as a swarm
+            # exists. A usenet grab has no equivalent -- see the note on download_url.
+            "info_hash":    data.get("torrentInfoHash"),
+        }
+        return {k: v for k, v in out.items() if v}
+
+    def _archive_stepdown_release(self, instance, sid, sn, en, row, eid, from_res, to_res) -> dict:
+        """File what this episode WAS, immediately before the step-down destroys it.
+
+        Returns the push descriptor (``{}`` when unavailable) so the caller can read
+        ``info_hash`` off it — that is how a torrent-sourced file is identified for the
+        GLD-RST-05 pinned-reclaim split, using the SAME history call the archive already
+        makes rather than a second one.
+
+        Never raises and never blocks the step-down: the archive is a courtesy to a
+        future restore, and losing it must not cost the reclaim that is the point of
+        the pass. dry_run writes nothing -- a disarmed run must not mutate a ledger.
+        """
+        if getattr(self, "dry_run", False):
+            return {}
+        push = {}
+        try:
+            push = self._push_descriptor(instance, eid) or {}
+            ekey = episode_key(sn, en)
+            rec = release_record(row)
+            if not ekey or not rec:
+                return push
+            rec = dict(rec)
+            if push:
+                rec["push"] = push
+            rec["from_resolution"] = from_res
+            rec["to_resolution"] = to_res
+            rec["archived_at"] = datetime.now(timezone.utc).isoformat()
+            key = self.STEPDOWN_RELEASES_KEY.format(inst=instance)
+            ledger = self.global_cache.get(key) or {}
+            sid_key = str(int(sid))
+            ledger[sid_key] = merge_ledger_entry(
+                ledger.get(sid_key), {"episodes": [[int(sn), int(en)]], "releases": {ekey: rec}})
+            self.global_cache.set(key, ledger)
+        except Exception as e:
+            self.logger.log_debug(f"  \U0001f4dd step-down archive skipped ({e}) — reclaim unaffected.")
+        return push
+
+    # ---- GLD-RST-06: seed gate plumbing -------------------------------------
+    def _qbit(self):
+        """Lazily-built read-only qBittorrent client, or None when not configured.
+
+        Import is local so a deployment without the download_clients block (or
+        without `requests`) never pays for the module at all.
+        """
+        if getattr(self, "_qbit_client", "__unset__") == "__unset__":
+            try:
+                from scripts.managers.services.qbittorrent.client import QbittorrentClient
+                c = QbittorrentClient(config=self.config, logger=self.logger)
+                self._qbit_client = c if c.enabled else None
+            except Exception:
+                self._qbit_client = None
+        return self._qbit_client
+
+    def _torrent_state(self, info_hash):
+        """The gate's three-way answer for one infohash.
+
+        ``None``      client answered and does not hold it -> proceed
+        ``"unknown"`` client could not be asked            -> defer (assume pinned)
+        ``dict``      client holds it                      -> defer
+
+        Results are memoised for the pass: one candidate series can put many episodes
+        of the same season pack through here, and a season pack is ONE torrent.
+        """
+        if not info_hash:
+            return None
+        cache = getattr(self, "_qbit_seen", None)
+        if cache is None:
+            cache = self._qbit_seen = {}
+        key = str(info_hash).strip().lower()
+        if key in cache:
+            return cache[key]
+        client = self._qbit()
+        if client is None:
+            cache[key] = "unknown"
+            return "unknown"
+        records, reachable = client.states_for([key])
+        cache[key] = records.get(key) if reachable else "unknown"
+        return cache[key]
+
+    def _seed_defer_mark(self, instance, eid, res, action="read"):
+        """The seed-deferral window ledger. *action* is ``read`` | ``stamp`` | ``clear``.
+
+        Read is deliberately separated from stamp. The gate needs the EXISTING mark to
+        evaluate `max_defer_days` before it can decide, but a file that then proceeds
+        must not have been written at all -- an unconditional stamp-then-clear wrote
+        this JSON ledger twice for every candidate the gate waved through, including
+        every usenet file that can never defer.
+        """
+        key = self.SEED_DEFER_KEY.format(inst=instance)
+        try:
+            ledger = self.global_cache.get(key) or {}
+            ekey = f"{int(eid)}:{int(res) if res else 0}"
+            if action == "read":
+                return ledger.get(ekey)
+            if getattr(self, "dry_run", False):
+                return ledger.get(ekey)       # a disarmed run reads but never writes
+            if action == "clear":
+                if ekey in ledger:
+                    ledger.pop(ekey, None)
+                    self.global_cache.set(key, ledger)
+                return None
+            if ekey not in ledger:            # stamp: first deferral only
+                ledger[ekey] = datetime.now(timezone.utc).isoformat()
+                self.global_cache.set(key, ledger)
+            return ledger.get(ekey)
+        except Exception:
+            return None                       # never let bookkeeping block the pass
 
     def __init__(self, logger=None, config=None, global_cache=None,
                  validator=None, registry=None, **kwargs):
@@ -241,6 +502,16 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         for idx in (cand.get("indices") or []):
             if idx not in df.index:
                 continue
+            # GLD-INV-01 — a pilot row is a FINGERPRINT, not a file this pass may act on.
+            # It has episode_number=None, so a step-down could not target it anyway, but
+            # its size_bytes would still be counted toward the series' reclaim on top of
+            # the real per-episode rows _ingest_inventory_tv writes. Exclude by origin.
+            if "is_pilot" in df.columns:
+                try:
+                    if bool(df.at[idx, "is_pilot"]):
+                        continue
+                except (TypeError, ValueError):
+                    pass
             fid = df.at[idx, "episode_file_id"] if "episode_file_id" in df.columns else None
             if fid is None or pd.isna(fid):
                 continue
@@ -480,9 +751,23 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             stamp_failure as _stamp_failure, wait_days as _wait_days,
         )
         _ledger = ledger if ledger is not None else {}
+        # GLD-RST-06 gate state, per candidate series (the pass calls this method once
+        # per series). `_gate_cap` bounds Sonarr history calls; the two _warned_ flags
+        # keep advisory findings to one line each instead of one per pinned file.
+        _seed_cfg = seed_config(self.config)
+        _gate_examined = 0
+        _gate_cap = max(1, int(budget) * self.SEED_GATE_EXAMINE_MULT)
+        _warned_unbounded = False
+        _warned_shortfall = False
         for idx, fid, res, size, sn, en in self._iter_stepdown_file_rows(df, cand, target_res):
             if exhaustive and free_base_gb is not None and target_u_gb is not None:
-                _net = (float(free_base_gb) + stats["realized_reclaim_gb"]
+                # CONFIRMED reclaim only (GLD-RST-05): pinned bytes are still on disk, so
+                # letting them raise `_net` would stop the pass short of the target while
+                # believing it arrived — and every replacement grabbed on the way is real
+                # new consumption. Pessimistic here is the safe direction, matching
+                # bin_forecast's rule that pending reclaim may only make us LESS aggressive.
+                _confirmed = stats["realized_reclaim_gb"] - stats.get("pinned_reclaim_gb", 0.0)
+                _net = (float(free_base_gb) + _confirmed
                         - stats.get("inflight_regrab_gb", 0.0))
                 if _net >= float(target_u_gb):
                     stats["stopped_at_target"] = stats.get("stopped_at_target", 0) + 1
@@ -512,6 +797,51 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 stats["failed"] += 1
                 continue
             budget -= 1
+            # ---- GLD-RST-06: the seed gate, BEFORE the interactive search --------
+            # Placed here deliberately. A pinned file's step-down is net negative --
+            # it unlinks a hardlink that frees nothing and then downloads a
+            # replacement -- so the cheapest correct move is to find out before
+            # spending an indexer call on it. The budget slot is refunded below for
+            # the same reason: a deferral performs no search, so charging it a slot
+            # would let pinned files starve the pass of the actionable ones.
+            _push = self._push_descriptor(instance, eid)
+            _seen = self._seed_defer_mark(instance, eid, res, action="read")
+            _defer, _why = should_defer_stepdown(
+                _push, self._torrent_state((_push or {}).get("info_hash")),
+                self.config, first_deferred_at=_seen)
+            if _defer:
+                self._seed_defer_mark(instance, eid, res, action="stamp")
+                budget += 1                       # refund: nothing was searched
+                _gate_examined += 1
+                stats["seed_deferred"] = stats.get("seed_deferred", 0) + 1
+                stats["seed_deferred_gb"] = stats.get("seed_deferred_gb", 0.0) + size / (1024 ** 3)
+                self.logger.log_debug(
+                    f"  \U0001f6d1 {label}: step-down deferred ({_why}) — unlinking a "
+                    f"seeded hardlink frees nothing and the replacement costs real space.")
+                _tor = self._torrent_state((_push or {}).get("info_hash"))
+                if isinstance(_tor, dict):
+                    if unbounded_seeding(_tor, _seed_cfg) and not _warned_unbounded:
+                        _warned_unbounded = True
+                        self.logger.log_warning(
+                            "⚠️ At least one pinned torrent has NO ratio or seed-time limit — "
+                            "it will seed until you intervene, so every episode hardlinked to "
+                            "it is permanently outside the reclaim pool.")
+                    _short = obligation_shortfall(_tor, _seed_cfg)
+                    if _short and not _warned_shortfall:
+                        _warned_shortfall = True
+                        self.logger.log_info(
+                            f"  \u2139\ufe0f Seed floor not yet met ({_short}) — advisory only; "
+                            f"Sonarr's indexer seedCriteria decide when the torrent is removed.")
+                if _gate_examined >= _gate_cap:
+                    self.logger.log_info(
+                        f"  \U0001f6d1 seed-gate examination cap ({_gate_cap}) reached — "
+                        f"remaining pinned candidates re-checked next run.")
+                    break
+                continue
+            if _seen:
+                # Only clear a mark that actually exists -- a proceed on a file that was
+                # never deferred has nothing to clean up and must not touch the ledger.
+                self._seed_defer_mark(instance, eid, res, action="clear")
             # Keyed on (episode id, CURRENT resolution): a file replaced at a different
             # tier lands on a fresh key and is retryable immediately.
             _ckey = _ekey(eid, res)
@@ -553,16 +883,35 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     f"(profile now {cand['target_name']}; attempt {_n}, "
                     f"re-probes in {_wait:.0f}d).")
                 continue
+            # GLD-RST-02 — file what this episode IS, while the file still exists. The
+            # DELETE below is the point of no return: after it, nothing in the system
+            # knows what was here. Archive BEFORE, so a delete that succeeds can never
+            # outrun its own record.
+            _push_arch = _push
+            self._archive_stepdown_release(
+                instance, sid, sn, en, df.loc[idx], eid,
+                from_res=res, to_res=int(target_res) if target_res else None)
             try:
                 self.sonarr_api._make_request(instance, f"episodefile/{fid}", method="DELETE")
             except Exception as e:
                 stats["failed"] += 1
                 self.logger.log_warning(f"  ⚠️ {label}: episode-file delete failed — file kept: {e}")
                 continue
-            # The file is gone from disk from here on: the reclaim is REAL regardless of
-            # which grab path (guid or blind fallback) restores the smaller copy.
+            # GLD-RST-05 — the file is UNLINKED from here on, which is not the same as
+            # freed. An infohash in the grab record means qbit holds the other hardlink,
+            # so the bytes stay on disk until the torrent is removed. Book those
+            # SEPARATELY: `realized_reclaim_gb` stays the honest "what we unlinked"
+            # figure for reporting, and only the confirmed remainder is allowed to move
+            # the exhaustive loop's stop condition below.
             stats["realized"] += 1
-            stats["realized_reclaim_gb"] += size / (1024 ** 3)
+            _gb = size / (1024 ** 3)
+            stats["realized_reclaim_gb"] += _gb
+            if (_push_arch or {}).get("info_hash"):
+                stats["pinned_reclaim_gb"] += _gb
+                stats["pinned_files"] = stats.get("pinned_files", 0) + 1
+                self.logger.log_info(
+                    f"  \U0001f517 {label}: {_gb:.2f}GB unlinked but PINNED by a seeding "
+                    f"torrent — not counted as free until qbit releases it.")
             # …but the replacement is IN FLIGHT: book its projected size against the
             # free-space figure so the pass can't chase the temporary spike.
             stats["inflight_regrab_gb"] = (stats.get("inflight_regrab_gb", 0.0)
@@ -619,7 +968,31 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             "failed":            0,
             # ── realize accounting (live only; dry_run leaves these at 0) ──
             "realized":            0,     # episode files actually deleted + replaced
-            "realized_reclaim_gb": 0.0,   # REAL GB freed (sum of deleted file sizes)
+            "realized_reclaim_gb": 0.0,   # GB unlinked (sum of deleted file sizes) — NOT all freed
+            # ---- GLD-RST-05: hardlink-pinned reclaim (qBittorrent) -------------
+            # Under the TRaSH layout the download dir and the media root share a
+            # filesystem and *arr HARDLINKS on import, so a seeding torrent's data and
+            # the library file are two links to ONE inode. DELETE episodefile/{fid}
+            # unlinks the library path; the seed keeps the inode alive; the delete frees
+            # ZERO bytes. movie_files._mirrored_tmdb_ids already states the rule for the
+            # cross-instance case -- "unlinking one of two hardlinks frees nothing" --
+            # this is that rule with qbit as the second link holder.
+            #
+            # WHY IT MATTERS MORE THAN IT LOOKS: realized_reclaim_gb feeds the exhaustive
+            # stop condition. Counting pinned bytes as freed makes the pass believe it is
+            # gaining space, so it keeps going AND grabs replacements -- real new bytes
+            # against a reclaim that never landed. Net space goes DOWN while the ledger
+            # reports it going up: the 2026-08-08 phantom-headroom failure with a
+            # different cause. Only CONFIRMED bytes may drive the loop.
+            "pinned_reclaim_gb":   0.0,   # unlinked but still held by a seeding torrent
+            "pinned_files":        0,     # how many of `realized` were torrent-sourced
+            # GLD-RST-06 — held back BEFORE any action, because acting would have cost
+            # space rather than saved it. Distinct from `deferred` (over the inline cap)
+            # and `no_release` (nothing smaller existed): those two describe a file we
+            # would still like to shrink, this one describes a file we deliberately will
+            # not touch until qbit releases its link.
+            "seed_deferred":       0,
+            "seed_deferred_gb":    0.0,
             "no_release":          0,     # no smaller release existed → file KEPT
             "identity_rejected":   0,     # releases dropped by the GLD-ACQ-27 series/episode gate
             "grab_fallback":       0,     # guid grab failed → blind EpisodeSearch (file already gone)
@@ -690,7 +1063,7 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             ceiling=ceiling,
             watch_cutoff=watch_cutoff,
             air_cutoff=air_cutoff,
-            keep_tags=self.KEEP_TAGS,
+            keep_tags=self.DOWNGRADE_KEEP_TAGS,   # GLD-TVQ-01 — keep tags gate DELETE, not quality
             default_runtime_min=self.DEFAULT_RUNTIME_MIN,
             floor_resolution=floor_resolution,
             exhaustive=_exhaustive,
