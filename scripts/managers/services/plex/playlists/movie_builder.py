@@ -23,6 +23,7 @@ from scripts.managers.machine_learning.playlists.cert_gate import (
 from scripts.managers.machine_learning.playlists.per_user import genre_match, priority_score
 from scripts.managers.machine_learning.playlists.rationale import explain_reason
 from scripts.managers.services.plex._common import anon_label
+from scripts.managers.machine_learning.affinity.account_links import expand, linked_id_map
 from scripts.managers.services.plex.playlists.builder import PlexPlaylistBuilderManager
 from scripts.managers.services.plex.playlists.movie_resolver import (
     _coll_key,
@@ -57,6 +58,9 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
         tracked = self._tracked_users()
         owned = self._load_owned_movies()
         inventory = self._cache_get(_INVENTORY_KEY, {})
+        # Linked accounts are ONE viewer, so one watch history (GLD-TAUT-16). Built per
+        # builder rather than shared: each is its own manager instance with its own run().
+        self._linked_ids = linked_id_map(self.config, tracked)
         watched_by_user = {u["safe_user"]: self._watched_movies_for(u.get("tautulli_user_id"))
                            for u in tracked}
         affinity_by_user = {u["safe_user"]: self._user_affinity(u.get("tautulli_username"))
@@ -200,8 +204,10 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
                                   certs=cert_by_rk, level=level)
             built += 1
         self._publish_protected_movie_tmdbs(_PROTECTED_KEY, protected)
-        self._emit_summary_grid("[dry-run] Movie playlists - per-profile summary")
-        self.logger.log_info(f"[MoviePlaylists] built {built} per-user movie plan(s) (dry-run — no Plex writes).")
+        self._emit_summary_grid("[plan] Movie playlists - per-profile summary")
+        self.logger.log_info(
+            f"[MoviePlaylists] built {built} per-user movie plan(s) — this stage never writes "
+            f"to Plex; write-back applies them if armed (see the [Writeback] banner).")
         return {"users": len(tracked), "built": built, "can_build": True}
 
     # ── space-coordinator delete shield ──────────────────────────────────────────
@@ -308,7 +314,17 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
         return out
 
     def _watched_movies_for(self, user_id) -> set:
-        if user_id is None or not self.registry:
+        """Movie-identity set this profile has already watched, unioned across the
+        account's LINK GROUP (``GLD-TAUT-16``).
+
+        The 2026-08-20 run is why this is not obviously needed and is: Mom and
+        mirandan75's MOVIE shelves matched for 25 straight rows while their TV shelves
+        diverged completely — not because movies were merged, but because neither
+        profile had watched any of those films. The first time one of them finishes a
+        movie the other would have been recommended it again.
+        """
+        ids = expand(getattr(self, "_linked_ids", None), user_id)
+        if not ids or not self.registry:
             return set()
         hm = self.registry.get("manager", "TautulliWatchHistoryManager")
         if hm is None:
@@ -316,15 +332,24 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
             hm = getattr(taut, "watch_history", None) if taut else None
         if not hm or not hasattr(hm, "get_all_history_cached"):
             return set()
-        try:
-            return watched_movie_keys(hm.get_all_history_cached(user_id))
-        except Exception:
-            return set()
+        out: set = set()
+        for uid in ids:
+            try:
+                out |= watched_movie_keys(hm.get_all_history_cached(uid))
+            except Exception:
+                continue
+        return out
 
     def _watched_movie_recency_for(self, user_id) -> dict:
         """{identity: latest unix watch ts} for this user — the resume boost's recency key. {} on
-        any miss. History is the same 24h-cached fetch _watched_movies_for uses (cache hit)."""
-        if user_id is None or not self.registry:
+        any miss. History is the same 24h-cached fetch _watched_movies_for uses (cache hit).
+
+        Unioned across the link group, latest timestamp winning, for the same reason the
+        TV pair is: a title filtered as watched by one half while its timestamp came from
+        the other would sort as if nobody had touched it.
+        """
+        ids = expand(getattr(self, "_linked_ids", None), user_id)
+        if not ids or not self.registry:
             return {}
         hm = self.registry.get("manager", "TautulliWatchHistoryManager")
         if hm is None:
@@ -332,10 +357,15 @@ class MoviePlaylistBuilderManager(PlexPlaylistBuilderManager):
             hm = getattr(taut, "watch_history", None) if taut else None
         if not hm or not hasattr(hm, "get_all_history_cached"):
             return {}
-        try:
-            return watched_movie_recency(hm.get_all_history_cached(user_id))
-        except Exception:
-            return {}
+        out: dict = {}
+        for uid in ids:
+            try:
+                for k, ts in (watched_movie_recency(hm.get_all_history_cached(uid)) or {}).items():
+                    if ts > out.get(k, 0):
+                        out[k] = ts
+            except Exception:
+                continue
+        return out
 
     def _resume_cfg(self):
         """(enabled, order, weight) from plex.playlists.resume_boost — lift an in-progress saga.

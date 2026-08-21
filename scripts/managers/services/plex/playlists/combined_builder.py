@@ -21,6 +21,7 @@ from scripts.managers.machine_learning.playlists.cert_gate import (
 )
 from scripts.managers.services.plex._common import anon_label
 from scripts.managers.services.plex.playlists.combined_resolver import build_combined_plan
+from scripts.managers.machine_learning.affinity.account_links import linked_id_map
 from scripts.managers.services.plex.playlists.movie_builder import MoviePlaylistBuilderManager
 from scripts.managers.services.plex.playlists.movie_resolver import movie_inputs
 from scripts.managers.services.plex.playlists.tv_resolver import tv_inputs
@@ -103,6 +104,9 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
         series_scores, series_genres = self._series_scores_and_genres()
         series_certs = self._series_certs()
         jit_by_user = self._jit_series_by_user(tracked)
+        # Linked accounts are ONE viewer, so one watch history (GLD-TAUT-16) — this builder
+        # merges BOTH mediums, so both call sites below depend on the map being set first.
+        self._linked_ids = linked_id_map(self.config, tracked)
         tv_watched = {u["safe_user"]: self._watched_for(u.get("tautulli_user_id")) for u in tracked}
         movie_watched = {u["safe_user"]: self._watched_movies_for(u.get("tautulli_user_id")) for u in tracked}
         affinity = {u["safe_user"]: self._user_affinity(u.get("tautulli_username")) for u in tracked}
@@ -257,6 +261,8 @@ class CombinedPlaylistBuilderManager(MoviePlaylistBuilderManager):
                                   certs=cert_by_rk, level=level)
             built += 1
         self._publish_protected_movie_tmdbs(_PROTECTED_KEY, protected)
-        self._emit_summary_grid("[dry-run] Combined (movie+TV) playlists - per-profile summary")
-        self.logger.log_info(f"[ComboPlaylists] built {built} per-user combined plan(s) (dry-run — no Plex writes).")
+        self._emit_summary_grid("[plan] Combined (movie+TV) playlists - per-profile summary")
+        self.logger.log_info(
+            f"[ComboPlaylists] built {built} per-user combined plan(s) — this stage never writes "
+            f"to Plex; write-back applies them if armed (see the [Writeback] banner).")
         return {"users": len(tracked), "built": built, "can_build": True}

@@ -24,6 +24,7 @@ from datetime import date, datetime, timezone
 
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.services.mdblist import client as mdblist_client
+from scripts.managers.machine_learning.affinity.account_links import expand, linked_id_map
 from scripts.managers.machine_learning.playlists.cert_gate import (
     ADULT,
     cert_allowed,
@@ -193,6 +194,11 @@ class PlexPlaylistBuilderManager(BaseManager):
         resolution_stats = self._cache_get(_STATS_KEY, {})
         series_scores, series_genres = self._series_scores_and_genres()
         series_certs = self._series_certs()
+        # Linked accounts (account_links) are ONE viewer, so their watch history is one
+        # history. GLD-TAUT-15 merged the gradings; without this the 2026-08-20 run showed
+        # Mom and mirandan75 with IDENTICAL affinity and 24-vs-16-item playlists, because
+        # each still filtered "already watched" on its own id alone (GLD-TAUT-16).
+        self._linked_ids = linked_id_map(self.config, tracked)
         watched_by_user = {u["safe_user"]: self._watched_for(u.get("tautulli_user_id"))
                            for u in tracked}
         affinity_by_user = {u["safe_user"]: self._user_affinity(u.get("tautulli_username"))
@@ -338,8 +344,10 @@ class PlexPlaylistBuilderManager(BaseManager):
                               anon=anon_label(u.get("title"), tier_name, idx),
                               certs=cert_by_rk, level=level)
             built += 1
-        self._emit_summary_grid("[dry-run] TV playlists - per-profile summary")
-        self.logger.log_info(f"[Playlists] built {built} per-user TV plan(s) (dry-run — no Plex writes).")
+        self._emit_summary_grid("[plan] TV playlists - per-profile summary")
+        self.logger.log_info(
+            f"[Playlists] built {built} per-user TV plan(s) — this stage never writes to "
+            f"Plex; write-back applies them if armed (see the [Writeback] banner).")
         # READ-ONLY projection. Wrapped so a progress failure can never cost the run the
         # playlists it just built.
         try:
@@ -403,7 +411,7 @@ class PlexPlaylistBuilderManager(BaseManager):
         # stay easy to validate by household member.
         to_file = getattr(self.logger, "log_to_file", None)
         if callable(to_file) and rows:
-            file_header = (f"[dry-run] '{title}' {family_label} - {len(plan.items)} {label}(s), "
+            file_header = (f"[plan] '{title}' {family_label} - {len(plan.items)} {label}(s), "
                            f"{stats.get('unresolved', 0)} unmatched")
             to_file("playlists", file_header)
             for r in rows:
@@ -1363,7 +1371,16 @@ class PlexPlaylistBuilderManager(BaseManager):
         """{safe_user: set(series_id)} — series JIT grabbed FOR each user. Intersects the
         per-instance ``sonarr/<i>/jit_grabbed`` set (what the JIT pass acquired/upgraded)
         with ``sonarr/<i>/jit_watchers`` (who recently watched each series) so a series is
-        JIT-priority ONLY for the member(s) actually watching it, never the whole household."""
+        JIT-priority ONLY for the member(s) actually watching it, never the whole household.
+
+        Linked accounts (``account_links``) are merged at the end: this is the "watching
+        now" signal, and it is the THIRD input to a linked viewer's shelves after the
+        watched-set and its recency. The 2026-08-20 22:04 run isolated it — with the
+        watched-sets merged, Mom and mirandan75's Long Glide held the SAME 25 titles in a
+        DIFFERENT order, because Blue Bloods scored 0.99 "watching now" for one and 0.45
+        for the other. One person mid-series is one person mid-series whichever login they
+        happened to press play on.
+        """
         out = {u["safe_user"]: set() for u in tracked}
         by_username = {}
         for u in tracked:
@@ -1383,6 +1400,18 @@ class PlexPlaylistBuilderManager(BaseManager):
                             out[safe].add(int(sid))
                         except (TypeError, ValueError):
                             pass
+        # Union across link groups. Computed into a separate dict first: mutating `out`
+        # while reading it would let the first member's merged set feed the second's,
+        # which is harmless for a pair and wrong for a group of three.
+        groups = linked_id_map(self.config, tracked, id_field="safe_user")
+        if groups:
+            merged = {}
+            for safe, members in groups.items():
+                acc: set = set()
+                for m in members:
+                    acc |= out.get(m, set())
+                merged[safe] = acc
+            out.update(merged)
         return out
 
     def _load_owned_episodes(self) -> list:
@@ -1569,7 +1598,15 @@ class PlexPlaylistBuilderManager(BaseManager):
         return pa if isinstance(pa, dict) else {}
 
     def _watched_for(self, user_id) -> set:
-        if user_id is None or not self.registry:
+        """Episode-identity set this profile has already watched.
+
+        Unions across the account's LINK GROUP: two logins declared as one person
+        share one watch history, so a title either of them finished must not be
+        recommended to the other. Unlinked accounts are a group of one, so the
+        merge below is a no-op for them.
+        """
+        ids = expand(getattr(self, "_linked_ids", None), user_id)
+        if not ids or not self.registry:
             return set()
         hm = self.registry.get("manager", "TautulliWatchHistoryManager")
         if hm is None:
@@ -1577,10 +1614,15 @@ class PlexPlaylistBuilderManager(BaseManager):
             hm = getattr(taut, "watch_history", None) if taut else None
         if not hm or not hasattr(hm, "get_all_history_cached"):
             return set()
-        try:
-            return watched_episode_keys(hm.get_all_history_cached(user_id))
-        except Exception:
-            return set()
+        out: set = set()
+        for uid in ids:
+            try:
+                out |= watched_episode_keys(hm.get_all_history_cached(uid))
+            except Exception:
+                # One member's history failing must not cost the profile the other
+                # member's -- a partial union is still better than none.
+                continue
+        return out
 
     def _trakt_household_episodes(self):
         """``(identities, recency, series_latest)`` from the household Trakt episode feed.
@@ -1925,6 +1967,9 @@ class PlexPlaylistBuilderManager(BaseManager):
         """
         if user_id is None or not self.registry:
             return set()
+        ids = expand(getattr(self, "_linked_ids", None), user_id)
+        if not ids:
+            return set()
         try:
             from scripts.managers.services.plex.playlists.movie_resolver import (
                 _norm as _mnorm, watched_movie_keys,
@@ -1935,7 +1980,15 @@ class PlexPlaylistBuilderManager(BaseManager):
                 hm = getattr(taut, "watch_history", None) if taut else None
             if not hm or not hasattr(hm, "get_all_history_cached"):
                 return set()
-            hist = hm.get_all_history_cached(user_id) or []
+            # Union across the LINK GROUP (GLD-TAUT-16). This one guards DELETES: a film
+            # one half of a linked viewer finished is a film that viewer has watched, and
+            # counting it against only one login means the shield protects the pair less
+            # than it protects a single account. Failing direction matters here more than
+            # in the playlist paths -- an under-counted watched-set makes a title eligible
+            # for reclaim, not merely mis-ranked.
+            hist = []
+            for uid in ids:
+                hist += (hm.get_all_history_cached(uid) or [])
             keys = watched_movie_keys(hist) or set()
         except Exception:
             return set()
@@ -2124,8 +2177,16 @@ class PlexPlaylistBuilderManager(BaseManager):
     def _watched_episode_recency_for(self, user_id) -> dict:
         """{episode-identity: latest unix watch ts} for this user — tv_inputs aggregates it per
         series into series_recency (The Long Glide's TV recency key). {} on any miss; the same
-        24h-cached history fetch _watched_for uses (cache hit)."""
-        if user_id is None or not self.registry:
+        24h-cached history fetch _watched_for uses (cache hit).
+
+        Unions across the link group for the same reason ``_watched_for`` does — and it has
+        to, or the two halves disagree: one member's episode could be filtered as watched
+        while its recency timestamp was missing, leaving the resume ordering with nothing to
+        sort on for exactly the series the person is mid-way through. Latest timestamp wins
+        on collision, which is what 'when did this viewer last watch it' means.
+        """
+        ids = expand(getattr(self, "_linked_ids", None), user_id)
+        if not ids or not self.registry:
             return {}
         hm = self.registry.get("manager", "TautulliWatchHistoryManager")
         if hm is None:
@@ -2133,10 +2194,15 @@ class PlexPlaylistBuilderManager(BaseManager):
             hm = getattr(taut, "watch_history", None) if taut else None
         if not hm or not hasattr(hm, "get_all_history_cached"):
             return {}
-        try:
-            return watched_episode_recency(hm.get_all_history_cached(user_id))
-        except Exception:
-            return {}
+        out: dict = {}
+        for uid in ids:
+            try:
+                for k, ts in (watched_episode_recency(hm.get_all_history_cached(uid)) or {}).items():
+                    if ts > out.get(k, 0):
+                        out[k] = ts
+            except Exception:
+                continue
+        return out
 
     def _daemon_enabled(self) -> bool:
         d = ((self.config.get("daemons", {}) if self.config else {}) or {}).get("enrich", {}) or {}
