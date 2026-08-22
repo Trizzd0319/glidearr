@@ -43,8 +43,8 @@ if str(_SCRIPTS_DIR.parent) not in sys.path:
 from scripts.managers.services.mdblist import age_cache          # noqa: E402
 from scripts.managers.services.mdblist.client import movie_ratings, show_ratings  # noqa: E402
 
-RADARR_BASE = os.environ.get("RECOMMENDARR_RADARR_INSTANCES_STANDARD_BASE_URL") or "http://192.168.1.110:8988"
-SONARR_BASE = os.environ.get("RECOMMENDARR_SONARR_INSTANCES_SONARR_BASE_URL") or "http://192.168.1.110:8990"
+RADARR_BASE = os.environ.get("RECOMMENDARR_RADARR_INSTANCES_STANDARD_BASE_URL") or "http://127.0.0.1:19011"
+SONARR_BASE = os.environ.get("RECOMMENDARR_SONARR_INSTANCES_SONARR_BASE_URL") or "http://127.0.0.1:19001"
 
 
 def _secret(path_key: str) -> str:

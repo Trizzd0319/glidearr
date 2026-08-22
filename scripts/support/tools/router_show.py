@@ -101,7 +101,7 @@ from support.utilities.library_classifier import (
 # file carries no secrets. Override a base URL at runtime with the matching env var
 # RECOMMENDARR_SONARR_INSTANCES_<NAME>_BASE_URL if your setup differs.
 SONARR_INSTANCES = {
-    "sonarr": "http://192.168.1.110:8990",
+    "sonarr": "http://127.0.0.1:19001",
 }
 DEFAULT_SONARR_INSTANCE = "sonarr"
 

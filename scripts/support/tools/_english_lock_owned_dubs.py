@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 import keyring
 import requests
 
-BASE = "http://192.168.1.110:8988"
+BASE = "http://127.0.0.1:19011"
 KR   = "radarr_instances.standard.api"
 CLONE_FROM_ID = 3                  # 'HD-720p' — the tier the dub films already use
 NEW_NAME = "English - HD-720p"

@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 import keyring
 import requests
 
-BASE = "http://192.168.1.110:8988"            # Radarr 'standard'
+BASE = "http://127.0.0.1:19011"            # Radarr 'standard'
 KR   = "radarr_instances.standard.api"
 BULK_PROFILE_NAME    = "English - HD-720p"            # id 12 — unmonitored films (no grab)
 CAMFREE_PROFILE_NAME = "English - HD Bluray + WEB"    # id 15 — cam-free, all monitored films

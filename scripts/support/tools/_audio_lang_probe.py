@@ -15,9 +15,9 @@ import keyring
 import requests
 
 INSTANCES = [
-    ("sonarr",   "http://192.168.1.110:8990", "sonarr_instances.sonarr.api"),
-    ("standard", "http://192.168.1.110:8988", "radarr_instances.standard.api"),
-    ("ultra",    "http://192.168.1.110:8989", "radarr_instances.ultra.api"),
+    ("sonarr",   "http://127.0.0.1:19001", "sonarr_instances.sonarr.api"),
+    ("standard", "http://127.0.0.1:19011", "radarr_instances.standard.api"),
+    ("ultra",    "http://127.0.0.1:19013", "radarr_instances.ultra.api"),
 ]
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "_audio_lang_probe_out")

@@ -51,9 +51,9 @@ EN_ID, ORIGINAL_ID, ANY_ID = 1, -2, -1
 ZERO_BLOCKERS = {"language: not original", "dubs only", "vostfr"}
 
 INSTANCES = [
-    ("sonarr",   "sonarr",  "http://192.168.1.110:8990", "sonarr_instances.sonarr.api"),
-    ("standard", "radarr",  "http://192.168.1.110:8988", "radarr_instances.standard.api"),
-    ("ultra",    "radarr",  "http://192.168.1.110:8989", "radarr_instances.ultra.api"),
+    ("sonarr",   "sonarr",  "http://127.0.0.1:19001", "sonarr_instances.sonarr.api"),
+    ("standard", "radarr",  "http://127.0.0.1:19011", "radarr_instances.standard.api"),
+    ("ultra",    "radarr",  "http://127.0.0.1:19013", "radarr_instances.ultra.api"),
 ]
 
 APPLY = "--apply" in sys.argv

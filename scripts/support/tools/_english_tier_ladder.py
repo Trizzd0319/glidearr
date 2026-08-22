@@ -27,7 +27,7 @@ import sys
 import keyring
 import requests
 
-BASE = "http://192.168.1.110:8988"          # Radarr 'standard'
+BASE = "http://127.0.0.1:19011"          # Radarr 'standard'
 KR   = "radarr_instances.standard.api"
 LADDER = [[0, 3], [20, 4], [30, 6], [40, 7], [55, 8], [65, 5], [70, 9], [85, 10]]
 ENGLISH_LANG = {"id": 1, "name": "English"}

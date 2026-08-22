@@ -97,8 +97,8 @@ from support.utilities.library_classifier import (
 # file carries no secrets. Override a base URL at runtime with the matching env var
 # RECOMMENDARR_RADARR_INSTANCES_<NAME>_BASE_URL if your setup differs.
 RADARR_INSTANCES = {
-    "standard": "http://192.168.1.110:8988",
-    "ultra":    "http://192.168.1.110:8989",
+    "standard": "http://127.0.0.1:19011",
+    "ultra":    "http://127.0.0.1:19013",
 }
 DEFAULT_RADARR_INSTANCE = "standard"
 

@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 import keyring
 import requests
 
-BASE = "http://192.168.1.110:8988"          # Radarr 'standard'
+BASE = "http://127.0.0.1:19011"          # Radarr 'standard'
 KR   = "radarr_instances.standard.api"
 CLONE_FROM_ID = 8                            # 'Remux + WEB 1080p'
 NEW_NAME = "English - Theatrical OK"
