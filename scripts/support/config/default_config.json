@@ -5,10 +5,10 @@
     "authorization": {
       "access_token": "",
       "token_type": "",
-      "expires_in":,
+      "expires_in": null,
       "refresh_token": "",
       "scope": "",
-      "created_at":
+      "created_at": null
     }
   },
   "tvdb": {
@@ -38,8 +38,8 @@
   "documentaryGenres": [
     ""
   ],
-  "free_space_limit":,
-  "firstRunCompleted":,
+  "free_space_limit": null,
+  "firstRunCompleted": null,
   "radarr-4k": {
     "url": "",
     "port": "",
@@ -87,7 +87,7 @@
   },
   "plex": {
     "url": "",
-    "port":,
+    "port": null,
     "plex_token": "",
     "plex_media_path": ""
   },
