@@ -83,3 +83,6 @@ scripts/support/tools/_acquire_preview_snapshots/
 *.patch
 Recommendarr_Audit_Checklist.xlsx
 README.glidarr-draft.md
+
+# migration backups
+*.bak.*
