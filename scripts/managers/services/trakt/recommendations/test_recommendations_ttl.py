@@ -37,13 +37,23 @@ class _Logger:
 
 
 class _Api:
-    """Counts fetches and returns a distinguishable payload each time."""
+    """Counts fetches and returns a distinguishable payload each time.
+
+    `params` is CAPTURED, not discarded. It used to be swallowed, which meant nothing
+    in the suite could tell whether the recommendations call sent its filters -- and
+    for a long time it sent none, so Trakt happily recommended titles the household
+    already owned. Measured 2026-08-22: **1,016 of 1,017 candidates came back
+    `already in library`**. A fake that drops an argument cannot fail a test about
+    that argument.
+    """
 
     def __init__(self):
         self.calls: list = []
+        self.params: list = []
 
     def _make_request(self, endpoint, params=None):
         self.calls.append(endpoint)
+        self.params.append(dict(params or {}))
         return [{"title": f"{endpoint} #{len(self.calls)}", "year": 2020}]
 
 
@@ -73,6 +83,17 @@ def _mgr(cache, api):
     return m
 
 
+#: The cache keys the manager actually uses. Defined ONCE here rather than spelled out
+#: at each `_age` call: these tests reach into the cache by path to backdate a file, so a
+#: key change in the manager silently makes them age a file nothing reads -- the test
+#: then passes or fails for a reason unrelated to what it is checking. That is exactly
+#: what happened when `ignore_collected`/`ignore_watchlisted` were added and the keys were
+#: bumped to `/v2` to stop TTL serving pre-filter results: all four TTL tests broke, none
+#: of them because the TTL behaviour had changed.
+_SHOWS_KEY = "trakt/u/recommendations/shows/v2"
+_MOVIES_KEY = "trakt/u/recommendations/movies/v2"
+
+
 def _age(cache, key, seconds):
     """Backdate the cached file so the TTL is genuinely exceeded."""
     path = cache.key_builder.build_cache_path(*key.split("/"), suffix=".json")
@@ -95,7 +116,7 @@ def test_an_expired_cache_is_ACTUALLY_REFETCHED(tmp_path):
     api = _Api()
     mgr = _mgr(cache, api)
     first = mgr.get_recommendations_shows()
-    _age(cache, "trakt/u/recommendations/shows", _RECOMMENDATIONS_TTL_S + 60)
+    _age(cache, _SHOWS_KEY, _RECOMMENDATIONS_TTL_S + 60)
     second = mgr.get_recommendations_shows()
     assert len(api.calls) == 2, api.calls
     assert second != first
@@ -106,7 +127,7 @@ def test_both_feeds_refresh_not_just_shows(tmp_path):
     api = _Api()
     mgr = _mgr(cache, api)
     mgr.get_recommendations_movies()
-    _age(cache, "trakt/u/recommendations/movies", _RECOMMENDATIONS_TTL_S + 60)
+    _age(cache, _MOVIES_KEY, _RECOMMENDATIONS_TTL_S + 60)
     mgr.get_recommendations_movies()
     assert api.calls == ["recommendations/movies", "recommendations/movies"], api.calls
 
@@ -118,7 +139,7 @@ def test_a_26_day_old_cache_is_stale_under_this_ttl(tmp_path):
     api = _Api()
     mgr = _mgr(cache, api)
     mgr.get_recommendations_shows()
-    _age(cache, "trakt/u/recommendations/shows", 26 * 24 * 3600)
+    _age(cache, _SHOWS_KEY, 26 * 24 * 3600)
     mgr.get_recommendations_shows()
     assert len(api.calls) == 2
 
@@ -135,10 +156,52 @@ def test_a_failed_refetch_serves_the_last_good_copy_rather_than_emptying_it(tmp_
     api = _Api()
     mgr = _mgr(cache, api)
     good = mgr.get_recommendations_shows()
-    _age(cache, "trakt/u/recommendations/shows", _RECOMMENDATIONS_TTL_S + 60)
+    _age(cache, _SHOWS_KEY, _RECOMMENDATIONS_TTL_S + 60)
     mgr.trakt_api = type("Dead", (), {"_make_request": lambda *a, **k: None})()
     after = mgr.get_recommendations_shows()
     assert after == good
+
+
+def test_the_owned_and_watchlisted_filters_are_actually_sent(tmp_path):
+    """The call must ask Trakt to exclude what the household already has.
+
+    Both params default to FALSE on Trakt's side, so omitting them is an active
+    request to INCLUDE owned titles — and that is what happened: of 1,017 candidates
+    gathered on 2026-08-22, **1,016 came back `already in library`**. One useful
+    suggestion per thousand, every run, at one API call each.
+
+    `ignore_watchlisted` bites immediately (the watchlist is already Trakt-side, and
+    is gathered as its OWN source, so recommendations were duplicating it).
+    `ignore_collected` is correct but INERT until a collection sync exists — glidearr
+    pushes watch history, never collection, so Trakt does not know what is owned.
+    It is asserted here anyway: the filter being present and idle is the state we
+    intend, and a future collection sync must not have to remember to add it.
+    """
+    api = _Api()
+    mgr = _mgr(_cache(tmp_path), api)
+    mgr.get_recommendations_shows()
+    mgr.get_recommendations_movies()
+    assert len(api.params) == 2, api.params
+    for sent in api.params:
+        assert sent.get("ignore_collected") == "true", sent
+        assert sent.get("ignore_watchlisted") == "true", sent
+        assert "limit" in sent, sent
+
+
+def test_the_cache_key_changed_with_the_filters(tmp_path):
+    """A params change with an unchanged cache key is a change that does nothing.
+
+    `get_or_generate_cache` serves the stored copy until the TTL expires, so adding
+    the filters without bumping the key would have kept serving PRE-FILTER results
+    for up to a day — and the operator would have read that as "the fix did not
+    work". The `/v2` suffix forces a fresh fetch on the very first run after the
+    change. This pins the two together so neither can move without the other.
+    """
+    mgr = _mgr(_cache(tmp_path), _Api())
+    import inspect
+    src = inspect.getsource(type(mgr))
+    assert "recommendations/shows/v2" in src
+    assert "recommendations/movies/v2" in src
 
 
 def test_recommendations_are_not_wired_into_the_intent_index():

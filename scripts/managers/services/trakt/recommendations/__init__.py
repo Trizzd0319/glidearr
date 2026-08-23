@@ -49,7 +49,7 @@ class TraktRecommendationsManager(BaseManager, ComponentManagerMixin):
 
     def get_recommendations_shows(self, limit: int = 10) -> list:
         return self.global_cache.get_or_generate_cache(
-            key=f"trakt/{self.user}/recommendations/shows",
+            key=f"trakt/{self.user}/recommendations/shows/v2",
             generator_function=lambda: self._fetch_shows(limit),
             expiration_time=_RECOMMENDATIONS_TTL_S,
             regenerate_on_expiry=True,
@@ -57,7 +57,7 @@ class TraktRecommendationsManager(BaseManager, ComponentManagerMixin):
 
     def get_recommendations_movies(self, limit: int = 10) -> list:
         return self.global_cache.get_or_generate_cache(
-            key=f"trakt/{self.user}/recommendations/movies",
+            key=f"trakt/{self.user}/recommendations/movies/v2",
             generator_function=lambda: self._fetch_movies(limit),
             expiration_time=_RECOMMENDATIONS_TTL_S,
             regenerate_on_expiry=True,
@@ -86,15 +86,36 @@ class TraktRecommendationsManager(BaseManager, ComponentManagerMixin):
     # to [] would therefore let one bad request blank a good recommendations file on TTL
     # expiry. ``self.trakt_api`` being absent (Trakt not configured) IS an honest empty, so
     # that branch still returns [].
+    #: Params sent with EVERY recommendations request. Trakt documents both on that
+    #: endpoint and both default to FALSE, so the call was asking Trakt to include
+    #: things the household already has -- and it did. Measured 2026-08-22: of 1,017
+    #: candidates gathered, **1,016 came back `already in library`**. One useful
+    #: suggestion per thousand, every run, at one API call each.
+    #:
+    #: `ignore_collected` filters against the Trakt COLLECTION, which is a different
+    #: thing from watch history -- glidearr syncs history (`TraktHistorySync`) and has
+    #: never synced collection, so Trakt genuinely does not know what is owned. Sending
+    #: this today is therefore CORRECT BUT INERT: it filters against an empty set until
+    #: a collection sync exists. It is sent anyway because the alternative is to
+    #: remember to add it later, and a filter that is right and idle beats a filter
+    #: that is missing.
+    #:
+    #: `ignore_watchlisted` works immediately -- the watchlist is already a Trakt-side
+    #: list -- and stops recommendations duplicating the watchlist source, which is
+    #: gathered separately three lines away in `candidates.py`.
+    _REC_FILTERS = {"ignore_collected": "true", "ignore_watchlisted": "true"}
+
     def _fetch_shows(self, limit: int):
         if not self.trakt_api:
             return []
-        return self.trakt_api._make_request("recommendations/shows", params={"limit": limit})
+        return self.trakt_api._make_request(
+            "recommendations/shows", params={"limit": limit, **self._REC_FILTERS})
 
     def _fetch_movies(self, limit: int):
         if not self.trakt_api:
             return []
-        return self.trakt_api._make_request("recommendations/movies", params={"limit": limit})
+        return self.trakt_api._make_request(
+            "recommendations/movies", params={"limit": limit, **self._REC_FILTERS})
 
 
 # ── WHY RECOMMENDATIONS DO NOT FEED GROUP-A5 ─────────────────────────────────────────
