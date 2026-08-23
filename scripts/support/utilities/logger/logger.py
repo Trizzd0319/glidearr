@@ -44,7 +44,14 @@ RUN_LOG_BACKUPS = 5                           # current + 5 previous = 6 logs re
 # (default-2.log <-> routing-2.log <-> timings-2.json are the same run). Rolled in a
 # single pass at orchestrator start by rotate_run_artifacts(). 'timings.json' replaces
 # the old unbounded 'timings.run-NNN.json' so the profiler now honours retention too.
-RUN_LOG_ARTIFACTS = ("default.log", "routing.log", "playlists.log", "timings.json")
+#: Files rolled aside together at the start of each run, sharing one ``-N`` suffix so a
+#: given run can be read ACROSS them (``default-2.log`` and ``routing-2.log`` are the same
+#: run). A dedicated log that is NOT listed here never rotates and grows without bound --
+#: `acquisition/decisions.log` is ~1,000 lines per run on this deployment, so omitting it
+#: would have cost a megabyte a week. The nested name works because `LOG_DIR / name`
+#: resolves the subfolder and `_rotate_run_logs` operates on the resolved path.
+RUN_LOG_ARTIFACTS = ("default.log", "routing.log", "playlists.log",
+                     "acquisition/decisions.log", "timings.json")
 
 # Set in the detached enrich daemon's environment (EnrichDaemonSupervisor.spawn). The
 # daemon is a SEPARATE process that briefly constructs the 'default' LoggerManager via

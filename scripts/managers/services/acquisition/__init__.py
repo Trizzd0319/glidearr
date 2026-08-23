@@ -18,7 +18,7 @@ import math
 from scripts.managers.factories.base_manager import BaseManager
 from scripts.managers.factories.mixins.component_manager import ComponentManagerMixin
 from scripts.managers.machine_learning.acquisition.demand import demand_priority, demand_score
-from scripts.managers.machine_learning.acquisition import space_budget
+from scripts.managers.machine_learning.acquisition import decision_log, space_budget
 from scripts.managers.machine_learning.ledger.pending_plan import record_pending
 from scripts.managers.machine_learning.playlists.per_user import genre_match
 from scripts.managers.machine_learning.space.routing_targets import uhd_remote_play_ok
@@ -248,6 +248,18 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             mult = 1.25
         free, U = self._space_band(gw, inst, cache)
         return free >= U * mult
+
+    def _decision_detail(self, msg, *, reset=False):
+        """Write one line to the dedicated acquisition decision log (`GLD-ACQS-22`).
+
+        `support/logs/acquisition/decisions.log` -- the nested path needs no plumbing
+        because `log_to_file` already does `path.parent.mkdir(parents=True)`. Same
+        contract as the routing manager's `_detail`: never echoes to the run log or the
+        console, and no-ops when the logger has no file sink, so a None logger in tests
+        cannot turn a diagnostic into a crash.
+        """
+        if self.logger and hasattr(self.logger, "log_to_file"):
+            self.logger.log_to_file("acquisition/decisions", msg, reset=reset)
 
     def _acquisition_paused(self, gw, inst, cache: dict) -> bool:
         """True when NEW media must not be acquired: free space is in/below the
@@ -796,6 +808,14 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
 
         raw = gatherer.gather()
         self.logger.log_info(f"[Acquisition] {len(raw)} candidate(s) from enabled sources.")
+        # Per-candidate decision record (`GLD-ACQS-22`). A candidate can be lost at SIX
+        # different points below, each knowing different things about it, and until now
+        # only the aggregate counts survived. With free space well above the band the
+        # byte budget refuses nothing, so `max_adds_per_run` becomes the SOLE limiter
+        # and the ranking alone decides what the household gets -- a ranking that was
+        # nowhere on disk. Written to its own file for the same reason routing's plan is:
+        # a thousand per-title lines would bury the run narrative an operator reads.
+        _dl = decision_log.new_log()
 
         prepared, skipped = [], {}
         for cand in raw:
@@ -803,6 +823,13 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             reason = enriched.get("skip_reason")
             if reason:
                 skipped[reason] = skipped.get(reason, 0) + 1
+                # FATE 1: rejected before scoring. No score exists yet, and recording a
+                # blank one is correct -- an invented score in a ranking audit is worse
+                # than an absent one.
+                decision_log.record(
+                    _dl, title=(enriched.get("title") or cand.get("title") or cand.get("ext_id")),
+                    disposition="skipped", media=enriched.get("type") or cand.get("type"),
+                    reason=reason)
                 continue
             sc = scorer.score(enriched)
             enriched["score"], enriched["matrix"] = sc["total"], sc["matrix"]
@@ -819,6 +846,14 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
 
         min_score = int(acq.get("min_score", 0) or 0)
         eligible = [e for e in prepared if e["score"] >= min_score]
+        # FATE 2: scored, but under the floor. This is the one disposition where the
+        # score is the WHOLE reason, so it is named in the row.
+        for e in prepared:
+            if e["score"] < min_score:
+                decision_log.record(
+                    _dl, title=e.get("title") or e.get("ext_id"), disposition="refused",
+                    score=e.get("score"), media=e.get("type"), instance=e.get("instance"),
+                    reason=f"below min_score ({min_score})")
         # Demand-aware ordering (acquisition.demand.enabled, default OFF → plain score-desc,
         # byte-identical). As an instance's free space nears the floor, weight a candidate by how many
         # household users would watch it (breadth) so the capped budget fills with broad-appeal media;
@@ -856,10 +891,39 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                                     for s in worst)
                         + (f" +{len(sb_skipped) - len(worst)} more" if len(sb_skipped) > len(worst) else "")
                         + " -- retried next run as budget refreshes.")
+                # FATE 3: the byte budget said no. The main log names only the five
+                # largest; every one lands here with the charge that priced it out, and
+                # `space_budget_hard_max` is kept DISTINCT from `space_budget` because
+                # they mean different things -- "no room" versus "room, but the count
+                # cap stopped us" -- and conflating them is how `GLD-ACQS-20` reported
+                # 122 hard-max refusals as "0 refused".
+                for s in sb_skipped:
+                    _r = s.get("skip_reason")
+                    decision_log.record(
+                        _dl, title=s.get("title") or s.get("ext_id"),
+                        disposition="capped" if _r == "space_budget_hard_max" else "refused",
+                        score=s.get("score"), media=s.get("type"), instance=s.get("instance"),
+                        gb=s.get("space_charge_gb") or s.get("expected_size_gb"),
+                        tier=(s.get("quality_profile") or {}).get("name"),
+                        reason=("hard_max_adds reached" if _r == "space_budget_hard_max"
+                                else "space budget exhausted"))
         else:
             if sb_mode == "fallback":
                 cap = cap or 10   # enabled-but-unbuildable NEVER degrades to unlimited
             selected = eligible[:cap] if cap > 0 else eligible
+            # FATE 4: THE SILENT ONE. `eligible[:cap]` discards the remainder with no
+            # counter, no log line and no record anywhere -- 1,007 titles on the
+            # 2026-08-22 run. It is also the disposition that matters most right now:
+            # with free space far above the band nothing is refused on budget, so this
+            # slice IS the decision, and the ranking that produced it was unrecoverable.
+            if cap > 0 and len(eligible) > cap:
+                for e in eligible[cap:]:
+                    decision_log.record(
+                        _dl, title=e.get("title") or e.get("ext_id"), disposition="capped",
+                        score=e.get("score"), media=e.get("type"), instance=e.get("instance"),
+                        gb=e.get("space_charge_gb") or e.get("expected_size_gb"),
+                        tier=(e.get("quality_profile") or {}).get("name"),
+                        reason=f"max_adds_per_run ({cap}) reached")
 
         # Stage-C remote-play gate (default OFF): when routing.movies.transcode_gate is on,
         # only emit the 4K bonus copy if a likely household device can DIRECT-PLAY a 2160p HEVC
@@ -900,6 +964,15 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
             # space freed, so pause new acquisition instead of stranding it in *arr.
             if self._acquisition_paused(gw, e.get("instance"), band_cache):
                 skipped["space_full_no_deletion"] = skipped.get("space_full_no_deletion", 0) + 1
+                # FATE 5: made the cut, then the instance turned out to have no way to
+                # reclaim space. Distinct from a budget refusal: this title was FUNDED
+                # and lost to a condition discovered later.
+                decision_log.record(
+                    _dl, title=e.get("title") or e.get("ext_id"), disposition="skipped",
+                    score=e.get("score"), media=e.get("type"), instance=e.get("instance"),
+                    gb=e.get("space_charge_gb") or e.get("expected_size_gb"),
+                    tier=(e.get("quality_profile") or {}).get("name"),
+                    reason="instance full and deletion not consented")
                 row = [
                     str(e.get("title") or e.get("ext_id"))[:34],
                     e.get("type"), e.get("score"), str(e.get("instance")),
@@ -948,6 +1021,19 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                     # Cross-run in-flight accounting -- only a REAL add commits bytes.
                     sb_ctx.commit(e, e.get("space_charge_gb"))
             failed += action == "add-failed"
+            # FATE 6: the outcome of actually trying. `would-fund` rather than `funded`
+            # on a dry run, because a preview that reports titles as acquired is how a
+            # dry run gets mistaken for a live one.
+            decision_log.record(
+                _dl, title=e.get("title") or e.get("ext_id"),
+                disposition={"added": "funded", "would-add": "would-fund",
+                             "deferred": "deferred"}.get(action, "skipped"),
+                score=e.get("score"), media=e.get("type"), instance=e.get("instance"),
+                gb=e.get("space_charge_gb") or e.get("expected_size_gb"),
+                tier=(e.get("quality_profile") or {}).get("name"),
+                reason=("searched on add" if action == "added" and not under_pressure else
+                        "added with search OFF (under pressure)" if action == "deferred" else
+                        res.get("error") or action))
 
             # Change-plan accounting (GLD-SPC-01). An acquisition has NO Parquet row to
             # stamp -- the title is not in the library yet -- so the decision ledger
@@ -1079,6 +1165,33 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 f"[Acquisition] {deferred} title(s) deferred under space pressure "
                 f"(added monitored, search OFF; will search when free >= U)."
             )
+
+        # ── the per-candidate record (`GLD-ACQS-22`) ────────────────────────────
+        # `reset=True` on the first line: ONE fresh plan per run, exactly like
+        # routing.log. A decision log that appends across runs would show a ranking
+        # from three runs ago beside this run's summary and read as a contradiction.
+        #
+        # Wrapped whole: this is a diagnostic, and a diagnostic that can fail the pass
+        # it documents is worse than no diagnostic. Everything above has already
+        # happened -- titles are added, bytes are committed -- so there is nothing left
+        # to protect by raising.
+        try:
+            _summary = decision_log.summarise(_dl)
+            if _summary["total"]:
+                _lines = decision_log.render(
+                    _dl,
+                    instance_label=", ".join(sorted({str(g) for g in gateways})) or None,
+                    hard_max=(int(acq.get("max_adds_per_run", 10) or 0) or None),
+                    free_gb=None)
+                for _i, _line in enumerate(_lines):
+                    self._decision_detail(_line, reset=(_i == 0))
+                self.logger.log_info(
+                    f"[Acquisition] decision log: {_summary['total']} candidate(s) — "
+                    f"{_summary['funded']} funded, {_summary['capped']} capped, "
+                    f"{_summary['refused']} refused, {_summary['skipped']} skipped — "
+                    f"full ranking in support/logs/acquisition/decisions.log")
+        except Exception as _dl_e:
+            self.logger.log_debug(f"[Acquisition] decision log not written: {_dl_e}")
 
         if rows:
             headers = ["title", "type", "score", "instance", "profile", "~size", "decision", "why"]
