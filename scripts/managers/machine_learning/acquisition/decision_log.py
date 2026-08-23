@@ -44,7 +44,7 @@ def new_log() -> dict:
 
 
 def record(log, *, title, disposition, score=None, tier=None, gb=None,
-           instance=None, reason=None, media=None) -> dict:
+           instance=None, reason=None, media=None, source=None) -> dict:
     """Append one candidate's outcome. Returns the log for chaining.
 
     EVERY field except title and disposition is optional, and that is deliberate:
@@ -53,6 +53,13 @@ def record(log, *, title, disposition, score=None, tier=None, gb=None,
     that it ran out of room. A recorder that demanded a full row would push its call
     sites into inventing values, and an invented `score` in a ranking audit is worse
     than a blank one.
+
+    `source` earns its place by measurement rather than tidiness. The first two live
+    runs funded 7 titles from 1,081 candidates, and the file could not say WHICH
+    SOURCE produced them -- answering that needed a second table cross-referenced by
+    hand. It turned out every one came from `universe` and Trakt contributed ZERO
+    across 1,081, which is the single most useful number the file can report and the
+    one it could not report.
     """
     if not isinstance(log, dict) or not isinstance(log.get("rows"), list):
         return log                      # never let a diagnostic break the run
@@ -69,7 +76,7 @@ def record(log, *, title, disposition, score=None, tier=None, gb=None,
     log["rows"].append({
         "n": _seq, "title": str(title or "?"), "disposition": str(disposition or "?"),
         "score": score, "tier": tier, "gb": gb, "instance": instance,
-        "reason": reason, "media": media,
+        "reason": reason, "media": media, "source": source,
     })
     return log
 
@@ -99,6 +106,19 @@ def summarise(log) -> dict:
     _gb = [r.get("gb") for r in rows if isinstance(r, dict)
            and r.get("disposition") == "funded" and isinstance(r.get("gb"), (int, float))]
     out["funded_gb"] = round(sum(_gb), 1) if _gb else 0.0
+    # Per-source yield: candidates offered vs titles actually funded. This is the
+    # ratio that decides whether a source is worth its API calls, and it was
+    # unanswerable from the file until `source` was recorded.
+    by_src: dict = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        k = r.get("source") or "?"
+        slot = by_src.setdefault(k, {"total": 0, "funded": 0})
+        slot["total"] += 1
+        if r.get("disposition") == "funded":
+            slot["funded"] += 1
+    out["by_source"] = by_src
     return out
 
 
@@ -130,6 +150,19 @@ def render(log, *, instance_label=None, hard_max=None, free_gb=None) -> list:
     if hard_max is not None and s["capped"] and not s["refused"]:
         head.append(f"NOTE: nothing was refused on budget -- hard_max_adds ({hard_max}) is the "
                     f"sole limiter, so the ranking below decided the outcome.")
+    # PER-SOURCE YIELD. The blunt question a thousand-line candidate file should
+    # answer on line four: which sources are earning their API calls. Measured on the
+    # 2026-08-23 run, `trakt_recommendations` offered ~1,000 candidates and funded
+    # NONE while `universe` offered 31 and funded 5 -- a ratio that took a hand
+    # cross-reference against a separate table to discover, and now does not.
+    _src = {k: v for k, v in (s.get("by_source") or {}).items() if k != "?"}
+    if _src:
+        head.append("")
+        head.append("by source (offered -> funded):")
+        for k, v in sorted(_src.items(), key=lambda kv: (-kv[1]["funded"], -kv[1]["total"])):
+            _pct = f"{v['funded'] * 100 / v['total']:.1f}%" if v["total"] else "-"
+            _flag = "   <-- funded nothing" if v["total"] >= 50 and not v["funded"] else ""
+            head.append(f"  {k:26s} {v['total']:5d} -> {v['funded']:3d}  ({_pct}){_flag}")
     head.append("")
 
     body = []
@@ -148,6 +181,7 @@ def render(log, *, instance_label=None, hard_max=None, free_gb=None) -> list:
             # run it is documenting.
             bits = [f"{_fmt(r.get('score'), '.0f'):>4}", f"{str(r.get('title') or '?')[:58]:58s}"]
             if r.get("media"):    bits.append(f"[{r['media']}]")
+            if r.get("source"):   bits.append(f"src {r['source']}")
             if r.get("tier"):     bits.append(f"tier {r['tier']}")
             if r.get("gb") is not None: bits.append(f"{_fmt(r.get('gb'), '.1f')} GB")
             if r.get("instance"): bits.append(f"-> {r['instance']}")

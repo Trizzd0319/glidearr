@@ -829,7 +829,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 decision_log.record(
                     _dl, title=(enriched.get("title") or cand.get("title") or cand.get("ext_id")),
                     disposition="skipped", media=enriched.get("type") or cand.get("type"),
-                    reason=reason)
+                    source=enriched.get("source") or cand.get("source"), reason=reason)
                 continue
             sc = scorer.score(enriched)
             enriched["score"], enriched["matrix"] = sc["total"], sc["matrix"]
@@ -853,7 +853,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 decision_log.record(
                     _dl, title=e.get("title") or e.get("ext_id"), disposition="refused",
                     score=e.get("score"), media=e.get("type"), instance=e.get("instance"),
-                    reason=f"below min_score ({min_score})")
+                    source=e.get("source"), reason=f"below min_score ({min_score})")
         # Demand-aware ordering (acquisition.demand.enabled, default OFF → plain score-desc,
         # byte-identical). As an instance's free space nears the floor, weight a candidate by how many
         # household users would watch it (breadth) so the capped budget fills with broad-appeal media;
@@ -903,6 +903,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                         _dl, title=s.get("title") or s.get("ext_id"),
                         disposition="capped" if _r == "space_budget_hard_max" else "refused",
                         score=s.get("score"), media=s.get("type"), instance=s.get("instance"),
+                        source=s.get("source"),
                         gb=s.get("space_charge_gb") or s.get("expected_size_gb"),
                         tier=(s.get("quality_profile") or {}).get("name"),
                         reason=("hard_max_adds reached" if _r == "space_budget_hard_max"
@@ -921,6 +922,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                     decision_log.record(
                         _dl, title=e.get("title") or e.get("ext_id"), disposition="capped",
                         score=e.get("score"), media=e.get("type"), instance=e.get("instance"),
+                        source=e.get("source"),
                         gb=e.get("space_charge_gb") or e.get("expected_size_gb"),
                         tier=(e.get("quality_profile") or {}).get("name"),
                         reason=f"max_adds_per_run ({cap}) reached")
@@ -970,6 +972,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 decision_log.record(
                     _dl, title=e.get("title") or e.get("ext_id"), disposition="skipped",
                     score=e.get("score"), media=e.get("type"), instance=e.get("instance"),
+                    source=e.get("source"),
                     gb=e.get("space_charge_gb") or e.get("expected_size_gb"),
                     tier=(e.get("quality_profile") or {}).get("name"),
                     reason="instance full and deletion not consented")
@@ -1029,6 +1032,7 @@ class AcquisitionManager(BaseManager, ComponentManagerMixin):
                 disposition={"added": "funded", "would-add": "would-fund",
                              "deferred": "deferred"}.get(action, "skipped"),
                 score=e.get("score"), media=e.get("type"), instance=e.get("instance"),
+                source=e.get("source"),
                 gb=e.get("space_charge_gb") or e.get("expected_size_gb"),
                 tier=(e.get("quality_profile") or {}).get("name"),
                 reason=("searched on add" if action == "added" and not under_pressure else
