@@ -111,6 +111,35 @@ DEFAULT_KIDS_GENRES = frozenset({"children", "family", "kids", "preschool"})
 HARD_KIDS_GENRES = frozenset({"children", "kids", "preschool"})
 # Matches sd_replace.py / SonarrSeriesQualityManager.KIDS_CERTS — keep in sync.
 DEFAULT_KIDS_CERTS = frozenset({"tv-y", "tv-y7", "tv-g", "g", "pg"})
+
+# TWO KINDS OF CERTIFICATE, and conflating them put 24 adult titles in the kids
+# library (`GLD-ROU-15`). Measured on a full-library reclassification: `Gunsmoke`,
+# `Miss Marple`, `Sherlock Holmes (1984)`, `Jesus of Nazareth`, `Wish Me Luck`
+# (a WWII drama), `Three's Company` and `Our Mutual Friend` all routed to Kids on
+# the certificate alone, with no kids genre and no animation.
+#
+#   DIRECTED-AT-CHILDREN  tv-y (all ages, made for kids), tv-y7 (7+, made for kids)
+#       These are POSITIVE evidence. The rating body is asserting the intended
+#       audience, so they may route to Kids on their own.
+#
+#   GENERAL-AUDIENCE      tv-g, g, pg
+#       These assert only that nothing in the content needs a warning. A 1955
+#       western and a Dickens adaptation are TV-G because they are inoffensive,
+#       NOT because they are children's programming. Permission is not evidence.
+#
+# The classifier already states this principle for Common Sense Media: *a low or
+# absent CSM age never routes a show INTO Kids on its own*. A general-audience
+# certificate is the same class of claim and gets the same treatment -- it needs
+# CORROBORATION from a real child-audience signal (a kids genre, a kids network,
+# or animation) before it can route.
+DIRECTED_KIDS_CERTS = frozenset({"tv-y", "tv-y7"})
+
+#: Corroboration required by EVERY certificate route. `animation` is not a kids
+#: signal by itself -- adult animation exists and is why the animation gate was
+#: dropped -- but "animated AND rated for children AND carrying no adult veto" is
+#: a materially different claim from any one of those alone. It is the pairing
+#: that carries the evidence.
+_CERT_CORROBORATION = frozenset({"animation"})
 # Kid-safe ratings (≤ TV-PG/PG) that let the SOFT 'Family' genre route to Kids. On
 # TVDB 'Family' often means "family DRAMA" (His Dark Materials, Apples Never Fall),
 # so a 'Family' show only counts as Kids when it is kid-safe rated OR unrated —
@@ -459,6 +488,7 @@ def classify_show_explained(
     is_anime_hint: bool = False,
     recommended_age: "int | None" = None,
     kids_age_max: int = 11,        # CSM CEILING: an age OVER this demotes a show out of Kids
+    current_category: "str | None" = None,   # where it lives NOW; see rule 8b (incumbency)
     anime_genres=None,
     kids_genres=None,
     kids_certs=None,
@@ -516,6 +546,10 @@ def classify_show_explained(
     anime_g = _as_set(anime_genres, DEFAULT_ANIME_GENRES)
     kids_g = _as_set(kids_genres, DEFAULT_KIDS_GENRES)
     kids_c = _as_set(kids_certs, DEFAULT_KIDS_CERTS)
+    # The directed-at-children subset is derived from whatever kids_certs is in
+    # play, NOT hard-coded: an operator who narrows kids_certs must not silently
+    # keep a directed cert the narrowed set no longer contains.
+    directed_c = kids_c & DIRECTED_KIDS_CERTS
     kids_nets = _as_set(kids_networks, DEFAULT_KIDS_NETWORKS)
     reality_g = _as_set(reality_genres, DEFAULT_REALITY_GENRES)
     doc_g = _as_set(documentary_genres, DEFAULT_DOCUMENTARY_GENRES)
@@ -600,9 +634,109 @@ def classify_show_explained(
     if doc_hit:
         return "documentary", f"genre:{sorted(doc_hit)[0]}"
 
-    # ── 8. Kids by CERTIFICATE (TV-G/G/PG) — last; skipped if vetoed or CSM>cutoff ─
+    # ── 8. Kids by CERTIFICATE — last; skipped if vetoed or CSM>cutoff ───────────
+    #
+    # A CERTIFICATE IS A CONSTRAINT, NOT A POSITIVE SIGNAL (`GLD-ROU-15`). It can
+    # veto — an adult rating disqualifies every kids route above — but it may never
+    # route to Kids ON ITS OWN, in either direction:
+    #
+    #   GENERAL-AUDIENCE (TV-G/G/PG) asserts only that nothing needs a warning. A
+    #   1955 western and a Dickens adaptation are TV-G because they are inoffensive,
+    #   not because they were made for children. Measured: 24 such titles reached
+    #   Kids on the certificate alone — `Gunsmoke`, `Miss Marple`,
+    #   `Sherlock Holmes (1984)`, `Jesus of Nazareth`, `Three's Company`.
+    #
+    #   DIRECTED-AT-CHILDREN (TV-Y/TV-Y7) *should* assert the intended audience, and
+    #   a first pass trusted it alone for exactly that reason. IT DOES NOT SURVIVE
+    #   CONTACT WITH NON-US METADATA. These are US TV Parental Guidelines; foreign
+    #   content routinely carries them unmapped or filled with junk. Measured on the
+    #   very next run: ~18 of 50 cert-routed titles were non-English LIVE-ACTION
+    #   drama wearing TV-Y/TV-Y7 — `Sanada Maru` (NHK Taiga drama), `The Thunder`
+    #   (Chinese narcotics drama), `Bloody Romance`, `Duel In The Sun` (1946
+    #   western), `Bref.` — and, worst, `Love and Fortune (2018)`, a Japanese drama
+    #   about an affair with a teenager, rated TV-Y7 and routed into the KIDS
+    #   library. A ~35% false-positive rate on a child-safety gate.
+    #
+    # So BOTH kinds now require corroboration from a real child-audience signal.
+    # This is the same principle the CSM rule states — *a low or absent CSM age never
+    # routes a show INTO Kids on its own* — applied to the other rating system that
+    # makes the same class of claim. An unreliable rating is not evidence of
+    # audience, and on a gate that decides what a child sees, the failure direction
+    # must be to withhold rather than to admit.
+    #
+    # Corroboration is `animation` because the kids GENRE and kids NETWORK routes
+    # already fired above: anything reaching this line has neither. "Animated AND
+    # rated for children AND carrying no adult veto" is a materially different claim
+    # from either half alone — it held all ~31 genuinely animated cases in the same
+    # measurement (`Iron Man`, `Transformers: EarthSpark`, `Beast Wars`,
+    # `Simon's Cat`, `Masha's Spooky Stories`) while dropping every live-action
+    # foreign drama.
+    # Corroboration is `animation`, and ONLY `animation`. A CSM age was tried as a
+    # second corroborator on the theory that two independent rating bodies agreeing
+    # is stronger than one -- and the live data killed it:
+    #
+    #     Sanada Maru        cert:tv-y+csm2     an NHK historical WAR drama
+    #     Jesus of Nazareth  cert:tv-g+csm2
+    #     Gunsmoke           cert:tv-g+csm10
+    #     Three's Company    cert:tv-g+csm10
+    #     The Bob Newhart Show / Here's Lucy    cert:tv-g+csm10
+    #
+    # `csm2` is not a rating anyone issued -- no body calls a 1966 war drama suitable
+    # for two-year-olds; it is a default, a parse failure or an unrated placeholder.
+    # And the csm10 cluster is CSM's genuine "10+" for classic US sitcoms, which sits
+    # BELOW an 11 ceiling and therefore corroborates. So CSM carries the same disease
+    # as the certificates: junk at the bottom for uncovered titles, and legitimately
+    # low values for adult-but-inoffensive ones.
+    #
+    # TWO UNRELIABLE SIGNALS AGREEING IS NOT TWO INDEPENDENT SIGNALS AGREEING. The
+    # premise that justified it -- "CSM coverage is US-centric, so foreign junk certs
+    # have no CSM age" -- is contradicted by `Sanada Maru`, which has both.
+    #
+    # `animation` measured clean over the same population: 31 titles, every one
+    # genuinely animated, no false positives. It is a claim about the WORK rather
+    # than about a rating body's opinion of it, which is why it does not rot the same
+    # way.
     if not vetoed and not csm_blocks_kids and cert and cert in kids_c:
-        return "kids", f"cert:{cert}"
+        if g & _CERT_CORROBORATION:
+            _kind = "directed" if cert in directed_c else "general"
+            return "kids", f"cert:{cert}+animation ({_kind})"
+
+    # ── 8b. INCUMBENCY: absence of a kids signal is not evidence AGAINST kids ──
+    #
+    # Every route above needs a POSITIVE kids signal — a genre, a network, a
+    # certificate. Pre-1990 animation has none of them: TVDB gives `The Bugs Bunny
+    # Show`, `Woody Woodpecker`, `Super Friends` and `Hanna-Barbera Superstars`
+    # nothing but `Animation, Comedy` with no certification and a BROADCAST network
+    # (CBS/ABC/NBC, not a kids channel). So they fell to `series` by default and a
+    # live run evicted 24 of them OUT of the kids library — children's programming,
+    # moved away from the children, because the metadata was thin rather than
+    # because anything said they were unsuitable.
+    #
+    # The CSM rule already states this principle in the other direction: *a low or
+    # absent CSM age never routes a show INTO Kids on its own*. Absence is not
+    # evidence. This enforces the inverse, which is the DESTRUCTIVE direction and
+    # therefore matters more: a show already sitting in Kids stays there unless
+    # something POSITIVELY says otherwise —
+    #
+    #     * an adult certificate      (TV-14/TV-MA/R/NC-17/…)
+    #     * a lifestyle/format veto   (reality/game show/talk show/food/… — `vetoed`)
+    #     * CSM rated OVER the ceiling
+    #
+    # The SHOW path has no adult-genre set of its own (`adult_veto_genres` belongs to
+    # the movie classifier), so `vetoed` carries the genre signal here. That is the
+    # correct set to use: it is the same veto every other soft kids route already
+    # consults, so incumbency cannot be more permissive than the routes above it.
+    #
+    # Note what this deliberately does NOT do: it does not route anything INTO
+    # Kids. `current_category` is the operator's own placement, and honouring it is
+    # a refusal to overrule a human decision on missing data — not a new inference.
+    # Adult animation is unaffected, because `Rick and Morty` carries TV-MA; the
+    # classifier cannot tell it from Bugs Bunny on genre alone, which is exactly why
+    # the animation gate was dropped and exactly why the answer is incumbency rather
+    # than a smarter positive rule.
+    if current_category == "kids" and not (vetoed or csm_blocks_kids
+                                           or cert in _ADULT_TV_CERTS):
+        return "kids", "incumbent:no adult signal"
 
     # ── 9. Default catch-all ──────────────────────────────────────────────────
     return "series", "default"

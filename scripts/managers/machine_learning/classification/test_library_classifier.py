@@ -230,8 +230,16 @@ def test_show_csm_age_alone_does_not_route_to_kids():
     assert _show(["Drama", "Science Fiction"], "TV-PG", recommended_age=10) == "series"   # DS9
     # CSM permits but does not promote: a Reality show at CSM 6 stays Reality (no kids signal).
     assert _show(["Reality"], recommended_age=6) == "reality"
-    # A corroborating signal is still required AND honoured: a kid-safe cert at a low CSM age → kids.
-    assert _show(["Comedy"], "TV-Y7", recommended_age=8) == "kids"
+    # A corroborating signal is still required AND honoured — but it must be a claim
+    # about the WORK, not another rating body's opinion of it. A kid-safe cert plus a
+    # low CSM age was tried and REVERTED: measured live, that pairing routed
+    # `Gunsmoke` (cert:tv-g+csm10), `Three's Company` (csm10), `The Bob Newhart Show`
+    # (csm10), `Jesus of Nazareth` (csm2) and `Sanada Maru` (tv-y+csm2, an NHK war
+    # drama) into the KIDS library. `csm2` is not a rating anyone issued, and CSM's
+    # genuine "10+" for classic US sitcoms sits below an 11 ceiling. Two unreliable
+    # signals agreeing is not two independent signals agreeing.
+    assert _show(["Comedy"], "TV-Y7", recommended_age=8) == "series"
+    assert _show(["Animation", "Comedy"], "TV-Y7", recommended_age=8) == "kids"
 
 
 # ── shows: a genuine KIDS NETWORK is a positive kids signal (the Trek franchise split) ──
@@ -318,7 +326,14 @@ def test_show_anime_beats_csm():
 def test_show_no_csm_leaves_genre_cert_flow_unchanged():
     # Regression: with no CSM age the existing genre/cert routing is unchanged.
     assert _show(["Comedy", "Family"], "TV-PG") == "kids"
-    assert _show(["Comedy"], "TV-G") == "kids"
+    # A GENERAL-AUDIENCE cert alone no longer routes (`GLD-ROU-15`) — and neither
+    # does a DIRECTED one, since foreign content carries US ratings unmapped. Both
+    # need corroboration, and ONLY `animation` qualifies — a CSM age does not (it
+    # routed Gunsmoke and Sanada Maru into Kids when it was tried).
+    assert _show(["Comedy"], "TV-Y") == "series"
+    assert _show(["Comedy"], "TV-G") == "series"
+    assert _show(["Comedy"], "TV-Y", recommended_age=6) == "series"   # CSM is NOT corroboration
+    assert _show(["Animation", "Comedy"], "TV-G") == "kids"
     assert _show(["Drama"]) == "series"
 
 
@@ -353,9 +368,43 @@ def test_movie_g_pg_cert_alone_is_not_kids():
 
 
 def test_tv_cert_route_unchanged():
-    # TV KEEPS its certificate route — a TV-G/TV-Y7 show with no genre signal is still Kids.
-    assert _show(["Comedy"], "TV-G") == "kids"
-    assert _show(["Adventure"], "TV-Y7") == "kids"
+    """TV keeps its certificate route — but SPLIT BY WHAT THE RATING CLAIMS.
+
+    POLICY CHANGE, deliberate (operator, 2026-08-22, `GLD-ROU-15`). This asserted
+    ``_show(["Comedy"], "TV-G") == "kids"`` under the comment *"a TV-G/TV-Y7 show
+    with no genre signal is still Kids"* — a sentence that conflates the two kinds
+    of certificate, which is the defect itself.
+
+    A full-library reclassification put **24 adult titles in the kids library** on
+    that rule alone: `Gunsmoke`, `Miss Marple`, `Sherlock Holmes (1984)`,
+    `Jesus of Nazareth`, `Wish Me Luck` (a WWII drama), `Three's Company` and
+    `Our Mutual Friend` — none with a kids genre, none animated. They are TV-G
+    because nothing in them needs a warning, not because they were made for
+    children. Permission is not evidence, and the classifier already says so about
+    Common Sense Media: *a low or absent CSM age never routes a show INTO Kids on
+    its own*.
+    """
+    # DIRECTED AT CHILDREN — nominally states the audience, but STILL needs
+    # corroboration: these are US TV Parental Guidelines and foreign content carries
+    # them unmapped. Measured on a live run, ~18 of 50 cert-routed titles were
+    # non-English LIVE-ACTION drama wearing TV-Y/TV-Y7, including `Love and Fortune`
+    # (a Japanese drama about an affair with a teenager) landing in the KIDS library.
+    assert _show(["Adventure"], "TV-Y7") == "series"
+    assert _show([], "TV-Y") == "series"
+    assert _show(["Drama", "Romance"], "TV-Y7") == "series"          # Love and Fortune
+    assert _show(["Drama", "History"], "TV-Y") == "series"           # Sanada Maru
+    # GENERAL AUDIENCE — same treatment; a live-action TV-G comedy is not kids.
+    assert _show(["Comedy"], "TV-G") == "series"
+    assert _show(["Action", "Adventure", "Western"], "TV-G") == "series"   # Gunsmoke
+    assert _show(["Crime", "Drama", "Mystery"], "TV-G") == "series"        # Miss Marple
+    # ...but WITH corroboration a certificate still routes. Corroboration is
+    # `animation` — a claim about the WORK, not another rating body's opinion of it.
+    assert _show(["Action", "Animation", "Science Fiction"], "TV-G") == "kids"   # Iron Man
+    assert _show(["Action", "Animation", "Drama", "Fantasy"], "TV-Y7") == "kids"  # X-Men: Evolution
+    # ...and a CSM age is NOT corroboration — it routed Gunsmoke (csm10) and
+    # Sanada Maru (csm2) into Kids when it was tried. See
+    # test_show_csm_age_alone_does_not_route_to_kids.
+    assert _show(["Action", "Adventure", "Western"], "TV-G", recommended_age=10) == "series"
 
 
 # ── movies: kids/family STUDIO is the only fallback when CSM has no rating ───────

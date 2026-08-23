@@ -37,7 +37,10 @@ from __future__ import annotations
 from scripts.managers.machine_learning.classification import library_router
 from scripts.managers.machine_learning.space.routing_targets import reorg_mode, relocation_enabled
 from scripts.managers.services.mdblist import age_cache
-from scripts.support.utilities.library_classifier import classify_movie, classify_show, is_anime_media
+from scripts.support.utilities.library_classifier import (
+    classify_movie, classify_movie_explained, classify_show, classify_show_explained,
+    is_anime_media,
+)
 
 
 class RoutingManager:
@@ -77,6 +80,10 @@ class RoutingManager:
         self._kids_age_max = self._read_kids_age_max()
         self._movie_ages = None       # CSM caches, lazy-loaded once
         self._show_ages = None
+        # Per-run classifier reasons, keyed by arr item id (`GLD-ROU-16`). Populated by
+        # the _classifier closures, read by the plan emitter. Reset per instance below so
+        # a stale reason can never be printed against a later run's plan.
+        self._why = {}
 
     #: Bounds for ``kidsAgeMax``. 2 is the youngest CSM rating in practice; 17 is the
     #: point above which "kids" is meaningless. A value outside this is treated as a
@@ -262,8 +269,17 @@ class RoutingManager:
                                   f"— full plan in support/logs/routing.log")
             self._detail(f"-- {name} ({kind}s): {len(plans)} misplaced --")
             for p in plans:
+                # TWO reasons, and they answer different questions (`GLD-ROU-16`):
+                #   p['reason'] — the ROUTER's: which folder rule produced the target.
+                #   _why        — the CLASSIFIER's: which signal decided the category
+                #                 (genre / network / cert / CSM / language / incumbency).
+                # Only the first was ever logged, so a line read `-> kids [kids folder]`
+                # and gave no way to tell a genre match from a certificate match. That
+                # gap cost an hour and two wrong theories on a single title.
+                _why = self._why.get(p.get("id"))
                 self._detail(f"[{name}] {p['title']}: {p['current_root'] or '?'} -> "
-                             f"{p['target_root'] or '(stay)'}  [{p['reason']}]")
+                             f"{p['target_root'] or '(stay)'}  [{p['reason']}]"
+                             + (f"  ({_why})" if _why else ""))
             if apply_here:
                 self._apply(im, name, put_ep, id_key, plans, is_show)
 
@@ -301,28 +317,76 @@ class RoutingManager:
         ol = it.get("originalLanguage")
         return ol.get("name") if isinstance(ol, dict) else ol
 
+    def _current_category(self, it) -> "str | None":
+        """Which configured bucket this item ALREADY sits in, or ``None``.
+
+        Feeds the classifier's incumbency rule (`GLD-ROU-14`): a show already in
+        Kids is not evicted merely because its metadata carries no kids signal.
+        Pre-1990 animation has none — `The Bugs Bunny Show`, `Super Friends`,
+        `Woody Woodpecker` are `Animation, Comedy` with no certification on a
+        broadcast network — and a live run moved 24 such shows OUT of the kids
+        library because thin metadata read as evidence against them.
+
+        Reverse-mapped from the item's OWN root path against the configured
+        folders, so it reports where the operator actually put it rather than
+        where anything thinks it should be. Longest-prefix wins: `tv/kids` must
+        not be matched by a shorter root that happens to be its parent.
+
+        `None` when the path is unreadable or sits under no configured root — and
+        `None` disables incumbency entirely, so an unrecognised path can never
+        pin an item in place. Absence of knowledge returns to the default
+        behaviour rather than inventing a claim.
+        """
+        path = str(it.get("rootFolderPath") or it.get("path") or "").strip()
+        if not path:
+            return None
+        p = path.replace("\\", "/").rstrip("/").lower()
+        # ITERATE PAIRS, DO NOT MERGE THE TWO MAPS. `kids` and `anime` are keys in
+        # BOTH rootFolders and movieRootFolders, so `{**tv, **movies}` silently drops
+        # the TV entry and every show under tv/kids reverse-maps to nothing -- which
+        # would disable incumbency for the exact population it was written for.
+        best, best_len = None, -1
+        for cat, root in [*(self._root_folders or {}).items(),
+                          *(self._movie_root_folders or {}).items()]:
+            r = str(root or "").replace("\\", "/").rstrip("/").lower()
+            if r and (p == r or p.startswith(r + "/")) and len(r) > best_len:
+                best, best_len = cat, len(r)
+        return best
+
     def _classifier(self, is_show):
         """A ``classify(item) -> category`` closure over the live arr object, matching the
         resolver's classify call (CSM-primary). is_uhd is left False — the same-instance
-        re-organizer routes by content; the 4K/anime INSTANCE split is the deferred path."""
+        re-organizer routes by content; the 4K/anime INSTANCE split is the deferred path.
+
+        SIDE-EFFECT BY DESIGN: the ``_explained`` variants return ``(category, reason)``
+        and the reason was being discarded (`GLD-ROU-16`). The plan line said WHERE a
+        title was going and never WHY, so `Galaxy Kickoff!!: series -> kids` could not be
+        distinguished from `[genre:children]`, `[network:nickelodeon]` or `[cert:tv-g]`
+        without re-deriving the whole decision by hand — which cost an hour and produced
+        two wrong theories before the answer came from one API call. The reason is
+        stashed per item id and emitted beside the destination.
+        """
         if is_show:
             def classify(it):
-                return classify_show(
+                cat, why = classify_show_explained(
                     genres=it.get("genres"), certification=it.get("certification"),
                     series_type=it.get("seriesType"), original_language=self._olang(it),
                     network=it.get("network"),
                     recommended_age=self._show_age(it.get("tmdbId")),
                     kids_age_max=self._kids_age_max,
+                    current_category=self._current_category(it),
                     anime_genres=self._anime_genres, kids_genres=self._kids_genres,
                     kids_certs=self._kids_certs, kids_networks=self._kids_networks,
                     reality_genres=self._reality_genres,
                     documentary_genres=self._doc_genres, news_genres=self._news_genres,
                     preschool_genres=self._preschool_genres,
                     non_kids_genres=self._non_kids_genres)
+                self._why[it.get("id")] = why
+                return cat
             return classify
 
         def classify(it):
-            return classify_movie(
+            cat, why = classify_movie_explained(
                 genres=it.get("genres"), certification=it.get("certification"),
                 original_language=self._olang(it), studio=it.get("studio"),
                 recommended_age=self._movie_age(it.get("tmdbId")), is_uhd=False,
@@ -330,6 +394,8 @@ class RoutingManager:
                 anime_genres=self._anime_genres, kids_genres=self._kids_genres,
                 kids_certs=self._kids_certs, preschool_genres=self._preschool_genres,
                 non_kids_genres=self._non_kids_genres)
+            self._why[it.get("id")] = why
+            return cat
         return classify
 
     def _anime_media(self, it):
