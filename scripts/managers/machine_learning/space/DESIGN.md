@@ -326,6 +326,16 @@ Constants: `PRESSURE_FALLBACK_GB` 25.0 · `PRESSURE_FALLBACK_FRACTION` 0.25 ·
   from `episodes/by_series/<sid>`, `tvdb_id` from the TRaSH folder name, `profile`
   from `profiles.json`. None costs an API call, which is why all three reach the
   `dry_run` and `marked-not-consented` paths
+- ✅ **Intersection drift detector** (`GLD-DEL-08`) — audits the parquet against the
+  *arr for the files it CLAIMS: `orphaned` rows (the *arr no longer has that
+  `file_id`) and `size_mismatch` (both hold it, bytes disagree). Gates scale √n at
+  `DRIFT_K = 1`; the size gate is derived from the count gate rather than being an
+  independent percentage.
+  ⚠️ **It does NOT compare totals.** The parquet is a WORKING SET — 97.6% of series
+  hold exactly one row, because an unwatched series gets only a pilot — so a totals
+  comparison breaches on a ~35% gap that is design, and no rebuild closes it. That
+  was the first implementation and it was wrong. `coverage()` reports the ratio as a
+  GAUGE and can never breach
 - ✅ Schmitt-trigger hysteresis on tightness engagement/release
 - ✅ Exhaustive downgrade on by default, byte-for-byte reversible
 - ✅ Delete pool structurally restricted to at/below-floor items
@@ -352,6 +362,11 @@ Constants: `PRESSURE_FALLBACK_GB` 25.0 · `PRESSURE_FALLBACK_FRACTION` 0.25 ·
 | `GLD-DEL-04` | **Clear `pending.jsonl` when the delete pass never evaluates** — the pass returns early when no rows are marked, so the snapshot is not rewritten and can go stale | Every row carries `run_id`, so a stale file is DETECTABLE by comparing against the current run; but it is not yet self-clearing. **Worse than an edge case under the standing config**: with consent armed and no pressure, `_do_delete_marked_files` DELEGATES to the coordinator and returns before the archive, so nothing writes `pending` at all — the candidate pool becomes invisible and the file keeps asserting `marked-not-consented` under a stale `run_id`. Needs a `deferred-to-coordinator` disposition written on the delegation path | S | `GLD-DEL-02` |
 | `GLD-SPA-11` | **Document the band semantics where the operator will read them** — `T`/`U` in `space_targets`, the coordinator's log line, and this file all describe the same hysteresis differently | Deletion engages BELOW `T`; `T..U` is downgrade-only. The variable names alone read as "target and ceiling", which is how the 2026-08-24 floor change came to trigger exhaustive step-down instead of the intended delete test | S | — |
 | `GLD-SPA-12` | 🎯 **A bounded way to exercise the delete path** — lowering `space_pressure_headroom_ratio` alongside a raised floor, or an explicit test hook | With headroom at 0.10, ANY deletion trigger implies a ~10%-of-floor deficit (~418 GB), which exceeds the ~322 GB marked-TV pool and escalates to movies. There is currently no way to exercise deletion on a small, bounded target — and `_persist_restore_set` is structurally undryrunnable, so its first execution is necessarily live | M | `GLD-RST-18` |
+| `GLD-DEL-09` | **Act on a drift breach, not just report it** — `intersection_drift` names the orphaned `file_id`s; nothing yet PRUNES those rows or refreshes their sizes | ✅ **Done** — `_do_purge_sonarr_deleted` widened to every file-owning row, and unhooked from the `coordinator_owns_deletion` short-circuit that made it unreachable under the standing config | M | `GLD-DEL-08` |
+| `GLD-DEL-10` | **Wire the `upgraded` disposition** — `run_jit_quality_upgrades` / `run_active_watcher_upgrades` record nothing, so `detect_churn` can never fire and `space_ledger` counts reclaim without spend | ✅ **Partly done** — the Sonarr JIT path now records an intent worklist and reconciles it at the START of the next pass, re-pointing landed upgrades so they never become orphans. Radarr's `run_active_watcher_upgrades` is still unrecorded, and no `upgraded` row reaches the archive yet, so `detect_churn` and the spend half of `space_ledger` remain inert | M | `GLD-DEL-06` |
+| `GLD-DEL-12` | **Reconcile Radarr's upgrades too** — `run_active_watcher_upgrades` fires a search and keeps no trace, so movie rows still go stale on every upgrade | The Sonarr mechanism (`upgrade_intent` / `reconcile_upgrades`) is service-agnostic and pure; Radarr needs only the two adapters | S | `GLD-DEL-10` |
+| `GLD-DEL-13` | **Emit `upgraded` / `upgrade-abandoned` rows into the archive** on reconciliation, so intent-vs-outcome is auditable and `detect_churn` has both directions | Reconciliation currently resolves the worklist silently — a landed upgrade leaves no event, so churn detection still sees only the step-down half | S | `GLD-DEL-10` |
+| `GLD-DEL-11` | **Reconcile intent against outcome** — a `stepped-down` row's `replaced_by` carries `state: "queued"`, meaning the *arr ACCEPTED the grab, not that it imported. Nothing ever goes back to confirm | *(**P-D**)* Without it the archive asserts replacements that may never have landed, and `space_ledger` counts their bytes. Per-FILE reconciliation only — the parquet is a working set, so absence there cannot distinguish deleted from never-synced *(**P-C**)*; it must ask the *arr about the specific id | M | `GLD-DEL-05` |
 | `GLD-SPA-05` | **Downgrade-vs-delete accounting** each run — GB reclaimed by each path | Proves D7/D8 are working; currently unmeasured | S | `GLD-SCO-09` |
 | `GLD-SPA-06` | **Per-mount bands** rather than one global floor | Multi-drive setups currently share one threshold | M | `disk_total_gb` per mount |
 | `GLD-SPA-07` | **Document `universe.DEFAULT_DOWNGRADE_GB` (10)** as a named exception in the ladder docs, not only inline | An intentional hardcoded floor is invisible to anyone reading `space_targets` | S | — |

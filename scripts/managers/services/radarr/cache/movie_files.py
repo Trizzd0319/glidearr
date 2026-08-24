@@ -39,6 +39,10 @@ from scripts.managers.machine_learning.classification.franchise import (
 )
 from scripts.managers.machine_learning.classification.keep_policy import build_keep_policy_map
 from scripts.managers.machine_learning.space.downgrade_planner import UNIVERSE_PROTECT_MIN
+from scripts.managers.machine_learning.space.deletion_log import (
+    coverage,
+    intersection_drift,
+)
 from scripts.managers.machine_learning.lifecycle.watched_definition import (
     play_is_watched,
     resolve_watched_percent,
@@ -1382,8 +1386,91 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                         f"[dry_run] Built movie_files cache for '{instance}' "
                         f"({len(df_new)} rows) — local write only, no Radarr changes."
                     )
+                # GLD-DEL-08 — audit AFTER the save so both sides read the same state.
+                # `movies` is the library walk this refresh already fetched, so the
+                # *arr side costs nothing extra.
+                self._check_parquet_drift(instance, df_new, movies)
 
         return stats
+
+    def _arr_file_index(self, movies):
+        """``{movie_file_id: size_bytes}`` from the library walk already in hand.
+
+        Radarr embeds ``movieFile`` in ``GET /movie``, so unlike the Sonarr twin —
+        which reads per-series episodefile caches — this needs no cache lookup and no
+        extra request. The list passed in is the SAME one the refresh built its rows
+        from, which is what makes the comparison a like-for-like audit rather than
+        two reads of different moments.
+        """
+        out = {}
+        for m in (movies or []):
+            if not isinstance(m, dict):
+                continue
+            mf = m.get("movieFile") or {}
+            fid, sz = mf.get("id"), mf.get("size")
+            if fid is None:
+                continue
+            try:
+                out[int(fid)] = int(sz or 0)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _check_parquet_drift(self, instance, df, movies=None):
+        """Audit the parquet against Radarr for the files it CLAIMS — GLD-DEL-08.
+
+        ⚠️ INTERSECTION ONLY — see the Sonarr twin for the full rationale. Comparing
+        totals would breach on a coverage gap that is by design; what matters is
+        whether the parquet is WRONG about a file it does track (orphaned rows, stale
+        byte counts), because both corrupt every space decision reading them.
+
+        Radarr's mirror is built from a FULL library walk rather than a watch-history
+        working set, so its coverage should sit near 1.0 — which makes the coverage
+        gauge more meaningful here than on the TV side, where 65% is normal. A
+        coverage collapse on THIS side would be a real signal.
+
+        There is no rebuild step: the *arr side is the walk itself, so re-reading it
+        would only repeat the same fetch. A breach here means the parquet diverged
+        from the very list it was built from, which is a defect in the build, not
+        staleness a resync could fix.
+
+        Never raises.
+        """
+        try:
+            if df is None or df.empty or "movie_file_id" not in df.columns:
+                return None
+            owned = df[df["movie_file_id"].notna() & df["size_bytes"].notna()]
+            if owned.empty:
+                return None
+            pq = {}
+            for fid, sz in zip(owned["movie_file_id"], owned["size_bytes"]):
+                try:
+                    pq[int(fid)] = int(sz)
+                except (TypeError, ValueError):
+                    continue
+            arr = self._arr_file_index(movies)
+
+            result = intersection_drift(pq, arr)
+            cov = coverage(len(pq), len(arr))
+            if cov.get("ratio") is not None:
+                self.logger.log_debug(
+                    f"  \U0001f4d0 parquet coverage '{instance}': {cov['parquet']:,} of "
+                    f"{cov['arr']:,} library files ({cov['ratio'] * 100:.0f}%) — gauge only")
+            if result.get("breach"):
+                self.logger.log_warning(
+                    f"  ⚠\ufe0f parquet drift on '{instance}' — " + "; ".join(result["reasons"])
+                    + " — the parquet disagrees with the library walk it was built from. "
+                      "See GLD-DEL-08.")
+            elif result.get("reasons"):
+                self.logger.log_debug(
+                    f"  parquet audit '{instance}': {result['reasons'][0]}")
+            return result
+        except Exception as e:
+            try:
+                self.logger.log_debug(f"  parquet audit skipped for '{instance}': {e}")
+            except Exception:
+                pass
+            return None
 
     # ── Grace period ─────────────────────────────────────────────────────────────
 

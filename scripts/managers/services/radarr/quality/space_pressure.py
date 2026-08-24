@@ -1380,6 +1380,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     _orig_release = release_record(df.loc[idx])
                     _orig_qname = cur_qp_name
                     _orig_size = _sz_f
+                    _grab_ok = True     # cleared by the grab branches below on failure
                     # CHECKED: DELETE success now returns True (base contract fix). On
                     # failure the old file is still on disk — grabbing anyway imports a
                     # second copy over a file Radarr cannot remove. Skip, stamp the
@@ -1414,6 +1415,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     if not _res:
                         movie_ids_to_search.append(movie_id)
                         stats["grab_failed"] = stats.get("grab_failed", 0) + 1
+                        _grab_ok = False
                         _stamp_failure(_ledger, _ck)
                         self.logger.log_warning(
                             f"  ⚠️ '{title}': file DELETED but the guid grab FAILED — blind "
@@ -1424,6 +1426,7 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 except Exception:
                     movie_ids_to_search.append(movie_id)   # file is gone → blind search now works
                     stats["grab_failed"] = stats.get("grab_failed", 0) + 1
+                    _grab_ok = False
 
                 df.at[idx, "quality_profile_id"]   = target_id
                 df.at[idx, "quality_profile_name"] = target_name
@@ -1449,14 +1452,24 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 # file. Recording the original's identity is the sole way a Remux master
                 # can ever be re-acquired deliberately. Before this, the only trace was a
                 # `default.log` line that rotates away in five runs.
+                #
+                # `replaced_by` ONLY on a confirmed grab (GLD-DEL-07). The grab-failure
+                # branch above does not `continue` — it falls through to here — so the
+                # first cut of this call asserted a replacement for releases that were
+                # never grabbed, and the space ledger then counted bytes that never
+                # landed. A POST that Radarr ACCEPTED is still only queued, not imported;
+                # `replaced_by` therefore means "this is what was asked for", and only
+                # reconciliation can promote it to what actually arrived.
                 self._archive_movie_deletion(
                     _archive, instance=instance, row=df.loc[idx], title=title,
                     disposition="stepped-down",
-                    reason=f"{reason} | {_orig_qname} → {target_name}",
+                    reason=(f"{reason} | {_orig_qname} → {target_name}"
+                            + ("" if _grab_ok else " | RE-GRAB FAILED, blind search queued")),
                     size_bytes=_orig_size, file_id=_fid_row, source="step_down",
-                    replaced_by={"title": pick.get("title"),
-                                 "size_bytes": pick.get("size"),
-                                 "quality_name": target_name},
+                    replaced_by=({"title": pick.get("title"),
+                                  "size_bytes": pick.get("size"),
+                                  "quality_name": target_name,
+                                  "state": "queued"} if _grab_ok else None),
                     release_override=_orig_release)
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ Downgrade failed for '{title}' (id={movie_id}): {e}")

@@ -82,10 +82,16 @@ from scripts.managers.machine_learning.lifecycle.restore_policy import (
     release_record,
 )
 from scripts.managers.machine_learning.space.deletion_log import (
+    coverage,
     deletion_record,
+    drift_after_rebuild,
+    intersection_drift,
+    merge_upgrade_intents,
     new_run_id,
+    reconcile_upgrades,
     split_by_kind,
     to_jsonl,
+    upgrade_intent,
 )
 from scripts.managers.machine_learning.lifecycle.stale_prune_policy import (
     restore_cooldown_active,
@@ -3417,33 +3423,46 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
 
     @timeit("_get_episode_files")
     def _get_episode_files(self, instance: str, series_id: int,
-                           retries: int = 2, retry_delay_s: float = 2.0) -> list[dict]:
-        """Fetch all episodefile records for a series (1 API call).
+                           retries: int = 2, retry_delay_s: float = 2.0) -> "list[dict] | None":
+        """All episodefile records for a series, or **None** when the fetch FAILED.
 
-        Retries up to ``retries`` times with ``retry_delay_s`` seconds between
-        attempts on transient failure before returning [].
+        ⚠️ None and [] MEAN DIFFERENT THINGS (GLD-DEL-09, **P-C**). ``[]`` is "Sonarr
+        holds no files for this series"; ``None`` is "we could not find out". Callers
+        that PRUNE on absence must treat them differently, or a failed read deletes
+        every row for the series.
+
+        This returned ``[]`` for both. ``_make_request(fallback=[])`` SWALLOWS HTTP
+        failures and returns the fallback rather than raising — the same P-A shape as
+        `GLD-SON-23` — so a 500 never reached the ``except``, the retry loop never ran,
+        and the caller saw an empty list indistinguishable from an empty series. That
+        was survivable while `_do_purge_sonarr_deleted` only scanned `marked_for_deletion`
+        rows; widening it to every file-owning row (10,225 of them) would have turned
+        one Sonarr blip into a mass row deletion.
+
+        ``fallback=None`` makes the failure legible, and the falsy check below now
+        distinguishes it from a genuine empty list.
         """
         last_exc = None
         for attempt in range(max(1, retries)):
             try:
-                return (
-                    self.sonarr_api._make_request(
-                        instance, f"episodefile?seriesId={series_id}", fallback=[]
-                    )
-                    or []
-                )
+                res = self.sonarr_api._make_request(
+                    instance, f"episodefile?seriesId={series_id}", fallback=None)
+                if res is not None:
+                    return list(res)
+                last_exc = "request returned no payload"
             except Exception as e:
                 last_exc = e
-                if attempt < retries - 1:
-                    self.logger.log_debug(
-                        f"  ↺ _get_episode_files series={series_id} "
-                        f"attempt {attempt + 1}/{retries} failed — retrying in {retry_delay_s:.1f}s: {e}"
-                    )
-                    time.sleep(retry_delay_s)
+            if attempt < retries - 1:
+                self.logger.log_debug(
+                    f"  ↺ _get_episode_files series={series_id} "
+                    f"attempt {attempt + 1}/{retries} failed — retrying in {retry_delay_s:.1f}s: {last_exc}"
+                )
+                time.sleep(retry_delay_s)
         self.logger.log_warning(
-            f"  ⚠️ _get_episode_files series={series_id} failed after {retries} attempt(s): {last_exc}"
+            f"  ⚠️ _get_episode_files series={series_id} failed after {retries} "
+            f"attempt(s): {last_exc} — treating as UNKNOWN, not empty."
         )
-        return []
+        return None
 
     @timeit("_get_episodes_for_season")
     def _get_episodes_for_season(
@@ -3532,7 +3551,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         if series_id not in files_cache:
             files_cache[series_id] = self._get_episode_files(instance, series_id)
 
-        all_files = files_cache[series_id]
+        # GLD-DEL-09: `_get_episode_files` now returns None on a FAILED fetch, so
+        # that pruning callers can tell it from an empty series. Read-only callers
+        # like this one only need it to be iterable.
+        all_files = files_cache[series_id] or []
         season_files = {f["id"]: f for f in all_files if f.get("seasonNumber") == season}
 
         if not season_files:
@@ -4007,7 +4029,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                                         instance, sid
                                     )
                                 file_rec2 = next(
-                                    (f for f in files_session_cache[sid] if f.get("id") == ep_fid),
+                                    (f for f in (files_session_cache[sid] or [])
+                                     if f.get("id") == ep_fid),
                                     None,
                                 )
                                 if file_rec2:
@@ -4339,16 +4362,48 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             return df, stats
 
         pending_mask = df["marked_for_deletion"].infer_objects(copy=False).fillna(False).astype(bool)
+        # GLD-DEL-09 — WIDENED beyond `marked_for_deletion`. That scope was the BBT S3
+        # `files=6` gap: a file deleted outside glidearr on an actively-watched series
+        # was never marked, so nothing ever asked Sonarr about it and the row stayed
+        # "owned" forever, counting bytes that were already gone. The drift detector
+        # measured the backlog at 194 orphans on 2026-08-24 (gate 102), converging to
+        # 102 after two re-syncs — a tail that re-syncing alone will never clear,
+        # because a fresh cache confirms the file is gone without removing the row.
+        #
+        # Only rows that CLAIM a file are added: a row with no `episode_file_id` is a
+        # watched stub, not an orphan, and the marked-row branch below still handles
+        # those under its own (narrower) semantics.
+        if "episode_file_id" in df.columns:
+            owns_file = df["episode_file_id"].notna()
+            pending_mask = pending_mask | owns_file
         if not pending_mask.any():
             return df, stats
 
         # One episodefile API call per series
         series_ids = df.loc[pending_mask, "series_id"].dropna().unique()
+        # GLD-DEL-09 — BOUND THE FIRST RUNS. Widening the mask turns this from a
+        # handful of marked rows into every file-owning series (5,258 on the measured
+        # library), and each is an API call. The cap makes the backlog drain over
+        # several nights instead of hammering Sonarr once, and it means a mistake in
+        # this pass costs a bounded number of rows rather than the whole cache.
+        # Series are taken in a stable order so the drain is deterministic rather
+        # than re-checking the same head every night.
+        _cap = int((self.config or {}).get("purge_max_series_per_run", 250) or 250)
+        if len(series_ids) > _cap:
+            series_ids = sorted(int(s) for s in series_ids)[:_cap]
+            self.logger.log_debug(
+                f"  purge scan capped at {_cap} series this run — the rest drain next run.")
         live_file_ids: dict[int, set | None] = {}
         for sid in series_ids:
             try:
                 files = self._get_episode_files(instance, int(sid))
-                live_file_ids[int(sid)] = {f.get("id") for f in files if f.get("id")}
+                # None means the fetch FAILED — leave every row for this series
+                # alone. An empty list means Sonarr genuinely holds no files and
+                # the rows really are stale. Conflating them (GLD-DEL-09, P-C) is
+                # how one 500 becomes a mass row deletion.
+                live_file_ids[int(sid)] = (
+                    None if files is None
+                    else {f.get("id") for f in files if f.get("id")})
             except Exception as e:
                 self.logger.log_warning(
                     f"⚠️ Could not verify episode files for series {sid}: {e}"
@@ -4364,15 +4419,28 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 stats["still_pending"] += 1
                 continue
             live = live_file_ids.get(int(sid))
-            if live is None:  # API call failed — leave
+            if live is None:  # fetch FAILED or series not scanned this run — leave
                 stats["still_pending"] += 1
                 continue
+            _marked = bool(df.at[idx, "marked_for_deletion"]) \
+                if "marked_for_deletion" in df.columns else False
             title  = df.at[idx, "series_title"] or f"series {sid}"
-            s_num  = int(df.at[idx, "season_number"]  or 0)
-            e_num  = int(df.at[idx, "episode_number"]  or 0)
+            # NaN-safe. `int(x or 0)` does NOT work here: NaN is TRUTHY, so `NaN or 0`
+            # returns NaN and int(NaN) raises. Latent while this pass only saw
+            # `marked_for_deletion` rows (which always carry season/episode); widening
+            # the mask to every file-owning row surfaced it immediately, and an
+            # uncaught ValueError here aborts the whole Tautulli sync.
+            _s_raw, _e_raw = df.at[idx, "season_number"], df.at[idx, "episode_number"]
+            s_num  = int(_s_raw) if pd.notna(_s_raw) else 0
+            e_num  = int(_e_raw) if pd.notna(_e_raw) else 0
             if pd.isna(fid):
                 # Orphan: marked for deletion but never had a Sonarr file id
                 # (e.g. a watched stub). Nothing to confirm — drop as cleanup.
+                # ONLY for marked rows: an unmarked row without a file id is a
+                # legitimate stub (pilot placeholder, next-up), not an orphan.
+                if not _marked:
+                    stats["still_pending"] += 1
+                    continue
                 drop_indices.append(idx)
                 stats["purged"] += 1
                 self.logger.log_info(
@@ -5695,6 +5763,255 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         try:
             return int(m.group(1))
         except (TypeError, ValueError):
+            return None
+
+    _UPGRADE_PENDING_KEY = "sonarr/{inst}/upgrade_pending"
+
+    def _persist_upgrade_intents(self, instance, intents):
+        """Merge this pass's upgrade intents into the pending worklist — GLD-DEL-10.
+
+        Never raises: failing to record an intent costs a reconciliation, not a file.
+        """
+        live = [i for i in (intents or []) if i]
+        if not live or not self.global_cache:
+            return 0
+        try:
+            key = self._UPGRADE_PENDING_KEY.format(inst=instance)
+            led = self.global_cache.get(key)
+            led = led if isinstance(led, dict) else {}
+            self.global_cache.set(key, merge_upgrade_intents(led, live))
+            self.logger.log_debug(
+                f"  ↑ tracked {len(live)} upgrade intent(s) for reconciliation next pass")
+            return len(live)
+        except Exception as e:
+            self.logger.log_debug(f"  upgrade intents not recorded ({e})")
+            return 0
+
+    def _observe_upgrade_targets(self, instance, ledger):
+        """``{key: current_episode_file_id_or_None}`` for the pending worklist.
+
+        ⚠️ Reads FRESH, bypassing the per-series episode cache. Reconciliation asks
+        "has this changed since we triggered it?", and a cache written before the
+        trigger answers the wrong question — it would report the OLD id and every
+        landed upgrade would read as still-pending forever.
+
+        A series whose fetch fails is simply ABSENT from the result. That is not the
+        same as "no file" (**P-C**): `reconcile_upgrades` leaves absent keys pending
+        rather than declaring them orphaned, so one bad fetch cannot manufacture
+        phantom orphans across a whole series.
+        """
+        obs = {}
+        if not isinstance(ledger, dict) or not ledger:
+            return obs
+        by_series = {}
+        for key, rec in ledger.items():
+            if isinstance(rec, dict) and rec.get("series_id") is not None:
+                by_series.setdefault(int(rec["series_id"]), []).append(rec)
+        for sid, recs in by_series.items():
+            try:
+                eps = self.sonarr_api._make_request(
+                    instance, f"episode?seriesId={int(sid)}", fallback=None)
+            except Exception:
+                eps = None
+            if eps is None:                      # unknown — leave every key absent
+                continue
+            live = {}
+            for e in eps:
+                if not isinstance(e, dict):
+                    continue
+                try:
+                    live[(int(e.get("seasonNumber")), int(e.get("episodeNumber")))] = (
+                        int(e.get("episodeFileId") or 0) or None)
+                except (TypeError, ValueError):
+                    continue
+            for rec in recs:
+                try:
+                    obs[rec["key"]] = live.get(
+                        (int(rec["season"]), int(rec["episode"])))
+                except (TypeError, ValueError):
+                    continue
+        return obs
+
+    def _reconcile_upgrade_intents(self, instance, df):
+        """Did the upgrades we triggered actually land? — GLD-DEL-10.
+
+        RUNS AT THE START of the pass, deliberately. The parquet drives every decision
+        the pass then makes, so reconciling at the end would leave the whole run
+        reasoning over rows already known to be wrong.
+
+        Upgrades are the FACTORY for orphans: Sonarr deletes the old file and imports
+        a new one with a new `episodeFileId`, so an upgrade that is not re-pointed
+        leaves a dead pointer behind. `GLD-DEL-09`'s purge sweeps those up eventually;
+        this stops them being created. Only rows WE triggered are checked, which keeps
+        it to a handful of API calls — Sonarr's own scheduled upgrades still produce
+        orphans that only the end-of-pass sweep catches.
+
+        A fulfilled intent is RE-POINTED via `_repoint_file_fields` rather than
+        dropped: the row keeps its watch history and scores and simply starts
+        describing the file that is actually there.
+
+        Returns ``(df, stats)``. Never raises.
+        """
+        stats = {"checked": 0, "repointed": 0, "orphaned": 0,
+                 "abandoned": 0, "pending": 0}
+        if df is None or df.empty or not self.global_cache:
+            return df, stats
+        try:
+            key = self._UPGRADE_PENDING_KEY.format(inst=instance)
+            led = self.global_cache.get(key)
+            led = led if isinstance(led, dict) else {}
+            if not led:
+                return df, stats
+            stats["checked"] = len(led)
+
+            res = reconcile_upgrades(led, self._observe_upgrade_targets(instance, led))
+            stats["pending"] = len(res["pending"])
+            stats["orphaned"] = len(res["orphaned"])
+            stats["abandoned"] = len(res["abandoned"])
+
+            files_cache = {}
+            for hit in res["fulfilled"]:
+                try:
+                    sid = int(hit["series_id"])
+                    if sid not in files_cache:
+                        files_cache[sid] = self._get_episode_files(instance, sid) or []
+                    rec = next((f for f in files_cache[sid]
+                                if int(f.get("id") or 0) == int(hit["observed_file_id"])), None)
+                    if not rec:
+                        continue
+                    mask = ((df["series_id"] == sid)
+                            & (df["season_number"] == hit["season"])
+                            & (df["episode_number"] == hit["episode"]))
+                    for idx in df.index[mask]:
+                        if self._repoint_file_fields(df, idx, rec, int(hit["observed_file_id"])):
+                            stats["repointed"] += 1
+                except Exception:
+                    continue
+
+            self.global_cache.set(key, res["pending"])
+            if stats["repointed"] or stats["orphaned"] or stats["abandoned"]:
+                self.logger.log_info(
+                    f"  ↑ upgrade reconcile '{instance}': {stats['repointed']} re-pointed, "
+                    f"{stats['orphaned']} now file-less, {stats['abandoned']} abandoned "
+                    f"(>48h), {stats['pending']} still queued.")
+            else:
+                self.logger.log_debug(
+                    f"  ↑ upgrade reconcile '{instance}': {stats['pending']} still queued.")
+        except Exception as e:
+            self.logger.log_debug(f"  upgrade reconcile skipped for '{instance}': {e}")
+        return df, stats
+
+    def _arr_file_index(self, instance, series_ids):
+        """``{episode_file_id: size_bytes}`` straight from Sonarr, for *series_ids*.
+
+        Reads the per-series `episodefiles/by_series/<sid>` caches the sync already
+        populated, so this costs NO extra API call. `get` rather than
+        `get_or_generate_cache` on purpose: a miss must read as "unknown", not
+        trigger a fetch — a detector that repopulates what it is auditing cannot
+        detect anything.
+        """
+        out = {}
+        if not self.global_cache:
+            return out
+        for sid in series_ids:
+            try:
+                rows = self.global_cache.get(
+                    f"sonarr/{instance}/episodefiles/by_series/{int(sid)}")
+            except Exception:
+                continue
+            for f in (rows or []):
+                if not isinstance(f, dict):
+                    continue
+                fid, sz = f.get("id"), f.get("size")
+                if fid is None:
+                    continue
+                try:
+                    out[int(fid)] = int(sz or 0)
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    def _check_parquet_drift(self, instance, df):
+        """Audit the parquet against Sonarr for the files it CLAIMS — GLD-DEL-08.
+
+        ⚠️ INTERSECTION ONLY. The parquet is a WORKING SET, not a mirror: 97.6% of
+        series hold exactly one row because an unwatched series gets only a pilot.
+        Comparing totals would breach every night on a 35% gap that is DESIGN, and
+        the rebuild it triggered could never close it. What this checks is whether
+        the parquet is WRONG about a file it does track — orphaned rows and stale
+        byte counts — both of which corrupt every space decision that reads them.
+
+        On breach: re-sync the affected series' file caches and measure AGAIN.
+        `drift_after_rebuild` decides whether it was staleness or something that
+        keeps re-breaking, and a `persistent` verdict deliberately does not retry.
+
+        Never raises. An audit that can abort the pass it audits is worse than none.
+        """
+        try:
+            if df is None or df.empty or "episode_file_id" not in df.columns:
+                return None
+            owned = df[df["episode_file_id"].notna() & df["size_bytes"].notna()]
+            if owned.empty:
+                return None
+            pq = {}
+            for fid, sz in zip(owned["episode_file_id"], owned["size_bytes"]):
+                try:
+                    pq[int(fid)] = int(sz)
+                except (TypeError, ValueError):
+                    continue
+            sids = {int(s) for s in owned["series_id"].dropna().unique()}
+            arr = self._arr_file_index(instance, sids)
+
+            first = intersection_drift(pq, arr)
+            cov = coverage(len(pq), len(arr))
+            if cov.get("ratio") is not None:
+                self.logger.log_debug(
+                    f"  \U0001f4d0 parquet coverage '{instance}': {cov['parquet']:,} of "
+                    f"{cov['arr']:,} tracked files ({cov['ratio'] * 100:.0f}%) — gauge only")
+            if not first.get("breach"):
+                if first.get("reasons"):
+                    self.logger.log_debug(f"  parquet audit '{instance}': {first['reasons'][0]}")
+                return first
+
+            self.logger.log_warning(
+                f"  ⚠\ufe0f parquet drift on '{instance}' — " + "; ".join(first["reasons"]))
+
+            # Re-sync EVERY series that diverged, then measure again. Driving this
+            # off a display-truncated id list was the 2026-08-24 defect: 194 orphans
+            # yielded only 9 series to repair, cleared 28%, and reported PERSISTENT.
+            bad = {int(fid) for fid in (first["orphaned_ids"] + first["mismatch_ids"])}
+            resync = {int(r["series_id"]) for _, r in owned.iterrows()
+                      if int(r["episode_file_id"]) in bad and pd.notna(r["series_id"])}
+            self.logger.log_debug(
+                f"  repairing {len(bad)} diverged file(s) across {len(resync)} series "
+                f"(sample ids: {sorted(bad)[:20]})")
+            for sid in resync:
+                try:
+                    self.global_cache.delete(
+                        f"sonarr/{instance}/episodefiles/by_series/{sid}")
+                    self.global_cache.get_or_generate_cache(
+                        key=f"sonarr/{instance}/episodefiles/by_series/{sid}",
+                        generator_function=lambda s=sid: self.sonarr_api._make_request(
+                            instance, f"episodefile?seriesId={s}", fallback=None),
+                        expiration_time=self._episode_files_ttl_s(),
+                        regenerate_on_expiry=True)
+                except Exception:
+                    continue
+
+            second = intersection_drift(pq, self._arr_file_index(instance, sids))
+            verdict = drift_after_rebuild(first, second)
+            self.logger.log_warning(
+                f"  ⚠\ufe0f parquet drift '{instance}' after re-syncing {len(resync)} series: "
+                f"{verdict.upper()} — orphaned {first['orphaned']}→{second['orphaned']}, "
+                f"stale-size {first['size_mismatch']}→{second['size_mismatch']} "
+                f"(gate {first['tolerance']}). See GLD-DEL-08.")
+            second["verdict"] = verdict
+            return second
+        except Exception as e:
+            try:
+                self.logger.log_debug(f"  parquet audit skipped for '{instance}': {e}")
+            except Exception:
+                pass
             return None
 
     def _series_meta(self, instance, series_id):
@@ -7527,7 +7844,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             is_stale_stub = sid in stale_stub_ids
             try:
                 files = self._get_episode_files(instance, sid)
-                rep   = self._pick_representative_file(files)
+                rep   = self._pick_representative_file(files or [])
                 if rep:
                     row = self._normalise(
                         raw=rep,
@@ -9175,6 +9492,9 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             "skipped_active_downgrade": 0,   # downgrades suppressed because the series is actively watched
             "held_pilot": 0,                 # unwatched pilots left at the floor (pilot_hold_at_floor)
         }
+        # GLD-DEL-10 — intents accumulate here and persist once, after the pass proves
+        # it actually changed something.
+        _upgrade_intents: list = []
 
         # ── Space reserve: JIT upgrades must keep free space above the configured
         # floor (U = free_space_limit + headroom) AND a JIT_RESERVE_PCT fraction of
@@ -9571,12 +9891,28 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 df.at[idx, "plan_reclaim_gb"] = -round(max(0.0, est_gb - _cur_gb), 2)
                 changed = True
                 stats["upgraded"] += 1
+                # GLD-DEL-10 — record the file this episode owns RIGHT NOW. When the
+                # upgrade lands, Sonarr's id will differ, and that difference is the
+                # only available proof. Without it an upgrade is fire-and-forget and
+                # the stale row it leaves behind becomes tomorrow's orphan.
+                _upgrade_intents.append(upgrade_intent(
+                    series_id=row.get("series_id"),
+                    season=row.get("season_number"),
+                    episode=row.get("episode_number"),
+                    file_id=row.get("episode_file_id"),
+                    size_bytes=row.get("size_bytes"),
+                    quality_name=row.get("quality_name"),
+                    title=row.get("series_title")))
             else:
                 stats["acquired"] += 1
 
             projected_free -= est_gb
 
         if (changed or reconcile_changed) and not self.dry_run:
+            # GLD-DEL-10 — persist the worklist alongside the rows it describes. Under
+            # dry_run nothing was actually searched, so recording intents would create
+            # a worklist for upgrades that never fired.
+            self._persist_upgrade_intents(instance, _upgrade_intents)
             self.save(instance, df)
         elif self.dry_run and changed:
             # Persist the JIT 'upgrade' ledger stamps as a plan-only preview — the real
@@ -10253,6 +10589,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 _hh_quorum = _need
 
         df = self.load(instance)
+        # GLD-DEL-10 — reconcile BEFORE anything reads the frame. The parquet drives
+        # every decision this pass makes, so a row still pointing at a file replaced
+        # by last night's upgrade would mis-inform all of them. Re-pointing here is
+        # also what stops that row becoming an orphan for GLD-DEL-09 to sweep up.
+        df, _up_rec = self._reconcile_upgrade_intents(instance, df)
 
         # Ensure household columns exist for backward-compat with pre-schema Parquets.
         for _hcol in ("all_household_watched", "household_last_watched_at"):
@@ -10452,11 +10793,20 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # purge to the coordinator's unified, space-driven, lowest-watchability pool.
         if coordinator_owns_deletion(self.config):
             delete_stats = {"deleted": 0, "bytes_freed": 0.0}
-            purge_stats  = {"purged": 0}
             self.logger.log_info(
                 "[EpisodeFiles] deletion delegated to the space-pressure coordinator "
                 "(grace marks applied)."
             )
+            # GLD-DEL-09 — the PURGE is not part of that delegation and must still run.
+            # Deleting is a policy decision the coordinator owns; purging is cache
+            # HYGIENE — it removes rows for files Sonarr no longer has, and touches
+            # nothing on disk. Skipping it alongside the delete pass meant that under
+            # the standing config (`coordinator_owns_deletion` true) the purge NEVER
+            # ran at all: the 2026-08-24 run measured 103 orphaned rows that a re-sync
+            # could not clear (103->103, PERSISTENT) precisely because the one pass
+            # that removes them was short-circuited here.
+            df, purge_stats = self._do_purge_sonarr_deleted(instance, df)
+            self.logger.log_info(f"[⏱️] purge_sonarr_deleted — {time.time()-_ps:.1f}s")
         else:
             df, delete_stats = self._do_delete_marked_files(instance, df)
             self.logger.log_info(f"[⏱️] delete_marked_files — {time.time()-_ps:.1f}s")
@@ -10570,6 +10920,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     f"[dry_run] Persisted episode_files cache for '{instance}' "
                     f"({len(df)} rows) — local write only, no Sonarr changes."
                 )
+            # GLD-DEL-08 — audit AFTER the save, so both sides read the same state.
+            # Timing is part of the measurement: a grab landing between the two reads
+            # shows up as drift, which is why this sits at the end of the sync rather
+            # than anywhere earlier.
+            self._check_parquet_drift(instance, df)
 
         verb = "would free" if self.dry_run else "freed"
         self.logger.log_table(

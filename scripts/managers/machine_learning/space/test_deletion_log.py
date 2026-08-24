@@ -15,12 +15,23 @@ from __future__ import annotations
 
 from scripts.managers.machine_learning.space.deletion_log import (
     DISPOSITIONS,
+    churn_key,
     deletion_record,
+    detect_churn,
+    drift_after_rebuild,
+    drift_tolerances,
+    intersection_drift,
+    merge_upgrade_intents,
+    reconcile_upgrades,
+    upgrade_intent,
+    upgrade_key,
+    coverage,
     library_class,
     new_run_id,
     parse_jsonl,
     render,
     seed_records,
+    space_ledger,
     to_jsonl,
 )
 
@@ -207,3 +218,345 @@ def test_dispositions_cover_the_states_a_pass_can_end_in():
     anywhere recorded WHICH 266."""
     assert "marked-not-consented" in DISPOSITIONS
     assert set(DISPOSITIONS) >= {"deleted", "would-delete", "failed"}
+
+
+# ── churn + space accounting (GLD-DEL-06) ──────────────────────────────────
+def _ev(disp, day, tmdb=1, size=0, new=None, title="T"):
+    return deletion_record(
+        run_id=_RUN, media="movie", instance="radarr-720", title=title,
+        disposition=disp, tmdb_id=tmdb, size_bytes=size,
+        deleted_at=f"2026-08-{day:02d}T00:00:00+00:00",
+        replaced_by=({"size_bytes": new} if new is not None else None))
+
+
+def test_a_flip_is_a_direction_CHANGE_not_an_event():
+    """Three consecutive step-downs are one descent, not churn. Counting events
+    instead would flag every ordinary multi-stage reclaim and the signal would be
+    ignored inside a week."""
+    descent = [_ev("stepped-down", d) for d in (1, 2, 3)]
+    assert detect_churn(descent, min_flips=1, window_days=None) == []
+
+    thrash = [_ev("upgraded", 1), _ev("stepped-down", 2), _ev("upgraded", 3)]
+    hits = detect_churn(thrash, min_flips=2, window_days=None)
+    assert len(hits) == 1 and hits[0]["flips"] == 2 and hits[0]["events"] == 3
+
+
+def test_churn_is_keyed_on_the_external_id_not_the_title():
+    """A title string changes with a metadata refresh; keying on it would split one
+    asset's history in two and hide the thrash."""
+    evs = [_ev("upgraded", 1, tmdb=27205, title="Inception"),
+           _ev("stepped-down", 2, tmdb=27205, title="Inception (2010)"),
+           _ev("upgraded", 3, tmdb=27205, title="Inception")]
+    hits = detect_churn(evs, min_flips=2, window_days=None)
+    assert len(hits) == 1 and hits[0]["key"] == "tmdb_id:27205"
+    assert churn_key({"title": "No ids"}) == "title:No ids"
+    assert churn_key(None) is None
+
+
+def test_churn_respects_the_window_and_sorts_worst_first():
+    from datetime import datetime, timezone
+    now = datetime(2026, 8, 31, tzinfo=timezone.utc)
+    old = [_ev("upgraded", 1, tmdb=9), _ev("stepped-down", 2, tmdb=9),
+           _ev("upgraded", 3, tmdb=9)]
+    assert detect_churn(old, window_days=3, min_flips=1, now=now) == []
+
+    mild = [_ev("upgraded", 29, tmdb=1), _ev("stepped-down", 30, tmdb=1)]
+    bad = [_ev("upgraded", 29, tmdb=2), _ev("stepped-down", 30, tmdb=2),
+           _ev("upgraded", 30, tmdb=2), _ev("stepped-down", 31, tmdb=2)]
+    hits = detect_churn(mild + bad, window_days=30, min_flips=1, now=now)
+    assert [h["key"] for h in hits] == ["tmdb_id:2", "tmdb_id:1"]
+
+
+def test_deletes_and_marks_are_not_churn():
+    """Only quality TRANSITIONS have a direction. A delete is terminal and a
+    `marked-not-consented` row is not an event at all."""
+    noise = [_ev("deleted", 1), _ev("marked-not-consented", 2), _ev("failed", 3)]
+    assert detect_churn(noise, min_flips=1, window_days=None) == []
+
+
+def test_space_ledger_counts_the_spend_not_only_the_reclaim():
+    """The system logged `freed_now_gb` and never the consumption that CAUSES the
+    pressure. A step-down that frees 29 GB and grabs back 4 GB nets 25 GB."""
+    gb = 1024 ** 3
+    led = space_ledger([
+        _ev("stepped-down", 1, size=29 * gb, new=4 * gb),
+        _ev("deleted", 2, size=2 * gb),
+        _ev("upgraded", 3, size=2 * gb, new=8 * gb),      # projected +6
+    ])
+    assert led["reclaimed_bytes"] == 31 * gb
+    assert led["spent_bytes"] == 10 * gb                   # 4 regrab + 6 projected
+    assert led["net_bytes"] == 21 * gb
+    assert led["by_disposition"]["stepped-down"]["n"] == 1
+
+
+def test_churn_and_ledger_never_raise_on_hostile_input():
+    for h in (None, [], [None], ["junk"], [{}], [{"disposition": "upgraded"}],
+              [{"disposition": "upgraded", "tmdb_id": 1, "deleted_at": None}],
+              [{"disposition": "stepped-down", "size_bytes": "x"}],
+              [{"disposition": "upgraded", "replaced_by": "notadict"}],
+              [{"disposition": "stepped-down", "replaced_by": {"size_bytes": "x"}}]):
+        assert isinstance(detect_churn(h, window_days=None), list)
+        assert isinstance(space_ledger(h), dict)
+
+
+# ── parquet drift (GLD-DEL-08) ─────────────────────────────────────────
+TIB = 1024 ** 4
+GiB = 1024 ** 3
+
+
+def test_gates_scale_with_sqrt_n_across_library_sizes():
+    """A flat gate breaks in OPPOSITE directions as the library grows: 5 files is
+    4.2% of a tiny library but 0.03% of a large one, while 5% of size is 5 GiB on
+    the former and 609 GiB on the latter. √n tightens the percentage as the library
+    grows, which is the correct direction, and is never absurd at either end."""
+    expect = {120: 11, 800: 29, 4_000: 64, 15_548: 125, 40_000: 200, 120_000: 347}
+    for n, files in expect.items():
+        t = drift_tolerances(n, n * 0.8 * (1024 ** 3))
+        assert t["files"] == files, (n, t["files"], files)
+    # monotonic in absolute terms, tightening in relative terms
+    pcts = [drift_tolerances(n, n * GiB)["files"] / n for n in sorted(expect)]
+    assert pcts == sorted(pcts, reverse=True)
+
+
+def test_the_floor_holds_for_tiny_libraries():
+    """Below ~25 files √n collapses and single-file events dominate."""
+    assert drift_tolerances(1, GiB)["files"] == 5
+    assert drift_tolerances(0, 0)["files"] == 5
+    assert drift_tolerances(9, 9 * GiB)["files"] == 5          # √9 = 3 -> floor
+    assert drift_tolerances(36, 36 * GiB)["files"] == 6        # √36 = 6 -> above floor
+
+
+def test_the_size_gate_is_derived_from_the_count_gate_not_a_percentage():
+    """Two independent gates measure different things and one always fires first —
+    at 12.2 TiB the 5% gate was 609 GiB while the 5-file gate was 0.03%, so size was
+    decorative. Derived, both express the same severity in different units."""
+    t = drift_tolerances(15_548, 12.2 * TIB)
+    assert t["files"] == 125
+    assert 100 < t["bytes"] / GiB < 101                        # ~100.4 GiB, not 609
+    assert abs(t["mean_file_bytes"] - (12.2 * TIB / 15_548)) < 1
+
+
+def test_the_by_design_coverage_gap_is_NOT_a_breach():
+    """The premise the first version was built on was FALSE. The parquet is a
+    working set: 97.6% of series (13,065 of 13,382) hold exactly one row, because
+    `_ingest_inventory_tv` gives an unwatched series only a PILOT row. Comparing
+    totals would have breached nightly forever and triggered a rebuild that cannot
+    close a gap that is design. The *arr having files the parquet does not is
+    therefore silent — that is the whole correction."""
+    parquet = {i: 1_000 for i in range(10_711)}
+    arr = {i: 1_000 for i in range(15_548)}          # 4,837 the parquet never tracked
+    d = intersection_drift(parquet, arr)
+    assert not d["breach"] and d["orphaned"] == 0 and d["size_mismatch"] == 0
+    assert d["checked"] == 10_711
+
+
+def test_orphaned_rows_breach():
+    """A file_id the parquet owns and the *arr does not: the row counts bytes that
+    are already gone. This is the BBT S3 `files=6` shape — deleted outside glidearr,
+    still owned."""
+    parquet = {i: 1_000 for i in range(10_000)}
+    arr = {i: 1_000 for i in range(10_000) if i >= 300}      # 300 vanished
+    d = intersection_drift(parquet, arr)
+    assert d["breach"] and d["orphaned"] == 300
+    assert d["tolerance"] == 100                              # √10,000
+    assert any("orphaned" in r for r in d["reasons"])
+
+
+def test_the_id_list_is_a_WORK_list_and_is_never_truncated():
+    """REGRESSION. These ids were capped at 50 for log readability, and the Sonarr
+    caller then drove its repair off the capped list — so the live 2026-08-24 breach
+    of 194 orphans re-synced only the 9 series covered by the first 50 ids, cleared
+    28% (194->140), and reported PERSISTENT when a full repair would likely have
+    closed it. Truncation belongs at the DISPLAY layer."""
+    parquet = {i: 1_000 for i in range(10_000)}
+    arr = {i: 1_000 for i in range(10_000) if i >= 300}
+    d = intersection_drift(parquet, arr)
+    assert len(d["orphaned_ids"]) == 300, "the repair list must be complete"
+    assert d["orphaned_ids"] == sorted(d["orphaned_ids"])
+
+
+def test_size_mismatches_breach():
+    """Both sides hold the id and disagree: the file was replaced and the parquet
+    kept the old figure, so every reclaim projection reading it is wrong."""
+    parquet = {i: 1_000 for i in range(10_000)}
+    arr = {i: (2_000 if i < 300 else 1_000) for i in range(10_000)}
+    d = intersection_drift(parquet, arr)
+    assert d["breach"] and d["size_mismatch"] == 300 and d["orphaned"] == 0
+
+
+def test_ordinary_staleness_stays_under_the_gate():
+    """A handful of rows going stale between syncs is normal; √n absorbs it."""
+    parquet = {i: 1_000 for i in range(10_000)}
+    arr = {i: (2_000 if i < 40 else 1_000) for i in range(10_000) if i >= 20}
+    d = intersection_drift(parquet, arr)
+    assert not d["breach"] and d["orphaned"] == 20 and d["size_mismatch"] == 20
+
+
+def test_tolerance_scales_over_the_INTERSECTION_not_the_library():
+    """The population being checked is what the parquet claims, not what the *arr
+    holds — scaling over the library would hand a working set a gate sized for data
+    it was never going to have."""
+    small = intersection_drift({i: 1 for i in range(100)}, {i: 1 for i in range(50_000)})
+    assert small["tolerance"] == 10                            # √100, not √50,000
+
+
+def test_an_empty_arr_side_does_not_condemn_the_whole_parquet():
+    """A failed fetch returns nothing. Calling every row orphaned on that would
+    declare the entire cache invalid on one bad read."""
+    d = intersection_drift({1: 100, 2: 200}, {})
+    assert not d["breach"] and d["orphaned"] == 0
+    assert any("unmeasurable" in r for r in d["reasons"])
+
+
+def test_coverage_is_a_gauge_and_never_a_gate():
+    """65% is the designed steady state. Kept separate from the detector so the two
+    can never be confused again."""
+    c = coverage(10_711, 15_548)
+    assert 0.68 < c["ratio"] < 0.69
+    assert "breach" not in c
+    assert coverage(None, "x")["ratio"] is None
+
+
+def test_intersection_drift_never_raises():
+    for p, a in ((None, None), ({}, {}), ("x", "y"), ([], []), ({1: "x"}, {1: "y"}),
+                 ({None: 1}, {1: 1}), ({1: None}, {1: None}), ({1: 0}, {1: 0})):
+        d = intersection_drift(p, a)
+        assert isinstance(d, dict) and isinstance(d["reasons"], list)
+
+
+def test_the_second_measurement_is_what_carries_the_verdict():
+    """A first breach cannot tell a stale cache from one that keeps going stale.
+    `persistent` must NOT trigger another resync, or an expensive pass repeats every
+    run to reach the same answer until the operator disables the detector."""
+    bad = {"breach": True, "orphaned": 300, "size_mismatch": 0}
+    clean = {"breach": False, "orphaned": 2, "size_mismatch": 0}
+    assert drift_after_rebuild(bad, clean) == "closed"
+    assert drift_after_rebuild(bad, bad) == "persistent"
+    assert drift_after_rebuild(bad, {"breach": True, "orphaned": 100,
+                                     "size_mismatch": 0}) == "improved"
+    assert drift_after_rebuild(bad, {"breach": True, "orphaned": 900,
+                                     "size_mismatch": 0}) == "worse"
+
+
+def test_drift_helpers_never_raise():
+    for a, b in ((None, None), ({}, {}), ("x", "y"), ({"breach": True}, None)):
+        assert isinstance(drift_after_rebuild(a, b), str)
+
+
+# ── upgrade intent + reconciliation (GLD-DEL-10) ─────────────────────────────
+from datetime import datetime, timedelta, timezone
+
+_NOW = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+
+
+def _intent(fid, hours_ago=1, sid=17209, s=1, e=2):
+    return upgrade_intent(series_id=sid, season=s, episode=e, file_id=fid,
+                          size_bytes=2_000_000_000, quality_name="WEBDL-720p",
+                          title="Ted Lasso",
+                          at=(_NOW - timedelta(hours=hours_ago)).isoformat())
+
+
+def test_the_intent_is_keyed_on_the_EPISODE_not_the_file():
+    """The file id is precisely the thing about to change — an upgrade deletes the old
+    file and imports a new one with a new id. Keying on what SURVIVES the upgrade is
+    what makes "did it land?" answerable."""
+    assert upgrade_key(17209, 1, 2) == "17209:S01E02"
+    assert upgrade_key(17209, None, 2) is None
+    assert upgrade_key("x", 1, 2) is None
+    i = _intent(63808)
+    assert i["key"] == "17209:S01E02" and i["from_file_id"] == 63808
+
+
+def test_an_unkeyable_intent_is_refused_rather_than_stored():
+    """It would sit on the worklist forever and never resolve."""
+    assert upgrade_intent(series_id=None, season=1, episode=2, file_id=1) is None
+
+
+def test_a_changed_file_id_is_the_proof_the_upgrade_LANDED():
+    led = merge_upgrade_intents({}, [_intent(63808)])
+    r = reconcile_upgrades(led, {"17209:S01E02": 99999}, now=_NOW)
+    assert len(r["fulfilled"]) == 1 and not r["pending"]
+    assert r["fulfilled"][0]["observed_file_id"] == 99999
+    assert r["fulfilled"][0]["from_file_id"] == 63808
+
+
+def test_an_unchanged_id_inside_the_window_stays_PENDING():
+    """Usenet queues. A 20 GB Remux sitting behind other downloads for hours is the
+    normal state, not a failure — which is why the window is 48h and not 30 minutes."""
+    led = merge_upgrade_intents({}, [_intent(63808, hours_ago=6)])
+    r = reconcile_upgrades(led, {"17209:S01E02": 63808}, now=_NOW)
+    assert not r["fulfilled"] and not r["abandoned"]
+    assert "17209:S01E02" in r["pending"]
+
+
+def test_an_unchanged_id_past_the_window_is_ABANDONED():
+    led = merge_upgrade_intents({}, [_intent(63808, hours_ago=60)])
+    r = reconcile_upgrades(led, {"17209:S01E02": 63808}, now=_NOW)
+    assert len(r["abandoned"]) == 1 and not r["pending"]
+
+
+def test_no_file_at_all_is_an_ORPHAN_not_a_fulfilment():
+    """The old file is gone and nothing replaced it, so the parquet row is a dead
+    pointer — exactly what the purge exists to remove."""
+    led = merge_upgrade_intents({}, [_intent(63808)])
+    r = reconcile_upgrades(led, {"17209:S01E02": None}, now=_NOW)
+    assert len(r["orphaned"]) == 1 and not r["fulfilled"]
+
+
+def test_ABSENT_and_NONE_are_not_the_same_thing():
+    """**P-C.** A key absent from `observed` means "not examined this pass"; a key
+    present with None means the *arr answered "no file". Conflating them would archive
+    phantom orphans for every series whose fetch failed — the same shape as
+    `_get_episode_files` returning [] for both empty and failed (GLD-DEL-09)."""
+    led = merge_upgrade_intents({}, [_intent(63808)])
+    absent = reconcile_upgrades(led, {}, now=_NOW)
+    assert not absent["orphaned"] and "17209:S01E02" in absent["pending"]
+    answered = reconcile_upgrades(led, {"17209:S01E02": None}, now=_NOW)
+    assert len(answered["orphaned"]) == 1 and not answered["pending"]
+
+
+def test_an_unreadable_observation_is_ignorance_too():
+    led = merge_upgrade_intents({}, [_intent(63808)])
+    r = reconcile_upgrades(led, {"17209:S01E02": "junk"}, now=_NOW)
+    assert not r["orphaned"] and not r["fulfilled"] and r["pending"]
+
+
+def test_a_re_triggered_upgrade_REPLACES_the_older_intent():
+    """The older `from_file_id` is stale the moment the newer search fires, and
+    keeping both would resolve the same episode twice."""
+    led = merge_upgrade_intents({}, [_intent(63808, hours_ago=40)])
+    led = merge_upgrade_intents(led, [_intent(70000, hours_ago=1)])
+    assert len(led) == 1 and led["17209:S01E02"]["from_file_id"] == 70000
+    r = reconcile_upgrades(led, {"17209:S01E02": 70000}, now=_NOW)
+    assert not r["abandoned"] and r["pending"]          # young again, not stale
+
+
+def test_a_missing_from_file_id_counts_as_fulfilled_when_a_file_appears():
+    """An episode with no file that gains one is a successful acquisition, and
+    leaving it pending forever would be wrong."""
+    led = merge_upgrade_intents({}, [_intent(None)])
+    r = reconcile_upgrades(led, {"17209:S01E02": 5150}, now=_NOW)
+    assert len(r["fulfilled"]) == 1
+
+
+def test_many_episodes_resolve_independently():
+    led = {}
+    for i, (fid, hrs) in enumerate([(1, 1), (2, 1), (3, 60), (4, 1)], start=1):
+        led = merge_upgrade_intents(led, [_intent(fid, hours_ago=hrs, e=i)])
+    obs = {"17209:S01E01": 900,        # changed -> fulfilled
+           "17209:S01E02": 2,          # unchanged, young -> pending
+           "17209:S01E03": 3,          # unchanged, stale -> abandoned
+           "17209:S01E04": None}       # no file -> orphaned
+    r = reconcile_upgrades(led, obs, now=_NOW)
+    assert len(r["fulfilled"]) == 1 and len(r["pending"]) == 1
+    assert len(r["abandoned"]) == 1 and len(r["orphaned"]) == 1
+
+
+def test_upgrade_helpers_never_raise():
+    for led in (None, {}, "x", {"k": None}, {"k": "junk"}, {"k": {}},
+                {"k": {"from_file_id": "x", "at": None}}):
+        for obs in (None, {}, "x", {"k": None}, {"k": "junk"}, {"k": 5}):
+            r = reconcile_upgrades(led, obs, now=_NOW)
+            assert isinstance(r, dict) and isinstance(r["pending"], dict)
+    assert isinstance(merge_upgrade_intents(None, None), dict)
+    assert isinstance(merge_upgrade_intents("x", [None, {}, {"key": "a"}]), dict)
