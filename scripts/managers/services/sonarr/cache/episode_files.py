@@ -91,6 +91,7 @@ from scripts.managers.machine_learning.space.deletion_log import (
     reconcile_upgrades,
     split_by_kind,
     to_jsonl,
+    upgrade_events,
     upgrade_intent,
 )
 from scripts.managers.machine_learning.lifecycle.stale_prune_policy import (
@@ -5870,6 +5871,7 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             stats["abandoned"] = len(res["abandoned"])
 
             files_cache = {}
+            _observed = {}
             for hit in res["fulfilled"]:
                 try:
                     sid = int(hit["series_id"])
@@ -5879,6 +5881,11 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                                 if int(f.get("id") or 0) == int(hit["observed_file_id"])), None)
                     if not rec:
                         continue
+                    # GLD-DEL-13 — what actually landed, measured rather than projected.
+                    _q = ((rec.get("quality") or {}).get("quality") or {})
+                    _observed[int(hit["observed_file_id"])] = {
+                        "size_bytes": rec.get("size"),
+                        "quality_name": _q.get("name")}
                     mask = ((df["series_id"] == sid)
                             & (df["season_number"] == hit["season"])
                             & (df["episode_number"] == hit["episode"]))
@@ -5887,6 +5894,18 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                             stats["repointed"] += 1
                 except Exception:
                     continue
+
+            # GLD-DEL-13 — emit the outcome. Reconciliation used to resolve the
+            # worklist SILENTLY, so a landed upgrade left no event at all: churn
+            # detection only ever saw the step-down half and could never register a
+            # direction change, and the space ledger counted reclaim without the spend
+            # that caused the pressure.
+            if not getattr(self, "_deletion_run_id", None):
+                self._deletion_run_id = new_run_id()
+            _events = upgrade_events(res, run_id=self._deletion_run_id,
+                                     instance=instance, observed_files=_observed)
+            if _events:
+                self._flush_deletion_archive(_events)
 
             self.global_cache.set(key, res["pending"])
             if stats["repointed"] or stats["orphaned"] or stats["abandoned"]:

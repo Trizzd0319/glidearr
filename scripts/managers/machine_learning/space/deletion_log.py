@@ -50,8 +50,8 @@ SCHEMA_VERSION = 1
 #: The others exist because "we decided to delete and did not" is exactly the
 #: state the 2026-08-23 run was in (266 rows marked, consent withheld) and it was
 #: invisible: no artifact anywhere said WHICH 266.
-DISPOSITIONS = ("deleted", "stepped-down", "upgraded", "would-delete",
-                "marked-not-consented", "guarded", "failed")
+DISPOSITIONS = ("deleted", "stepped-down", "upgraded", "upgrade-abandoned",
+                "would-delete", "marked-not-consented", "guarded", "failed")
 
 #: Dispositions that describe something that HAPPENED. Append-only, never deduped,
 #: never rewritten: a file deleted twice is genuinely two events.
@@ -63,13 +63,13 @@ DISPOSITIONS = ("deleted", "stepped-down", "upgraded", "would-delete",
 #: recorded what the original was. On 2026-08-24 four movies lost 83.9 GB of Remux
 #: masters whose only trace was four `default.log` lines that rotate away in five
 #: runs, plus recycle-bin files on a 24-hour timer.
-EVENT_DISPOSITIONS = ("deleted", "stepped-down", "upgraded", "failed")
+EVENT_DISPOSITIONS = ("deleted", "stepped-down", "upgraded", "upgrade-abandoned", "failed")
 
-#: Directions a quality transition can move, for churn detection. ``upgraded`` is
-#: recorded as INTENT rather than outcome: both upgrade paths trigger a SEARCH and
-#: the *arr picks and swaps asynchronously, so at record time we know what is being
-#: replaced but not what replaces it. ``replaced_by`` is therefore absent on an
-#: upgrade row and present on a step-down, where this system does the swap itself.
+#: Directions a quality transition can move, for churn detection. An ``upgraded`` row
+#: is emitted at RECONCILIATION rather than at trigger (`GLD-DEL-13`): both upgrade
+#: paths fire a SEARCH and the *arr swaps asynchronously, so at trigger time we know
+#: only what is being replaced. By reconciliation the replacement has been observed,
+#: which is what lets ``replaced_by`` carry a measured size instead of a projection.
 _DIRECTION = {"upgraded": "up", "stepped-down": "down"}
 
 #: Dispositions that describe a STATE rather than an event — "these are queued",
@@ -418,8 +418,9 @@ def space_ledger(records) -> dict:
             out["reclaimed_bytes"] += sz
             out["spent_bytes"] += new
         elif disp == "upgraded":
-            # Projected: the row records what is being REPLACED, so the spend is the
-            # projected delta if known, else the target's size when supplied.
+            # REAL by the time this row exists: `upgrade_events` emits at
+            # RECONCILIATION, when the replacement has actually been observed, so the
+            # spend is measured rather than projected.
             out["spent_bytes"] += max(0, new - sz) if new else 0
     out["net_bytes"] = out["reclaimed_bytes"] - out["spent_bytes"]
     return out
@@ -636,38 +637,55 @@ def drift_after_rebuild(before, after) -> str:
 UPGRADE_TERMINAL_HOURS = 48.0
 
 
-def upgrade_key(series_id, season, episode) -> "str | None":
-    """``"17209:S01E02"`` — the stable worklist key for one episode.
+def upgrade_key(series_id=None, season=None, episode=None, *, movie_id=None) -> "str | None":
+    """``"17209:S01E02"`` or ``"movie:812"`` — the stable worklist key.
 
-    Keyed on the EPISODE, not on the file id, because the whole point is that the
-    file id is about to change: an upgrade deletes the old file and imports a new one
-    with a brand-new ``episodeFileId``. Keying on the thing that survives the upgrade
-    is what makes "did it land?" answerable at all.
+    Keyed on the ASSET, not the file id, because the file id is precisely the thing
+    about to change: an upgrade deletes the old file and imports a new one with a
+    brand-new id. Keying on what SURVIVES the upgrade is what makes "did it land?"
+    answerable at all.
+
+    A movie has no season/episode, so it gets its own namespace rather than being
+    forced into the TV shape — and the ``movie:`` prefix means a Sonarr and a Radarr
+    worklist can never collide on a shared id.
     """
+    if movie_id is not None:
+        try:
+            return f"movie:{int(movie_id)}"
+        except (TypeError, ValueError):
+            return None
     try:
         return f"{int(series_id)}:S{int(season):02d}E{int(episode):02d}"
     except (TypeError, ValueError):
         return None
 
 
-def upgrade_intent(*, series_id, season, episode, file_id, size_bytes=None,
-                   quality_name=None, title=None, at=None) -> "dict | None":
+def upgrade_intent(*, series_id=None, season=None, episode=None, file_id,
+                   movie_id=None, size_bytes=None, quality_name=None,
+                   title=None, media=None, at=None) -> "dict | None":
     """One pending upgrade, recorded at the moment the search is triggered — GLD-DEL-10.
 
-    ``file_id`` is the file the episode owns RIGHT NOW. That is the entire mechanism:
-    when the upgrade lands, Sonarr's id for this episode will be different, and the
-    difference is the proof. Recording it is what turns an untracked fire-and-forget
-    search into something that can be reconciled.
+    ``file_id`` is the file the asset owns RIGHT NOW. That is the entire mechanism:
+    when the upgrade lands, the *arr's id will be different, and the difference is the
+    proof. Recording it is what turns an untracked fire-and-forget search into
+    something that can be reconciled.
 
-    Returns None when the episode cannot be keyed — an unkeyable intent is worse than
+    Pass ``movie_id`` for Radarr or ``series_id``/``season``/``episode`` for Sonarr.
+    Returns None when the asset cannot be keyed — an unkeyable intent is worse than
     none, because it would sit on the worklist forever and never resolve.
     """
-    key = upgrade_key(series_id, season, episode)
+    key = upgrade_key(series_id, season, episode, movie_id=movie_id)
     if key is None:
         return None
-    rec = {"key": key, "series_id": int(series_id),
-           "season": int(season), "episode": int(episode),
+    rec = {"key": key,
+           "media": media or ("movie" if movie_id is not None else "episode"),
            "at": at or datetime.now(timezone.utc).isoformat()}
+    if movie_id is not None:
+        rec["movie_id"] = int(movie_id)
+    else:
+        rec["series_id"] = int(series_id)
+        rec["season"] = int(season)
+        rec["episode"] = int(episode)
     try:
         rec["from_file_id"] = int(file_id) if file_id is not None else None
     except (TypeError, ValueError):
@@ -749,6 +767,70 @@ def reconcile_upgrades(ledger, observed, *, now=None,
             out["abandoned"].append({**rec, "observed_file_id": cur})
         else:
             out["pending"][key] = rec
+    return out
+
+
+def upgrade_events(result, *, run_id, instance, observed_files=None) -> list:
+    """Archive rows for a reconciliation outcome — GLD-DEL-13.
+
+    Reconciliation resolved the worklist SILENTLY: a landed upgrade left no event at
+    all, so `detect_churn` only ever saw the step-down half and could never register a
+    direction change, and `space_ledger` counted reclaim without the spend that caused
+    the pressure in the first place.
+
+    ⚠️ ``replaced_by`` here is REAL, not projected. At trigger time the *arr had not
+    picked a release yet, so an intent could only say what was being replaced. By
+    reconciliation the new file EXISTS and *observed_files* (``{file_id: {size,
+    quality_name}}``) carries what actually landed — which is why emitting at this
+    point rather than at trigger is what makes the spend figure trustworthy.
+
+    Only ``fulfilled`` and ``abandoned`` produce rows. ``pending`` has not happened
+    yet, and ``orphaned`` is handled by the purge, which owns that row's fate.
+    """
+    out = []
+    if not isinstance(result, dict):
+        return out
+    obs = observed_files if isinstance(observed_files, dict) else {}
+
+    for rec in (result.get("fulfilled") or []):
+        if not isinstance(rec, dict):
+            continue
+        new = obs.get(rec.get("observed_file_id")) or {}
+        out.append(deletion_record(
+            run_id=run_id, media=rec.get("media") or "episode", instance=instance,
+            title=rec.get("title") or rec.get("key"),
+            disposition="upgraded",
+            season=rec.get("season"), episode=rec.get("episode"),
+            series_id=rec.get("series_id"),
+            file_id=rec.get("from_file_id"),
+            size_bytes=rec.get("from_size_bytes"),
+            quality_name=rec.get("from_quality"),
+            reason=(f"upgrade landed: {rec.get('from_quality') or '?'} → "
+                    f"{new.get('quality_name') or '?'}"),
+            source="upgrade",
+            replaced_by={k: v for k, v in
+                         (("file_id", rec.get("observed_file_id")),
+                          ("size_bytes", new.get("size_bytes")),
+                          ("quality_name", new.get("quality_name")),
+                          ("state", "imported")) if v is not None},
+            deleted_at=rec.get("at")))
+
+    for rec in (result.get("abandoned") or []):
+        if not isinstance(rec, dict):
+            continue
+        out.append(deletion_record(
+            run_id=run_id, media=rec.get("media") or "episode", instance=instance,
+            title=rec.get("title") or rec.get("key"),
+            disposition="upgrade-abandoned",
+            season=rec.get("season"), episode=rec.get("episode"),
+            series_id=rec.get("series_id"),
+            file_id=rec.get("from_file_id"),
+            size_bytes=rec.get("from_size_bytes"),
+            quality_name=rec.get("from_quality"),
+            reason=(f"upgrade never landed within {UPGRADE_TERMINAL_HOURS:.0f}h — "
+                    f"file unchanged"),
+            source="upgrade",
+            deleted_at=rec.get("at")))
     return out
 
 

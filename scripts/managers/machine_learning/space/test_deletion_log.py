@@ -24,6 +24,7 @@ from scripts.managers.machine_learning.space.deletion_log import (
     merge_upgrade_intents,
     reconcile_upgrades,
     upgrade_intent,
+    upgrade_events,
     upgrade_key,
     coverage,
     library_class,
@@ -560,3 +561,86 @@ def test_upgrade_helpers_never_raise():
             assert isinstance(r, dict) and isinstance(r["pending"], dict)
     assert isinstance(merge_upgrade_intents(None, None), dict)
     assert isinstance(merge_upgrade_intents("x", [None, {}, {"key": "a"}]), dict)
+
+
+# ── movies + archive emission (GLD-DEL-12 / GLD-DEL-13) ───────────────────────
+def test_a_movie_gets_its_own_key_namespace():
+    """A movie has no season/episode. The `movie:` prefix also means a Sonarr and a
+    Radarr worklist can never collide on a shared numeric id."""
+    assert upgrade_key(movie_id=812) == "movie:812"
+    assert upgrade_key(movie_id=None, series_id=17209, season=1, episode=2) == "17209:S01E02"
+    assert upgrade_key(movie_id="x") is None
+    i = upgrade_intent(movie_id=812, file_id=9001, size_bytes=4_000_000_000,
+                       quality_name="Remux-1080p", title="Inception")
+    assert i["key"] == "movie:812" and i["media"] == "movie" and i["movie_id"] == 812
+    assert "season" not in i and "series_id" not in i
+
+
+def test_reconciliation_is_media_agnostic():
+    """The comparison is id-then vs id-now; nothing about it is TV-specific, which is
+    why Radarr needs only the two adapters and no second implementation (P-E)."""
+    led = merge_upgrade_intents({}, [
+        upgrade_intent(movie_id=812, file_id=9001, at=(_NOW - timedelta(hours=1)).isoformat()),
+        _intent(63808)])
+    r = reconcile_upgrades(led, {"movie:812": 9500, "17209:S01E02": 63808}, now=_NOW)
+    assert len(r["fulfilled"]) == 1 and r["fulfilled"][0]["media"] == "movie"
+    assert len(r["pending"]) == 1
+
+
+def test_a_landed_upgrade_emits_an_event_with_a_MEASURED_replacement():
+    """At trigger time the *arr had not picked a release, so an intent could only say
+    what was being replaced. Emitting at RECONCILIATION is what lets `replaced_by`
+    carry a real size — and that is what makes the spend figure trustworthy."""
+    led = merge_upgrade_intents({}, [_intent(63808)])
+    r = reconcile_upgrades(led, {"17209:S01E02": 99999}, now=_NOW)
+    evs = upgrade_events(r, run_id=_RUN, instance="sonarr-720",
+                         observed_files={99999: {"size_bytes": 6_000_000_000,
+                                                 "quality_name": "WEBDL-1080p"}})
+    assert len(evs) == 1
+    e = evs[0]
+    assert e["disposition"] == "upgraded" and e["source"] == "upgrade"
+    assert e["size_bytes"] == 2_000_000_000              # what was replaced
+    assert e["replaced_by"]["size_bytes"] == 6_000_000_000
+    assert e["replaced_by"]["state"] == "imported"       # observed, not queued
+    assert "WEBDL-720p" in e["reason"] and "WEBDL-1080p" in e["reason"]
+
+
+def test_an_abandoned_upgrade_emits_an_event_with_no_replacement():
+    led = merge_upgrade_intents({}, [_intent(63808, hours_ago=60)])
+    r = reconcile_upgrades(led, {"17209:S01E02": 63808}, now=_NOW)
+    evs = upgrade_events(r, run_id=_RUN, instance="sonarr-720")
+    assert len(evs) == 1 and evs[0]["disposition"] == "upgrade-abandoned"
+    assert "replaced_by" not in evs[0]
+
+
+def test_pending_and_orphaned_emit_NOTHING():
+    """`pending` has not happened yet; `orphaned` belongs to the purge, which owns
+    that row's fate. Emitting either would put a non-event in an append-only file."""
+    led = merge_upgrade_intents({}, [_intent(63808, e=2), _intent(1, e=3)])
+    r = reconcile_upgrades(led, {"17209:S01E02": 63808, "17209:S01E03": None}, now=_NOW)
+    assert r["pending"] and r["orphaned"]
+    assert upgrade_events(r, run_id=_RUN, instance="sonarr-720") == []
+
+
+def test_upgrade_events_close_the_churn_loop():
+    """This is why GLD-DEL-13 exists: without an `upgraded` row, detect_churn only ever
+    saw the step-down half and could never register a direction CHANGE."""
+    up = upgrade_events(
+        reconcile_upgrades(merge_upgrade_intents({}, [_intent(1)]),
+                           {"17209:S01E02": 2}, now=_NOW),
+        run_id=_RUN, instance="sonarr-720")
+    for e in up:
+        e["tmdb_id"] = 27205
+    down = [deletion_record(run_id=_RUN, media="episode", instance="sonarr-720",
+                            title="T", disposition="stepped-down", tmdb_id=27205,
+                            deleted_at="2026-08-24T06:00:00+00:00")]
+    assert detect_churn(up, min_flips=1, window_days=None) == []      # one side alone
+    hits = detect_churn(up + down, min_flips=1, window_days=None)
+    assert len(hits) == 1 and hits[0]["flips"] == 1
+
+
+def test_upgrade_events_never_raise():
+    for r in (None, {}, "x", {"fulfilled": None}, {"fulfilled": [None, "x", {}]},
+              {"abandoned": [{}]}, {"fulfilled": [{"observed_file_id": None}]}):
+        evs = upgrade_events(r, run_id=_RUN, instance="i", observed_files="junk")
+        assert isinstance(evs, list)

@@ -1390,6 +1390,18 @@ class RadarrCacheMovieFilesManager(BaseManager, ComponentManagerMixin):
                 # `movies` is the library walk this refresh already fetched, so the
                 # *arr side costs nothing extra.
                 self._check_parquet_drift(instance, df_new, movies)
+                # GLD-DEL-12 — resolve any upgrades we triggered last pass. Delegated to
+                # the space-pressure manager, which owns the worklist because it also
+                # owns the trigger; splitting them would put half a contract in each
+                # service (P-E).
+                try:
+                    _sp = self.registry.get("manager", "RadarrSpacePressureManager") \
+                        if getattr(self, "registry", None) else None
+                    if _sp is not None:
+                        _sp._reconcile_upgrade_intents(instance, df_new)
+                except Exception as e:
+                    self.logger.log_debug(
+                        f"  movie upgrade reconcile not reachable for '{instance}': {e}")
 
         return stats
 

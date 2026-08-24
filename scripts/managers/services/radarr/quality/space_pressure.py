@@ -69,9 +69,13 @@ from scripts.managers.machine_learning.lifecycle.restore_policy import (
 )
 from scripts.managers.machine_learning.space.deletion_log import (
     deletion_record,
+    merge_upgrade_intents,
     new_run_id,
+    reconcile_upgrades,
     split_by_kind,
     to_jsonl,
+    upgrade_events,
+    upgrade_intent,
 )
 from scripts.managers.machine_learning.scoring.critic import critic_avg
 from scripts.managers.machine_learning.space.delete_planner import (
@@ -1581,6 +1585,127 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
     # ── Stage 2: delete (last resort) ────────────────────────────────────────────
 
+    _UPGRADE_PENDING_KEY = "radarr/{inst}/upgrade_pending"
+
+    def _persist_upgrade_intents(self, instance, intents):
+        """Merge this pass's upgrade intents into the pending worklist — GLD-DEL-12.
+
+        Never raises: failing to record an intent costs a reconciliation, not a file.
+        """
+        live = [i for i in (intents or []) if i]
+        if not live or not self.global_cache:
+            return 0
+        try:
+            key = self._UPGRADE_PENDING_KEY.format(inst=instance)
+            led = self.global_cache.get(key)
+            led = led if isinstance(led, dict) else {}
+            self.global_cache.set(key, merge_upgrade_intents(led, live))
+            self.logger.log_debug(
+                f"  ↑ tracked {len(live)} movie upgrade intent(s) for the next pass")
+            return len(live)
+        except Exception as e:
+            self.logger.log_debug(f"  upgrade intents not recorded ({e})")
+            return 0
+
+    def _observe_upgrade_targets(self, instance, ledger):
+        """``{key: current_movie_file_id_or_None}`` for the pending worklist.
+
+        ⚠️ Reads FRESH from `GET /movie/{id}`. Reconciliation asks "has this changed
+        since we triggered it?", and a cache written BEFORE the trigger answers the
+        wrong question — every landed upgrade would read as still-pending forever.
+
+        A movie whose fetch fails is simply ABSENT from the result, which is not the
+        same as "no file" (**P-C**): `reconcile_upgrades` leaves absent keys pending
+        rather than declaring them orphaned, so one bad fetch cannot manufacture a
+        phantom orphan.
+        """
+        obs = {}
+        if not isinstance(ledger, dict) or not ledger:
+            return obs
+        for key, rec in ledger.items():
+            if not isinstance(rec, dict) or rec.get("movie_id") is None:
+                continue
+            try:
+                payload = self.radarr_api._make_request(
+                    instance, f"movie/{int(rec['movie_id'])}", fallback=None)
+            except Exception:
+                payload = None
+            if payload is None:                  # unknown — leave the key absent
+                continue
+            mf = payload.get("movieFile") if isinstance(payload, dict) else None
+            try:
+                obs[key] = int((mf or {}).get("id") or 0) or None
+            except (TypeError, ValueError):
+                continue
+        return obs
+
+    def _reconcile_upgrade_intents(self, instance, df):
+        """Did the movie upgrades we triggered actually land? — GLD-DEL-12.
+
+        The Radarr twin of the Sonarr pass. Radarr's parquet is rebuilt from a full
+        library walk each refresh, so a stale row heals on its own — but the ARCHIVE
+        does not: without this, a landed movie upgrade leaves no `upgraded` event, so
+        churn detection sees only the step-down half and the space ledger counts
+        reclaim without the spend that caused the pressure.
+
+        The pure half (`upgrade_intent` / `reconcile_upgrades`) is media-agnostic, so
+        this is two adapters rather than a second implementation (**P-E**).
+
+        Returns ``(df, stats)``. Never raises.
+        """
+        stats = {"checked": 0, "fulfilled": 0, "orphaned": 0,
+                 "abandoned": 0, "pending": 0}
+        if not self.global_cache:
+            return df, stats
+        try:
+            key = self._UPGRADE_PENDING_KEY.format(inst=instance)
+            led = self.global_cache.get(key)
+            led = led if isinstance(led, dict) else {}
+            if not led:
+                return df, stats
+            stats["checked"] = len(led)
+
+            res = reconcile_upgrades(led, self._observe_upgrade_targets(instance, led))
+            stats["fulfilled"] = len(res["fulfilled"])
+            stats["orphaned"] = len(res["orphaned"])
+            stats["abandoned"] = len(res["abandoned"])
+            stats["pending"] = len(res["pending"])
+
+            # What actually landed, read off the same rows the refresh rebuilt.
+            _observed = {}
+            if df is not None and not df.empty and "movie_file_id" in df.columns:
+                for hit in res["fulfilled"]:
+                    try:
+                        fid = int(hit["observed_file_id"])
+                        row = df[df["movie_file_id"] == fid]
+                        if row.empty:
+                            continue
+                        r0 = row.iloc[0]
+                        _observed[fid] = {"size_bytes": r0.get("size_bytes"),
+                                          "quality_name": r0.get("quality_name")}
+                    except Exception:
+                        continue
+
+            if not getattr(self, "_deletion_run_id", None):
+                self._deletion_run_id = new_run_id()
+            _events = upgrade_events(res, run_id=self._deletion_run_id,
+                                     instance=instance, observed_files=_observed)
+            if _events:
+                self._flush_movie_deletions(_events)
+
+            self.global_cache.set(key, res["pending"])
+            if stats["fulfilled"] or stats["orphaned"] or stats["abandoned"]:
+                self.logger.log_info(
+                    f"  ↑ movie upgrade reconcile '{instance}': {stats['fulfilled']} landed, "
+                    f"{stats['orphaned']} now file-less, {stats['abandoned']} abandoned "
+                    f"(>48h), {stats['pending']} still queued.")
+            else:
+                self.logger.log_debug(
+                    f"  ↑ movie upgrade reconcile '{instance}': {stats['pending']} still queued.")
+        except Exception as e:
+            self.logger.log_debug(f"  movie upgrade reconcile skipped for '{instance}': {e}")
+        return df, stats
+
     def _movie_grab_descriptor(self, instance, movie_id):
         """The redacted ``release/push`` descriptor for one movie, or ``{}``.
 
@@ -2278,6 +2403,8 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
             "checked": 0, "upgraded": 0, "already_best": 0,
             "skipped_kids": 0, "skipped_not_active": 0, "failed": 0,
         }
+        # GLD-DEL-12 — intents accumulate here and persist once, after the pass.
+        _upgrade_intents: list = []
 
         if free_space_gb < upgrade_min_free_gb:
             self.logger.log_debug(
@@ -2377,6 +2504,16 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     df.at[idx, "quality_profile_name"] = target_name
                     movie_ids_to_search.append(int(movie_id))
                     stats["upgraded"] += 1
+                    # GLD-DEL-12 — record the file this movie owns RIGHT NOW. When the
+                    # upgrade lands Radarr's id will differ, and that difference is the
+                    # only proof available; without it the upgrade is fire-and-forget
+                    # and leaves no `upgraded` event for churn or the space ledger.
+                    _upgrade_intents.append(upgrade_intent(
+                        movie_id=movie_id,
+                        file_id=df.at[idx, "movie_file_id"] if "movie_file_id" in df.columns else None,
+                        size_bytes=df.at[idx, "size_bytes"] if "size_bytes" in df.columns else None,
+                        quality_name=cur_qp_name,
+                        title=title))
                     changed = True
                     self.logger.log_info(
                         f"  📈 Upgraded: '{title}' "
@@ -2389,6 +2526,10 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 stats["failed"] += 1
 
         if movie_ids_to_search and not self.dry_run:
+            # GLD-DEL-12 — persist the worklist only when searches actually fired. A
+            # dry_run triggers nothing, so recording intents would build a worklist for
+            # upgrades that never happened.
+            self._persist_upgrade_intents(instance, _upgrade_intents)
             try:
                 self.radarr_api._make_request(
                     instance, "command", method="POST",
