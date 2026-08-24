@@ -297,6 +297,35 @@ Constants: `PRESSURE_FALLBACK_GB` 25.0 · `PRESSURE_FALLBACK_FRACTION` 0.25 ·
 - ✅ Complete sweep to drive-relative thresholds — no gate respects a hardcoded GB floor
 - ✅ Acquisition tightness with a deliberately wider band than deletion
 - ✅ `watchability × demand^t` demand-aware ranking
+- ✅ **Permanent deletion archive** (`deletion_log.py`, `GLD-RST-08`) — append-only
+  JSONL recording what was destroyed, why, from where, and how to re-acquire it
+  (release identity + redacted `release/push` descriptor + infohash). Deliberately
+  NOT in `RUN_LOG_ARTIFACTS`: a deletion is an event, not a plan, so rotating it
+  would expire the record in six days. Indexed centrally in
+  [`ENHANCEMENTS.md`](../../../ENHANCEMENTS.md) §4.54
+- ✅ **Event/state split** (`GLD-DEL-02`) — `deletions.jsonl` holds EVENTS
+  (`deleted`/`failed`), append-only and never deduped; `pending.jsonl` holds STATE
+  (`marked-not-consented`/`would-delete`/`guarded`) and is replaced each run.
+  Appending state grew 271 rows into 24,390 over ninety nightly runs while
+  describing the same 271 files. An unrecognised disposition routes to the archive —
+  the safe direction
+- ⚠️ **THE PRESSURE BAND IS DOWNGRADE-ONLY** (`GLD-SPA-11`). `space_targets` returns
+  `(T, U)` where `U = T × 1.10`, and the names invite exactly the wrong reading.
+  Deletion **engages when free breaches the FLOOR** `T`; the band `T..U` is where
+  step-down runs and deletion deliberately holds. The coordinator states it
+  outright: *"downgrades ran; deletion holds until free breaches the floor
+  (hysteresis)."* Raising the floor to sit just under free does NOT arm deletion —
+  it parks the system in the step-down band, which is the more destructive
+  behaviour. That misreading cost 4 movies (Remux/1080p → 720p, 83.9 GB binned) on
+  2026-08-24 and suppressed acquisition, JIT and active-watcher upgrades for the
+  run. To exercise deletion at all, free must go BELOW `T`, and the 0.10 headroom
+  then implies a deficit of ~10% of the floor — structurally larger than the marked
+  pool, so it reaches for movies unless `space_pressure_headroom_ratio` is lowered
+  too
+- ✅ **Identity joins from existing caches** — `episode_id`/`episode_title`/`air_date`
+  from `episodes/by_series/<sid>`, `tvdb_id` from the TRaSH folder name, `profile`
+  from `profiles.json`. None costs an API call, which is why all three reach the
+  `dry_run` and `marked-not-consented` paths
 - ✅ Schmitt-trigger hysteresis on tightness engagement/release
 - ✅ Exhaustive downgrade on by default, byte-for-byte reversible
 - ✅ Delete pool structurally restricted to at/below-floor items
@@ -316,6 +345,13 @@ Constants: `PRESSURE_FALLBACK_GB` 25.0 · `PRESSURE_FALLBACK_FRACTION` 0.25 ·
 | `GLD-SPA-02` | **Report regrab-cap saturation** in the run summary — how many items deferred | §6 row 4: partial progress is invisible | S | — |
 | `GLD-SPA-03` | **Warn on a non-truthy consent env var** overriding a config `true` | §6 row 9: silently safe, but surprising | S | — |
 | `GLD-SPA-04` | **Space forecast** — at current growth, when is the floor reached? | Turns a reactive band into a planning tool | M | `GLD-WEB-16` |
+| `GLD-RST-10` | **Prove the step-down archive actually writes** — `stepdown_releases.json` does not exist under either instance key; `stepdown_cooldown` shows 12 attempts on 2026-08-15 that all failed their search or deferred, and `_archive_stepdown_release` fires only after a successful pick | `GLD-RST-02`/`-05` are built, wired, correct and have **zero production evidence**; the deletion archive is now the better-exercised path | S | — |
+| `GLD-RST-12` | **Reconcile Sonarr's reported paths with the 2026-08-23 reclassification** — 10,385 of 10,387 file paths still read `/data/media/tv/series`, and the cached SERIES records agree, so it is not parquet staleness | The archive's `class` field is derived from `path`, so it currently reads `series` for nearly everything. The raw `path` is stored beside it, so the field is recomputable rather than lost | M | — |
+| `GLD-DEL-01` | **Render the archive on demand** — a small CLI over `parse_jsonl` + `render` so a past run can be read back without hand-grepping JSONL | The data is complete and queryable; only the operator-facing view is missing | S | `GLD-RST-08` |
+| `GLD-DEL-03` | **Prune the event archive by age, never by count** — `deletions.jsonl` grows only when something is destroyed, but it grows forever | Bounded today by behaviour rather than policy. Any prune must be age-based and must never rewrite rows in place, or the immutability guarantee that makes it trustworthy is gone | S | `GLD-DEL-02` |
+| `GLD-DEL-04` | **Clear `pending.jsonl` when the delete pass never evaluates** — the pass returns early when no rows are marked, so the snapshot is not rewritten and can go stale | Every row carries `run_id`, so a stale file is DETECTABLE by comparing against the current run; but it is not yet self-clearing. **Worse than an edge case under the standing config**: with consent armed and no pressure, `_do_delete_marked_files` DELEGATES to the coordinator and returns before the archive, so nothing writes `pending` at all — the candidate pool becomes invisible and the file keeps asserting `marked-not-consented` under a stale `run_id`. Needs a `deferred-to-coordinator` disposition written on the delegation path | S | `GLD-DEL-02` |
+| `GLD-SPA-11` | **Document the band semantics where the operator will read them** — `T`/`U` in `space_targets`, the coordinator's log line, and this file all describe the same hysteresis differently | Deletion engages BELOW `T`; `T..U` is downgrade-only. The variable names alone read as "target and ceiling", which is how the 2026-08-24 floor change came to trigger exhaustive step-down instead of the intended delete test | S | — |
+| `GLD-SPA-12` | 🎯 **A bounded way to exercise the delete path** — lowering `space_pressure_headroom_ratio` alongside a raised floor, or an explicit test hook | With headroom at 0.10, ANY deletion trigger implies a ~10%-of-floor deficit (~418 GB), which exceeds the ~322 GB marked-TV pool and escalates to movies. There is currently no way to exercise deletion on a small, bounded target — and `_persist_restore_set` is structurally undryrunnable, so its first execution is necessarily live | M | `GLD-RST-18` |
 | `GLD-SPA-05` | **Downgrade-vs-delete accounting** each run — GB reclaimed by each path | Proves D7/D8 are working; currently unmeasured | S | `GLD-SCO-09` |
 | `GLD-SPA-06` | **Per-mount bands** rather than one global floor | Multi-drive setups currently share one threshold | M | `disk_total_gb` per mount |
 | `GLD-SPA-07` | **Document `universe.DEFAULT_DOWNGRADE_GB` (10)** as a named exception in the ladder docs, not only inline | An intentional hardcoded floor is invisible to anyone reading `space_targets` | S | — |

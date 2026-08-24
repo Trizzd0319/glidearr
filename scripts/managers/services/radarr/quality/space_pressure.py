@@ -63,6 +63,16 @@ from scripts.managers.factories.mixins.component_manager import ComponentManager
 from scripts.support.utilities.decorators.timing import timeit
 from scripts.support.utilities.logger.logger import LoggerManager
 from scripts.managers.machine_learning.ledger.decision_ledger import stamp
+from scripts.managers.machine_learning.lifecycle.restore_policy import (
+    push_descriptor,
+    release_record,
+)
+from scripts.managers.machine_learning.space.deletion_log import (
+    deletion_record,
+    new_run_id,
+    split_by_kind,
+    to_jsonl,
+)
 from scripts.managers.machine_learning.scoring.critic import critic_avg
 from scripts.managers.machine_learning.space.delete_planner import (
     bare_universe_protected,
@@ -1030,6 +1040,10 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         Set low-priority/low-score movies to HD-720p and trigger MovieSearch.
         Movies with watchability score >= WATCHABILITY_PROTECT_THRESHOLD are protected.
         """
+        # GLD-DEL-05 — step-down rows accumulate here and flush once after the loop.
+        _archive: list = []
+        if not getattr(self, "_deletion_run_id", None):
+            self._deletion_run_id = new_run_id()
         stats = {
             "candidates_found":   0,
             "downgraded":         0,
@@ -1359,6 +1373,13 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     changed = True
                     continue
                 if _fid_row is not None and pd.notna(_fid_row):
+                    # GLD-DEL-05 — snapshot the ORIGINAL before anything mutates it. The
+                    # rows below overwrite quality_profile_id/name in place, and the file
+                    # itself is about to be destroyed, so this is the last moment the
+                    # original release identity exists anywhere.
+                    _orig_release = release_record(df.loc[idx])
+                    _orig_qname = cur_qp_name
+                    _orig_size = _sz_f
                     # CHECKED: DELETE success now returns True (base contract fix). On
                     # failure the old file is still on disk — grabbing anyway imports a
                     # second copy over a file Radarr cannot remove. Skip, stamp the
@@ -1423,6 +1444,20 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     f"({self._fmt_bytes(_sz_f)}, {cur_qp_name} → {target_name}) — file deleted, "
                     f"grabbed '{pick.get('title')}' ({_pick_gb:.1f} GB) — {reason}{_below}"
                 )
+                # GLD-DEL-05. A step-down destroys quality IRREVERSIBLY: unlike a delete,
+                # `match_release` cannot undo it, because the replacement is now the only
+                # file. Recording the original's identity is the sole way a Remux master
+                # can ever be re-acquired deliberately. Before this, the only trace was a
+                # `default.log` line that rotates away in five runs.
+                self._archive_movie_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    disposition="stepped-down",
+                    reason=f"{reason} | {_orig_qname} → {target_name}",
+                    size_bytes=_orig_size, file_id=_fid_row, source="step_down",
+                    replaced_by={"title": pick.get("title"),
+                                 "size_bytes": pick.get("size"),
+                                 "quality_name": target_name},
+                    release_override=_orig_release)
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ Downgrade failed for '{title}' (id={movie_id}): {e}")
                 stats["failed"] += 1
@@ -1444,6 +1479,13 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         # (the latter is the dry_run preview path).
         if changed or plan_changed:
             mfm.save(instance, df)
+        # GLD-DEL-05 — a step-down destroys quality irreversibly, so its rows are EVENTS
+        # and land in the append-only archive. Flushed once, after the loop.
+        _archived = self._flush_movie_deletions(_archive)
+        if _archived:
+            self.logger.log_info(
+                f"  \U0001f5c3\ufe0f  archived {_archived} step-down row(s) → "
+                f"logs/deletions/deletions.jsonl (run {self._deletion_run_id})")
         # Ledger saves regardless: a cooldown stamped this run must survive even when
         # nothing else changed, or the backoff would reset every pass.
         self._save_stepdown_ledger(instance, _ledger)
@@ -1525,6 +1567,104 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         return stats
 
     # ── Stage 2: delete (last resort) ────────────────────────────────────────────
+
+    def _movie_grab_descriptor(self, instance, movie_id):
+        """The redacted ``release/push`` descriptor for one movie, or ``{}``.
+
+        Radarr's ``history/movie?movieId=`` returns a bare list rather than the paged
+        envelope Sonarr uses on some routes; ``push_descriptor`` tolerates both, which
+        is the reason it is pure and shared rather than duplicated per service (P-E).
+
+        Radarr's grab history is FINITE, so this is captured at the moment of
+        destruction rather than hoped for later. Best-effort: every failure returns
+        ``{}`` and the caller proceeds, because losing the descriptor must never cost
+        the deletion it documents.
+
+        RUNS UNDER dry_run — a read-only ``GET`` destroys nothing, and skipping it made
+        the descriptor path the one thing a disarmed run could not prove.
+        """
+        if movie_id is None:
+            return {}
+        try:
+            raw = self.radarr_api._make_request(
+                instance, f"history/movie?movieId={int(movie_id)}&eventType=1",
+                fallback=None)
+            return push_descriptor(raw) or {}
+        except Exception:
+            return {}
+
+    def _archive_movie_deletion(self, sink, *, instance, row, title,
+                                disposition, reason=None, size_bytes=None,
+                                file_id=None, score=None, source=None,
+                                fetch_descriptor=True, replaced_by=None,
+                                release_override=None):
+        """Append one movie deletion row to *sink* — GLD-RST-08.
+
+        Radarr previously stored ``tmdb_id`` + a timestamp and nothing else, despite
+        ``movie_files`` carrying every ``RELEASE_FIELDS`` column. Records WHAT was
+        destroyed, WHY, FROM WHERE (path + derived library class) and HOW TO GET IT
+        BACK (release identity + redacted grab descriptor).
+
+        Never raises; a failed row is logged rather than silently dropped, because a
+        missing row means a permanently unrecoverable file.
+        """
+        try:
+            get = (lambda k: row.get(k)) if hasattr(row, "get") else (lambda k: None)
+            # `release_override` carries a snapshot taken BEFORE the row was mutated —
+            # the step-down path overwrites quality in place, so reading it here would
+            # describe the replacement rather than what was destroyed.
+            rel = release_override if release_override is not None else (
+                release_record(row) if row is not None else None)
+            push = (self._movie_grab_descriptor(instance, get("movie_id"))
+                    if fetch_descriptor else {})
+            sink.append(deletion_record(
+                run_id=self._deletion_run_id,
+                media="movie",
+                instance=instance,
+                title=title,
+                year=get("year"),
+                disposition=disposition,
+                reason=reason,
+                path=get("path"),
+                file_id=file_id,
+                tmdb_id=get("tmdb_id"),
+                quality_profile_id=get("quality_profile_id"),
+                quality_profile_name=get("quality_profile_name"),
+                quality_name=get("quality_name"),
+                resolution=get("resolution"),
+                size_bytes=size_bytes,
+                score=score,
+                release=rel,
+                push=push or None,
+                source=source,
+                replaced_by=replaced_by,
+            ))
+        except Exception as e:
+            try:
+                self.logger.log_warning(
+                    f"  \u26a0\ufe0f deletion archive row FAILED for '{title}' ({e}) — the file "
+                    f"is still being deleted, but this row will not be recorded.")
+            except Exception:
+                pass
+
+    def _flush_movie_deletions(self, sink):
+        """Persist this pass's movie rows, routed by KIND. One write per kind.
+
+        Events append to the permanent archive; state rows replace the pending
+        snapshot — see ``deletion_log.STATE_DISPOSITIONS``.
+        """
+        if not sink:
+            return 0
+        try:
+            from scripts.support.utilities.logger.logger import (
+                append_deletions, write_pending_deletions,
+            )
+            events, states = split_by_kind(sink)
+            n = append_deletions(to_jsonl(events)) if events else 0
+            n += write_pending_deletions(to_jsonl(states))
+            return n
+        except Exception:
+            return 0
 
     @LoggerManager().log_function_entry
     @timeit("run_space_pressure_deletions")
@@ -1624,6 +1764,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         changed  = False
         stamped  = False   # any planned_action='delete' written → persist for the ledger
         deleted_tmdbs: list[int] = []
+        # GLD-RST-08 — the permanent record of what this pass destroys. Accumulated
+        # here and flushed ONCE after the loop rather than appended per row.
+        _archive: list = []
+        if not getattr(self, "_deletion_run_id", None):
+            self._deletion_run_id = new_run_id()
         for tier, score, critic, _neg, idx, fid, size in candidates:
             if free_space_gb + freed_gb >= U:
                 stats["target_met"] = True
@@ -1644,21 +1789,53 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 stats["bytes_freed"] += size
                 stats["deleted"] += 1
                 stats["tier_watched" if tier == 0 else "tier_unwatched"] += 1
+                self._archive_movie_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    disposition="would-delete", reason=reason, size_bytes=size,
+                    file_id=fid, score=score, source="space_pressure")
                 continue
+            _del_ok = False
             try:
-                self.radarr_api._make_request(instance, f"moviefile/{fid}", method="DELETE")
-                df.at[idx, "marked_for_deletion"] = False
-                freed_gb += size_gb
-                stats["bytes_freed"] += size
-                stats["deleted"] += 1
-                stats["tier_watched" if tier == 0 else "tier_unwatched"] += 1
-                changed = True
-                if tmdb_id is not None and pd.notna(tmdb_id):
-                    deleted_tmdbs.append(int(tmdb_id))
-                self.logger.log_info(f"  🗑️ Deleted: '{title}' ({self._fmt_bytes(size)}) — {reason}")
+                # CHECKED (GLD-RST-20). `_make_request` swallows HTTP failures and
+                # returns the fallback, so the old bare try/except was DEAD protection
+                # for every 500 — the same P-A shape `delete_selected_movie_files`
+                # already guards against a few hundred lines below. An unchecked DELETE
+                # here credits freed GB, clears the mark, feeds `deleted_tmdbs` and
+                # writes an archive row, all for a file still on disk.
+                _del_ok = bool(self.radarr_api._make_request(
+                    instance, f"moviefile/{fid}", method="DELETE"))
             except Exception as e:
-                self.logger.log_warning(f"  ⚠️ Delete failed for '{title}' (movieFileId={fid}): {e}")
+                self.logger.log_warning(f"  ⚠️ Delete raised for '{title}' (movieFileId={fid}): {e}")
+            if not _del_ok:
+                self.logger.log_warning(
+                    f"  ⚠️ Delete FAILED for '{title}' (movieFileId={fid}) — "
+                    f"file KEPT, mark kept, retries next run.")
+                self._archive_movie_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    disposition="failed", reason=f"{reason} | DELETE returned falsy",
+                    size_bytes=size, file_id=fid, score=score,
+                    source="space_pressure", fetch_descriptor=False)
                 stats["failed"] += 1
+                continue
+            df.at[idx, "marked_for_deletion"] = False
+            freed_gb += size_gb
+            stats["bytes_freed"] += size
+            stats["deleted"] += 1
+            stats["tier_watched" if tier == 0 else "tier_unwatched"] += 1
+            changed = True
+            if tmdb_id is not None and pd.notna(tmdb_id):
+                deleted_tmdbs.append(int(tmdb_id))
+            self.logger.log_info(f"  🗑️ Deleted: '{title}' ({self._fmt_bytes(size)}) — {reason}")
+            self._archive_movie_deletion(
+                _archive, instance=instance, row=df.loc[idx], title=title,
+                disposition="deleted", reason=reason, size_bytes=size,
+                file_id=fid, score=score, source="space_pressure")
+
+        _archived = self._flush_movie_deletions(_archive)
+        if _archived:
+            self.logger.log_info(
+                f"  \U0001f5c3\ufe0f  archived {_archived} movie deletion row(s) → "
+                f"logs/deletions/deletions.jsonl (run {self._deletion_run_id})")
 
         if free_space_gb + freed_gb >= U:
             stats["target_met"] = True
@@ -1962,10 +2139,16 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
         now = datetime.now(tz=timezone.utc)
         changed = False
         deleted_tmdbs: list[int] = []
+        # GLD-RST-08 — this path stamped the reason into the ledger but dropped it from
+        # every log line, so a coordinator-driven delete was the least traceable of all.
+        _archive: list = []
+        if not getattr(self, "_deletion_run_id", None):
+            self._deletion_run_id = new_run_id()
         for c in picks:
             idx, fid, size = c["idx"], c["fid"], float(c.get("size_bytes") or 0.0)
             title = c.get("title") or f"movie {fid}"
-            self._stamp_plan(df, idx, "delete", c.get("reason") or "coordinator pool", size / (1024 ** 3))
+            _reason = c.get("reason") or "coordinator pool"
+            self._stamp_plan(df, idx, "delete", _reason, size / (1024 ** 3))
             if effective_dry_run(self.dry_run, self.global_cache):    # also dry when backup gate disarmed
                 # debug: 400+ per-title lines in selection order were live-log spam —
                 # the decision ledger (stamped above) renders them sorted with GB +
@@ -1973,6 +2156,10 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 self.logger.log_debug(f"  🗑️ [dry_run] Would delete movie: '{title}' ({self._fmt_bytes(size)})")
                 stats["deleted"] += 1
                 stats["bytes_freed"] += size
+                self._archive_movie_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    disposition="would-delete", reason=_reason, size_bytes=size,
+                    file_id=fid, source="coordinator")
                 continue
             try:
                 # CHECKED: DELETE success returns True (base contract fix). The old
@@ -1984,6 +2171,11 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                     self.logger.log_warning(
                         f"  ⚠️ Movie delete FAILED for '{title}' (movieFileId={fid}) — "
                         f"see instance-manager error above; mark kept, retries next run.")
+                    self._archive_movie_deletion(
+                        _archive, instance=instance, row=df.loc[idx], title=title,
+                        disposition="failed", reason=f"{_reason} | DELETE returned falsy",
+                        size_bytes=size, file_id=fid, source="coordinator",
+                        fetch_descriptor=False)
                     stats["failed"] += 1
                     continue
                 if "marked_for_deletion" in df.columns:
@@ -1994,9 +2186,24 @@ class RadarrSpacePressureManager(BaseManager, ComponentManagerMixin):
                 if c.get("tmdb_id") is not None:
                     deleted_tmdbs.append(int(c["tmdb_id"]))
                 self.logger.log_info(f"  🗑️ Deleted movie: '{title}' ({self._fmt_bytes(size)})")
+                self._archive_movie_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    disposition="deleted", reason=_reason, size_bytes=size,
+                    file_id=fid, source="coordinator")
             except Exception as e:
                 self.logger.log_warning(f"  ⚠️ Movie delete failed for '{title}' (movieFileId={fid}): {e}")
+                self._archive_movie_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    disposition="failed", reason=f"{_reason} | DELETE failed: {e}",
+                    size_bytes=size, file_id=fid, source="coordinator",
+                    fetch_descriptor=False)
                 stats["failed"] += 1
+
+        _archived = self._flush_movie_deletions(_archive)
+        if _archived:
+            self.logger.log_info(
+                f"  \U0001f5c3\ufe0f  archived {_archived} movie deletion row(s) → "
+                f"logs/deletions/deletions.jsonl (run {self._deletion_run_id})")
 
         if deleted_tmdbs and self.global_cache:
             try:

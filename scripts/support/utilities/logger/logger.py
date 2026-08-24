@@ -31,6 +31,12 @@ LOG_FILES = {
     "api_failures": LOG_DIR / "api_failures.log.jsonl",
     "function_tracking": LOG_DIR / "function_tracking.log.jsonl",
     "tvdb_trace": LOG_DIR / "TVDB_enrichment_trace.log",
+    # GLD-RST-08 / GLD-DEL-01. APPEND-ONLY and deliberately NOT in
+    # RUN_LOG_ARTIFACTS below — see append_deletions() for why.
+    "deletions": LOG_DIR / "deletions" / "deletions.jsonl",
+    # The STATE companion: what is queued right now. Rewritten each run, so it is
+    # always current rather than a growing pile of identical snapshots.
+    "deletions_pending": LOG_DIR / "deletions" / "pending.jsonl",
 }
 
 # ── Per-run log rotation (Kometa-style) ───────────────────────────────────────
@@ -59,6 +65,92 @@ RUN_LOG_ARTIFACTS = ("default.log", "routing.log", "playlists.log",
 # run log out from under it and (b) write its config-load lines into default.log. When
 # set, the daemon's default logger is redirected to its own sink and never rotates.
 DAEMON_ENV = "GLIDEARR_DAEMON"
+
+#: Set once the pending snapshot has been truncated for this process/run — see
+#: write_pending_deletions(). Module-level because several managers contribute to
+#: one snapshot and only the FIRST of them may clear it.
+_pending_truncated = False
+
+
+def append_deletions(lines) -> int:
+    """Append rendered deletion rows to the permanent archive. Returns rows written.
+
+    WHY THIS FILE IS NOT IN ``RUN_LOG_ARTIFACTS``. Every artifact in that tuple is a
+    PLAN — recomputed each run, so run N+1's copy supersedes run N's. A deletion is
+    an EVENT: never recomputed, and this record is the only evidence it happened. At
+    ``RUN_LOG_BACKUPS = 5`` on a nightly cadence, rotating it would expire the answer
+    to "what did I lose and how do I get it back" in six days.
+
+    The unbounded-growth warning on ``RUN_LOG_ARTIFACTS`` does not apply here, and
+    the difference is behavioural rather than a judgement call: ``decisions.log``
+    costs ~1,000 lines EVERY run regardless of outcome, while this is written only
+    when something is actually destroyed. Most runs append nothing at all.
+
+    Best-effort by construction. A failure to record a deletion must never abort the
+    deletion pass — but unlike a rotation failure it is NOT silent, because a missing
+    row is a permanently unrecoverable file. Failures warn loudly and return 0.
+    """
+    rows = [str(x) for x in (lines or []) if str(x or "").strip()]
+    if not rows:
+        return 0
+    path = LOG_FILES["deletions"]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(row.rstrip("\n") + "\n")
+        return len(rows)
+    except OSError as e:
+        try:
+            logging.getLogger("default").warning(
+                "\u26a0\ufe0f  DELETION ARCHIVE WRITE FAILED (%s) — %d row(s) NOT recorded at %s. "
+                "The files are gone; the record of them is not on disk.", e, len(rows), path)
+        except Exception:
+            pass
+        return 0
+
+
+def write_pending_deletions(lines) -> int:
+    """Replace the pending-deletions snapshot for this run. Returns rows written.
+
+    THE COMPANION TO :func:`append_deletions`, AND THE OPPOSITE POLICY. That file is
+    an append-only record of what HAPPENED. This one holds what is merely QUEUED —
+    ``marked-not-consented`` and ``would-delete`` — which is a STATE, not an event.
+    Nothing was destroyed, the set is recomputed from scratch every run, and run N+1
+    supersedes run N. Appending it instead grew 271 rows into 24,390 over ninety
+    nights, all describing the same 271 files, with the oldest copies frozen around
+    fields that were missing then and have since been fixed.
+
+    TRUNCATES ON THE FIRST CALL OF THE PROCESS, appends afterwards. One run is one
+    process, so that yields exactly "rewritten each run" while still letting several
+    passes (Sonarr, then Radarr) contribute to one snapshot. Passing an empty list
+    still truncates — a run that clears the queue must not leave a stale file
+    claiming rows are pending.
+
+    The daemon is a SEPARATE process and must never truncate the orchestrator's
+    snapshot, so it only ever appends (same reasoning as ``rotate_run_artifacts``).
+    """
+    global _pending_truncated
+    rows = [str(x) for x in (lines or []) if str(x or "").strip()]
+    path = LOG_FILES["deletions_pending"]
+    is_daemon = bool(os.environ.get(DAEMON_ENV))
+    mode = "a" if (_pending_truncated or is_daemon) else "w"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, mode, encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(row.rstrip("\n") + "\n")
+        if not is_daemon:
+            _pending_truncated = True
+        return len(rows)
+    except OSError as e:
+        try:
+            logging.getLogger("default").warning(
+                "\u26a0\ufe0f  PENDING-DELETIONS WRITE FAILED (%s) — %d row(s) not recorded at %s.",
+                e, len(rows), path)
+        except Exception:
+            pass
+        return 0
 
 
 def _rotate_run_logs(log_path: Path, backups: int = RUN_LOG_BACKUPS) -> None:

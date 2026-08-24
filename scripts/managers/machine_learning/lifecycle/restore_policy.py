@@ -44,6 +44,9 @@ Public API (landed):
   * merge_ledger_entry(existing, incoming) -> one entry, v1-safe
   * ledger_releases(entry)                -> {"S02E15": {...}}  ({} for v1)
   * match_release(releases, recorded)     -> the chosen release dict, or None
+  * redact_grab_url(url)                  -> url with secrets named-placeholdered (GLD-RST-07)
+  * refill_grab_url(url, key)             -> url made whole again, or None if it cannot be
+  * looks_like_secret(value)              -> the credential-shape test both of the above use
 """
 from __future__ import annotations
 
@@ -121,8 +124,16 @@ def release_record(row) -> "dict | None":
     all-null stub would just make a v2 entry that behaves exactly like v1 while
     pretending otherwise. ``scene_name`` is populated on roughly a fifth of rows
     and ``release_group`` on roughly a third, so partial records are the norm and
-    are kept: a group + quality still narrows a targeted search considerably."""
-    if not row:
+    are kept: a group + quality still narrows a targeted search considerably.
+
+    Accepts ANY mapping. The emptiness check is ``row is None`` rather than
+    ``not row``, because a pandas Series raises on truthiness ("truth value of a
+    Series is ambiguous") and the delete paths hand this a parquet ROW directly.
+    ``GLD-RST-08`` hit exactly that: every one of 266 records was lost to the
+    caller's swallowed exception, with only a warning per row to show for it. An
+    empty dict still returns None via ``out or None`` below, so the contract is
+    unchanged for every existing caller."""
+    if row is None:
         return None
     out = {}
     for field in RELEASE_FIELDS:
@@ -374,6 +385,324 @@ def match_release(releases, recorded, *, min_confidence=2) -> "dict | None":
     return best
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# GRAB-URL REDACTION (GLD-RST-07) — the inverse of push_payload's refill.
+# ══════════════════════════════════════════════════════════════════════════════
+# WHY THIS MOVED HERE. The scrub used to be a staticmethod on the Sonarr space
+# pressure manager while its inverse (push_payload) lived here, so the two halves
+# of one contract sat in different layers. Radarr's delete path needs the same
+# scrub, and a service-to-service import is exactly the pressure that produces a
+# second, subtly different copy (P-E). They live together now.
+#
+# WHY THE POLICY INVERTED. The old rule named six secret query params and passed
+# everything else through. On a cache that safe_cache_clear rotates, an unknown
+# param leaking is a bounded mistake. The deletion archive is APPEND-ONLY and
+# never rotates, so the same leak becomes a credential on disk permanently — and
+# the fail direction has to flip with the damage bound, exactly as GLD-ACQS-13 did
+# for the space budget. Unknown now means REDACT. Over-redaction costs a
+# release/push that falls back to a magnet or a search, which is what happens
+# today anyway; under-redaction cannot be undone.
+#
+# MEASURED. Against a corpus of real grab shapes (Prowlarr link=, Jackett path=,
+# Torznab direct, path-embedded passkey, gazelle authkey/torrent_pass, netloc
+# userinfo) the previous implementation leaked 6 of 9 secret-bearing URLs; two of
+# those read CLEAN to a naive check because the passkey was base64 inside link=.
+
+#: v1 placeholder. Entries already on disk carry it and must keep refilling forever.
+REDACTION_PLACEHOLDER = "<redacted>"
+
+#: Query params that are known-inert Torznab/Newznab/*arr search terms. Anything
+#: NOT here is redacted — see the fail-direction note above.
+_SAFE_QS_KEYS = frozenset({
+    "t", "id", "cat", "q", "o", "season", "ep", "imdbid", "tvdbid", "tmdbid",
+    "tvmazeid", "rid", "limit", "offset", "extended", "raw", "attrs", "group",
+    "maxsize", "minsize", "action", "type", "format", "file", "title", "dn",
+})
+
+#: Params carrying a NESTED download URL rather than a scalar. Prowlarr's ``link``
+#: is base64 of the upstream indexer URL, which on a private tracker embeds the
+#: passkey — so blanking the outer apikey alone leaves the real secret on disk,
+#: merely base64-encoded and invisible to any grep for it.
+_BLOB_QS_KEYS = frozenset({"link", "path", "url", "href"})
+
+#: Route words that are never credentials, whatever their length.
+_SAFE_PATH_WORDS = frozenset({
+    "download", "downloads", "torrent", "torrents", "getnzb", "nzb", "api",
+    "indexer", "release", "releases", "rss", "feed", "dl", "file", "files",
+})
+
+#: Placeholder names refillable from config. The *arr-side indexer key is the ONE
+#: secret this system holds; a tracker passkey, a path token and netloc userinfo
+#: were never stored and never can be put back.
+_REFILLABLE_NAMES = ("apikey", "api_key", "jackett_apikey", "rss_key", "rsskey")
+
+_TOKENISH = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# A release name and a passkey are both long alphanumeric runs; only one carries
+# MEDIA structure. Requiring a POSITIVE signal (rather than loosening the length
+# test) keeps the fail direction intact — a flat random token cannot match, so the
+# exemption can never be used to smuggle a credential through.
+_MEDIA_TOKEN = re.compile(
+    r"(?i)(?:^|[._\-])(?:s\d{1,2}e\d{1,3}|\d{3,4}p|(?:19|20)\d{2}"
+    r"|web[._\-]?dl|webrip|bluray|bdrip|hdtv|remux|dvdrip|hdr|x26[45]|h\.?26[45]|hevc)"
+    r"(?:[._\-]|$)")
+
+
+def _placeholder(kind) -> str:
+    """``"apikey"`` -> ``"<redacted:apikey>"``.
+
+    Placeholders are NAMED because more than one component of a single URL can now
+    be blanked, and the refill knows exactly one secret. An unnamed placeholder
+    would let it stuff the indexer api key into a passkey slot and emit a URL that
+    fails at the tracker instead of failing here, where it is diagnosable."""
+    return f"<redacted:{kind}>"
+
+
+def looks_like_secret(value, *, min_len: int = 16) -> bool:
+    """Whether *value* has the SHAPE of an opaque credential.
+
+    Deliberately crude and deliberately biased toward yes. A passkey is a long
+    charset-restricted token; a release name carries dots or a media token, a
+    numeric id is all digits, a route word is short and in the vocabulary. Each is
+    excluded; anything else long enough is treated as a secret.
+
+    The asymmetry is the whole point. A false positive costs a push that would have
+    fallen back to a magnet or a search. A false negative writes a credential into a
+    file that is never rotated."""
+    v = str(value or "")
+    if len(v) < min_len or not _TOKENISH.fullmatch(v):
+        return False
+    if v.isdigit() or v.lower() in _SAFE_PATH_WORDS:
+        return False
+    if _MEDIA_TOKEN.search(v):
+        return False                      # a named release, not a credential
+    if any(c.isdigit() for c in v) and any(c.isalpha() for c in v):
+        return True
+    # Pure-alpha keys are rarer but real (some trackers issue alpha-only rss keys).
+    # A legitimate path segment that long with no digit, dot or media token is not a
+    # thing, so length alone carries it past the bar.
+    return len(v) >= 24
+
+
+def _redact_blob(value) -> "str | None":
+    """A nested-URL param, scrubbed in place, or None when it must be blanked whole.
+
+    Returns None in two cases, both meaning "the caller must not keep this":
+    the blob cannot be decoded to a URL at all (we cannot prove it is clean), or the
+    inner URL DID carry a secret. In the second case the scrubbed inner is
+    deliberately NOT re-encoded: a base64 blob hides its own placeholders, so
+    push_payload would see only a refillable outer apikey and push a URL that is
+    dead on the inside. Blanking the param makes the descriptor read as what it
+    is — un-pushable. The indexer name is carried separately, so nothing
+    identifying is lost."""
+    from urllib.parse import unquote, urlparse
+    import base64
+    raw = unquote(str(value or ""))
+    if not raw:
+        return None
+    decoders = [("plain", lambda s: s)]
+    if _TOKENISH.fullmatch(raw.replace("=", "")) or "=" in raw:
+        decoders += [
+            ("b64", lambda s: base64.b64decode(s + "=" * (-len(s) % 4)).decode("utf-8")),
+            ("b64url", lambda s: base64.urlsafe_b64decode(s + "=" * (-len(s) % 4)).decode("utf-8")),
+        ]
+    for kind, fn in decoders:
+        try:
+            inner = fn(raw)
+        except Exception:
+            continue
+        p = urlparse(inner)
+        if not p.scheme or not p.netloc:
+            continue
+        cleaned = redact_grab_url(inner, _depth=1)
+        if cleaned is None or REDACTION_PLACEHOLDER[:-1] in cleaned:
+            return None
+        if kind == "plain":
+            return cleaned
+        enc = (base64.b64encode if kind == "b64" else base64.urlsafe_b64encode)(cleaned.encode())
+        return enc.decode()
+    return None
+
+
+def redact_grab_url(url, *, _depth: int = 0) -> "str | None":
+    """*url* with every credential-shaped component replaced by a named placeholder.
+
+    Four channels carry secrets; the previous implementation scrubbed one:
+
+      0. malformed query — ``&k=v`` appended with no ``?`` (urlparse calls it PATH)
+      1. query params      — allowlisted, not denylisted (unknown key -> redact)
+      2. nested URL params — ``link=`` / ``path=`` decoded, scrubbed, re-encoded
+      3. path segments     — token-shaped segments blanked (``/rss/<key>/``)
+      4. netloc userinfo   — ``user:pass@host`` stripped
+
+    Returns None for anything unparseable. A URL we cannot confidently redact is one
+    we must not persist — that contract is unchanged from the original."""
+    if not url:
+        return None
+    try:
+        from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+        p = urlparse(str(url))
+        if not p.scheme or not p.netloc:
+            return None
+
+        netloc = p.netloc
+        if "@" in netloc:                                       # (4)
+            netloc = f"{_placeholder('userinfo')}@{netloc.rsplit('@', 1)[1]}"
+
+        # (0) MALFORMED QUERY STRINGS. Real indexers emit URLs whose parameters are
+        # appended with `&` and NO `?` — e.g.
+        #   https://host/getnzb/<id>.nzb&i=139402&r=<apikey>
+        # urlparse puts that entire tail in PATH and leaves `query` empty, so neither
+        # the query allowlist NOR the path-segment test can see it: the segment holds
+        # `.` and `&`, fails the token charset check, and passes through VERBATIM.
+        # This shipped a live Newznab apikey (`r=`) into 266 archive rows before it was
+        # caught by reading real output rather than the corpus, which contained only
+        # well-formed URLs. Split the tail back into a query so the allowlist applies.
+        path, query = p.path, p.query
+        if not query and "&" in path:
+            path, _, query = path.partition("&")
+
+        segs = []                                               # (3)
+        for seg in path.split("/"):
+            segs.append(_placeholder("pathtoken") if looks_like_secret(seg) else seg)
+        path = "/".join(segs)
+
+        qs = []
+        for k, v in parse_qsl(query, keep_blank_values=True):    # (1) + (2)
+            kl = k.lower()
+            if kl in _BLOB_QS_KEYS and _depth == 0:
+                inner = _redact_blob(v)
+                qs.append((k, inner if inner is not None else _placeholder(kl)))
+            elif kl in _SAFE_QS_KEYS:
+                qs.append((k, _placeholder(kl) if looks_like_secret(v) else v))
+            else:
+                qs.append((k, _placeholder(kl)))
+        return urlunparse(p._replace(netloc=netloc, path=path, query=urlencode(qs)))
+    except Exception:
+        return None
+
+
+def refill_grab_url(url, indexer_api_key=None) -> "str | None":
+    """*url* with refillable placeholders restored, or None when it cannot be made whole.
+
+    v1 entries hold a bare ``<redacted>`` and keep working unchanged. v2 entries hold
+    NAMED placeholders, and the name decides: an indexer-key placeholder is refilled
+    from config, and ANY other surviving placeholder means the URL carries a secret
+    this system deliberately never wrote down — so the descriptor is dropped rather
+    than pushed. Sonarr would accept a half-dead URL, fail the fetch, and surface it
+    as a bad release, which reads as a broken indexer instead of the missing
+    credential it actually is.
+
+    Both encodings are checked: a placeholder in the PATH survives literally while
+    one in the QUERY is percent-encoded by urlencode."""
+    if not url:
+        return None
+    from urllib.parse import quote
+    out = str(url)
+    if indexer_api_key:
+        names = [_placeholder(n) for n in _REFILLABLE_NAMES] + [REDACTION_PLACEHOLDER]
+        for token in names:
+            for form in (token, quote(token, safe=""),
+                         quote(token, safe="").replace("%3A", "%3a")):
+                out = out.replace(form, indexer_api_key)
+    for probe in ("<redacted", "%3Credacted", "%3credacted"):
+        if probe in out:
+            return None
+    return out
+
+
+def push_descriptor(raw, *, events=HISTORY_GRAB_EVENTS) -> dict:
+    """A redacted ``POST /release/push`` descriptor built from *arr grab history — GLD-RST-08.
+
+    WHY THIS IS PURE AND SHARED. ``GLD-RST-02`` built this as a method on the Sonarr
+    step-down manager, wired to that ONE path. Every DELETE path needs it and Radarr
+    needs it too, and a service-to-service import is exactly the pressure that
+    produces a second, subtly different copy (**P-E**). The HTTP call stays in the
+    service adapter; only the projection lives here.
+
+    *raw* is the unmodified response body. Sonarr answers ``history?episodeId=`` with
+    a paged ``{records: [...]}`` envelope on some routes and a bare list on others;
+    Radarr's ``history/movie?movieId=`` returns a bare list. All three shapes are
+    tolerated rather than betting on one.
+
+    ``eventType`` is matched against BOTH the string form (``"grabbed"``) and the
+    integer form (``1``): the query string filters server-side with the int, but the
+    JSON body carries the string, and a caller that omits the query filter must still
+    get grabs only. An import / delete / rename row must never be mistaken for the
+    release that was taken.
+
+    Every URL is passed through :func:`redact_grab_url`, so nothing credential-shaped
+    reaches the archive. Returns ``{}`` — never raises, never partially — on any
+    unusable input: a missing descriptor degrades a future restore to an indexer
+    search, which is exactly what happens today, and it must never cost a deletion.
+    """
+    rows = raw.get("records") if isinstance(raw, dict) else raw
+    if not isinstance(rows, list) or not rows:
+        return {}
+    want = {_norm(e) for e in events} | {"1"}
+    grabs = [r for r in rows if isinstance(r, dict)
+             and (_norm(r.get("eventType")) in want or r.get("eventType") == 1)]
+    if not grabs:
+        return {}
+    grabs.sort(key=lambda r: str(r.get("date") or ""), reverse=True)
+    row = grabs[0]
+    data = row.get("data") if isinstance(row.get("data"), dict) else {}
+
+    out = {
+        "title":        row.get("sourceTitle"),
+        "protocol":     data.get("protocol") or row.get("protocol"),
+        "publish_date": data.get("publishedDate"),
+        "indexer":      data.get("indexer"),
+        "info_url":     redact_grab_url(data.get("nzbInfoUrl")),
+        "download_url": redact_grab_url(data.get("downloadUrl")),
+        # Torrents only, and the ONE durable identifier in the whole record: an
+        # infohash is content-addressed, so it stays valid for as long as a swarm
+        # exists. A usenet grab has no equivalent.
+        "info_hash":    data.get("torrentInfoHash") or data.get("infoHash"),
+        "grabbed_at":   row.get("date"),
+    }
+    return {k: v for k, v in out.items() if v}
+
+
+def push_descriptors_by_episode(raw, *, events=HISTORY_GRAB_EVENTS) -> dict:
+    """``{"S02E15": descriptor}`` from ONE series-wide history fetch — GLD-RST-08.
+
+    WHY SERIES-WIDE AND NOT PER-EPISODE. The parquet delete path carries
+    ``episode_file_id`` but NOT ``episodeId``, so ``history?episodeId=`` — the filter
+    the step-down path uses — is unavailable to it without a second lookup per row.
+    Fetching ``history?seriesId=&includeEpisode=true`` once per SERIES answers every
+    episode of that series in one call: on a 266-row prune spanning ~50 series that
+    is ~50 requests rather than 266.
+
+    Rows are keyed off the embedded ``episode`` object. A row without one is keyed by
+    ``episodeId`` instead so it is still retrievable, rather than being dropped — a
+    grab we cannot key is still evidence the grab happened.
+
+    Returns ``{}`` on any unusable input. Never raises.
+    """
+    rows = raw.get("records") if isinstance(raw, dict) else raw
+    if not isinstance(rows, list) or not rows:
+        return {}
+    buckets: dict = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        ep = r.get("episode") if isinstance(r.get("episode"), dict) else {}
+        key = episode_key(ep.get("seasonNumber"), ep.get("episodeNumber"))
+        if not key:
+            eid = r.get("episodeId")
+            key = f"id:{eid}" if eid is not None else None
+        if not key:
+            continue
+        buckets.setdefault(key, []).append(r)
+    out = {}
+    for key, group in buckets.items():
+        d = push_descriptor(group, events=events)
+        if d:
+            out[key] = d
+    return out
+
+
 def magnet_from_hash(info_hash, title=None, trackers=None) -> "str | None":
     """A ``magnet:`` URI rebuilt from a bare infohash — GLD-RST-04.
 
@@ -429,14 +758,10 @@ def push_payload(descriptor, *, indexer_api_key=None) -> "dict | None":
         return None
 
     def _refill(url):
-        if not url:
-            return None
-        if "<redacted>" not in url and "%3Credacted%3E" not in url:
-            return url
-        if not indexer_api_key:
-            return None
-        return (url.replace("%3Credacted%3E", indexer_api_key)
-                   .replace("<redacted>", indexer_api_key))
+        # GLD-RST-07: delegated to refill_grab_url, which understands the NAMED
+        # placeholders the v2 scrub emits. v1's bare <redacted> still refills, so
+        # every entry already on disk keeps working.
+        return refill_grab_url(url, indexer_api_key)
 
     magnet = magnet_from_hash(d.get("info_hash"), title=d.get("title"))
     dl = _refill(d.get("download_url"))

@@ -26,6 +26,7 @@ Storage
 
 from __future__ import annotations
 
+import re
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -76,7 +77,15 @@ from scripts.managers.machine_learning.lifecycle.restore_policy import (
     match_release,
     merge_ledger_entry,
     merge_release_records,
+    push_descriptor,
+    push_descriptors_by_episode,
     release_record,
+)
+from scripts.managers.machine_learning.space.deletion_log import (
+    deletion_record,
+    new_run_id,
+    split_by_kind,
+    to_jsonl,
 )
 from scripts.managers.machine_learning.lifecycle.stale_prune_policy import (
     restore_cooldown_active,
@@ -2623,6 +2632,10 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         done: set[int] = set()
         deleted_fids: set[int] = set()      # files actually removed (would-be in dry_run)
         restore_add: dict[str, dict] = {}   # series_id(str) -> {episodes:[[s,e]], ts}
+        # GLD-RST-08 — permanent record; flushed once after the loop.
+        _archive: list = []
+        if not getattr(self, "_deletion_run_id", None):
+            self._deletion_run_id = new_run_id()
         _del_rows: list[list] = []          # per-file movements for the end-of-run summary
         for idx in df.index:
             fid = df.at[idx, "episode_file_id"]
@@ -2657,23 +2670,58 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
             done.add(fid)
             size = float(df.at[idx, "size_bytes"]) if ("size_bytes" in df.columns and pd.notna(df.at[idx, "size_bytes"])) else 0.0
             title = df.at[idx, "series_title"] if "series_title" in df.columns else f"series {sid}"
+            _why = None
+            if "planned_reason" in df.columns and pd.notna(df.at[idx, "planned_reason"]):
+                _why = str(df.at[idx, "planned_reason"])
+            _why = _why or "coordinator pool"
             if effective_dry_run(self.dry_run, self.global_cache):    # also dry when backup gate disarmed
                 self.logger.log_info(f"  🗑️ [dry_run] Would delete episode file: '{title}' (fid={fid}, {self._fmt_bytes(size)})")
                 _del_rows.append([str(title), _se, str(fid), self._fmt_bytes(size), "would delete"])
                 stats["deleted"] += 1
                 stats["bytes_freed"] += size
                 deleted_fids.add(fid)
+                self._archive_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    season=sn, episode=en, disposition="would-delete",
+                    reason=_why, size_bytes=size, file_id=fid, source="coordinator")
                 continue
+            _del_ok = False
             try:
-                self.sonarr_api._make_request(instance, f"episodefile/{fid}", method="DELETE")
-                stats["deleted"] += 1
-                stats["bytes_freed"] += size
-                deleted_fids.add(fid)
-                self.logger.log_info(f"  🗑️ Deleted episode file: '{title}' (fid={fid}, {self._fmt_bytes(size)})")
-                _del_rows.append([str(title), _se, str(fid), self._fmt_bytes(size), "deleted"])
+                # CHECKED (GLD-RST-20) — see `_do_delete_marked_files`. `_make_request`
+                # swallows HTTP failures and returns the fallback, so the old bare
+                # try/except could not catch a 500 and every failed DELETE counted as
+                # freed bytes AND wrote a restore-ledger entry for a file still on disk.
+                _del_ok = bool(self.sonarr_api._make_request(
+                    instance, f"episodefile/{fid}", method="DELETE"))
             except Exception as e:
-                self.logger.log_warning(f"  ⚠️ Episode-file delete failed for '{title}' (fid={fid}): {e}")
+                self.logger.log_warning(f"  ⚠️ Episode-file delete raised for '{title}' (fid={fid}): {e}")
+            if not _del_ok:
+                self.logger.log_warning(
+                    f"  ⚠️ Episode-file delete FAILED for '{title}' (fid={fid}) — "
+                    f"file KEPT; retries next run.")
+                _del_rows.append([str(title), _se, str(fid), self._fmt_bytes(size), "FAILED"])
+                self._archive_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    season=sn, episode=en, disposition="failed",
+                    reason=f"{_why} | DELETE returned falsy", size_bytes=size,
+                    file_id=fid, source="coordinator", fetch_descriptor=False)
                 stats["failed"] += 1
+                continue
+            stats["deleted"] += 1
+            stats["bytes_freed"] += size
+            deleted_fids.add(fid)
+            self.logger.log_info(f"  🗑️ Deleted episode file: '{title}' (fid={fid}, {self._fmt_bytes(size)})")
+            _del_rows.append([str(title), _se, str(fid), self._fmt_bytes(size), "deleted"])
+            self._archive_deletion(
+                _archive, instance=instance, row=df.loc[idx], title=title,
+                season=sn, episode=en, disposition="deleted",
+                reason=_why, size_bytes=size, file_id=fid, source="coordinator")
+
+        _archived = self._flush_deletion_archive(_archive)
+        if _archived:
+            self.logger.log_info(
+                f"  \U0001f5c3\ufe0f  archived {_archived} deletion row(s) → "
+                f"logs/deletions/deletions.jsonl (run {self._deletion_run_id})")
 
         _rs = getattr(self.global_cache, "run_summary", None) if self.global_cache else None
         if _rs is not None and _del_rows:
@@ -5577,6 +5625,476 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
     #      are armed. → SonarrEpisodeRetentionManager (merges with §6, §10, §14)
     # ══════════════════════════════════════════════════════════════════════════════
 
+    def _series_grab_index(self, instance, series_id):
+        """``{"S01E02": descriptor}`` for one series, fetched once per run.
+
+        Sonarr's grab history is FINITE, so the descriptor is captured at the moment
+        of destruction rather than hoped for later. Memoised per (instance, series)
+        because a prune deletes many episodes of the same show and the history call
+        answers all of them at once.
+
+        Best-effort by construction: every failure path returns ``{}`` and the caller
+        proceeds, because losing the descriptor must never cost the deletion it
+        documents. A failed fetch is cached as empty so one bad series does not get
+        re-requested once per episode.
+
+        RUNS UNDER ``dry_run``. This is a read-only ``GET`` — it destroys nothing and
+        mutates nothing — and skipping it made the descriptor path the ONE thing a
+        dry_run could not prove, which is backwards: it is also the path most likely to
+        be wrong, since it depends on Sonarr honouring ``includeEpisode=true``. A
+        disarmed run must not WRITE; reading is how the operator verifies the archive
+        before arming consent.
+        """
+        if series_id is None:
+            return {}
+        try:
+            sid = int(series_id)
+        except (TypeError, ValueError):
+            return {}
+        cache = getattr(self, "_grab_index_cache", None)
+        if cache is None:
+            cache = self._grab_index_cache = {}
+        ck = (instance, sid)
+        if ck in cache:
+            return cache[ck]
+        idx = {}
+        try:
+            raw = self.sonarr_api._make_request(
+                instance,
+                f"history?seriesId={sid}&eventType=1&includeEpisode=true&pageSize=500",
+                fallback=None)
+            idx = push_descriptors_by_episode(raw) or {}
+        except Exception:
+            idx = {}
+        cache[ck] = idx
+        return idx
+
+    def _grab_descriptor(self, instance, series_id, season, episode):
+        """The redacted ``release/push`` descriptor for one episode, or ``{}``."""
+        try:
+            key = episode_key(season, episode)
+        except Exception:
+            return {}
+        if not key:
+            return {}
+        return self._series_grab_index(instance, series_id).get(key) or {}
+
+    _TVDB_IN_PATH = re.compile(r"\{tvdb-(\d+)\}")
+
+    @classmethod
+    def _tvdb_from_path(cls, path):
+        """The tvdb id out of a TRaSH-style folder name, or None.
+
+        ``.../Ted Lasso (2020) {tvdb-383203}/Season 01/...`` -> ``383203``. Zero
+        dependencies and present on every path in this library, which is why it is the
+        FIRST source rather than a fallback: the series-record join it replaces turned
+        out to depend on a broken accessor (see :meth:`_series_meta`)."""
+        m = cls._TVDB_IN_PATH.search(str(path or ""))
+        if not m:
+            return None
+        try:
+            return int(m.group(1))
+        except (TypeError, ValueError):
+            return None
+
+    def _series_meta(self, instance, series_id):
+        """``{pid, path, tvdb_id, title}`` for one series, or ``{}`` — GLD-RST-08.
+
+        WHY THIS EXISTS. ``episode_files`` carries no ``quality_profile_id``: on the TV
+        side the quality profile belongs to the SERIES, so the deletion record has to
+        join it in. The series library is already cached, so this costs no API call —
+        which matters because it is the only way pid reaches the ``dry_run`` and
+        ``marked-not-consented`` paths, neither of which may touch the network.
+
+        ⚠️ TWO SOURCES, BECAUSE THE OBVIOUS ONE IS BROKEN.
+        ``SonarrStorageLibraryManager.get_series_cache`` calls
+        ``global_cache.load_cache(...)``, and **no such method exists** on
+        ``GlobalCacheManager`` or ``BaseManager`` — its surface is
+        ``get``/``get_json``/``get_or_generate_cache``. It therefore raises
+        ``AttributeError`` on every call (``GLD-SON-27``). The 2026-08-23 22:00 run
+        wrote 271 rows with ``pid`` and ``tvdb_id`` absent from every one, and said
+        nothing, because this method swallowed it. The direct ``global_cache.get`` read
+        is tried FIRST and the manager kept only as a fallback for when that defect is
+        fixed.
+
+        Failures are now LOGGED ONCE per instance rather than swallowed. A silent
+        degradation is what cost the previous run.
+        """
+        if series_id is None:
+            return {}
+        try:
+            sid = int(series_id)
+        except (TypeError, ValueError):
+            return {}
+        idx = getattr(self, "_series_meta_index", None)
+        if idx is None or idx.get("__inst__") != instance:
+            idx = {"__inst__": instance}
+            records, how, err = [], None, None
+            try:
+                raw = self.global_cache.get(f"sonarr/{instance}/library") if self.global_cache else None
+                if isinstance(raw, dict):
+                    records, how = list(raw.values()), "global_cache"
+                elif isinstance(raw, list):
+                    records, how = raw, "global_cache"
+            except Exception as e:
+                err = e
+            if not records:
+                try:
+                    lib = self.registry.get("manager", "SonarrStorageLibraryManager") if self.registry else None
+                    cache = lib.get_series_cache(instance) if lib else {}
+                    if isinstance(cache, dict):
+                        records, how = list(cache.values()), "library_manager"
+                    elif isinstance(cache, list):
+                        records, how = cache, "library_manager"
+                except Exception as e:
+                    err = err or e
+            for s in records:
+                if not isinstance(s, dict):
+                    continue
+                try:
+                    idx[int(s.get("id"))] = {
+                        "pid": s.get("qualityProfileId"),
+                        "path": s.get("path"),
+                        "tvdb_id": s.get("tvdbId"),
+                        "title": s.get("title"),
+                    }
+                except (TypeError, ValueError):
+                    continue
+            self._series_meta_index = idx
+            if len(idx) <= 1:
+                self.logger.log_warning(
+                    f"  ⚠\ufe0f series metadata unavailable for '{instance}' "
+                    f"({type(err).__name__ + ': ' + str(err) if err else 'cache empty'}) — "
+                    f"deletion rows will carry no quality-profile id. See GLD-SON-27.")
+            else:
+                self.logger.log_debug(
+                    f"  series metadata for '{instance}': {len(idx) - 1} series via {how}")
+        return idx.get(sid) or {}
+
+    def _episode_index(self, instance, series_id):
+        """``{episodeFileId: rec}`` and ``{(season, episode): rec}`` for one series.
+
+        Sonarr's own ``episodeId`` is NOT on the parquet — ``episode_files`` carries
+        ``episode_file_id`` only — but the episode records are already cached per series
+        at ``sonarr/<instance>/episodes/by_series/<sid>``, as plain (uncompressed) JSON.
+        Unlike the series LIBRARY, that key resolves cleanly through
+        ``global_cache.get`` (``build_cache_path`` maps it to ``by_series/<sid>.json``),
+        so this costs no API call and works on the ``dry_run`` and
+        ``marked-not-consented`` paths.
+
+        Two indexes because they fail in different places. ``episodeFileId`` is the
+        DIRECT link — it is the same id the delete path is about to destroy — but it is
+        ``0`` on every episode with no file, so it cannot resolve a row whose file is
+        already gone. ``(season, episode)`` always resolves but is only as good as the
+        parquet's indices. Measured on Ted Lasso: both hit 33/33 marked rows with zero
+        disagreement, so file_id is preferred and (s,e) is the fallback.
+
+        Memoised per (instance, series). Returns ``({}, {})`` on any failure.
+        """
+        try:
+            sid = int(series_id)
+        except (TypeError, ValueError):
+            return {}, {}
+        cache = getattr(self, "_episode_index_cache", None)
+        if cache is None:
+            cache = self._episode_index_cache = {}
+        ck = (instance, sid)
+        if ck in cache:
+            return cache[ck]
+        by_fid, by_se = {}, {}
+        try:
+            raw = self.global_cache.get(
+                f"sonarr/{instance}/episodes/by_series/{sid}") if self.global_cache else None
+            records = raw.values() if isinstance(raw, dict) else (raw or [])
+            for e in records:
+                if not isinstance(e, dict) or e.get("id") is None:
+                    continue
+                try:
+                    fid = int(e.get("episodeFileId") or 0)
+                except (TypeError, ValueError):
+                    fid = 0
+                if fid:
+                    by_fid[fid] = e
+                try:
+                    by_se[(int(e.get("seasonNumber")), int(e.get("episodeNumber")))] = e
+                except (TypeError, ValueError):
+                    pass
+        except Exception as e:
+            self.logger.log_debug(f"  episode index unavailable for series {sid} ({e})")
+        cache[ck] = (by_fid, by_se)
+        return cache[ck]
+
+    def _episode_facts(self, instance, series_id, season, episode, file_id):
+        """``{episode_id, episode_title, air_date}`` for one episode, or ``{}``."""
+        by_fid, by_se = self._episode_index(instance, series_id)
+        rec = None
+        try:
+            if file_id is not None:
+                rec = by_fid.get(int(file_id))
+        except (TypeError, ValueError):
+            rec = None
+        if rec is None:
+            try:
+                rec = by_se.get((int(season), int(episode)))
+            except (TypeError, ValueError):
+                rec = None
+        if not isinstance(rec, dict):
+            return {}
+        out = {"episode_id": rec.get("id"),
+               "episode_title": rec.get("title"),
+               "air_date": rec.get("airDateUtc") or rec.get("airDate")}
+        return {k: v for k, v in out.items() if v is not None}
+
+    def _profile_names(self, instance):
+        """``{profile_id: profile_name}`` for one instance, memoised. ``{}`` on failure.
+
+        A bare ``pid: 3`` is not something an operator can act on months later; the
+        cached profile list turns it into ``HD-720p``. Plain JSON at
+        ``sonarr/<instance>/profiles``, so it resolves through ``global_cache.get`` and
+        costs no API call — unlike the gzip-sharded series library.
+        """
+        cache = getattr(self, "_profile_name_cache", None)
+        if cache is None:
+            cache = self._profile_name_cache = {}
+        if instance in cache:
+            return cache[instance]
+        names = {}
+        try:
+            raw = self.global_cache.get(f"sonarr/{instance}/profiles") if self.global_cache else None
+            records = raw.values() if isinstance(raw, dict) else (raw or [])
+            for p in records:
+                if isinstance(p, dict) and p.get("id") is not None and p.get("name"):
+                    try:
+                        names[int(p["id"])] = str(p["name"])
+                    except (TypeError, ValueError):
+                        continue
+        except Exception as e:
+            self.logger.log_debug(f"  profile names unavailable for '{instance}' ({e})")
+        cache[instance] = names
+        return names
+
+    def _archive_deletion(self, sink, *, instance, row, title, season, episode,
+                          disposition, reason=None, size_bytes=None, file_id=None,
+                          source=None, fetch_descriptor=True):
+        """Append one deletion row to *sink* — GLD-RST-08.
+
+        Records WHAT was destroyed (title/season/episode), WHY (``reason``), FROM
+        WHERE (``path``, and the library ``class`` derived from it) and HOW TO GET IT
+        BACK (the parquet-side release identity plus the redacted grab descriptor).
+
+        Never raises. A diagnostic that can abort the pass it documents is worse than
+        no diagnostic — but a swallowed failure here means a permanently
+        unrecoverable file, so the miss is logged rather than silently dropped.
+        """
+        try:
+            get = (lambda k: row.get(k)) if hasattr(row, "get") else (lambda k: None)
+            rel = release_record(row) if row is not None else None
+            meta = self._series_meta(instance, get("series_id"))
+            _pid = get("quality_profile_id") or meta.get("pid")
+            _pname = get("quality_profile_name")
+            if not _pname and _pid is not None:
+                try:
+                    _pname = self._profile_names(instance).get(int(_pid))
+                except (TypeError, ValueError):
+                    _pname = None
+            facts = self._episode_facts(instance, get("series_id"), season, episode, file_id)
+            push = (self._grab_descriptor(instance, get("series_id"), season, episode)
+                    if fetch_descriptor else {})
+            sink.append(deletion_record(
+                run_id=self._deletion_run_id,
+                media="episode",
+                instance=instance,
+                title=title,
+                season=season,
+                episode=episode,
+                disposition=disposition,
+                reason=reason,
+                path=get("path") or meta.get("path"),
+                file_id=file_id,
+                series_id=get("series_id"),
+                tvdb_id=(get("tvdb_id") or meta.get("tvdb_id")
+                         or self._tvdb_from_path(get("path"))),
+                quality_profile_id=_pid,
+                quality_profile_name=_pname,
+                quality_name=get("quality_name"),
+                resolution=get("resolution"),
+                size_bytes=size_bytes,
+                score=get("watchability_score"),
+                release=rel,
+                push=push or None,
+                source=source,
+                **facts,
+            ))
+        except Exception as e:
+            try:
+                self.logger.log_warning(
+                    f"  \u26a0\ufe0f deletion archive row FAILED for '{title}' ({e}) — "
+                    f"the file is still being deleted, but this row will not be recorded.")
+            except Exception:
+                pass
+
+    def _archive_marked_not_consented(self, instance, df=None):
+        """Record the rows this run WOULD have deleted, when consent is withheld.
+
+        Deliberately cheap and side-effect free: no mutation of any kind, because a
+        disabled pass must stay disabled. It DOES fetch grab descriptors — that is a
+        read-only ``GET`` costing roughly one request per SERIES (memoised), and it is
+        what makes the pending snapshot actionable: you can see what is re-acquirable
+        BEFORE consenting, rather than discovering after 271 files are gone. Reading is
+        not the thing consent gates.
+
+        ``df`` is passed in by the choke point inside ``_do_delete_marked_files``,
+        which already holds the frame it just evaluated — re-loading there would both
+        cost a parquet read and risk archiving a DIFFERENT set of rows than the ones
+        the gate actually saw. It falls back to ``self.load`` for the standalone
+        wrapper, which gates before loading anything.
+
+        Idempotent per (instance, run). Two gates gate the same rows — the choke
+        point and the standalone wrapper — and although only one can fire in a given
+        call chain, both can be reached in one RUN by different callers. Without this
+        guard that would append the same 271 rows twice to an append-only file that is
+        never rewritten.
+
+        Never raises: this is a courtesy record on a path whose whole point is that it
+        does nothing.
+        """
+        try:
+            seen = getattr(self, "_notconsent_archived", None)
+            if seen is None:
+                seen = self._notconsent_archived = set()
+            if instance in seen:
+                return
+            if df is None:
+                df = self.load(instance)
+            if df is None or "marked_for_deletion" not in df.columns:
+                return
+            marked = df[df["marked_for_deletion"].infer_objects(copy=False)
+                        .fillna(False).astype(bool)]
+            if marked.empty:
+                return
+            seen.add(instance)
+            if not getattr(self, "_deletion_run_id", None):
+                self._deletion_run_id = new_run_id()
+            sink: list = []
+            for idx in marked.index:
+                row = df.loc[idx]
+                sz = row.get("size_bytes")
+                self._archive_deletion(
+                    sink, instance=instance, row=row,
+                    title=row.get("series_title") or f"series {row.get('series_id')}",
+                    season=row.get("season_number"), episode=row.get("episode_number"),
+                    disposition="marked-not-consented",
+                    reason=deletions_disabled_reason(self.config),
+                    size_bytes=float(sz) if pd.notna(sz) else None,
+                    file_id=row.get("episode_file_id"),
+                    source="grace_expiry", fetch_descriptor=True)
+            n = self._flush_deletion_archive(sink)
+            if n:
+                self.logger.log_info(
+                    f"  \U0001f5c3\ufe0f  archived {n} marked-but-not-consented row(s) → "
+                    f"logs/deletions/pending.jsonl (run {self._deletion_run_id})")
+            else:
+                self.logger.log_warning(
+                    f"  ⚠\ufe0f  {len(marked)} marked row(s) were NOT archived — the deletion "
+                    f"record for '{instance}' is missing for this run.")
+        except Exception as e:
+            try:
+                self.logger.log_warning(
+                    f"  ⚠\ufe0f marked-not-consented archive skipped ({e}) — nothing was deleted, "
+                    f"but this run has no record of what was queued.")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _flush_deletion_archive(sink):
+        """Persist this pass's rows, routed by KIND. Returns rows written.
+
+        Events (``deleted`` / ``failed``) append to the permanent archive; state rows
+        (``marked-not-consented`` / ``would-delete``) replace the pending snapshot.
+        Mixing them was the accumulation bug — see ``deletion_log.STATE_DISPOSITIONS``.
+
+        ONE write per kind per pass rather than per row: an append per deletion would
+        fsync 271 times on a heavy prune, and ``parse_jsonl`` already tolerates a torn
+        final line.
+        """
+        if not sink:
+            return 0
+        try:
+            from scripts.support.utilities.logger.logger import (
+                append_deletions, write_pending_deletions,
+            )
+            events, states = split_by_kind(sink)
+            n = append_deletions(to_jsonl(events)) if events else 0
+            # Called even when empty: a run that clears the queue must not leave a
+            # stale snapshot claiming rows are still pending.
+            n += write_pending_deletions(to_jsonl(states))
+            return n
+        except Exception:
+            return 0
+
+    def _record_restore_entry(self, restore_add, df, idx, sn, en, ts_iso):
+        """Add one deleted episode to the restore set — GLD-RST-15.
+
+        Mirrors `delete_selected_episode_files` exactly, including ledger v2 release
+        identity, so `restore_recovered_episode_deletions` and `_targeted_restore`
+        treat entries from both paths identically.
+
+        The release record is what makes restore TARGETED rather than blind: the
+        operator's chosen strategy is search-based recovery (`match_release` on
+        scene_name + group + quality + resolution), because Sonarr MASKS indexer
+        api keys — `GET /indexer` returns `apiKey` as ``********`` — so an archived
+        download URL can never be refilled from Sonarr's own config. That makes this
+        block the entire restore capability, not a nicety.
+
+        Never raises: a bookkeeping failure must not abort a delete pass mid-flight.
+        """
+        try:
+            sid = df.at[idx, "series_id"] if "series_id" in df.columns else None
+            if pd.isna(sid) or pd.isna(sn) or pd.isna(en):
+                return
+            ent = restore_add.setdefault(str(int(sid)), {"episodes": [], "ts": ts_iso})
+            pair = [int(sn), int(en)]
+            if pair not in ent["episodes"]:
+                ent["episodes"].append(pair)
+            _rr = release_record({f: df.at[idx, f] for f in RELEASE_FIELDS
+                                  if f in df.columns})
+            _ek = episode_key(sn, en)
+            if _rr and _ek:
+                ent.setdefault("releases", {})[_ek] = _rr
+        except Exception as e:
+            try:
+                self.logger.log_warning(
+                    f"  ⚠\ufe0f restore-set entry FAILED for season {sn} episode {en} ({e}) — "
+                    f"the file is deleted and will NOT be automatically restorable.")
+            except Exception:
+                pass
+
+    def _persist_restore_set(self, instance, restore_add):
+        """Merge this pass's restore entries into `deleted_episodes` — GLD-RST-15.
+
+        Skipped under dry_run: tracking files that were never removed would make the
+        recovery pass re-grab things still on disk.
+
+        `merge_ledger_entry` tolerates BOTH schema versions on either side, so a v1
+        record already written by the coordinator path keeps working and simply gains
+        a releases map from here on.
+        """
+        if not restore_add or not self.global_cache or self.dry_run:
+            return 0
+        dkey = self._DELETED_EPISODES_KEY.format(inst=instance)
+        try:
+            dset = self.global_cache.get(dkey)
+            dset = dset if isinstance(dset, dict) else {}
+            for sk, ent in restore_add.items():
+                dset[sk] = merge_ledger_entry(dset.get(sk), ent)
+            self.global_cache.set(dkey, dset)
+            return len(restore_add)
+        except Exception as e:
+            self.logger.log_error(
+                f"[EpisodeFiles] ⚠\ufe0f Failed to persist episode restore-set ({dkey}): {e} — "
+                f"{len(restore_add)} series' deletions are NOT restorable.")
+            return 0
+
     @timeit("_do_delete_marked_files")
     def _do_delete_marked_files(
         self, instance: str, df: pd.DataFrame
@@ -5634,6 +6152,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"[EpisodeFiles] deletions DISABLED — {deletions_disabled_reason(self.config)}; "
                 f"leaving {int(marked_mask.sum())} marked row(s) untouched."
             )
+            # GLD-RST-08. THIS is the live gate — `sync_from_tautulli` calls
+            # `_do_delete_marked_files` directly, so the standalone wrapper's gate is
+            # never reached on the real path. Archiving only there produced a run with
+            # 271 rows held back and no deletions.jsonl at all. `df` is passed in
+            # because this gate already holds the frame it evaluated.
+            self._archive_marked_not_consented(instance, df=df)
             return df, stats
 
         # Pre-compute protected file IDs (defence-in-depth mirror of _apply_grace_period).
@@ -5671,6 +6195,22 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
         # Multi-episode files share one episodeFileId across several episode
         # rows; coalesce so each physical file is deleted (and counted) once.
         attempted_fids: set[int] = set()
+
+        # GLD-RST-08 — the permanent record of what this pass destroys. Accumulated
+        # here and flushed ONCE at the end rather than appended per row.
+        _archive: list = []
+        if not getattr(self, "_deletion_run_id", None):
+            self._deletion_run_id = new_run_id()
+
+        # GLD-RST-15 — THE RESTORE LEDGER, which this pass did not write.
+        # `restore_recovered_episode_deletions` reads `deleted_episodes`, NOT the
+        # deletion archive: the archive is a forensic record, the ledger is the
+        # mechanism. Only `delete_selected_episode_files` fed it, so every file this
+        # path removed was permanently outside automated restore — 273 of them queued
+        # on the 2026-08-24 run. Same `restore_add` shape and same `merge_ledger_entry`
+        # merge the coordinator path uses, so one ledger serves both.
+        restore_add: dict[str, dict] = {}
+        _now_iso = datetime.now(tz=timezone.utc).isoformat()
 
         for idx in df.index[marked_mask]:
             stats["checked"] += 1
@@ -5877,27 +6417,64 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     f"  🗑️ [dry_run] Would delete: '{title}' {sn_str}{en_str} "
                     f"({self._fmt_bytes(_sz_f)}) — {reason}"
                 )
+                self._archive_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    season=sn, episode=en, disposition="would-delete",
+                    reason=reason, size_bytes=_sz_f, file_id=fid,
+                    source="grace_expiry")
                 stats["deleted"] += 1
                 continue
 
+            _del_ok = False
             try:
-                self.sonarr_api._make_request(
+                # CHECKED (GLD-RST-20). `_make_request` SWALLOWS HTTP failures: it logs
+                # a warning and returns the fallback rather than raising, so the old
+                # bare `try/except` around this call was DEAD protection for every 500
+                # — the identical P-A shape `GLD-SON-23` fixed on the step-down path.
+                # Under the 2026-08-24 Sonarr SQLite outage ('unable to open database
+                # file') every DELETE would have returned the fallback and this pass
+                # would have booked 273 PHANTOM deletions: archive rows and
+                # restore-ledger entries for files still on disk, and a recovery pass
+                # that re-grabs 273 episodes it already has. A successful DELETE
+                # returns True under the base contract.
+                _del_ok = bool(self.sonarr_api._make_request(
                     instance,
                     f"episodefile/{fid}",
                     method="DELETE",
-                )
-                stats["bytes_freed"] += _sz_f
-                self.logger.log_info(
-                    f"  🗑️ Deleted: '{title}' {sn_str}{en_str} "
-                    f"({self._fmt_bytes(_sz_f)}) — {reason}"
-                )
-                stats["deleted"] += 1
+                ))
             except Exception as e:
                 self.logger.log_warning(
-                    f"  ⚠️ Delete failed for '{title}' {sn_str}{en_str} "
+                    f"  ⚠️ Delete raised for '{title}' {sn_str}{en_str} "
                     f"(episodeFileId={fid}): {e}"
                 )
+            if not _del_ok:
+                self.logger.log_warning(
+                    f"  ⚠️ Delete FAILED for '{title}' {sn_str}{en_str} "
+                    f"(episodeFileId={fid}) — file KEPT, mark kept, retries next run."
+                )
+                self._archive_deletion(
+                    _archive, instance=instance, row=df.loc[idx], title=title,
+                    season=sn, episode=en, disposition="failed",
+                    reason=f"{reason} | DELETE returned falsy", size_bytes=_sz_f,
+                    file_id=fid, source="grace_expiry",
+                    fetch_descriptor=False)
                 stats["failed"] += 1
+                continue
+            stats["bytes_freed"] += _sz_f
+            self.logger.log_info(
+                f"  🗑️ Deleted: '{title}' {sn_str}{en_str} "
+                f"({self._fmt_bytes(_sz_f)}) — {reason}"
+            )
+            self._archive_deletion(
+                _archive, instance=instance, row=df.loc[idx], title=title,
+                season=sn, episode=en, disposition="deleted",
+                reason=reason, size_bytes=_sz_f, file_id=fid,
+                source="grace_expiry")
+            # Restore ledger (GLD-RST-15). Only reached once the DELETE is CONFIRMED —
+            # a file still on disk must never enter the restore set, or the next
+            # recovery pass re-grabs something already present.
+            self._record_restore_entry(restore_add, df, idx, sn, en, _now_iso)
+            stats["deleted"] += 1
 
         if stats["checked"]:
             prefix = "[dry_run] " if self.dry_run else ""
@@ -5916,6 +6493,8 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                     ["shared-file guard",  stats["skipped_shared_file"]],
                     ["no file id",         stats["skipped_no_file"]],
                     ["multi-ep coalesced", stats["coalesced_multiep"]],
+                    ["archived rows",      self._flush_deletion_archive(_archive)],
+                    ["restore-set series", self._persist_restore_set(instance, restore_add)],
                 ],
                 title=f"🗑️ {prefix}Sonarr deletion pass '{instance}' ({verb} {self._fmt_bytes(stats['bytes_freed'])})",
                 caption="Per-pass outcome of the Sonarr file deletion sweep: how many "
@@ -6002,6 +6581,12 @@ class SonarrCacheEpisodeFilesManager(BaseManager, ComponentManagerMixin):
                 f"[EpisodeFiles] deletions DISABLED — {deletions_disabled_reason(self.config)}; "
                 "skipping the grace-marked episode delete pass."
             )
+            # GLD-RST-08. The gate used to return here having recorded NOTHING, so
+            # "266 rows were marked and consent was withheld" existed only as a count
+            # in one log line that rotates away in six days — nothing anywhere said
+            # WHICH 266. They are archived as `marked-not-consented`: no API call, no
+            # descriptor fetch, no mutation. Purely a record of what was queued.
+            self._archive_marked_not_consented(instance)
             return {"checked": 0, "deleted": 0, "failed": 0, "purged": 0,
                     "skipped_disabled": True}
         df = self.load(instance)

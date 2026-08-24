@@ -55,6 +55,7 @@ from scripts.managers.machine_learning.space.downgrade_planner import plan_serie
 from scripts.managers.machine_learning.lifecycle.restore_policy import (
     episode_key,
     merge_ledger_entry,
+    redact_grab_url,
     release_record,
 )
 from scripts.managers.machine_learning.space.reclaim_ledger import (
@@ -181,24 +182,21 @@ class SonarrSpacePressureManager(BaseManager, ComponentManagerMixin):
 
     # ---- GLD-RST-02 helpers -------------------------------------------------
     @staticmethod
-    def _redact_grab_url(url, secret_keys) -> "str | None":
-        """*url* with every secret-bearing query param blanked to ``<redacted>``.
+    def _redact_grab_url(url, secret_keys=None) -> "str | None":
+        """*url* with every credential-shaped component replaced by a named placeholder.
 
-        Returns None for anything unparseable rather than storing a half-scrubbed
-        string: a URL we cannot confidently redact is one we must not persist.
+        GLD-RST-07: delegates to ``lifecycle.restore_policy.redact_grab_url``. The
+        implementation moved because its INVERSE (``push_payload``'s refill) already
+        lived there, and Radarr's delete path needs the same scrub — a service-to-
+        service import is exactly the pressure that produces a second, subtly
+        different copy (P-E).
+
+        ``secret_keys`` is accepted and IGNORED. The pure function allowlists inert
+        params instead of denylisting known-secret ones, so there is no key set to
+        pass; the parameter is kept so this signature stays call-compatible.
+        Returns None for anything unparseable — that contract is unchanged.
         """
-        if not url:
-            return None
-        try:
-            from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-            p = urlparse(str(url))
-            if not p.scheme or not p.netloc:
-                return None
-            qs = [(k, "<redacted>" if k.lower() in secret_keys else v)
-                  for k, v in parse_qsl(p.query, keep_blank_values=True)]
-            return urlunparse(p._replace(query=urlencode(qs)))
-        except Exception:
-            return None
+        return redact_grab_url(url)
 
     def _push_descriptor(self, instance, eid) -> dict:
         """The ``POST /release/push`` descriptor for the file about to be destroyed.

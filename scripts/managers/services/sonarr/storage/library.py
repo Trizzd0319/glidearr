@@ -1,3 +1,5 @@
+import gzip
+import json
 import shutil
 
 from scripts.managers.factories.base_manager import BaseManager
@@ -34,10 +36,92 @@ class SonarrStorageLibraryManager(BaseManager, ComponentManagerMixin):
     @LoggerManager().log_function_entry
     @timeit("get_series_cache")
     def get_series_cache(self, instance: str) -> dict:
+        """``{series_id: series_record}`` for one instance — GLD-SON-27.
+
+        ⚠️ THIS METHOD NEVER WORKED. It previously read::
+
+            key  = f"{Paths.sonarr.SONARR_LIBRARY}.{resolved_instance}"
+            data = self.global_cache.load_cache(key) or {}
+
+        and both halves were broken:
+
+        1. **``load_cache`` does not exist.** ``GlobalCacheManager``'s surface is
+           ``get`` / ``get_json`` / ``set_json`` / ``json_exists`` /
+           ``get_or_generate_cache`` / ``format_cache_key``, and ``BaseManager``
+           defines no ``load_cache`` and no ``__getattr__`` delegation. Every call
+           raised ``AttributeError``, and every caller here wraps in a broad
+           ``except`` or a ``or {}``, so it degraded to "library is empty" in silence.
+        2. **The ``<instance>`` placeholder was never substituted.** The template is
+           ``"sonarr/<instance>/library"`` and this appended ``.{instance}`` instead of
+           replacing, yielding ``"sonarr/<instance>/library.sonarr-720"``. Every other
+           call site uses ``.replace("<instance>", instance)`` — compare
+           ``key_builder.build_future_episodes_cache_key``.
+
+        Found because the deletion archive (``GLD-RST-08``) joined pid/tvdbId through
+        here and wrote 271 rows with both fields absent from every one.
+
+        **THE LIBRARY IS SHARDED, so there is no single key to read.** It is stored one
+        key per title-initial — ``sonarr/<instance>/library/<letter>`` — which lands on
+        disk as ``library/a.json.gz``, ``library/z.json.gz`` and so on. The cache layer
+        does no sharding of its own and ``json_handler.load_json`` opens plain text, so
+        a compressed shard cannot be read through ``global_cache.get`` at all. This
+        unions the shards directly, handling both ``.json`` and ``.json.gz``.
+
+        Keyed by ``str(id)``. Every consumer in this module iterates ``.values()`` and
+        none does a key lookup, so the key type is free; a string keeps it JSON-safe.
+        One bad shard is skipped with a warning rather than failing the whole read —
+        a partial library is far better than none for the guard paths that use it.
+        """
         resolved_instance = self.manager.resolve_instance(instance)
-        key = f"{Paths.sonarr.SONARR_LIBRARY}.{resolved_instance}"
-        data = self.global_cache.load_cache(key) or {}
-        self.logger.log_debug(f"📦 Loaded series cache for {resolved_instance}: {len(data)} entries")
+        base_key = Paths.sonarr.SONARR_LIBRARY.replace("<instance>", resolved_instance)
+
+        data: dict = {}
+        root = None
+        try:
+            root = self.global_cache.key_builder.get_base_directory().joinpath(*base_key.split("/"))
+        except Exception as e:
+            self.logger.log_warning(f"⚠️ Could not resolve series-cache directory for "
+                                    f"{resolved_instance}: {e}")
+
+        if root is not None and root.is_dir():
+            for shard in sorted(root.iterdir()):
+                if not shard.is_file() or shard.name.endswith(".last_updated"):
+                    continue
+                try:
+                    if shard.suffix == ".gz":
+                        with gzip.open(shard, "rt", encoding="utf-8") as fh:
+                            payload = json.load(fh)
+                    elif shard.suffix == ".json":
+                        with open(shard, "r", encoding="utf-8") as fh:
+                            payload = json.load(fh)
+                    else:
+                        continue
+                except Exception as e:
+                    self.logger.log_warning(f"⚠️ Skipping unreadable series shard "
+                                            f"{shard.name} for {resolved_instance}: {e}")
+                    continue
+                records = payload.values() if isinstance(payload, dict) else (payload or [])
+                for series in records:
+                    if isinstance(series, dict) and series.get("id") is not None:
+                        data[str(series["id"])] = series
+
+        if not data:
+            # Legacy single-key layout, for any deployment that never sharded.
+            try:
+                legacy = self.global_cache.get(base_key)
+                if isinstance(legacy, dict) and legacy:
+                    data = legacy
+            except Exception:
+                pass
+
+        if not data:
+            self.logger.log_warning(
+                f"⚠️ Series cache for {resolved_instance} is EMPTY — looked in "
+                f"{root}. Guards and joins that depend on series records will "
+                f"degrade silently; see GLD-SON-27.")
+        else:
+            self.logger.log_debug(
+                f"📦 Loaded series cache for {resolved_instance}: {len(data)} entries")
         return data
 
     @LoggerManager().log_function_entry
@@ -122,23 +206,70 @@ class SonarrStorageLibraryManager(BaseManager, ComponentManagerMixin):
     @LoggerManager().log_function_entry
     @timeit("has_episode_file")
     def has_episode_file(self, series_id: int, season: int, episode: int, instance: str) -> bool:
-        key = f"{Paths.sonarr.EPISODE_FILE_MAP}.{instance}"
-        ep_files = self.global_cache.load_cache(key) or {}
-        series_key = f"{series_id}_{season}_{episode}"
-        found = series_key in ep_files
-        self.logger.log_debug(f"🔎 Episode S{season}E{episode} for Series {series_id} in {instance} found: {found}")
-        return found
+        """Whether Sonarr holds a file for this episode — GLD-SON-27.
+
+        Previously read ``load_cache(f"{Paths.sonarr.EPISODE_FILE_MAP}.{instance}")``,
+        which was broken twice over: ``load_cache`` does not exist on
+        ``GlobalCacheManager`` (see :meth:`get_series_cache`), and ``EPISODE_FILE_MAP``
+        is not among the declared ``CacheKeyPaths.sonarr`` constants either. It could
+        only ever raise, be swallowed by the caller, and report **False for every
+        episode in the library**.
+
+        Re-pointed at the per-series episode cache, which is plain JSON at a key that
+        resolves cleanly and carries both ``hasFile`` and ``episodeFileId``. Prefers
+        ``hasFile``; falls back to a non-zero ``episodeFileId`` for records written
+        before that flag was populated.
+        """
+        try:
+            resolved = self.manager.resolve_instance(instance)
+            raw = self.global_cache.get(
+                f"sonarr/{resolved}/episodes/by_series/{int(series_id)}")
+            records = raw.values() if isinstance(raw, dict) else (raw or [])
+            for e in records:
+                if not isinstance(e, dict):
+                    continue
+                try:
+                    if (int(e.get("seasonNumber", -1)) == int(season)
+                            and int(e.get("episodeNumber", -1)) == int(episode)):
+                        found = bool(e.get("hasFile")) or bool(e.get("episodeFileId"))
+                        self.logger.log_debug(
+                            f"🔎 Episode S{season}E{episode} for Series {series_id} "
+                            f"in {instance} found: {found}")
+                        return found
+                except (TypeError, ValueError):
+                    continue
+        except Exception as e:
+            self.logger.log_debug(
+                f"🔎 Episode lookup failed for S{season}E{episode} / {series_id} "
+                f"in {instance}: {e}")
+        return False
 
     @staticmethod
     @LoggerManager().log_function_entry
     @timeit("warm_cache")
     def warm_cache(logger, cache, instance=None):
-        key = f"{Paths.sonarr.SONARR_LIBRARY}.{instance or 'default'}"
-        data = cache.get(key)
-        if data:
-            logger.log_debug(f"📦 Warmed cache key: {key} ({len(data)} entries)")
+        """Report whether the series library is populated — GLD-SON-27.
+
+        Two prior bugs: the ``<instance>`` placeholder was never substituted (so the
+        key named a literal ``<instance>`` directory), and the library is SHARDED, so
+        no single ``cache.get`` could confirm it regardless. This counts shards on
+        disk, which is what "warm" actually means for this cache.
+        """
+        inst = instance or "default"
+        base = Paths.sonarr.SONARR_LIBRARY.replace("<instance>", inst)
+        shards = []
+        try:
+            root = cache.key_builder.get_base_directory().joinpath(*base.split("/"))
+            if root.is_dir():
+                shards = [p for p in root.iterdir()
+                          if p.is_file() and p.suffix in (".gz", ".json")]
+        except Exception as e:
+            logger.log_warning(f"⚠️ Could not inspect cache key {base}: {e}")
+            return
+        if shards:
+            logger.log_debug(f"📦 Warmed cache key: {base} ({len(shards)} shard(s))")
         else:
-            logger.log_warning(f"⚠️ Cache key {key} is empty or missing")
+            logger.log_warning(f"⚠️ Cache key {base} is empty or missing")
 
     @LoggerManager().log_function_entry
     @timeit("record_filesystem_prompt")
@@ -175,7 +306,9 @@ class SonarrStorageLibraryManager(BaseManager, ComponentManagerMixin):
     @timeit("get_cached_total_space")
     def get_cached_total_space(self, instance: str, path: str) -> int | None:
         cache_key = f"sonarr/manual_fs_total/{instance}"
-        data = self.global_cache.load_cache(cache_key) or []
+        # GLD-SON-27: was load_cache(), which does not exist. The key itself is fine
+        # (no <instance> template) and set_with_pretty_output writes to the same one.
+        data = self.global_cache.get(cache_key) or []
         for entry in data:
             if entry.get("path") == path:
                 return entry.get("totalSpace")

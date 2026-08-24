@@ -276,6 +276,21 @@ Constants: `DEFAULT_WATCHED_PERCENT` 85.0.
 - ✅ Percentile-scaled grace window, byte-identical by default
 - ✅ Saga retention across series boundaries
 - ✅ Monitor, restore and stale-prune policies
+- ✅ Restore identity (`GLD-RST-01`..`-07`) — `RELEASE_FIELDS` lifted off the parquet
+  row at delete time, history enrichment, infohash→magnet reconstruction, and
+  credential-safe grab-URL archiving. Indexed centrally in
+  [`ENHANCEMENTS.md`](../../../ENHANCEMENTS.md) §4.54
+- ✅ Grab-URL redaction hardened against MALFORMED urls (`GLD-RST-13`) — params
+  appended with `&` and no `?` land in `path`, where urlparse leaves `query` empty;
+  a live Newznab apikey reached 266 archive rows that way. Malformed tails are now
+  split back into a query before the allowlist runs
+- ✅ **Restore is SEARCH-based, not URL-based** (`GLD-RST-15`/`-16`, operator ruling
+  2026-08-24). Sonarr masks indexer api keys — `GET /indexer` returns `apiKey` as
+  `********` — so an archived download URL can never be refilled from Sonarr's own
+  config and is forensic only. Recovery runs `match_release` against
+  `scene_name` + `release_group` + `quality_name` + `resolution` from the
+  `deleted_episodes` ledger, which makes that release record the ENTIRE restore
+  capability rather than an enhancement. Both delete paths now feed one ledger
 - ✅ Behavioural auto-rater
 - ✅ Legacy config alias
 
@@ -293,6 +308,11 @@ Constants: `DEFAULT_WATCHED_PERCENT` 85.0.
 | `GLD-LIF-08` | **Per-viewer retention visibility** — which accounts are holding which episodes | The log attributes it; nothing aggregates it | S | `GLD-WEB-04` |
 | `GLD-LIF-09` | **Re-measure the sample rate** — 9.8 % episodes / 36.2 % movies was measured once; confirm the bar still holds | The figure justified the change and is now unmonitored | S | `GLD-LIF-02` |
 | `GLD-LIF-10` | **Auto-rater confidence** — behavioural ratings feed A4 alongside real Trakt ratings | Inferred and declared ratings currently look alike downstream | M | `GLD-ML-11` |
+| `GLD-RST-08` | ✅ **Record release identity on the DELETE paths, not just the step-down** — done in §0.1 #86/#87. All four delete paths plus the consent gate now archive; `GLD-RST-02`'s descriptor was wired to the step-down ONLY, so the path that held 271 marked rows recorded nothing | Closed. Verified in production: 271/271 rows carrying identity, reason, path, class, pid, profile, episode_id and a redacted grab descriptor | M | ✅ Done |
+| `GLD-RST-09` | **Retire `_SECRET_QS_KEYS`** on `SonarrSeriesSpacePressureManager` | Dead constant since `GLD-RST-07` replaced the denylist with an allowlist; nothing reads it *(P-A)*. Left in place pending a grep for external callers | S | `GLD-RST-07` |
+| `GLD-RST-14` | **Build the redaction corpus from PRODUCTION urls, not from imagination** — harvest distinct `downloadUrl` shapes out of live `*arr` history and assert on every one | `GLD-RST-13` leaked a live apikey because all nine corpus urls were WELL-FORMED: the adversarial cases covered base64-nested passkeys, path tokens and netloc userinfo, and never a url that simply does not parse. The corpus tested an imagined adversary | S | `GLD-RST-13` |
+| `GLD-RST-18` | **Detector for a restore-set write that silently does nothing** — assert `deleted_episodes` grew by the expected series count after an armed pass, and surface it in the deletion summary | `_persist_restore_set` skips under `dry_run` BY DESIGN, so it is structurally impossible to dry-run and executes for the first time on a live armed run. Its failure mode is the worst one in the system: files gone, no restore. Errors are logged, but nothing yet CHECKS the write landed *(**P-D**)* | S | `GLD-RST-15` |
+| `GLD-RST-19` | **Audit `push_payload` / `magnet_from_hash` — built by `GLD-RST-04`, never called** | Dead code (**P-A**): the only two consumers of an archived `download_url`, and nothing invokes them. With `GLD-RST-16` settling restore as search-based they may simply be deleted; a torrent-side magnet restore is the only case that would justify wiring them | S | `GLD-RST-16` |
 
 ## 10. Open questions
 
